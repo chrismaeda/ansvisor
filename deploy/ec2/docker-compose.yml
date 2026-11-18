@@ -1,0 +1,23 @@
+# Runs on the EC2 VM from /opt/ansvisor. Images are pulled from ECR; nothing
+# is built here. REGISTRY and TAG come from ./.env. cloudflared runs on the
+# host and sends https://aeo.b0tc0.net to 127.0.0.1:3000 and
+# https://aeoapi.b0tc0.net (only /cloro/callback is open in Access) to
+# 127.0.0.1:8080. The web container reaches the server as server:80.
+services:
+  web:
+    image: ${REGISTRY}/ansvisor-web:${TAG}
+    ports:
+      - "127.0.0.1:3000:3000"
+    env_file: ./web.env
+    depends_on:
+      - server
+    restart: unless-stopped
+
+  # Exactly one instance: the server runs the daily tracking job in-process
+  # (node-cron). A second replica would duplicate tracking runs and API spend.
+  server:
+    image: ${REGISTRY}/ansvisor-server:${TAG}
+    ports:
+      - "127.0.0.1:8080:80"
+    env_file: ./server.env
+    restart: unless-stopped

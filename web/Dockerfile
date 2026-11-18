@@ -19,7 +19,18 @@ FROM base AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-RUN npm run build
+# NEXT_PUBLIC_* values are inlined into the bundle at build time. They come
+# from .env.build (public values only; every other .env* file is kept out by
+# .dockerignore), which Next reads as .env.production.
+RUN if [ -f .env.build ]; then cp .env.build .env.production; fi
+# `next build` evaluates route modules, and src/lib/supabase/admin.ts and
+# src/lib/stripe.ts create their clients at import time, which throws on an
+# empty key. Placeholders scoped to this one command satisfy them; server-only
+# vars aren't inlined, so the real keys are read from the runtime env (web.env)
+# and none is baked in.
+RUN SUPABASE_SERVICE_ROLE_KEY=build-time-placeholder \
+    STRIPE_SECRET_KEY=build-time-placeholder \
+    npm run build
 
 # Production
 FROM base AS runner

@@ -42,3 +42,10 @@ next-env.d.ts
 
 # claude
 .claude/
+
+# deployment env files (deploy/ec2)
+web/.env.build
+web/.env.production
+deploy/ec2/.env
+deploy/ec2/web.env
+deploy/ec2/server.env

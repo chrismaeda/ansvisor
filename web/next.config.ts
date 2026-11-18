@@ -4,6 +4,7 @@ import createNextIntlPlugin from 'next-intl/plugin';
 const withNextIntl = createNextIntlPlugin('./src/i18n/request.ts');
 
 const nextConfig: NextConfig = {
+  output: 'standalone',
   // The Prompts area has a route per view (PROMPT-001). Older links and
   // bookmarks — /dashboard/prompts and its ?tab= / ?view= shapes — land on
   // the matching route; their other query params come along.

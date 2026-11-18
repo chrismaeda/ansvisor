@@ -1,0 +1,21 @@
+# Keep secrets and local artifacts out of the build context (COPY . .).
+node_modules
+.next
+.git
+.gitignore
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+coverage
+.vercel
+.DS_Store
+
+# Every env file is excluded except .env.build, which holds ONLY public
+# NEXT_PUBLIC_* values. The Dockerfile's builder stage turns it into
+# .env.production for `next build`.
+.env
+.env*
+.env.local
+.env*.local
+!.env.build
