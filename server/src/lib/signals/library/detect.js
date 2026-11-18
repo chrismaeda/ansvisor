@@ -27,10 +27,22 @@ import { resolveBrandSources } from '../../action-center/sources.js';
 import * as c from './classify.js';
 import { isTransientDbError } from '../../pulse/metrics.js';
 import { describeSignal } from '../../audit/rubric.js';
+import { canonicalIssue } from '../../audit/canonical.js';
 import { TRAFFIC_WINDOW_DAYS } from '../traffic-evidence.js';
+import { chooseBridgeLinks } from '../../action-center/bridge-links.js';
+import { chooseProductPages } from '../../action-center/product-page-groups.js';
+import { pageKey } from '../../audit/history.js';
+import { siteTypeOf } from '../../content-page-types.js';
+import { ownDomainMatcher } from '../../response-parser.js';
+import { mergedCompetitorDomains } from '../../competitor-aliases.js';
+import { readSourceRules, sourceAllowed } from '../../content-rules.js';
 
 const { library: t } = resolve();
 const DAY_MS = 86_400_000;
+/** Every page the AI Traffic list has for the bridge links' pairs: site_pages keeps 500. */
+const BRIDGE_PAGES_LIMIT = 1000;
+/** Days of shopping cards, AI visits and sales the product pages are chosen on. */
+const PRODUCT_PAGES_DAYS = 30;
 
 const AI = ['ai_results'];
 const GSC = ['gsc'];
@@ -128,7 +140,7 @@ export function group(kind, entity, rows, toTarget, source, extra = {}) {
 }
 
 /** A finding about one thing — a topic, a platform, a source, a competitor. */
-function single(kind, key, entity, target, source, values = {}, extra = {}) {
+export function single(kind, key, entity, target, source, values = {}, extra = {}) {
   return {
     kind,
     dedupKey: `${kind}:${key}`,
@@ -162,6 +174,17 @@ export function cap(candidates, score) {
 }
 
 /**
+ * Whether a competitor id is one the brand still tracks: a deleted one, or
+ * one merged into another (00543), keeps its rollup rows (its history) but
+ * raises no signal. A context without the read (a test's) takes every id.
+ */
+async function trackedCompetitors(ctx) {
+  if (typeof ctx.liveCompetitorIds !== 'function') return () => true;
+  const ids = await ctx.liveCompetitorIds();
+  return (id) => ids.has(id);
+}
+
+/**
  * Lazily-loaded, memoised reads shared between families, so the prompt
  * summary two families need is fetched once.
  */
@@ -186,6 +209,15 @@ function context(brandId, now, sources) {
     week,
     prompts: () => once('prompts', () => rpc('ae_prompt_stats', week)),
     dimensions: () => once('dimensions', () => rpc('ae_dimension_stats', week)),
+    // The brand's tracked competitors: one deleted, or merged into another
+    // (00543), is out of the table, and its past rollup rows raise nothing.
+    liveCompetitorIds: () =>
+      once('liveCompetitorIds', async () => {
+        const rows = await selectAll(() =>
+          supabaseAdmin.from('competitors').select('id').eq('brand_id', brandId).order('id'),
+        );
+        return new Set(rows.map((r) => r.id));
+      }),
     promptTexts: () =>
       once('promptTexts', async () => {
         const sets = await selectAll(() =>
@@ -301,7 +333,7 @@ function trafficTarget(p) {
   };
 }
 
-const promptTarget = (texts) => (p) => ({
+export const promptTarget = (texts) => (p) => ({
   id: p.prompt_id,
   label: String(texts.get(p.prompt_id) ?? '').slice(0, 160),
   volume: p.volume ?? 0,
@@ -421,10 +453,10 @@ const FAMILIES = [
     requires: ['tracking', 'competitors'],
     kinds: ['competitor_leads', 'competitor_momentum'],
     async run(ctx) {
-      const dims = await ctx.dimensions();
+      const [dims, live] = await Promise.all([ctx.dimensions(), trackedCompetitors(ctx)]);
       const brandMentions = (dims.platforms ?? []).reduce((s, p) => s + (p.cur_mentions ?? 0), 0);
       const found = [];
-      for (const competitor of dims.competitors ?? []) {
+      for (const competitor of (dims.competitors ?? []).filter((x) => live(x.key))) {
         for (const kind of c.classifyCompetitor(competitor, brandMentions, t)) {
           found.push(
             single(
@@ -454,12 +486,14 @@ const FAMILIES = [
     requires: ['tracking', 'competitors'],
     kinds: ['competitor_high_value_lead', 'competitor_topic_lead', 'competitor_uncovered_topic'],
     async run(ctx) {
-      const [prompts, compRows, texts, dims] = await Promise.all([
+      const [prompts, allCompRows, texts, dims, live] = await Promise.all([
         ctx.prompts(),
         rpc('ae_competitor_prompt_stats', ctx.week),
         ctx.promptTexts(),
         ctx.dimensions(),
+        trackedCompetitors(ctx),
       ]);
+      const compRows = allCompRows.filter((row) => live(row.competitor_id));
       const names = new Map((dims.competitors ?? []).map((x) => [x.key, x.name]));
       const leader = new Map();
       for (const row of compRows) {
@@ -542,12 +576,45 @@ const FAMILIES = [
       'competitor_winning_source',
     ],
     async run(ctx) {
-      const domains = await rpc('ae_citation_sources', {
-        p_brand_id: ctx.brandId,
-        p_from: new Date(ctx.now.getTime() - t.windowDays * DAY_MS).toISOString(),
-      });
+      const [domains, competitors, mergedDomains] = await Promise.all([
+        rpc('ae_citation_sources', {
+          p_brand_id: ctx.brandId,
+          p_from: new Date(ctx.now.getTime() - t.windowDays * DAY_MS).toISOString(),
+        }),
+        selectAll(() =>
+          supabaseAdmin
+            .from('competitors')
+            .select('domain')
+            .eq('brand_id', ctx.brandId)
+            .order('id'),
+        ),
+        mergedCompetitorDomains(ctx.brandId),
+      ]);
+      // A tracked competitor's own site (its blog too) is never a source to
+      // earn a link or a citation from: same host rule as the brand's own.
+      // Nor is a merged one's (00543): it is the kept competitor's site.
+      const isCompetitor = ownDomainMatcher([
+        ...competitors.map((row) => row.domain),
+        ...mergedDomains,
+      ]);
+      // The brand's Content rules: never a blocked domain; "only these" keeps its allowed ones
+      // and its own site.
+      const rules = await readSourceRules(ctx.brandId);
+      const own = rules.onlyAllowedDomains
+        ? (
+            await selectAll(() =>
+              supabaseAdmin
+                .from('brand_domains')
+                .select('domain')
+                .eq('brand_id', ctx.brandId)
+                .order('id'),
+            )
+          ).map((row) => row.domain)
+        : [];
+      const permitted = sourceAllowed(rules, own);
       const found = [];
       for (const d of domains) {
+        if (isCompetitor(d.domain) || !permitted(d.domain)) continue;
         const kind = c.classifySource(d, t);
         if (!kind) continue;
         found.push(
@@ -712,6 +779,110 @@ const FAMILIES = [
         });
       }
       return found;
+    },
+  },
+
+  // Links from the pages AI sends readers to that rarely convert, to the
+  // pages that convert (AC plan P-10, spec §8): one signal with the pairs,
+  // chosen by bridge-links.js. Conversions are Analytics', so it needs both.
+  {
+    name: 'bridgeLinks',
+    requires: ['ai_traffic', 'analytics'],
+    kinds: ['bridge_link_gap'],
+    async run(ctx) {
+      const [list, sitePages] = await Promise.all([
+        rpc('ai_traffic_pages', {
+          p_brand_id: ctx.brandId,
+          p_from: utcMidnight(ctx.now, t.bridgeWindowDays),
+          p_to: ctx.now.toISOString(),
+          p_tab: 'all',
+          p_limit: BRIDGE_PAGES_LIMIT,
+          p_offset: 0,
+        }),
+        selectAll(() =>
+          supabaseAdmin
+            .from('site_pages')
+            .select('url, title, h1, lastmod')
+            .eq('brand_id', ctx.brandId)
+            .order('id'),
+        ),
+      ]);
+      const { pairs, siteKeyRate } = chooseBridgeLinks(
+        { pages: list?.rows ?? [], sitePages, now: ctx.now },
+        t,
+      );
+      if (pairs.length === 0) return [];
+      return [
+        group(
+          'bridge_link_gap',
+          'pages',
+          pairs,
+          ({ from, ...pair }) => ({ id: from, label: from, ...pair }),
+          GA,
+          {
+            siteKeyRate: rounded(siteKeyRate),
+          },
+        ),
+      ];
+    },
+  },
+
+  // An online store's product pages worth optimizing (AC plan P-6, spec
+  // §6.1): one signal with up to ten products, best first, chosen by
+  // product-page-groups.js. Only on a store: its site type says so.
+  {
+    name: 'productPages',
+    requires: ['tracking'],
+    kinds: ['product_pages_to_optimize'],
+    async run(ctx) {
+      const { data: brand, error } = await supabaseAdmin
+        .from('brands')
+        .select('site_type, industry, shopping_mode_enabled')
+        .eq('id', ctx.brandId)
+        .maybeSingle();
+      if (error) throw new Error(error.message);
+      const siteType = siteTypeOf({
+        siteType: brand?.site_type,
+        industry: brand?.industry,
+        shoppingModeEnabled: brand?.shopping_mode_enabled,
+      });
+      if (siteType !== 'ecommerce') return [];
+      const since = new Date(ctx.now.getTime() - PRODUCT_PAGES_DAYS * DAY_MS).toISOString();
+      const candidates = await rpc('product_page_candidates', {
+        p_brand_id: ctx.brandId,
+        p_from: since,
+      });
+      if (!candidates?.length) return [];
+      const [prompts, drafts] = await Promise.all([
+        ctx.prompts(),
+        selectAll(() =>
+          supabaseAdmin
+            .from('content_drafts')
+            .select('source_url')
+            .eq('brand_id', ctx.brandId)
+            .eq('method', 'optimize')
+            .in('status', ['ready', 'published'])
+            .gte('updated_at', since)
+            .not('source_url', 'is', null)
+            .order('id'),
+        ),
+      ]);
+      const products = chooseProductPages({
+        candidates,
+        volumes: new Map((prompts ?? []).map((p) => [p.prompt_id, p.volume ?? null])),
+        optimized: new Set(drafts.map((d) => pageKey(d.source_url)?.key).filter(Boolean)),
+      });
+      if (products.length === 0) return [];
+      return [
+        group(
+          'product_pages_to_optimize',
+          'pages',
+          products,
+          // The score only orders them.
+          ({ url, title, score: _score, ...figures }) => ({ id: url, label: title, ...figures }),
+          AI,
+        ),
+      ];
     },
   },
 
@@ -893,6 +1064,7 @@ const FAMILIES = [
       'weak_entity',
       'weak_internal_links',
       'content_gap',
+      'canonical_issue',
     ],
     async run(ctx) {
       const since = new Date(ctx.now.getTime() - 90 * DAY_MS).toISOString();
@@ -939,7 +1111,7 @@ const FAMILIES = [
         });
         set.set(page, entry);
       }
-      return Object.entries(groups).map(([kind, pages]) =>
+      const found = Object.entries(groups).map(([kind, pages]) =>
         group(
           kind,
           'pages',
@@ -948,6 +1120,39 @@ const FAMILIES = [
           AUDIT,
         ),
       );
+
+      // The canonical tag (AC plan P-11): missing, or pointing to another
+      // site, a redirect, a noindex or a missing page, as the audit read it.
+      // Passing the score, it's still read: a wrong tag scores as present.
+      const canonicals = await selectAll(() =>
+        supabaseAdmin
+          .from('audit_signal_results')
+          .select('audit_id, evidence')
+          .in('audit_id', ids)
+          .eq('signal_key', 'canonical'),
+      );
+      const wrong = canonicals
+        .map((r) => ({ page: pageOf.get(r.audit_id), evidence: r.evidence ?? {} }))
+        .map((e) => ({ ...e, issue: canonicalIssue(e.evidence) }))
+        .filter((e) => e.page && e.issue);
+      if (wrong.length) {
+        found.push(
+          group(
+            'canonical_issue',
+            'pages',
+            wrong,
+            (e) => ({
+              id: e.page,
+              label: e.page,
+              issue: e.issue,
+              canonical: e.evidence.canonical ?? null,
+              ...(e.evidence.target?.to ? { to: e.evidence.target.to } : {}),
+            }),
+            AUDIT,
+          ),
+        );
+      }
+      return found;
     },
   },
 ];

@@ -14,7 +14,9 @@ const logError = vi.fn();
 const assertBrandAccess = vi.fn();
 const readBrandFacts = vi.fn();
 const setFactStatus = vi.fn();
+const setFactScope = vi.fn();
 const isOrgActive = vi.fn();
+const isDemoBrand = vi.fn();
 
 vi.mock('../config/supabase.js', () => ({
   default: {
@@ -30,14 +32,21 @@ vi.mock('../config/supabase.js', () => ({
 }));
 vi.mock('../lib/access.js', () => ({
   assertBrandAccess: (...args) => assertBrandAccess(...args),
+  // The caller may (the role rule's own tests: run-roles.test.js).
+  MANAGER_ROLES: ['admin', 'manager'],
+  assertRole: vi.fn(async () => 'manager'),
 }));
 vi.mock('../lib/brand-facts.js', () => ({
   readBrandFacts: (...args) => readBrandFacts(...args),
   setFactStatus: (...args) => setFactStatus(...args),
+  setFactScope: (...args) => setFactScope(...args),
 }));
 
 vi.mock('../lib/active-subscriptions.js', () => ({
   isOrgActive: (...args) => isOrgActive(...args),
+}));
+vi.mock('../middleware/demo-brand.js', () => ({
+  isDemoBrand: (...args) => isDemoBrand(...args),
 }));
 
 const { default: router } = await import('./brand-facts.js');
@@ -51,7 +60,9 @@ beforeEach(async () => {
   assertBrandAccess.mockReset().mockResolvedValue({ orgId: 'o1' });
   readBrandFacts.mockReset().mockResolvedValue({ facts: [], pages: [], paused: false });
   setFactStatus.mockReset().mockResolvedValue({ id: FACT, status: 'approved' });
+  setFactScope.mockReset().mockResolvedValue({ id: FACT, scope: 'Bozcaada' });
   isOrgActive.mockReset().mockResolvedValue(true);
+  isDemoBrand.mockReset().mockResolvedValue(false);
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -83,6 +94,14 @@ describe('/api/brand-facts', () => {
     const res = await send(`?brandId=${BRAND}`, 'GET');
     expect(res.status).toBe(200);
     expect(isOrgActive).toHaveBeenCalledWith('o1');
+    expect(readBrandFacts).toHaveBeenCalledWith(BRAND, { orgId: 'o1', keptOnly: true });
+  });
+
+  it('reads only what is kept on a demo brand: its facts are sample data', async () => {
+    isDemoBrand.mockResolvedValue(true);
+    const res = await send(`?brandId=${BRAND}`, 'GET');
+    expect(res.status).toBe(200);
+    expect(isDemoBrand).toHaveBeenCalledWith(BRAND);
     expect(readBrandFacts).toHaveBeenCalledWith(BRAND, { orgId: 'o1', keptOnly: true });
   });
 
@@ -119,11 +138,36 @@ describe('/api/brand-facts', () => {
     expect((await send(`/${FACT}`, 'PATCH', { status: 'rejected' })).status).toBe(404);
   });
 
+  it('sets where a fact holds, or the whole brand, and says when that fact is kept there already', async () => {
+    const res = await send(`/${FACT}`, 'PATCH', { scope: 'Bozcaada' });
+    expect(res.status).toBe(200);
+    expect(assertBrandAccess).toHaveBeenCalledWith(BRAND, 'u1');
+    expect(setFactScope).toHaveBeenCalledWith(factRow, 'Bozcaada');
+    expect((await send(`/${FACT}`, 'PATCH', { scope: null })).status).toBe(200);
+    expect(setFactScope).toHaveBeenLastCalledWith(factRow, null);
+    // No word in it, too long, or a status beside it.
+    for (const body of [
+      { scope: '→' },
+      { scope: 'x'.repeat(101) },
+      { scope: 'A', status: 'approved' },
+    ]) {
+      expect((await send(`/${FACT}`, 'PATCH', body)).status).toBe(400);
+    }
+    setFactScope.mockRejectedValueOnce(Object.assign(new Error('kept'), { status: 409 }));
+    const taken = await send(`/${FACT}`, 'PATCH', { scope: 'Gökçeada' });
+    expect(taken.status).toBe(409);
+    expect((await taken.json()).code).toBe('duplicate');
+    expect(setFactStatus).not.toHaveBeenCalled();
+  });
+
   it('changes no fact of another workspace’s brand', async () => {
     assertBrandAccess.mockRejectedValueOnce(Object.assign(new Error('Not yours'), { status: 403 }));
     const res = await send(`/${FACT}`, 'PATCH', { status: 'approved' });
     expect(res.status).toBe(403);
     expect(setFactStatus).not.toHaveBeenCalled();
+    assertBrandAccess.mockRejectedValueOnce(Object.assign(new Error('Not yours'), { status: 403 }));
+    expect((await send(`/${FACT}`, 'PATCH', { scope: 'Bozcaada' })).status).toBe(403);
+    expect(setFactScope).not.toHaveBeenCalled();
   });
 
   it('logs a failure without the provider’s request', async () => {

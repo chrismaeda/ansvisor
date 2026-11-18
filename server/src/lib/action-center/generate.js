@@ -47,6 +47,7 @@
 
 import supabaseAdmin from '../../config/supabase.js';
 import { logger } from '../logger.js';
+import { captureWorkspaceEvent } from '../core-loop-events.js';
 import { resolve } from '../../config/action-engine.js';
 import { isEligible, loadDefinitions } from './definitions/index.js';
 import { resolveBrandSources } from './sources.js';
@@ -54,8 +55,14 @@ import { planTasks } from './tasks/plan.js';
 import { orderByPriority, scoreCandidate } from './candidates.js';
 import { priorityColumns, promptIdsOf, scorePriority } from './priority.js';
 import { kindTrackOrNone, loadPromptDemand } from './priority-data.js';
+import { withWorkScope } from './work-scope.js';
+import { PLAY_DEFINITIONS, categoryPagePlay, choosePlay } from './playbooks.js';
+import { categoryPageFor } from './category-play.js';
+import { siteTypeOf } from '../content-page-types.js';
 
 const DAY_MS = 86_400_000;
+/** The definition a store's topic action with a live category page optimizes it in (G16). */
+const CATEGORY_PLAY_DEFINITION = 'create_content_for_topics';
 
 // Thresholds live in config/action-engine.js (#818 phase 2.5).
 const { noise } = resolve();
@@ -122,16 +129,118 @@ function startOfUtcDay(now) {
   return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
 }
 
+/**
+ * The payload with the prompts and pages its work is about (work-scope.js),
+ * so a draft started from it opens with them. Best effort: a failed read
+ * opens the action as the night found it.
+ */
+async function scopedPayload(brandId, definitionId, payload) {
+  try {
+    return await withWorkScope(brandId, payload);
+  } catch (err) {
+    logger.warn(
+      { brandId, definitionId, err: err.message },
+      "[actions] work's prompts and pages not read",
+    );
+    return payload;
+  }
+}
+
+/** The topics a topic action (G16) is about: its targets' ids. */
+function topicIdsOf(payload) {
+  if (payload.targetEntity !== 'topics') return [];
+  const listed = Array.isArray(payload.targetIds)
+    ? payload.targetIds
+    : (Array.isArray(payload.targets) ? payload.targets : []).map((t) => t?.id);
+  return [...new Set(listed.filter((id) => typeof id === 'string' && id))];
+}
+
+/**
+ * The payload with the play its prompts pick (playbooks.js, AC plan §5),
+ * for G15, G16 and C09: the brand's kind of site and its prompts' intents
+ * and AI searches read, then chosen. On a store, a topic action whose topic
+ * has a live category page optimizes that page instead (AC plan P-7,
+ * category-play.js): its page, its best sellers locked into the draft's
+ * shopping path, and the optimize branch of its plan; one whose category
+ * has products but no page writes a buying guide (EC-1), its best sellers
+ * locked in. A live category page with no buying guide yet has one also
+ * worth doing, next to the page and linking it. Best effort: a failed read,
+ * or no play the data supports, opens the action without one.
+ */
+async function playedPayload(brandId, definitionId, payload) {
+  if (!PLAY_DEFINITIONS.includes(definitionId) || payload.play) return payload;
+  const promptIds = Array.isArray(payload.promptIds) ? payload.promptIds : [];
+  const topicIds = definitionId === CATEGORY_PLAY_DEFINITION ? topicIdsOf(payload) : [];
+  if (!promptIds.length && !topicIds.length) return payload;
+  try {
+    const [brand, demand] = await Promise.all([
+      supabaseAdmin
+        .from('brands')
+        .select('site_type, industry, shopping_mode_enabled')
+        .eq('id', brandId)
+        .maybeSingle(),
+      promptIds.length ? loadPromptDemand(promptIds) : new Map(),
+    ]);
+    if (brand.error) throw new Error(brand.error.message);
+    const siteType = siteTypeOf({
+      siteType: brand.data?.site_type,
+      industry: brand.data?.industry,
+      shoppingModeEnabled: brand.data?.shopping_mode_enabled,
+    });
+    const prompts = promptIds.map((id) => ({
+      id,
+      intent: demand.get(id)?.intent ?? null,
+      volume: demand.get(id)?.volume ?? null,
+    }));
+    if (siteType === 'ecommerce' && topicIds.length) {
+      const found = await categoryPageFor(brandId, topicIds);
+      // Its page optimized, or a buying guide written when it has none (EC-1).
+      if (found?.category.url) {
+        return {
+          ...payload,
+          play: categoryPagePlay({
+            siteType,
+            category: found.category,
+            prompts,
+            guideMissing: found.guideMissing,
+          }),
+          contentExists: true,
+          pages: [found.category.url],
+          products: found.products,
+        };
+      }
+      if (found) {
+        return {
+          ...payload,
+          play: categoryPagePlay({ siteType, category: found.category, prompts }),
+          products: found.products,
+        };
+      }
+    }
+    if (!prompts.length) return payload;
+    const play = choosePlay({ siteType, prompts });
+    return play ? { ...payload, play } : payload;
+  } catch (err) {
+    logger.warn({ brandId, definitionId, err: err.message }, '[actions] play not chosen');
+    return payload;
+  }
+}
+
 async function openCycle({
   brandId,
   definition,
   signals,
   impact,
   available,
-  payload,
+  payload: found,
   priority,
   now,
 }) {
+  const payload = await playedPayload(
+    brandId,
+    definition.id,
+    await scopedPayload(brandId, definition.id, found),
+  );
   const { data: inserted, error } = await supabaseAdmin
     .from('actions')
     .insert({
@@ -153,7 +262,7 @@ async function openCycle({
   // The plan follows from what this brand has and what this action is about
   // — not from the kind alone (#818 phase 5). Two brands with the same
   // problem and different integrations get different lists here.
-  const plan = planTasks(definition, { sources: available, payload });
+  const plan = planTasks(definition, { sources: available, payload, signals });
   const { error: tasksErr } = await supabaseAdmin.from('action_tasks').insert(
     plan.map((item) => ({
       action_id: inserted.id,
@@ -163,6 +272,7 @@ async function openCycle({
       mode: item.mode,
       permission: item.permission,
       depends_on: item.dependsOn,
+      title: item.title,
       title_params: item.titleParams,
       details: item.details,
     })),
@@ -174,6 +284,11 @@ async function openCycle({
     signalCount: signals.length,
     definitionVersion: definition.version,
     taskCount: plan.length,
+  });
+  void captureWorkspaceEvent(brandId, 'action_created', {
+    source: 'signals',
+    kind: definition.id,
+    task_count: plan.length,
   });
   await linkSignals(inserted.id, signals, now.toISOString());
   return inserted.id;

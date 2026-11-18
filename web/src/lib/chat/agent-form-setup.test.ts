@@ -1,0 +1,343 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { FakeSupabase } from './testing/fake-supabase';
+import { BRAND, ORG, OTHER_ORG, PEOPLE, seedWorkspace } from './testing/chat-fixtures';
+
+/**
+ * What the create and edit pages know before the form opens (CHAT-21 §D):
+ * the person's role, the brands (never the demo brand) and their topics,
+ * the plan's engines, Full auto open, locked or off, Settings › Chat's
+ * defaults, the names they see and whose key Chat runs on.
+ */
+
+vi.mock('@/lib/supabase/admin', async () => ({
+  supabaseAdmin: (await import('./testing/fake-supabase')).createFakeSupabase(),
+}));
+vi.mock('@/lib/supabase/server', () => ({ createClient: async () => ({}) }));
+const key = vi.hoisted(() => {
+  class OwnKeyUnreadableError extends Error {
+    provider: string;
+    constructor(provider: string) {
+      super('unreadable');
+      this.provider = provider;
+    }
+  }
+  return {
+    own: false,
+    unreadable: false,
+    providers: [] as string[] | Error,
+    OwnKeyUnreadableError,
+  };
+});
+const keyCap = vi.hoisted(() => ({
+  reached: null as { reached: boolean; renewsAt: string | null } | null,
+  read: null as { reached: boolean; renewsAt: string | null } | null,
+}));
+vi.mock('./own-key-cap', () => ({
+  ownKeyCapReached: vi.fn(async () => keyCap.reached),
+  readOwnKeyCap: vi.fn(async () => keyCap.read),
+}));
+vi.mock('./key', () => ({
+  OwnKeyUnreadableError: key.OwnKeyUnreadableError,
+  resolveChatModelKey: vi.fn(async () => {
+    if (key.unreadable) throw new key.OwnKeyUnreadableError('azure');
+    return key.own
+      ? { source: 'own', config: { provider: 'openai', apiKey: 'k', settings: {} } }
+      : { source: 'ansvisor', config: { provider: 'anthropic', apiKey: 'k', settings: {} } };
+  }),
+  ownChatKeyProviders: vi.fn(async () => {
+    if (key.providers instanceof Error) throw key.providers;
+    return key.providers;
+  }),
+}));
+vi.mock('./agent-shares', () => ({ readAgentShares: vi.fn(async () => null) }));
+
+const { supabaseAdmin } = await import('@/lib/supabase/admin');
+const db = supabaseAdmin as unknown as FakeSupabase;
+const { readAgentContext } = await import('./agents');
+const { agentFormSetupFor } = await import('./agent-form-setup');
+
+const BRAND_2 = '33333333-3333-4333-8333-333333333333';
+const DEMO = '66666666-6666-4666-8666-666666666666';
+
+async function setupOf(userId: string) {
+  const ctx = await readAgentContext({ userId, email: null, organizationId: ORG });
+  if (!ctx) throw new Error('no context');
+  return agentFormSetupFor(ctx);
+}
+
+beforeEach(() => {
+  vi.stubEnv('NEXT_PUBLIC_IS_CLOUD', 'true');
+  seedWorkspace(db);
+  key.own = false;
+  key.providers = [];
+  db.tables.brands = [
+    { id: BRAND, organization_id: ORG, name: 'Zeta', is_demo: false },
+    { id: BRAND_2, organization_id: ORG, name: 'Alpha', is_demo: false },
+    { id: DEMO, organization_id: ORG, name: 'Demo', is_demo: true },
+    {
+      id: 'f0000000-0000-4000-8000-000000000001',
+      organization_id: OTHER_ORG,
+      name: 'Theirs',
+      is_demo: false,
+    },
+  ];
+  db.tables.chat_skills = [];
+  db.tables.topics = [
+    { id: 't1', brand_id: BRAND, name: 'Pricing', is_active: true },
+    { id: 't2', brand_id: BRAND, name: 'Old', is_active: false },
+    { id: 't3', brand_id: DEMO, name: 'Sample', is_active: true },
+  ];
+  db.tables.chat_agents = [
+    {
+      id: 'a1',
+      organization_id: ORG,
+      name: 'Shared one',
+      visibility: 'workspace',
+      owner_id: PEOPLE.admin,
+    },
+    {
+      id: 'a2',
+      organization_id: ORG,
+      name: 'My own',
+      visibility: 'private',
+      owner_id: PEOPLE.manager,
+    },
+    {
+      id: 'a3',
+      organization_id: ORG,
+      name: 'Their private',
+      visibility: 'private',
+      owner_id: PEOPLE.otherManager,
+    },
+  ];
+});
+
+describe('agentFormSetupFor', () => {
+  it('lists the Library skills an Admin approved that the person may run (W4-19)', async () => {
+    const sha = 'c'.repeat(40);
+    const skill = (name: string, over: Record<string, unknown> = {}) => ({
+      id: `skill-${name}`,
+      organization_id: ORG,
+      name,
+      title: name.replace(/-/g, ' '),
+      source: 'library',
+      source_url: `https://github.com/acme/skills/tree/${sha}/${name}`,
+      status: 'approved',
+      enabled: true,
+      visibility: 'workspace',
+      created_by: PEOPLE.admin,
+      ...over,
+    });
+    db.tables.chat_skills = [
+      skill('shared-one'),
+      skill('my-own', { visibility: 'private', created_by: PEOPLE.manager }),
+      skill('their-private', { visibility: 'private', created_by: PEOPLE.otherManager }),
+      skill('waiting', { status: 'pending_review' }),
+      skill('turned-off', { enabled: false }),
+      skill('an-import', { source: 'import' }),
+      { ...skill('elsewhere'), organization_id: OTHER_ORG },
+    ];
+    expect((await setupOf(PEOPLE.manager)).librarySkills).toEqual([
+      { name: 'my-own', title: 'my own', repo: 'acme/skills' },
+      { name: 'shared-one', title: 'shared one', repo: 'acme/skills' },
+    ]);
+    // An Admin sees their private ones, but runs only theirs and the shared ones.
+    expect((await setupOf(PEOPLE.admin)).librarySkills!.map((s) => s.name)).toEqual(['shared-one']);
+  });
+
+  it('reads the brands without the demo, their active topics, and the plan’s engines', async () => {
+    const setup = await setupOf(PEOPLE.manager);
+    expect(setup.role).toBe('manager');
+    expect(setup.brands).toEqual([
+      { id: BRAND_2, name: 'Alpha' },
+      { id: BRAND, name: 'Zeta' },
+    ]);
+    expect(setup.topics).toEqual([{ id: 't1', name: 'Pricing', brandId: BRAND }]);
+    expect(setup.engines.length).toBeGreaterThan(0);
+    expect(setup).toMatchObject({
+      fullAuto: 'open',
+      planName: 'Growth',
+      runShareDefault: 0.1,
+      workspaceAgentsAdminsOnly: false,
+      ownKeyProvider: null,
+      ownKeyProviders: [],
+      modelChoiceOpen: true,
+    });
+  });
+
+  it('names the Ansvisor skills this install does not offer now: the ChatGPT profile check until Business Hub is on, and Ads’ until Ads is', async () => {
+    vi.stubEnv('BUSINESS_HUB_ENABLED', '');
+    vi.stubEnv('ADS_ENABLED', '');
+    vi.stubEnv('CHAT_OPERATOR', '');
+    expect((await setupOf(PEOPLE.manager)).offSkills).toEqual([
+      'chatgpt-profile',
+      'earn-or-pay',
+      'ad-drafts',
+      // The AEO Operator's skill until CHAT_OPERATOR is on for the workspace (PR 4).
+      'operator',
+    ]);
+    vi.stubEnv('BUSINESS_HUB_ENABLED', 'true');
+    vi.stubEnv('ADS_ENABLED', 'true');
+    vi.stubEnv('CHAT_OPERATOR', 'true');
+    expect((await setupOf(PEOPLE.manager)).offSkills).toEqual([]);
+    // CHAT_OPERATOR_ORGS names another workspace: off for this one.
+    vi.stubEnv('CHAT_OPERATOR_ORGS', '99999999-9999-4999-8999-999999999999');
+    expect((await setupOf(PEOPLE.manager)).offSkills).toEqual(['operator']);
+    vi.unstubAllEnvs();
+  });
+
+  it('carries the time zone the person picked in Settings › Account, null for Automatic', async () => {
+    expect((await setupOf(PEOPLE.manager)).timeZone).toBeNull();
+
+    db.tables.profiles = db.tables.profiles.map((row) =>
+      row.id === PEOPLE.manager ? { ...row, time_zone: 'Asia/Tokyo' } : row,
+    );
+    expect((await setupOf(PEOPLE.manager)).timeZone).toBe('Asia/Tokyo');
+    // Another person's pick isn't theirs.
+    expect((await setupOf(PEOPLE.admin)).timeZone).toBeNull();
+  });
+
+  it('names only the agents the person sees; an Admin sees them all', async () => {
+    expect((await setupOf(PEOPLE.manager)).takenNames.sort()).toEqual(['My own', 'Shared one']);
+    expect((await setupOf(PEOPLE.admin)).takenNames.sort()).toEqual([
+      'My own',
+      'Shared one',
+      'Their private',
+    ]);
+  });
+
+  it('offers Can call the agents the person sees that are on or paused, by name; locked below Growth', async () => {
+    db.tables.chat_agents[0].status = 'active';
+    db.tables.chat_agents[1].status = 'draft';
+    db.tables.chat_agents[2].status = 'paused';
+    expect(await setupOf(PEOPLE.manager)).toMatchObject({
+      callable: [{ id: 'a1', name: 'Shared one' }],
+      canCallLocked: false,
+    });
+    expect((await setupOf(PEOPLE.admin)).callable).toEqual([
+      { id: 'a1', name: 'Shared one' },
+      { id: 'a3', name: 'Their private' },
+    ]);
+    db.tables.organizations = db.tables.organizations.map((org) =>
+      org.id === ORG ? { ...org, plan: 'starter' } : org,
+    );
+    expect((await setupOf(PEOPLE.manager)).canCallLocked).toBe(true);
+  });
+
+  it('offers an AEO Operator its owner’s agents and the workspace’s, on or paused; never an Operator, a sample or another’s private one', async () => {
+    db.tables.chat_agents = [
+      ...db.tables.chat_agents.map((a) => ({ ...a, status: 'active' })),
+      {
+        id: 'a4',
+        organization_id: ORG,
+        name: 'Paused mine',
+        visibility: 'private',
+        owner_id: PEOPLE.manager,
+        status: 'paused',
+      },
+      {
+        id: 'a5',
+        organization_id: ORG,
+        name: 'Draft mine',
+        visibility: 'private',
+        owner_id: PEOPLE.manager,
+        status: 'draft',
+      },
+      {
+        id: 'a6',
+        organization_id: ORG,
+        name: 'An Operator',
+        visibility: 'private',
+        owner_id: PEOPLE.manager,
+        status: 'active',
+        kind: 'operator',
+      },
+      {
+        id: 'a7',
+        organization_id: ORG,
+        name: 'Sample',
+        visibility: 'workspace',
+        owner_id: PEOPLE.admin,
+        status: 'active',
+        demo_brand_id: DEMO,
+      },
+    ];
+    expect((await setupOf(PEOPLE.manager)).operatorAgents).toEqual([
+      { id: 'a2', name: 'My own', mine: true, workspace: false },
+      { id: 'a4', name: 'Paused mine', mine: true, workspace: false },
+      { id: 'a1', name: 'Shared one', mine: false, workspace: true },
+    ]);
+    // An Admin sees the others' private agents, yet an Operator never runs them (decision 4).
+    expect((await setupOf(PEOPLE.admin)).operatorAgents).toEqual([
+      { id: 'a1', name: 'Shared one', mine: true, workspace: true },
+    ]);
+  });
+
+  it('locks Full auto below Growth, hides it where Settings › Chat turned it off, and follows Settings › Chat’s defaults', async () => {
+    db.tables.organizations = db.tables.organizations.map((org) =>
+      org.id === ORG ? { ...org, plan: 'starter' } : org,
+    );
+    const starter = await setupOf(PEOPLE.manager);
+    expect(starter).toMatchObject({
+      fullAuto: 'plan',
+      planName: 'Starter',
+      fullAutoPlan: 'Growth',
+    });
+    // Growth's engines are more than Starter's.
+    db.tables.organizations = db.tables.organizations.map((org) =>
+      org.id === ORG ? { ...org, plan: 'growth' } : org,
+    );
+    expect((await setupOf(PEOPLE.manager)).engines.length).toBeGreaterThan(starter.engines.length);
+
+    db.tables.chat_settings = [
+      {
+        organization_id: ORG,
+        agent_run_share_default: 0.2,
+        agents_full_auto: true,
+        workspace_agents_admins_only: true,
+        full_auto_for_members: false,
+      },
+    ];
+    expect(await setupOf(PEOPLE.manager)).toMatchObject({
+      fullAuto: 'policy',
+      runShareDefault: 0.2,
+      workspaceAgentsAdminsOnly: true,
+    });
+    expect((await setupOf(PEOPLE.admin)).fullAuto).toBe('open');
+  });
+
+  it('says whose key Chat runs on: the workspace’s own, by provider', async () => {
+    key.own = true;
+    expect((await setupOf(PEOPLE.admin)).ownKeyProvider).toBe('openai');
+    // A saved key that can't be read is still the one agents run on, not the AI limit.
+    key.unreadable = true;
+    expect((await setupOf(PEOPLE.admin)).ownKeyProvider).toBe('azure');
+    key.own = false;
+    key.unreadable = false;
+  });
+
+  it('carries the own keys for Chat a picked model may run on, and whether the plan runs a pick', async () => {
+    key.own = true;
+    key.providers = ['openai', 'anthropic'];
+    expect(await setupOf(PEOPLE.admin)).toMatchObject({
+      ownKeyProvider: 'openai',
+      ownKeyProviders: ['openai', 'anthropic'],
+      modelChoiceOpen: true,
+    });
+    // Unread, a picked model reads as on the AI limit: the run itself still finds its key.
+    key.providers = new Error('down');
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect((await setupOf(PEOPLE.admin)).ownKeyProviders).toEqual([]);
+    expect(logged).toHaveBeenCalledWith(
+      '[chat/agents] could not read the own keys for Chat:',
+      key.providers,
+    );
+    logged.mockRestore();
+
+    // The free trial runs Auto, whatever the agent picked.
+    db.tables.organizations = db.tables.organizations.map((row) =>
+      row.id === ORG ? { ...row, subscription_status: 'trialing' } : row,
+    );
+    expect((await setupOf(PEOPLE.admin)).modelChoiceOpen).toBe(false);
+  });
+});

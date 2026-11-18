@@ -22,6 +22,7 @@ function builder(table: string) {
         : { data: demandRows.filter((r) => ids.includes(r.prompt_id as string)), error: null },
     order: () => chain,
     limit: async () => ({ data: rows, error: null }),
+    range: async () => ({ data: rows, count: rows.length, error: null }),
     maybeSingle: async () => ({ data: table === 'brands' ? { id: 'b1' } : null, error: null }),
   };
   return chain;
@@ -38,6 +39,8 @@ const auth: McpAuthContext = {
   email: null,
   organizationId: 'org-1',
   apiKeyId: 'key-1',
+  brandAccess: 'all',
+  role: 'admin',
 };
 
 const row = (over: Record<string, unknown>) => ({

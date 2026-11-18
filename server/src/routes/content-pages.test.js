@@ -24,17 +24,27 @@ vi.mock('../config/supabase.js', () => ({
               data: { id: BRAND, organization_id: 'o1', name: 'Northwind', site_type: 'b2c' },
               error: null,
             }
-          : name === 'content_drafts'
-            ? { data: draftRow, error: null }
-            : name === 'brand_facts'
-              ? { data: [{ quote: 'Bluesign certified' }], error: null }
-              : {
-                  data: [
-                    { domain: 'https://www.Northwind.example/' },
-                    { domain: 'northwind.shop' },
-                  ],
-                  error: null,
-                };
+          : name === 'profiles'
+            ? // The caller, with All brands (lib/access.js reads it once).
+              { data: { organization_id: org, role: 'manager', brand_scope: 'all' }, error: null }
+            : name === 'content_drafts'
+              ? { data: draftRow, error: null }
+              : name === 'brand_facts'
+                ? // A claim for one place the page doesn't name is left out (00539).
+                  {
+                    data: [
+                      { quote: 'Bluesign certified', scope: null },
+                      { quote: 'Sewn in Bozcaada', scope: 'Bozcaada' },
+                    ],
+                    error: null,
+                  }
+                : {
+                    data: [
+                      { domain: 'https://www.Northwind.example/' },
+                      { domain: 'northwind.shop' },
+                    ],
+                    error: null,
+                  };
       const asked = (calls ??= {})[name] ?? (calls[name] = []);
       const chain = {
         select: () => chain,
@@ -432,7 +442,7 @@ describe('POST /api/content-pages/page-read (Quality CE-049)', () => {
       ['is', 'gone_at', null],
       ['order', 'first_seen_at'],
       ['order', 'id'],
-      ['limit', 10],
+      ['limit', 60],
     ]);
   });
 

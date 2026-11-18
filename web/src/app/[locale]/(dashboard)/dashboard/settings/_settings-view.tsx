@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslations } from 'next-intl';
 import { useRouter } from '@/i18n/navigation';
 import { createClient } from '@/lib/supabase/client';
@@ -20,9 +20,16 @@ import { AiProvidersSection } from '@/components/settings/ai-providers-section';
 import { NotificationsSection } from '@/components/settings/notifications-section';
 import { IntegrationsSection } from '@/components/settings/integrations-section';
 import { OrganizationSection } from '@/components/settings/organization-section';
+import { WhiteLabelSection } from '@/components/settings/white-label-section';
 import { MenuAccessSection } from '@/components/settings/menu-access-section';
 import { WorkAreasCard } from '@/components/settings/work-areas-card';
+import { TimeZoneField } from '@/components/settings/time-zone-field';
 import { useCanManageMenus } from '@/components/providers/menu-access-provider';
+import { useChatAgentic } from '@/components/providers/chat-agentic-provider';
+import { RolesAccessSection } from '@/components/chat-access/roles-access-section';
+import { YourAccessSlot } from '@/components/chat-access/your-access-card';
+import { ChatSettingsSection } from '@/components/chat-access/chat-settings-section';
+import { countPendingAccessRequests } from '@/lib/actions/chat-access-requests';
 import { Badge } from '@/components/ui/badge';
 import { updateAccountName } from '@/lib/actions/organization';
 import { Loader2 } from 'lucide-react';
@@ -31,9 +38,21 @@ import {
   SETTINGS_SECTIONS,
   hasSettingsSection,
   settingsSectionPath,
+  teamSection,
   type SettingsSection,
 } from './_sections';
 import { HeaderWithAiUsage } from '@/components/ai-usage/ai-usage-meter';
+import {
+  SettingsDotMark,
+  markSettingsSeen,
+  settingsPlaceOf,
+  useJoinedNames,
+  useSettingsDots,
+} from '@/components/layout/settings-dots';
+import { SETTINGS_SEEN_KEYS, type SettingsState } from '@/lib/settings-dots';
+import { useUserRole } from '@/hooks/use-user-role';
+import { useBrandStore } from '@/stores/use-brand-store';
+import { UserPlus } from 'lucide-react';
 
 /**
  * Settings, opened on `section`: from its own address (/dashboard/settings/
@@ -46,7 +65,57 @@ export function SettingsView({ section }: { section: SettingsSection }) {
   const router = useRouter();
   const { isCloud } = usePlanContext();
   const canManageMenus = useCanManageMenus();
-  const [active, setActive] = useState<SettingsSection>(section);
+  const chatAgentic = useChatAgentic();
+  // Ask your Admin requests waiting for an Admin: the count on Roles & access.
+  const [pendingRequests, setPendingRequests] = useState(0);
+  const [requestsRead, setRequestsRead] = useState(0);
+  useEffect(() => {
+    if (!chatAgentic) return;
+    let live = true;
+    countPendingAccessRequests()
+      .then((read) => {
+        // A failed count shows none: the list itself says it couldn't load.
+        if (live) setPendingRequests(read.ok ? read.count : 0);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [chatAgentic, requestsRead]);
+  // Roles & access and Chat are the new Chat's: with it off, their addresses open Account.
+  // With it on, Team's address opens Team, roles & access, where the team now is.
+  const opened: SettingsSection =
+    (section === 'roles-access' || section === 'chat') && !chatAgentic
+      ? 'account'
+      : section === 'team'
+        ? teamSection(chatAgentic)
+        : section;
+  const [active, setActive] = useState<SettingsSection>(opened);
+  // An old link to Team: the address names the section it opened.
+  useEffect(() => {
+    if (opened !== section) {
+      window.history.replaceState(null, '', settingsSectionPath(window.location.pathname, opened));
+    }
+  }, [opened, section]);
+
+  // Settings' dots on the tabs (admins and managers); opening a tab clears its green.
+  const { dots, state: dotState } = useSettingsDots();
+  const { canManage } = useUserRole();
+  const brandId = useBrandStore((s) => s.activeBrandId);
+  const place = settingsPlaceOf(active);
+  useEffect(() => {
+    if (canManage && place && place in SETTINGS_SEEN_KEYS) {
+      markSettingsSeen(brandId, place as keyof typeof SETTINGS_SEEN_KEYS);
+    }
+  }, [canManage, place, brandId]);
+  // Who joined since the last visit, kept while Members is open: the read clears it later.
+  const [joinedNote, setJoinedNote] = useState<SettingsState['joined']>(null);
+  if (place === 'members' && dotState?.joined && joinedNote === null) {
+    setJoinedNote(dotState.joined);
+  }
+  const joinedNames = useJoinedNames();
+  const membersRef = useRef<HTMLDivElement>(null);
+  const tDots = useTranslations('settingsDots');
 
   const show = (next: SettingsSection) => {
     setActive(next);
@@ -86,7 +155,10 @@ export function SettingsView({ section }: { section: SettingsSection }) {
   const labels: Record<SettingsSection, string> = {
     account: t('account'),
     organization: t('organization'),
+    'white-label': t('whiteLabel.title'),
     team: t('team'),
+    // The team is in it with the new Chat on (owner, 2026-11-09).
+    'roles-access': t('teamRolesAccess'),
     'menu-access': t('menuAccess.title'),
     authors: t('authors.title'),
     content: t('content.title'),
@@ -95,13 +167,23 @@ export function SettingsView({ section }: { section: SettingsSection }) {
     'api-keys': t('apiKeys'),
     'ai-providers': t('aiProviders'),
     billing: t('billing'),
+    chat: t('chatSettings'),
   };
   // AI Providers (bring your own key) and Billing are cloud-only: self-host
   // operators set ANTHROPIC_API_KEY in their own env.
-  // Menu access is listed for admins and the managers they let change menus.
+  // Menu access is listed for admins and the managers they let change menus,
+  // Roles & access and Chat for everyone while the new Chat is on.
   const navItems = SETTINGS_SECTIONS.filter(
-    (id) => hasSettingsSection(id, { isCloud }) && (id !== 'menu-access' || canManageMenus),
-  ).map((id) => ({ id, label: labels[id] }));
+    (id) =>
+      hasSettingsSection(id, { isCloud }) &&
+      (id !== 'menu-access' || canManageMenus) &&
+      ((id !== 'roles-access' && id !== 'chat') || chatAgentic) &&
+      // With the new Chat on, Team is in Team, roles & access.
+      (id !== 'team' || !chatAgentic),
+  ).map((id) => {
+    const at = settingsPlaceOf(id);
+    return { id, label: labels[id], dot: at ? (dots[at] ?? null) : null };
+  });
 
   return (
     <div className="space-y-6">
@@ -129,6 +211,12 @@ export function SettingsView({ section }: { section: SettingsSection }) {
               )}
             >
               {item.label}
+              {item.dot && <SettingsDotMark dot={item.dot} className="ml-2 align-middle" />}
+              {item.id === 'roles-access' && pendingRequests > 0 && (
+                <Badge className="ml-2 px-1.5 py-0 text-[10px] tabular-nums">
+                  {pendingRequests}
+                </Badge>
+              )}
               {item.id === 'menu-access' && (
                 <Badge variant="secondary" className="ml-2 px-1.5 py-0 text-[10px]">
                   {t('menuAccess.new')}
@@ -140,6 +228,38 @@ export function SettingsView({ section }: { section: SettingsSection }) {
 
         {/* Main content — only active section shown */}
         <div className="lg:col-span-2">
+          {/* Who joined since the last visit, with the way to their role and menu access. */}
+          {place === 'members' && joinedNote && (
+            <p
+              data-slot="members-joined"
+              className="mb-4 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border bg-muted/40 px-3 py-2 text-sm"
+            >
+              <UserPlus className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
+              <span className="min-w-0 flex-1">
+                {tDots('membersNote', {
+                  count: joinedNote.count,
+                  names: joinedNames(joinedNote.names, joinedNote.count),
+                })}
+              </span>
+              <button
+                type="button"
+                className="font-medium underline underline-offset-2 hover:text-foreground"
+                onClick={() => membersRef.current?.scrollIntoView({ behavior: 'smooth' })}
+              >
+                {tDots('setRoles')}
+              </button>
+              {canManageMenus && (
+                <button
+                  type="button"
+                  className="font-medium underline underline-offset-2 hover:text-foreground"
+                  onClick={() => show('menu-access')}
+                >
+                  {tDots('menuAccess')}
+                </button>
+              )}
+            </p>
+          )}
+
           {/* Account */}
           {active === 'account' && (
             <Card>
@@ -173,6 +293,9 @@ export function SettingsView({ section }: { section: SettingsSection }) {
                   {t('save')}
                 </Button>
                 <Separator className="my-2" />
+                {/* Saved as it changes, apart from Save changes above. */}
+                <TimeZoneField />
+                <Separator className="my-2" />
                 <Button
                   variant="outline"
                   onClick={handleSignOut}
@@ -184,6 +307,9 @@ export function SettingsView({ section }: { section: SettingsSection }) {
             </Card>
           )}
 
+          {/* What the person may do, in the app and through Chat (CHAT-20 §4b). */}
+          {active === 'account' && chatAgentic && <YourAccessSlot className="mt-6" />}
+
           {/* What the person works on or leads: it narrows their own menu. */}
           {active === 'account' && (
             <div className="mt-6">
@@ -194,8 +320,28 @@ export function SettingsView({ section }: { section: SettingsSection }) {
           {/* Organization */}
           {active === 'organization' && <OrganizationSection />}
 
+          {active === 'white-label' && hasSettingsSection('white-label', { isCloud }) && (
+            <WhiteLabelSection />
+          )}
+
           {/* Team */}
-          {active === 'team' && <TeamSection />}
+          {active === 'team' && (
+            <div ref={membersRef}>
+              <TeamSection />
+            </div>
+          )}
+
+          {/* Team, roles & access: the team and its invitations, then the roles and access. */}
+          {active === 'roles-access' && chatAgentic && (
+            <div ref={membersRef} className="space-y-6">
+              {/* One members table: the team's, with the roles' columns (owner, 2026-11-09). */}
+              <TeamSection withChatAccess />
+              <RolesAccessSection
+                showMembers={false}
+                onRequestsChanged={() => setRequestsRead((n) => n + 1)}
+              />
+            </div>
+          )}
 
           {active === 'menu-access' && <MenuAccessSection />}
 
@@ -207,11 +353,13 @@ export function SettingsView({ section }: { section: SettingsSection }) {
 
           {active === 'integrations' && <IntegrationsSection />}
 
-          {/* API Keys */}
+          {/* MCP & API Keys */}
           {active === 'api-keys' && <ApiKeysSection />}
 
           {/* AI Providers (cloud BYOK) */}
           {active === 'ai-providers' && isCloud && <AiProvidersSection />}
+
+          {active === 'chat' && chatAgentic && <ChatSettingsSection />}
 
           {/* Billing */}
           {active === 'billing' && isCloud && <BillingSection />}

@@ -3,7 +3,9 @@
 import { useRef, useState, useEffect } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Cell } from 'recharts';
 import { formatCompactNumber } from '@/lib/format';
+import { getPlatformColor } from '@/lib/platform-colors';
 import { formatEstimateRange, scaleEstimate } from '@/lib/volume-estimate';
+import { AI_PLATFORM_SHARES } from './_platform-shares';
 
 // ─── Auto-sizing wrapper ─────────────────────────────────────────────────────
 
@@ -43,39 +45,6 @@ interface PlatformVolumeItem {
   color: string;
 }
 
-/**
- * Estimated share of AI-answered search queries across major answer engines.
- *
- * Derivation (all daily volume figures, early 2026):
- *   • Google Search:            ~16.4B searches/day  (ExplodingTopics, Feb 2026)
- *   • AI Overview coverage:     ~35% of Google searches  (Semrush / Pew estimates)
- *     → AI Overview volume:     ~5.74B/day
- *   • Google AI Mode:           ~100M MAU / ~1B monthly queries (Alphabet Q2 2025
- *     disclosures, 2026 industry estimates), still below Gemini app scale
- *   • ChatGPT:                  ~2.5B prompts/day  (Ahrefs, Jul 2025)
- *   • Other chatbots combined:  ~1.13B/day, split using the blended standalone
- *     chatbot market share average from Statcounter (Mar 2026),
- *     Similarweb (Jan 2026) and FirstPageSage (Apr 2026).
- *
- * Unlike raw chatbot-only market-share charts, this distribution reflects the
- * "any query that gets an AI-generated answer" universe — which is the
- * relevant denominator for Answer Engine Optimisation (AEO). Shares sum to 1.
- */
-export const AI_PLATFORM_SHARES: {
-  name: string;
-  share: number;
-  color: string;
-}[] = [
-  { name: 'Google AI Overviews', share: 0.602, color: '#4285f4' },
-  { name: 'ChatGPT', share: 0.27, color: '#10a37f' },
-  { name: 'Google Gemini', share: 0.055, color: '#8ab4f8' },
-  { name: 'Microsoft Copilot', share: 0.029, color: '#0ea5e9' },
-  { name: 'Perplexity', share: 0.018, color: '#6366f1' },
-  { name: 'Claude', share: 0.013, color: '#d97706' },
-  { name: 'Google AI Mode', share: 0.008, color: '#1a73e8' },
-  { name: 'Grok', share: 0.005, color: '#18181b' },
-];
-
 export function PlatformVolumeChart({
   totalVolume,
   totalRange,
@@ -96,7 +65,7 @@ export function PlatformVolumeChart({
     name: p.name,
     share: p.share,
     volume: Math.round(totalVolume * p.share),
-    color: p.color,
+    color: getPlatformColor(p.name),
   })).sort((a, b) => b.volume - a.volume);
 
   return (
@@ -112,7 +81,7 @@ export function PlatformVolumeChart({
           <CartesianGrid strokeDasharray="3 3" className="stroke-border" horizontal={false} />
           <XAxis
             type="number"
-            tick={{ fontSize: 10 }}
+            tick={{ fontSize: 10, fill: 'var(--muted-foreground)' }}
             tickLine={false}
             axisLine={false}
             className="fill-muted-foreground"
@@ -121,7 +90,7 @@ export function PlatformVolumeChart({
           <YAxis
             type="category"
             dataKey="name"
-            tick={{ fontSize: 11 }}
+            tick={{ fontSize: 11, fill: 'var(--muted-foreground)' }}
             tickLine={false}
             axisLine={false}
             className="fill-muted-foreground"

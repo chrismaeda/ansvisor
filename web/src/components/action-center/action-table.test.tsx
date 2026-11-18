@@ -6,6 +6,7 @@ import messages from '../../../messages/en.json';
 import type { ActionItem } from '@/lib/actions/action-center';
 import { ActionTable } from './action-table';
 import { UpgradeDialogContext } from '@/components/providers/upgrade-gate';
+import { ChatPanelContext, type ChatPanelState } from '@/components/chat/panel/chat-panel-context';
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT =
   true;
@@ -83,6 +84,40 @@ afterEach(() => {
   container.remove();
 });
 
+describe('a stale action (00432)', () => {
+  const stale: ActionItem = { ...action, status: 'new', staleAt: '2026-10-31T03:00:00.000Z' };
+  const onKeep = vi.fn();
+
+  it('shows Stale beside New, and offers Still relevant in its menu', async () => {
+    render({ actions: [stale], onKeep });
+    expect(container.textContent).toContain('NewStale');
+    const items = await openMenu();
+    expect(items.map((item) => item.textContent)).toEqual([
+      'In Progress',
+      'Completed',
+      'Dismiss',
+      'Still relevant',
+      'Delete',
+    ]);
+    await act(async () => items[3].click());
+    expect(onKeep).toHaveBeenCalledWith(stale);
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it('is neither once it left New, nor without the stamp', async () => {
+    render({ actions: [{ ...stale, status: 'on_hold' }], onKeep });
+    expect(container.textContent).not.toContain('Stale');
+    expect((await openMenu()).map((item) => item.textContent)).not.toContain('Still relevant');
+  });
+
+  it('keeps nothing on a read-only workspace: the upgrade dialog instead', async () => {
+    render({ actions: [stale], onKeep }, true);
+    await act(async () => (await openMenu())[3].click());
+    expect(onKeep).not.toHaveBeenCalled();
+    expect(openUpgrade).toHaveBeenCalled();
+  });
+});
+
 describe('ActionTable row menu', () => {
   it('offers In Progress, Completed, Dismiss and Delete, the current status off', async () => {
     render();
@@ -149,6 +184,35 @@ describe('ActionTable row menu', () => {
     expect(onDelete).not.toHaveBeenCalled();
   });
 
+  it('starts an open writing action in the Content Editor (AC plan P-3)', async () => {
+    const onStartNow = vi.fn();
+    const writing = { ...action, startNow: 'create' as const };
+    render({ actions: [writing], onStartNow });
+    const items = await openMenu();
+    expect(items[0].textContent).toBe('Start in Content Editor');
+    await act(async () => items[0].click());
+    expect(onStartNow).toHaveBeenCalledWith(writing);
+    expect(onSelect).not.toHaveBeenCalled();
+
+    // Not for work that isn't writing, nor a closed action.
+    render({ onStartNow });
+    expect((await openMenu()).map((item) => item.textContent)).not.toContain(
+      'Start in Content Editor',
+    );
+    render({ actions: [{ ...writing, status: 'completed' }], onStartNow });
+    expect((await openMenu()).map((item) => item.textContent)).not.toContain(
+      'Start in Content Editor',
+    );
+  });
+
+  it('starts nothing on a read-only workspace: the upgrade dialog instead', async () => {
+    const onStartNow = vi.fn();
+    render({ actions: [{ ...action, startNow: 'optimize' }], onStartNow }, true);
+    await act(async () => (await openMenu())[0].click());
+    expect(openUpgrade).toHaveBeenLastCalledWith(expect.stringMatching(/needs a plan/));
+    expect(onStartNow).not.toHaveBeenCalled();
+  });
+
   it("keeps Delete off for members who can't delete", async () => {
     render({ canDelete: false });
     const items = await openMenu();
@@ -211,5 +275,126 @@ describe('ActionTable assignee', () => {
       ],
     });
     expect(assigneeCell().textContent).toBe('AK');
+  });
+});
+
+describe('ActionTable and Chat’s side panel (W1-08)', () => {
+  it('asks about a task from its row, without opening the task', () => {
+    const ask = vi.fn();
+    act(() => {
+      root.render(
+        <NextIntlClientProvider locale="en" messages={messages} timeZone="UTC">
+          <ChatPanelContext.Provider value={{ available: true, ask } as unknown as ChatPanelState}>
+            <ActionTable actions={[action]} onSelect={onSelect} />
+          </ChatPanelContext.Provider>
+        </NextIntlClientProvider>,
+      );
+    });
+    const icon = container.querySelector<HTMLButtonElement>('[data-action="page.askAboutThis"]')!;
+    act(() => icon.click());
+    expect(ask).toHaveBeenCalledExactlyOnceWith({
+      type: 'task',
+      id: 'a1',
+      label: expect.any(String),
+    });
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it('has no Ask about this without the panel', () => {
+    render();
+    expect(container.querySelector('[data-action="page.askAboutThis"]')).toBeNull();
+  });
+
+  it('shows a dot beside the title when its outcome was measured since it was last opened', () => {
+    render({
+      actions: [
+        {
+          ...action,
+          dotFacts: {
+            taskWaiting: false,
+            taskFailed: false,
+            agentRun: null,
+            writingTasks: false,
+            draftWriting: false,
+            draftInReview: false,
+            publishFailed: false,
+            measuredAt: '2026-11-10T00:00:00.000Z',
+            seenAt: null,
+          },
+        },
+      ],
+    });
+    const dot = container.querySelector('[data-menu-dot="green"]')!;
+    expect(dot.getAttribute('role')).toBe('img');
+    expect(dot.getAttribute('aria-label')).toBe('New results: its outcome was measured');
+    // The status pill stays.
+    expect(container.textContent).toContain('In Progress');
+  });
+});
+
+// Owner's feedback (14 Nov): Chat names actions by their code, so each row shows it.
+describe('ActionTable action code', () => {
+  it('shows the code Chat names an action by, muted, on the line under its title', () => {
+    render({ actions: [{ ...action, actionNo: 1497 }] });
+    const row = container.querySelector('tbody tr')!;
+    const code = [...row.querySelectorAll('span')].find((el) => el.textContent === 'AC-1497')!;
+    expect(code.className).toContain('text-muted-foreground');
+    expect(code.className).toContain('whitespace-nowrap');
+    // Beside the category, not inside the title that truncates.
+    expect(code.parentElement!.textContent).toContain('Recover');
+    expect(row.querySelector('p.truncate')!.textContent).not.toContain('AC-1497');
+  });
+});
+
+// Owner's feedback (14 Nov): the Updated column sorts the list on a click.
+describe('ActionTable sortable headers', () => {
+  const onSortChange = vi.fn();
+  const head = (label: string) =>
+    [...container.querySelectorAll<HTMLTableCellElement>('thead th')].find((th) =>
+      th.textContent?.startsWith(label),
+    )!;
+  const click = (label: string) => act(() => head(label).querySelector('button')!.click());
+
+  it('sorts by Updated most recent first, then oldest first, with its arrow state', () => {
+    render({ sort: 'priority', onSortChange });
+    expect(head('Updated').hasAttribute('aria-sort')).toBe(false);
+    expect(head('Priority Score').getAttribute('aria-sort')).toBe('descending');
+    expect(head('Updated').querySelector('button')!.title).toBe('Sort: Recently updated');
+    click('Updated');
+    expect(onSortChange).toHaveBeenLastCalledWith('updated');
+
+    render({ sort: 'updated', onSortChange });
+    expect(head('Updated').getAttribute('aria-sort')).toBe('descending');
+    expect(head('Priority Score').hasAttribute('aria-sort')).toBe(false);
+    expect(head('Updated').querySelector('button')!.title).toBe('Sort: Least recently updated');
+    click('Updated');
+    expect(onSortChange).toHaveBeenLastCalledWith('updated_asc');
+
+    render({ sort: 'updated_asc', onSortChange });
+    expect(head('Updated').getAttribute('aria-sort')).toBe('ascending');
+    click('Updated');
+    expect(onSortChange).toHaveBeenLastCalledWith('updated');
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it('sorts by Priority Score highest first, then lowest first', () => {
+    render({ sort: 'updated', onSortChange });
+    click('Priority Score');
+    expect(onSortChange).toHaveBeenLastCalledWith('priority');
+
+    render({ sort: 'priority', onSortChange });
+    click('Priority Score');
+    expect(onSortChange).toHaveBeenLastCalledWith('priority_asc');
+
+    render({ sort: 'priority_asc', onSortChange });
+    expect(head('Priority Score').getAttribute('aria-sort')).toBe('ascending');
+    click('Priority Score');
+    expect(onSortChange).toHaveBeenLastCalledWith('priority');
+  });
+
+  it('keeps plain headers where the list has no sort to set', () => {
+    render();
+    expect(head('Updated').querySelector('button')).toBeNull();
+    expect(container.querySelector('thead [aria-sort]')).toBeNull();
   });
 });

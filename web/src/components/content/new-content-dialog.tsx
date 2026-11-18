@@ -46,7 +46,7 @@ import {
   startAgentWriting,
 } from '@/lib/actions/content-drafts';
 import { assignAction } from '@/lib/actions/action-center';
-import { listMembers, type TeamMember } from '@/lib/actions/team';
+import { listBrandMembers, type TeamMember } from '@/lib/actions/team';
 import { memberLabel } from '@/lib/action-center/display';
 import { agentWriteRequest, useRuleDescriber } from '@/lib/content/agent-write';
 import { MAX_ATTACHMENT_BYTES, textToHtml } from '@/lib/content/attachments';
@@ -80,7 +80,9 @@ import {
   type ContentSummary,
 } from '@/lib/content/start';
 import { formatNumber } from '@/lib/format';
+import { frictionFlow } from '@/lib/friction-events';
 import { cn } from '@/lib/utils';
+import { actionCodeNo } from '@/lib/action-center/action-ref';
 import { useBrandStore } from '@/stores/use-brand-store';
 import { useUpgradeGate } from '@/components/providers/upgrade-gate';
 
@@ -164,6 +166,9 @@ export type DialogPreset = (
 type Who = 'me' | 'agent' | 'team';
 const WHO: Who[] = ['agent', 'me', 'team'];
 
+/** content_generate: Start's Open editor, until the draft is with its writer. */
+const CONTENT_GENERATE = frictionFlow('content_generate');
+
 /** The Overview's read for one source: null while it runs. */
 interface OverlapRead {
   key: string;
@@ -225,8 +230,10 @@ export function NewContentDialog({
   const [start, setStart] = useState<StartChoice | null>(null);
   const [opening, setOpening] = useState(false);
   const [who, setWho] = useState<Who>('me');
-  // Team's assignee: the task goes to this teammate once it is sent.
-  const [members, setMembers] = useState<TeamMember[]>([]);
+  // Team's assignee: the task goes to this teammate once it is sent. The
+  // teammates are the people who can see the brand, read for it.
+  const [team, setTeam] = useState<{ brandId: string; members: TeamMember[] } | null>(null);
+  const members = team && team.brandId === brandId ? team.members : [];
   const [assigneeId, setAssigneeId] = useState<string | null>(null);
   const [overlapRead, setOverlapRead] = useState<OverlapRead | null>(null);
   const [overlapAttempt, setOverlapAttempt] = useState(0);
@@ -251,15 +258,15 @@ export function NewContentDialog({
     };
   }, [open, brandId, attempt]);
 
-  // The team, for Team's assignee: read once, when Team is first chosen.
-  const membersRead = useRef(false);
+  // The team, for Team's assignee: read once per brand, when Team is first chosen.
+  const membersRead = useRef<string | null>(null);
   useEffect(() => {
-    if (who !== 'team' || membersRead.current) return;
-    membersRead.current = true;
-    listMembers()
-      .then(setMembers)
+    if (who !== 'team' || membersRead.current === brandId) return;
+    membersRead.current = brandId;
+    listBrandMembers(brandId)
+      .then((list) => setTeam({ brandId, members: list }))
       .catch((err) => console.error('Failed to load the team:', err));
-  }, [who]);
+  }, [who, brandId]);
 
   // From the Content plan: Start for its opportunity once the options are in
   // (one no longer open is left to pick), or its page read to optimize.
@@ -500,6 +507,7 @@ export function NewContentDialog({
   const openEditor = async () => {
     if (!start) return;
     setOpening(true);
+    CONTENT_GENERATE.started();
     try {
       // An existing page Start chose to optimize brings its live text; if it
       // can't be read, the draft starts with its title, and says so.
@@ -529,9 +537,11 @@ export function NewContentDialog({
         await sendToAgent(id, bodyHtml);
         return;
       }
+      CONTENT_GENERATE.completed();
       router.push(contentEditorPath(id));
     } catch (err) {
       console.error('Failed to start a draft:', err);
+      CONTENT_GENERATE.failed();
       toast.error(t('start.failed'));
       setOpening(false);
     }
@@ -573,10 +583,12 @@ export function NewContentDialog({
     }
     onSent?.();
     if ('error' in started) {
+      CONTENT_GENERATE.failed(started.error);
       changeOpen(false);
       toast.error(t(`start.agentErrors.${started.error}`), { action: openDraft });
       return;
     }
+    CONTENT_GENERATE.completed();
     // As Me does: the dialog stays, its button busy, until the editor shows
     // the agent at work, rather than the page under it for a few seconds.
     router.push(contentEditorPath(id));
@@ -591,6 +603,7 @@ export function NewContentDialog({
     changeOpen(false);
     onSent?.();
     if ('error' in sent) {
+      CONTENT_GENERATE.failed('send_failed');
       toast.error(t('start.sendFailed'), {
         description: sent.error,
         action: { label: t('start.openDraft'), onClick: () => router.push(contentEditorPath(id)) },
@@ -606,8 +619,9 @@ export function NewContentDialog({
         toast.warning(t('who.assignFailed'));
       }
     }
+    CONTENT_GENERATE.completed();
     toast.success(t('start.sent'), {
-      description: t('start.sentDescription', { number: sent.actionNo }),
+      description: t('start.sentDescription', { number: actionCodeNo(sent) }),
       duration: 10_000,
       action: {
         label: t('start.openAction'),
@@ -918,7 +932,8 @@ export function NewContentDialog({
                       <p className="truncate text-sm font-medium" title={content.title}>
                         {content.title}
                       </p>
-                      <p className="text-xs text-muted-foreground">
+                      {/* The page's address wraps anywhere: unbroken, it ran under the clear button. */}
+                      <p className="text-xs text-muted-foreground [overflow-wrap:anywhere]">
                         {[
                           content.fileName ?? (content.sourceUrl && pagePath(content.sourceUrl)),
                           t('content.summary', {
@@ -1176,7 +1191,8 @@ function OverlapCheck({
               )}
             />
             <span className="min-w-0">
-              <span className="flex flex-wrap items-center gap-1.5 text-sm font-medium">
+              {/* A long address with no break in it (a slug in %-escapes) wraps, not widens the dialog. */}
+              <span className="flex flex-wrap items-center gap-1.5 text-sm font-medium [overflow-wrap:anywhere]">
                 {text.title}
               </span>
               <span className="block text-xs text-muted-foreground">{text.reason}</span>

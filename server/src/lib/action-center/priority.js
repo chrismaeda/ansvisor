@@ -26,11 +26,22 @@
  *
  * Pure: the caller reads the signals and the prompts' demand and passes them
  * in. Alongside the score it returns the facts it rests on, from which the
- * app writes "Why this priority?" in the reader's language.
+ * app writes "Why this priority?" in the reader's language. Its scales, sum,
+ * past success and levels are the ones every screen's score shares
+ * (priority-core.js, learning D4).
  */
 
 import { resolve } from '../../config/action-engine.js';
-import { INTENT_WEIGHTS } from '../opportunity-limits.js';
+import {
+  COMMERCIAL,
+  INTENT_WEIGHTS,
+  clamp,
+  levelOf,
+  logScale,
+  pastSuccessOf as pastSuccessAt,
+  round,
+  weightedScore,
+} from '../priority-core.js';
 
 const DAY_MS = 86_400_000;
 
@@ -84,6 +95,7 @@ const KIND_CHANGE = {
   competitor_momentum: 'slipping',
   // Something to fix on the site.
   structured_data_issue: 'issue',
+  canonical_issue: 'issue',
   outdated_content: 'issue',
   weak_entity: 'issue',
   weak_internal_links: 'issue',
@@ -93,6 +105,8 @@ const KIND_CHANGE = {
   // Ground to win.
   page_opportunity: 'opportunity',
   ai_landing_page_winner: 'opportunity',
+  bridge_link_gap: 'opportunity',
+  product_pages_to_optimize: 'opportunity',
   new_engine: 'opportunity',
   ai_platform_new: 'opportunity',
   gsc_low_ctr: 'opportunity',
@@ -140,6 +154,14 @@ const SESSION_KINDS = new Set([
 /** Severity when an action has no open evidence left: its findings resolved. */
 const NO_EVIDENCE_SEVERITY = 0.3;
 
+/**
+ * A topic gap sent from Visibility (from-topic-gap.js): the rival's lead,
+ * in Visibility points, at which its severity is full. A gap of half this
+ * (20 points, where its impact turns high) is as severe as any gap; one of
+ * three quarters as a slip.
+ */
+const TOPIC_GAP_FULL_AT = 40;
+
 /** Kinds that report losing ground the brand held: nearer to hand than new ground. */
 const HELD_BEFORE = new Set([
   'lost_citations',
@@ -182,9 +204,6 @@ const CATEGORY_RECOVERABILITY = { recover: 1, protect: 0.9, fix: 0.9, compete: 0
 /** What a page is worth to the business, by the signal that ranked it. */
 const PAGE_VALUE = { revenue: 1, transactions: 0.95, key_events: 0.85, engagement: 0.65 };
 
-/** Commercial enough to say so in "Why this priority?". */
-const COMMERCIAL = 0.85;
-
 const LEVEL_RANK = { low: 1, medium: 2, high: 3 };
 
 /**
@@ -204,9 +223,6 @@ function realDemandOf(payloads, prompts) {
   return { level, floor };
 }
 
-const clamp01 = (n) => Math.min(1, Math.max(0, n));
-const round2 = (n) => Math.round(n * 100) / 100;
-
 /** What kind of change a finding is; a kind this table has not met counts as a gap. */
 function changeOf(kind) {
   return KIND_CHANGE[kind] ?? 'gap';
@@ -214,7 +230,7 @@ function changeOf(kind) {
 
 /** Demand on the shared log scale: 0 → 0, `demandFullAt` and above → 1. */
 function demandScale(value) {
-  return clamp01(Math.log10(1 + value) / Math.log10(1 + P.demandFullAt));
+  return logScale(value, P.demandFullAt);
 }
 
 /** The sum of the `demandTopTargets` largest values. */
@@ -345,7 +361,7 @@ function demandAndValue(payloads, signals, prompts) {
 function confidenceOf(signals) {
   const kinds = new Set(signals.map((s) => s.kind));
   const sources = new Set(signals.flatMap((s) => (Array.isArray(s.source) ? s.source : [])));
-  const value = clamp01(
+  const value = clamp(
     0.3 + 0.2 * Math.max(kinds.size - 1, 0) + 0.2 * Math.max(sources.size - 1, 0),
   );
   return { value, kinds: kinds.size, sources: sources.size };
@@ -374,7 +390,7 @@ function sentByHand(action) {
     return {
       change: 'gap',
       severity,
-      confidence: clamp01(0.3 + 0.15 * gaps.length),
+      confidence: clamp(0.3 + 0.15 * gaps.length),
       recoverability: 0.7,
       subject: { entity: 'platforms', count: gaps.length },
     };
@@ -412,6 +428,28 @@ function sentByHand(action) {
       subject: { entity: 'pages', count: 1 },
     };
   }
+  // Setting up a ChatGPT Business Hub profile (from-business-hub.js): room to
+  // grow on one platform, raised once from its tracked answers, and work a
+  // person can finish in a few sittings.
+  // Its weekly reminder to enter the numbers is small, sure work.
+  if (action.kind === 'business_hub_numbers') {
+    return {
+      change: 'opportunity',
+      severity: SEVERITY.opportunity,
+      confidence: 0.8,
+      recoverability: 1,
+      subject: { entity: 'platforms', count: 1 },
+    };
+  }
+  if (action.kind === 'business_hub_setup') {
+    return {
+      change: 'opportunity',
+      severity: SEVERITY.opportunity,
+      confidence: 0.6,
+      recoverability: 0.8,
+      subject: { entity: 'platforms', count: 1 },
+    };
+  }
   // Pages sent from AI Traffic (AT-006). Answers citing a page nobody clicks
   // rest on two sources, citations and traffic, and the page already earns
   // the answer; a page AI skips rests on traffic alone.
@@ -423,6 +461,38 @@ function sentByHand(action) {
       confidence: cited ? 0.6 : 0.45,
       recoverability: cited ? 0.7 : 0.5,
       subject: { entity: 'pages', count: p.targetCount ?? null },
+    };
+  }
+  // A finding sent from Chat (CHAT-09 §E): what it is about, as the person
+  // approved it. Recover work rests on something lost, Fix on an issue, the
+  // rest on a gap; its prompts, pages or competitors are its subject.
+  if (action.kind === 'chat_finding') {
+    const change =
+      action.category === 'recover' ? 'slipping' : action.category === 'fix' ? 'issue' : 'gap';
+    return {
+      change,
+      severity: SEVERITY[change],
+      confidence: 0.5,
+      recoverability: 0.6,
+      subject: { entity: p.targetEntity ?? 'prompts', count: p.targetCount ?? null },
+    };
+  }
+  // A topic gap sent from Visibility (VIS-010, from-topic-gap.js): a rival
+  // leads one of the brand's topics by `gap` Visibility points, as Ansvisor
+  // measured it on 20 answers or more. The wider the lead, the more severe:
+  // from a resolved finding's at no gap to past a slip's at
+  // TOPIC_GAP_FULL_AT. Its prompts bring the demand and intent, as a
+  // content opportunity's do; "Why this priority?" names the gap and rival.
+  if (action.kind === 'topic_competitor_gap') {
+    const gap = Number.isFinite(p.gap) && p.gap > 0 ? p.gap : 0;
+    const competitor = typeof p.competitorName === 'string' ? p.competitorName.trim() : '';
+    return {
+      change: 'gap',
+      severity: NO_EVIDENCE_SEVERITY + 0.4 * clamp(gap / TOPIC_GAP_FULL_AT),
+      confidence: 0.6,
+      recoverability: CATEGORY_RECOVERABILITY.compete,
+      subject: { entity: p.targetEntity ?? 'prompts', count: p.targetCount ?? null },
+      competitorGap: gap > 0 && competitor ? { points: round(gap, 1), competitor } : null,
     };
   }
   // A page sent from a Site Audit report (learning D2): a fix on the site,
@@ -440,6 +510,20 @@ function sentByHand(action) {
   return null;
 }
 
+/** The factors' weights, in the order they add up. */
+const WEIGHTS = {
+  impact: P.weightImpact,
+  demand: P.weightDemand,
+  severity: P.weightSeverity,
+  businessValue: P.weightBusinessValue,
+  confidence: P.weightConfidence,
+  recoverability: P.weightRecoverability,
+  recency: P.weightRecency,
+};
+
+/** The key a play's track is kept under beside the kinds' (AC plan §11): `play:{id}`. */
+export const playTrackKey = (playId) => `play:${playId}`;
+
 /**
  * Past success (learning B4): from a kind's results at this brand, the
  * share that improved, shrunk toward the prior by a few imagined results,
@@ -448,20 +532,16 @@ function sentByHand(action) {
  * @param {{ improved?: number, results?: number } | undefined} track
  */
 export function pastSuccessOf(track) {
-  const improved = Math.max(0, Math.floor(Number(track?.improved) || 0));
-  const results = Math.max(improved, Math.floor(Number(track?.results) || 0));
-  const rate =
-    (improved + P.pastSuccessPseudoCount * P.pastSuccessPrior) /
-    (results + P.pastSuccessPseudoCount);
-  return { rate, points: (rate - P.pastSuccessPrior) * P.pastSuccessSwing, improved, results };
+  return pastSuccessAt(track, {
+    prior: P.pastSuccessPrior,
+    pseudoCount: P.pastSuccessPseudoCount,
+    swing: P.pastSuccessSwing,
+  });
 }
 
 /** The level a score falls in. */
 export function priorityLevel(score) {
-  if (score >= P.levelCritical) return 'critical';
-  if (score >= P.levelHigh) return 'high';
-  if (score >= P.levelMedium) return 'medium';
-  return 'low';
+  return levelOf(score, { critical: P.levelCritical, high: P.levelHigh, medium: P.levelMedium });
 }
 
 /**
@@ -537,17 +617,12 @@ export function scorePriority(
     recoverability,
     recency,
   };
-  const past = pastSuccessOf(track.get(action.kind));
-  const score = Math.round(
-    factors.impact * P.weightImpact +
-      factors.demand * P.weightDemand +
-      factors.severity * P.weightSeverity +
-      factors.businessValue * P.weightBusinessValue +
-      factors.confidence * P.weightConfidence +
-      factors.recoverability * P.weightRecoverability +
-      factors.recency * P.weightRecency +
-      past.points,
-  );
+  // Its play's track first (AC plan §11), once one of its results is in; else its kind's.
+  const playId = typeof action.payload?.play?.id === 'string' ? action.payload.play.id : null;
+  const played = playId ? track.get(playTrackKey(playId)) : undefined;
+  const byPlay = Boolean(played?.results);
+  const past = pastSuccessOf(byPlay ? played : track.get(action.kind));
+  const score = Math.round(weightedScore(factors, WEIGHTS).total + past.points);
   const bounded = Math.min(100, Math.max(0, score));
 
   const p = action.payload ?? {};
@@ -563,6 +638,9 @@ export function scorePriority(
       version: 1,
       change,
       subject,
+      // A topic gap's lead and rival ("A 23.4-pt gap with Northbound Roasters
+      // on 12 prompts"); only a topic gap sent from Visibility carries one.
+      ...(byHand?.competitorGap ? { competitorGap: byHand.competitorGap } : {}),
       // Measured demand only: an unmeasured one is not called low.
       demand: demand === null ? null : demand >= 0.67 ? 'high' : demand >= 0.4 ? 'medium' : 'low',
       // The prompts' measured demand level (PROMPT-014), the highest, when it
@@ -577,13 +655,18 @@ export function scorePriority(
       sources: confidence.sources,
       // How its kind did here before (learning B4); null with nothing to go on.
       pastSuccess: past.results
-        ? { improved: past.improved, results: past.results, points: round2(past.points) }
+        ? {
+            improved: past.improved,
+            results: past.results,
+            points: round(past.points),
+            ...(byPlay ? { play: playId } : {}),
+          }
         : null,
       // Its rate only with a result behind it: with none, the prior would
       // read as a measured 0.5.
       factors: Object.fromEntries(
         Object.entries({ ...factors, ...(past.results ? { pastSuccess: past.rate } : {}) }).map(
-          ([k, v]) => [k, round2(v)],
+          ([k, v]) => [k, round(v)],
         ),
       ),
     },

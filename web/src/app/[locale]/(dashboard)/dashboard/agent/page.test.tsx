@@ -4,6 +4,7 @@ import { NextIntlClientProvider } from 'next-intl';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import messages from '../../../../../../messages/en.json';
 import { UpgradeDialogContext } from '@/components/providers/upgrade-gate';
+import { DemoBrandContext } from '@/components/providers/demo-brand-provider';
 
 /**
  * Chat on a read-only workspace (plan not active): New chat and sending open
@@ -81,15 +82,25 @@ afterEach(() => {
   Element.prototype.scrollIntoView = originalScrollIntoView;
 });
 
-async function render(isLocked: boolean) {
+async function render(isLocked: boolean, isDemo = false) {
   await act(async () => {
     root.render(
       <NextIntlClientProvider locale="en" messages={messages} timeZone="UTC">
-        <UpgradeDialogContext.Provider
-          value={{ isLocked, reason: 'ended', adminName: null, openUpgrade }}
+        <DemoBrandContext.Provider
+          value={{ isDemo, demoBrand: null, offer: 'trial', neverSubscribed: true }}
         >
-          <AgentPage />
-        </UpgradeDialogContext.Provider>
+          <UpgradeDialogContext.Provider
+            value={{
+              isLocked,
+              isDemo,
+              reason: isDemo ? 'demo' : 'ended',
+              adminName: null,
+              openUpgrade,
+            }}
+          >
+            <AgentPage />
+          </UpgradeDialogContext.Provider>
+        </DemoBrandContext.Provider>
       </NextIntlClientProvider>,
     );
   });
@@ -153,5 +164,24 @@ describe('Chat on a read-only workspace', () => {
     expect(writes()).toEqual([['/api/agent/conversations/c1', { method: 'DELETE' }]]);
     expect(container.textContent).not.toContain('Pricing questions');
     expect(openUpgrade).not.toHaveBeenCalled();
+  });
+});
+
+// The demo brand's Chat is the real one, locked as the rest of the demo
+// (useUpgradeGate's isLocked): with the new Chat off, this page, as on a
+// read-only workspace.
+describe('Chat on the demo brand', () => {
+  it('opens the Agent Chat, which starts and sends nothing: each opens the upgrade dialog', async () => {
+    await render(true, true);
+    expect(container.textContent).toContain('Pricing questions');
+    expect(container.querySelector('iframe')).toBeNull();
+    expect(container.textContent).not.toContain('Soon');
+
+    await act(async () => button('New chat').click());
+    expect(openUpgrade).toHaveBeenLastCalledWith('Starting a chat needs a plan');
+    await send('How do we rank?');
+    expect(openUpgrade).toHaveBeenLastCalledWith('Chatting with the agent needs a plan');
+    expect(chat.sendMessage).not.toHaveBeenCalled();
+    expect(writes()).toEqual([]);
   });
 });

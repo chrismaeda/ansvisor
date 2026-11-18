@@ -1,0 +1,1241 @@
+'use client';
+
+import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { useTranslations } from 'next-intl';
+import { toast } from 'sonner';
+import { ArrowUp, AtSign, Building2, CalendarDays, FileText, ListFilter } from 'lucide-react';
+import { Link, useRouter } from '@/i18n/navigation';
+import { useUserRole } from '@/hooks/use-user-role';
+import { useAiUsage } from '@/components/providers/ai-usage-provider';
+import { aiUsageTone, percentLabel } from '@/lib/billing/ai-usage';
+import { requestAccess } from '@/lib/actions/chat-access-requests';
+import type { ChatSkillItem } from '@/lib/chat/composer-setup';
+import {
+  asksToAddKey,
+  looksLikeApiKey,
+  pastedKeyOf,
+  withoutApiKeys,
+  type PastedKeyProvider,
+} from '@/lib/chat/key-paste';
+import { AddKeyCard } from '@/components/chat/run/add-key-card';
+import type { ChatMode } from '@/lib/chat/precedence';
+import { AUTO_CHOICE, type ChatModelChoice } from '@/lib/chat/models';
+import { MAX_REFERENCES, type ChatReference } from '@/lib/chat/references';
+import {
+  IMAGE_SHORTCUT,
+  keepsTrigger,
+  shortcutCommand,
+  type Shortcut,
+  type ShortcutId,
+} from '@/lib/chat/shortcuts';
+import {
+  CHAT_UPLOAD_TYPES,
+  UPLOAD_ACCEPT,
+  uploadProblem,
+  uploadTypeOf,
+  type SentFile,
+  type UploadProblem,
+} from '@/lib/chat/uploads';
+import { cn } from '@/lib/utils';
+import { composerKeyAction } from './composer-keys';
+import {
+  PlusMenu,
+  ReferenceMenu,
+  SlashMenu,
+  matchShortcuts,
+  matchSkills,
+  type PlusItem,
+} from './composer-menus';
+import { ModeMenu } from './mode-menu';
+import { RangeChip } from '../range/range-line';
+import { ModelMenu, useModelLabel } from './model-menu';
+import { VoiceButton } from './voice-button';
+import { YourKeysDialog } from './your-keys-dialog';
+
+/** Where the composer sits (CHAT-02 variants): Chat home, an open chat's dock, the side panel. */
+export type ComposerVariant = 'home' | 'dock' | 'panel';
+
+/** The tallest the box grows before it scrolls (CHAT-02 item 4). */
+const MAX_HEIGHT = 240;
+
+/** A chip's longest label; longer ones are cut, the whole one in its tooltip (item 5). */
+const CHIP_LABEL = 28;
+
+/** Where a reader learns what their role can do (B1, Your access). */
+const ACCESS_HREF = '/dashboard/chat/capabilities';
+
+/** Where an Admin connects a tool. */
+const INTEGRATIONS_HREF = '/dashboard/settings/integrations';
+
+/**
+ * A context chip (CHAT-02 items 5–7): what Chat looks at, as the page names
+ * it ("Ansvisor", "Last 30 days"). `key` is the page's own handle for it,
+ * never shown; the label is a name, never an ID.
+ */
+export interface ComposerChip {
+  key: string;
+  label: string;
+  /** What the run reads for it (a platform id, a date range); never shown. */
+  value?: string;
+}
+
+/**
+ * Something a page hands the box (CHAT-01 items 21–22): a question to put
+ * in it, unsent, or an object to attach as an @ reference. A new `nonce`
+ * is a new hand-off.
+ */
+export interface ComposerDraft {
+  nonce: number;
+  text?: string;
+  reference?: ChatReference;
+}
+
+/** What goes with a sent text: the chips still in the box, the data referenced with @, and the files attached. */
+export interface ComposerSend {
+  context: ComposerChip[];
+  references: ChatReference[];
+  /** The attachments' ids (chat_uploads), each up and ready. */
+  attachments: string[];
+  /** The same files as the question's bubble shows them, while it waits for the saved chat. */
+  files?: SentFile[];
+  /**
+   * The shortcut picked from the / menu (CHAT-08 item 4), while the text
+   * still starts with its trigger words: the run uses its data plan.
+   */
+  shortcutId?: ShortcutId;
+}
+
+/**
+ * How the composer attaches a file (W1-13): the page's, for the chat it is
+ * in (uploadChatFile, dropChatUpload). Without it, nothing is attached.
+ */
+export interface ComposerUploader {
+  upload: (file: File) => Promise<{ ok: true; id: string } | { ok: false; failure: string }>;
+  remove: (id: string) => void | Promise<void>;
+}
+
+/** A file in the box: going up, up (its id), or failed (Retry). */
+interface AttachedFile {
+  key: string;
+  file: File;
+  status: 'uploading' | 'ready' | 'failed';
+  id?: string;
+}
+
+/** A chip's label as it shows: cut at CHIP_LABEL characters. */
+export const chipLabel = (label: string) =>
+  label.length > CHIP_LABEL ? `${label.slice(0, CHIP_LABEL - 1)}…` : label;
+
+/** An open menu: which, and for / and @ what is typed after it and where it starts. */
+type OpenMenu =
+  | { kind: 'slash'; query: string; typed: boolean }
+  | { kind: 'at'; query: string; start: number }
+  | { kind: 'plus' };
+
+/** "@…" right before the cursor, at the start of a word: what is typed after it, and where it starts. */
+export function atQuery(text: string, cursor: number): { query: string; start: number } | null {
+  const match = /(^|\s)@([^\s@]*)$/.exec(text.slice(0, cursor));
+  return match ? { query: match[2], start: cursor - match[2].length - 1 } : null;
+}
+
+const refKey = (ref: ChatReference) => `ref:${ref.type}:${ref.id}`;
+
+/** A chip's small icon, by its key: @ data, the brand, the page's dates or a filter, else the page. */
+function ChipIcon({ chipKey }: { chipKey: string }) {
+  const Icon = chipKey.startsWith('ref:')
+    ? AtSign
+    : chipKey === 'brand'
+      ? Building2
+      : chipKey === 'dates'
+        ? CalendarDays
+        : chipKey.startsWith('filter:')
+          ? ListFilter
+          : FileText;
+  return <Icon className="size-3 shrink-0 text-muted-foreground" aria-hidden />;
+}
+
+/**
+ * Chat's composer (CHAT-02; the owner's layout of 2026-11-14, in every Chat
+ * box): context chips above the box, then the text, then one row in the box:
+ * ＋ / @ on the left, the microphone and Send on the right. One line under the
+ * box holds the run mode and the model on the right, by their full names
+ * (the owner's change after testing it live, 2026-11-14), and the run's
+ * status on the left; the line keeps its height, so nothing moves as a run
+ * starts or ends. Alerts follow under it. The placeholder carries the
+ * "/ skills · @ data" hint. Enter sends, Shift+Enter adds a
+ * line. While a run answers, Send is Stop (Esc too), and the box steers:
+ * Enter stops the run, its done steps kept, and sends the text as the next
+ * message (decided 2026-10-30). Analysts and Agency partners read only: no
+ * run mode and no skills, a "Read-only" link to what they can do in the mode's place.
+ * A send the page refuses (it answers false) puts the text back.
+ *
+ * Context chips sit above the box (W1-11), each with a small icon, then
+ * Chat's date range: × takes one off, and the page keeps it off for the rest
+ * of the chat; a send carries the chips left. The
+ * empty box can show one ghost suggestion, dim, with a Tab hint: Tab (or a
+ * click on it) makes it the text, to edit or send; typing replaces it; it
+ * never sends itself, and Enter and Send wait while only it shows.
+ *
+ * Menus (W1-12): "/" first in an empty box, or the / button, lists the
+ * shortcuts that start a message, then the enabled skills, whose /command
+ * starts it (W2-04: the server loads the skill it names). A shortcut's
+ * message carries it while its trigger words stay (W2-09: the server runs
+ * its playbook); rewritten, it is a message like any other. "@" at the start
+ * of a word, or the @ button, references data (the page's own first, then
+ * the brand's prompts, pages and open tasks), the pick a chip; ＋ attaches
+ * files and connects a tool. ↑ ↓ move, Enter picks, Esc closes and keeps
+ * the text.
+ *
+ * A `draft` from the page (W1-08) puts its question in the box, or attaches
+ * its object as an @ chip, and the cursor goes to the end.
+ *
+ * The microphone (W4-04) puts what is said into the box, in the browser's
+ * language, and never sends it; it shows only where the browser can listen.
+ *
+ * Text that holds an API key is never sent (W4-05): a line under the box
+ * says so, Send waits, and Remove takes the key out. Save securely shows
+ * only where the page offers it (`onSaveKey`: an Admin on Enterprise).
+ */
+export function ChatComposer({
+  variant = 'dock',
+  mode,
+  onModeChange,
+  fullAutoOpen,
+  fullAutoOffByAdmin = false,
+  running = false,
+  answering = false,
+  maxLength,
+  onSend,
+  onStop,
+  onSteer,
+  chips = [],
+  onRemoveChip,
+  draft,
+  ghost,
+  references: pageReferences = [],
+  searchReferences,
+  skills = [],
+  uploader,
+  sharedReadOnly = false,
+  placeholder,
+  disabled = false,
+  modelLabel,
+  onOpenModel,
+  modelChoice,
+  onModelChoice,
+  imageModel = null,
+  onSaveKey,
+  keyForm = false,
+  className,
+}: {
+  variant?: ComposerVariant;
+  /** The mode the next run starts in: the person's default mode until they pick one. */
+  mode: ChatMode;
+  onModeChange: (mode: ChatMode) => void;
+  /** Full auto is open to this person (plan facts: Growth and up, paid; and the Admin's switch). */
+  fullAutoOpen: boolean;
+  /** Full auto is closed by the Admin's switch for non-Admins, not by the plan. */
+  fullAutoOffByAdmin?: boolean;
+  /** A run answers: Send is Stop, and the box steers. */
+  running?: boolean;
+  /**
+   * The run waits on a question (CHAT-07 §A items 8–9): the message answers
+   * it, so Send stays, with Stop beside it, and Esc, to end the run.
+   */
+  answering?: boolean;
+  /** The most the box takes (an answer's 500 characters); no limit by default. */
+  maxLength?: number;
+  onSend: (text: string, sent: ComposerSend) => boolean | void | Promise<boolean | void>;
+  onStop?: () => void;
+  /** Stops the run and sends the text: without it, Enter waits for the run. */
+  onSteer?: (text: string, sent: ComposerSend) => boolean | void | Promise<boolean | void>;
+  /** What Chat looks at, as chips above the text (the page's context, CHAT-01). */
+  chips?: ComposerChip[];
+  /** × on a chip: the page drops it for this chat. */
+  onRemoveChip?: (key: string) => void;
+  /** A question or an object the page hands the box (Ask about this, a suggestion). */
+  draft?: ComposerDraft | null;
+  /**
+   * One suggestion for the empty box: the variant's starter before the first
+   * message, then a clear follow-up only (CHAT-07). A READ one for Analysts
+   * and Agency partners: the page picks it.
+   */
+  ghost?: string;
+  /** What the page itself can be asked about, first in the @ menu (W1-08). */
+  references?: ChatReference[];
+  /** The brand's matches for "@…" (searchChatReferences); none without it. */
+  searchReferences?: (query: string) => Promise<ChatReference[]>;
+  /** The enabled skills, the / menu's Skills group (CHAT-13 item 5); none while the new Chat is off. */
+  skills?: ChatSkillItem[];
+  /** Attaching files: ＋ Attach files, drop and paste (W1-13); none without it. */
+  uploader?: ComposerUploader;
+  /** A teammate's shared chat: read, never added to (00407). */
+  sharedReadOnly?: boolean;
+  /** The empty box's line; "Ask anything…" by default. */
+  placeholder?: string;
+  /** No sending at all (the usage cap's state, W1-23). */
+  disabled?: boolean;
+  /**
+   * Not shown since 2026-11-14: the AI usage is in the model menu, and its
+   * warning a dot on the model button. Kept so callers still compile.
+   */
+  usage?: ReactNode;
+  /** The model button's words; "Auto" by default. */
+  modelLabel?: ReactNode;
+  onOpenModel?: () => void;
+  /**
+   * The chat's model and effort (W4-02): with `onModelChoice`, the model
+   * button opens the model menu, and its pick goes with each message.
+   */
+  modelChoice?: ChatModelChoice;
+  onModelChoice?: (choice: ChatModelChoice) => void;
+  /**
+   * The image model the chat's latest answer picked or made images with
+   * (CHAT-15 item 18, W4-08b): the model button reads "Image · {model}"
+   * for that task; null for the chat model.
+   */
+  imageModel?: string | null;
+  /**
+   * Save securely on the pasted-key line: the text goes to the page's own
+   * key form, never to Chat. Without it, only Remove shows.
+   */
+  onSaveKey?: (text: string) => void;
+  /**
+   * The own-key forms (W4-06): Save securely and a message such as "use my
+   * OpenAI key" open the Add API key card above the box, never the chat;
+   * the model menu opens Your API keys for Admins.
+   */
+  keyForm?: boolean;
+  className?: string;
+}) {
+  const t = useTranslations('chatComposer');
+  const tRoles = useTranslations('chatAccess.roleNames');
+  const tAsk = useTranslations('chatAccess.askAdmin');
+  const tMeter = useTranslations('aiUsage.meter');
+  const { usage: aiUsage } = useAiUsage();
+  const router = useRouter();
+  const { role, canAdmin, canManage } = useUserRole();
+  const readOnly = !canManage;
+  const [text, setText] = useState('');
+  const [sending, setSending] = useState(false);
+  // The data referenced with @, as chips after the page's.
+  const [refs, setRefs] = useState<ChatReference[]>([]);
+  const [menu, setMenu] = useState<OpenMenu | null>(null);
+  const [active, setActive] = useState(0);
+  const [found, setFound] = useState<{ query: string; refs: ChatReference[] } | null>(null);
+  const [files, setFiles] = useState<AttachedFile[]>([]);
+  const [fileProblem, setFileProblem] = useState<UploadProblem | null>(null);
+  // The microphone wasn't allowed (W4-04): one line under the box.
+  const [micDenied, setMicDenied] = useState(false);
+  const [modelOpen, setModelOpen] = useState(false);
+  const [keysOpen, setKeysOpen] = useState(false);
+  // The Add API key card above the box, with a pasted key and its provider (W4-06).
+  const [keyCard, setKeyCard] = useState<{ provider?: PastedKeyProvider; key?: string } | null>(
+    null,
+  );
+  // The message the card was last offered for: sent again, it goes to Chat as typed.
+  const [keyOfferedFor, setKeyOfferedFor] = useState<string | null>(null);
+  const chosenLabel = useModelLabel(modelChoice ?? AUTO_CHOICE);
+  // The shortcut picked from the / menu, and the trigger words it put in the box.
+  const [shortcut, setShortcut] = useState<{ id: ShortcutId; trigger: string } | null>(null);
+  const picker = useRef<HTMLInputElement>(null);
+  const root = useRef<HTMLDivElement>(null);
+  // The box the / @ ＋ menus open on, as popovers in the page's body.
+  const shell = useRef<HTMLDivElement>(null);
+  // The page's last hand-off taken in: each one once.
+  const [taken, setTaken] = useState<number | null>(null);
+  if (draft && draft.nonce !== taken) {
+    setTaken(draft.nonce);
+    if (draft.text !== undefined) {
+      setText(draft.text);
+      setShortcut(null);
+    }
+    const reference = draft.reference;
+    if (reference) {
+      setRefs((all) =>
+        all.length >= MAX_REFERENCES || all.some((r) => refKey(r) === refKey(reference))
+          ? all
+          : [...all, reference],
+      );
+    }
+  }
+  const box = useRef<HTMLTextAreaElement>(null);
+  const hasText = text.trim().length > 0;
+  // A pasted API key: the text stays in the box until it is taken out.
+  const keyInText = hasText && looksLikeApiKey(text);
+  // Save securely: the page's own form, else the Add API key card for an Admin (W4-06).
+  const saveKey =
+    onSaveKey ??
+    (keyForm && canAdmin
+      ? (value: string) => {
+          const found = pastedKeyOf(value);
+          setKeyCard({ provider: found?.provider, key: found?.key });
+          putText(withoutApiKeys(value));
+        }
+      : undefined);
+  const uploading = files.some((f) => f.status === 'uploading');
+  const failed = files.filter((f) => f.status === 'failed');
+  const failedFiles = failed.length > 0;
+  const readyFiles = files.filter((f) => f.status === 'ready' && f.id);
+  // Words, or files alone: an image with no text is a message.
+  const sendable = hasText || readyFiles.length > 0;
+  // The ghost shows in an empty box, not while a run answers, the box is off or files wait in it.
+  const ghostShown = !!ghost && text === '' && files.length === 0 && !running && !disabled;
+  const ghostId = useId();
+
+  // The box grows with its lines, from its rows up to MAX_HEIGHT, then scrolls.
+  useLayoutEffect(() => {
+    const el = box.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, MAX_HEIGHT)}px`;
+    el.style.overflowY = el.scrollHeight > MAX_HEIGHT ? 'auto' : 'hidden';
+  }, [text]);
+
+  // A hand-off from the page: the cursor at the end of the box, to go on typing.
+  useEffect(() => {
+    if (taken === null) return;
+    const el = box.current;
+    el?.focus();
+    el?.setSelectionRange(el.value.length, el.value.length);
+  }, [taken]);
+
+  // A menu closes on a click outside the composer and its menu (in the page's body).
+  useEffect(() => {
+    if (!menu) return;
+    const onDown = (e: MouseEvent) => {
+      const target = e.target as Node;
+      if (root.current?.contains(target)) return;
+      if (target instanceof Element && target.closest('[data-slot="composer-menu"]')) return;
+      setMenu(null);
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [menu]);
+
+  // The brand's matches for what follows "@": the last search answered wins.
+  const atSearch = menu?.kind === 'at' ? menu.query : null;
+  useEffect(() => {
+    if (atSearch === null || !searchReferences) return;
+    let stale = false;
+    const timer = setTimeout(() => {
+      void searchReferences(atSearch)
+        .catch(() => [])
+        .then((matches) => {
+          if (!stale) setFound({ query: atSearch, refs: matches });
+        });
+    }, 150);
+    return () => {
+      stale = true;
+      clearTimeout(timer);
+    };
+  }, [atSearch, searchReferences]);
+
+  const shortcutName = (s: Shortcut) => t(`slash.shortcuts.${s.key}.name`);
+  // A skill under a shortcut's command takes its place: the message calls the skill. The
+  // library has none (its hidden playbooks hold those names); this keeps the menu one per command.
+  const shortcuts =
+    menu?.kind === 'slash'
+      ? matchShortcuts(menu.query, shortcutName).filter(
+          (s) => !skills.some((skill) => `/${skill.name}` === shortcutCommand(s)),
+        )
+      : [];
+  const skillRows = menu?.kind === 'slash' ? matchSkills(menu.query, skills) : [];
+  const atRefs = (() => {
+    if (menu?.kind !== 'at') return [];
+    const q = menu.query.toLowerCase();
+    const own = pageReferences.filter((r) => !q || r.label.toLowerCase().includes(q));
+    const searched = found && found.query === menu.query ? found.refs : [];
+    const picked = new Set(refs.map(refKey));
+    const seen = new Set<string>();
+    return [...own, ...searched]
+      .filter((r) => {
+        const key = refKey(r);
+        if (picked.has(key) || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .slice(0, MAX_REFERENCES);
+  })();
+  const atLoading = menu?.kind === 'at' && !!searchReferences && found?.query !== menu.query;
+
+  const plusItems: PlusItem[] = [
+    ...(uploader
+      ? [
+          {
+            key: 'attach' as const,
+            mark: '⤒',
+            label: t('plus.attach'),
+            note: t('plus.attachNote'),
+            onPick: () => {
+              setMenu(null);
+              picker.current?.click();
+            },
+          },
+        ]
+      : []),
+    // Create an image (mockup #plusmenu): the /image shortcut's first words in the box, for
+    // those who may make images (Admins and Managers; generate_image's role).
+    ...(readOnly
+      ? []
+      : [
+          {
+            key: 'image' as const,
+            mark: '◫',
+            label: t('plus.image'),
+            note: t('plus.imageNote'),
+            onPick: () => pickShortcut(IMAGE_SHORTCUT),
+          },
+        ]),
+    {
+      key: 'connect',
+      mark: '⛓',
+      label: canAdmin ? t('plus.connect') : t('plus.connectAsk'),
+      note: t('plus.connectNote'),
+      onPick: () => {
+        setMenu(null);
+        if (canAdmin) router.push(INTEGRATIONS_HREF);
+        else void askToConnect();
+      },
+    },
+  ];
+
+  const menuLength =
+    menu?.kind === 'slash'
+      ? shortcuts.length + skillRows.length
+      : menu?.kind === 'at'
+        ? atRefs.length
+        : menu?.kind === 'plus'
+          ? plusItems.length
+          : 0;
+
+  /** One file going up: its chip turns ready, or failed with Retry. */
+  function send(entry: AttachedFile) {
+    if (!uploader) return;
+    void uploader
+      .upload(entry.file)
+      .catch(() => ({ ok: false as const, failure: 'failed' }))
+      .then((result) => {
+        setFiles((all) =>
+          all.map((f) =>
+            f.key !== entry.key
+              ? f
+              : result.ok
+                ? { ...f, status: 'ready', id: result.id }
+                : { ...f, status: 'failed' },
+          ),
+        );
+      });
+  }
+
+  /** Files picked, dropped or pasted: each one that may go up starts; the first problem shows. */
+  function attach(list: FileList | File[]) {
+    if (!uploader) return;
+    let count = files.length;
+    let problem: UploadProblem | null = null;
+    const added: AttachedFile[] = [];
+    for (const file of Array.from(list)) {
+      const why = uploadProblem(file, count);
+      if (why) {
+        problem ??= why;
+        continue;
+      }
+      count += 1;
+      added.push({ key: `${Date.now()}-${count}-${file.name}`, file, status: 'uploading' });
+    }
+    setFileProblem(problem);
+    if (added.length === 0) return;
+    setFiles((all) => [...all, ...added]);
+    added.forEach(send);
+  }
+
+  /** × on a file: gone from the box, and from the server once it was up. */
+  function dropFile(entry: AttachedFile) {
+    setFiles((all) => all.filter((f) => f.key !== entry.key));
+    if (entry.id) void uploader?.remove(entry.id);
+  }
+
+  /** Retry: every failed file goes up again. */
+  function retryFiles() {
+    const failed = files.filter((f) => f.status === 'failed');
+    setFiles((all) => all.map((f) => (f.status === 'failed' ? { ...f, status: 'uploading' } : f)));
+    failed.forEach(send);
+  }
+
+  /** One click asks the workspace's Admins to connect a tool (B2's requests). */
+  async function askToConnect() {
+    try {
+      const result = await requestAccess({ asked: t('plus.connectAsked'), ruleKind: 'role' });
+      if (result.ok) toast.success(tAsk('sent'));
+      else if (result.reason === 'already_today') toast.info(tAsk('alreadyToday'));
+      else toast.error(tAsk('failed'));
+    } catch {
+      toast.error(tAsk('failed'));
+    }
+  }
+
+  /** The box's text and where its cursor is, after a change: which menu that opens. */
+  function textChanged(next: string, cursor: number) {
+    setText(next);
+    // Its trigger words rewritten: the message is the person's own, without the shortcut.
+    if (shortcut && !keepsTrigger(next, shortcut.trigger)) setShortcut(null);
+    if (!readOnly && /^\/\S*$/.test(next.slice(0, cursor))) {
+      setMenu({ kind: 'slash', query: next.slice(1, cursor), typed: true });
+      setActive(0);
+      return;
+    }
+    const at = atQuery(next, cursor);
+    if (at) {
+      setMenu({ kind: 'at', ...at });
+      setActive(0);
+      return;
+    }
+    if (menu && menu.kind !== 'plus') setMenu(null);
+  }
+
+  /** The text and the cursor after it, focused. */
+  function putText(next: string) {
+    setText(next);
+    requestAnimationFrame(() => {
+      const el = box.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(next.length, next.length);
+    });
+  }
+
+  /** Words heard by the microphone (W4-04): after the text, never sent by themselves. */
+  function addSpoken(spoken: string) {
+    setText((before) => (before.trim() ? `${before.trimEnd()} ${spoken}` : spoken));
+    requestAnimationFrame(() => {
+      const el = box.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(el.value.length, el.value.length);
+    });
+  }
+
+  /** The ghost as the box's text, to edit or send, the cursor after it. */
+  const acceptGhost = () => {
+    if (ghost) putText(ghost);
+  };
+
+  function pickShortcut(picked: Shortcut) {
+    const starter = t(`slash.shortcuts.${picked.key}.starter`);
+    // Typed "/…" is the shortcut's; from the button, the text stays after the starter.
+    const rest = menu?.kind === 'slash' && menu.typed ? '' : text.trim();
+    setMenu(null);
+    setShortcut({ id: picked.id, trigger: starter });
+    putText(`${starter} ${rest}`);
+  }
+
+  /** A skill: its /command first in the box, so the message calls it. */
+  function pickSkill(skill: ChatSkillItem) {
+    // Typed "/…" is the skill's; from the button, the text stays after the command.
+    const rest = menu?.kind === 'slash' && menu.typed ? '' : text.trim();
+    setMenu(null);
+    setShortcut(null);
+    putText(`/${skill.name} ${rest}`);
+  }
+
+  function pickReference(ref: ChatReference) {
+    if (menu?.kind !== 'at') return;
+    // "@…" leaves the text; the pick is a chip.
+    const end = menu.start + 1 + menu.query.length;
+    const next = `${text.slice(0, menu.start)}${text.slice(end)}`.replace(/ {2,}/g, ' ');
+    setRefs((all) => [...all, ref]);
+    setMenu(null);
+    putText(next.trimStart());
+  }
+
+  function pickActive() {
+    if (menu?.kind === 'slash' && shortcuts[active]) pickShortcut(shortcuts[active]);
+    else if (menu?.kind === 'slash' && skillRows[active - shortcuts.length]) {
+      pickSkill(skillRows[active - shortcuts.length]);
+    } else if (menu?.kind === 'at' && atRefs[active]) pickReference(atRefs[active]);
+    else if (menu?.kind === 'plus' && plusItems[active]) plusItems[active].onPick();
+  }
+
+  /** A menu from its button: / and ＋ open, @ goes in at the cursor and opens. */
+  function openFromButton(kind: 'slash' | 'at' | 'plus') {
+    if (menu?.kind === kind) {
+      setMenu(null);
+      return;
+    }
+    setActive(0);
+    if (kind === 'at') {
+      const el = box.current;
+      const cursor = el?.selectionStart ?? text.length;
+      const before = text.slice(0, cursor);
+      const insert = before === '' || /\s$/.test(before) ? '@' : ' @';
+      const next = `${before}${insert}${text.slice(cursor)}`;
+      const at = cursor + insert.length;
+      setText(next);
+      setMenu({ kind: 'at', query: '', start: at - 1 });
+      requestAnimationFrame(() => {
+        box.current?.focus();
+        box.current?.setSelectionRange(at, at);
+      });
+      return;
+    }
+    setMenu(kind === 'slash' ? { kind: 'slash', query: '', typed: false } : { kind: 'plus' });
+    box.current?.focus();
+  }
+
+  async function submit(steer: boolean) {
+    const message = text.trim();
+    // A file that didn't upload holds the message: it never goes without it (its line says so).
+    if (!sendable || sending || disabled || uploading || failedFiles) return;
+    if (looksLikeApiKey(message)) return;
+    // "Use my OpenAI key": the card answers it, and the key never goes to Chat (W4-06).
+    // The message stays in the box, and a second send sends it, so a misread loses nothing.
+    if (keyForm && asksToAddKey(message) && keyOfferedFor !== message) {
+      setKeyOfferedFor(message);
+      setKeyCard({});
+      return;
+    }
+    const handler = steer ? onSteer : onSend;
+    if (!handler) return;
+    const sentRefs = refs;
+    const sentFiles = files;
+    const ready = sentFiles.filter((f) => f.status === 'ready' && f.id);
+    const sentShortcut = shortcut && keepsTrigger(message, shortcut.trigger) ? shortcut : null;
+    setSending(true);
+    setText('');
+    setRefs([]);
+    setFiles([]);
+    setFileProblem(null);
+    setMenu(null);
+    setShortcut(null);
+    const restore = () => {
+      setText(message);
+      setRefs(sentRefs);
+      setFiles(sentFiles);
+      setShortcut(sentShortcut);
+    };
+    try {
+      const sent = await handler(message, {
+        context: chips,
+        references: sentRefs,
+        attachments: ready.map((f) => f.id!),
+        ...(ready.length > 0
+          ? {
+              files: ready.map((f) => ({
+                id: f.id!,
+                name: f.file.name,
+                mimeType: uploadTypeOf(f.file)!,
+                sizeBytes: f.file.size,
+              })),
+            }
+          : {}),
+        ...(sentShortcut ? { shortcutId: sentShortcut.id } : {}),
+      });
+      if (sent === false) restore();
+    } catch {
+      restore();
+    } finally {
+      setSending(false);
+      box.current?.focus();
+    }
+  }
+
+  // The status on the line under the box: the files, what Enter and Esc do now, a ghost's Tab.
+  const status = uploading
+    ? t('files.sendWaits')
+    : running
+      ? hasText && onSteer
+        ? t('under.steer')
+        : t('under.answering')
+      : answering
+        ? t('under.answerQuestion')
+        : ghostShown && !readOnly
+          ? t('under.ghostHint')
+          : null;
+
+  // The empty box's line carries the / and @ hint, except while a run answers, a question waits or the box is off.
+  const baseHolder = running ? t('steerPlaceholder') : (placeholder ?? t('placeholder'));
+  const holder =
+    running || answering || disabled
+      ? baseHolder
+      : t(readOnly ? 'placeholderHintReadOnly' : 'placeholderHint', {
+          placeholder: baseHolder.replace(/…$/, ''),
+        });
+
+  // From 80% of the month's AI usage (the meter left the line under the box), a dot on the model button.
+  const usageTone = aiUsage && !aiUsage.unlimited ? aiUsageTone(aiUsage) : 'normal';
+  const usageWarn = usageTone === 'warning' || usageTone === 'exhausted' ? usageTone : null;
+  const usageLabel =
+    !aiUsage || !usageWarn
+      ? undefined
+      : aiUsage.trial
+        ? tMeter(`trialLabel.${usageWarn}`)
+        : tMeter(usageWarn === 'warning' ? 'labelWarning' : 'labelExhausted', {
+            percent: percentLabel(aiUsage.percentUsed ?? 0),
+          });
+  const usageDot = usageWarn && (
+    <i
+      aria-hidden
+      data-slot="model-usage-dot"
+      data-tone={usageWarn}
+      className={cn(
+        'size-1.5 shrink-0 rounded-full',
+        usageWarn === 'warning' ? 'bg-amber-500' : 'bg-red-500',
+      )}
+    />
+  );
+  // The model's short name: Auto, the chosen model, or the images' model.
+  const modelWords = onModelChoice
+    ? imageModel
+      ? t('modelImage', { model: imageModel })
+      : (chosenLabel ?? t('modelAuto'))
+    : (modelLabel ?? t('modelAuto'));
+
+  const shownChips: (ComposerChip & { remove?: () => void })[] = [
+    ...chips.map((chip) => ({
+      ...chip,
+      remove: onRemoveChip ? () => onRemoveChip(chip.key) : undefined,
+    })),
+    ...refs.map((ref) => ({
+      key: refKey(ref),
+      label: ref.label,
+      remove: () => setRefs((all) => all.filter((r) => refKey(r) !== refKey(ref))),
+    })),
+  ];
+  const iconButton =
+    'flex size-7 items-center justify-center rounded-lg text-sm text-muted-foreground hover:bg-muted hover:text-foreground aria-expanded:bg-muted aria-expanded:text-foreground';
+
+  // A teammate's shared chat is read only: nothing goes into it.
+  if (sharedReadOnly) {
+    return (
+      <div className={cn('w-full', className)}>
+        <div className="flex flex-wrap items-center gap-2 rounded-[14px] border bg-muted/40 px-3 py-2.5 text-sm text-muted-foreground">
+          <span className="min-w-0 flex-1">{t('shared.note')}</span>
+          <Link
+            data-action="chat.new"
+            href="/dashboard/chat"
+            className="font-medium text-foreground underline underline-offset-2"
+          >
+            {t('shared.start')}
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div ref={root} className={cn('w-full', className)}>
+      {keyCard && (
+        <div className="mb-2">
+          <AddKeyCard initial={keyCard} onClose={() => setKeyCard(null)} />
+        </div>
+      )}
+      {keyForm && <YourKeysDialog open={keysOpen} onClose={() => setKeysOpen(false)} />}
+      {/* Context chips above the box, then Chat's date range (not beside a page's dates, which
+          Chat reads instead): empty, the row hides. */}
+      <div
+        data-slot="composer-context"
+        className="mb-1.5 flex flex-wrap items-center gap-1.5 empty:hidden"
+      >
+        {shownChips.map((chip) => {
+          const shown = chipLabel(chip.label);
+          return (
+            <span
+              key={chip.key}
+              title={shown === chip.label ? undefined : chip.label}
+              className="inline-flex h-[22px] items-center gap-1 rounded-[7px] border bg-muted/60 pr-1 pl-[7px] text-[11.5px] text-foreground/80"
+            >
+              <ChipIcon chipKey={chip.key} />
+              {shown}
+              {chip.remove && (
+                <button
+                  type="button"
+                  data-action="composer.removeChip"
+                  onClick={() => {
+                    chip.remove?.();
+                    // The × goes with its chip: keep the focus in the composer.
+                    box.current?.focus();
+                  }}
+                  aria-label={t('removeChip', { label: chip.label })}
+                  className="-ml-0.5 inline-flex size-4 items-center justify-center rounded-[4px] text-muted-foreground hover:bg-muted hover:text-foreground"
+                >
+                  ×
+                </button>
+              )}
+            </span>
+          );
+        })}
+        {!chips.some((chip) => chip.key === 'dates') && <RangeChip running={running} />}
+      </div>
+      <div
+        ref={shell}
+        data-slot="composer-box"
+        onDragOver={(e) => {
+          if (uploader && e.dataTransfer.types.includes('Files')) e.preventDefault();
+        }}
+        onDrop={(e) => {
+          if (!uploader || e.dataTransfer.files.length === 0) return;
+          e.preventDefault();
+          attach(e.dataTransfer.files);
+        }}
+        className={cn(
+          'relative rounded-[14px] border bg-card shadow-[0_1px_2px_rgba(10,10,10,.04)] transition-colors focus-within:border-foreground/25',
+          disabled && 'bg-muted/40',
+        )}
+      >
+        {uploader && (
+          <input
+            ref={picker}
+            type="file"
+            multiple
+            hidden
+            accept={UPLOAD_ACCEPT}
+            data-action="composer.pickFiles"
+            onChange={(e) => {
+              if (e.target.files) attach(e.target.files);
+              e.target.value = '';
+            }}
+          />
+        )}
+        {menu?.kind === 'slash' && (
+          <SlashMenu
+            anchor={shell}
+            shortcuts={shortcuts}
+            skills={skillRows}
+            skillsOn={skills.length > 0}
+            active={active}
+            onPick={pickShortcut}
+            onPickSkill={pickSkill}
+          />
+        )}
+        {menu?.kind === 'at' && (
+          <ReferenceMenu
+            anchor={shell}
+            references={atRefs}
+            loading={atLoading}
+            active={active}
+            onPick={pickReference}
+          />
+        )}
+        {menu?.kind === 'plus' && <PlusMenu anchor={shell} items={plusItems} active={active} />}
+        {files.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 px-2.5 pt-2">
+            {files.map((entry) => {
+              const type = uploadTypeOf(entry.file);
+              return (
+                <span
+                  key={entry.key}
+                  data-slot="composer-file"
+                  data-status={entry.status}
+                  title={entry.file.name}
+                  className={cn(
+                    'inline-flex h-[22px] max-w-[220px] items-center gap-1 rounded-[7px] border bg-muted/60 pr-1 pl-1.5 text-[11.5px] text-foreground/80',
+                    entry.status === 'failed' &&
+                      'border-red-300 bg-red-50 text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300',
+                  )}
+                >
+                  <b className="text-[10px] font-semibold">
+                    {type ? CHAT_UPLOAD_TYPES[type].tag : ''}
+                  </b>
+                  <span className="truncate">{entry.file.name}</span>
+                  {entry.status === 'uploading' && (
+                    <span className="shrink-0 text-muted-foreground">{t('files.uploading')}</span>
+                  )}
+                  <button
+                    type="button"
+                    data-action="composer.removeFile"
+                    onClick={() => dropFile(entry)}
+                    aria-label={t('removeChip', { label: entry.file.name })}
+                    className="inline-flex size-4 shrink-0 items-center justify-center rounded-[4px] text-muted-foreground hover:bg-muted hover:text-foreground"
+                  >
+                    ×
+                  </button>
+                </span>
+              );
+            })}
+          </div>
+        )}
+        <div className="relative">
+          <textarea
+            ref={box}
+            data-action="composer.input"
+            value={text}
+            rows={variant === 'home' ? 2 : 1}
+            disabled={disabled}
+            maxLength={maxLength}
+            aria-label={t('message')}
+            aria-describedby={ghostShown ? ghostId : undefined}
+            placeholder={ghostShown ? undefined : holder}
+            onChange={(e) => textChanged(e.target.value, e.target.selectionStart ?? 0)}
+            onPaste={(e) => {
+              if (!uploader || e.clipboardData.files.length === 0) return;
+              e.preventDefault();
+              attach(e.clipboardData.files);
+            }}
+            onKeyDown={(e) => {
+              if (menu) {
+                if (e.key === 'Escape') {
+                  e.preventDefault();
+                  setMenu(null);
+                  return;
+                }
+                if (menuLength > 0 && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+                  e.preventDefault();
+                  const step = e.key === 'ArrowDown' ? 1 : -1;
+                  setActive((i) => (i + step + menuLength) % menuLength);
+                  return;
+                }
+                if (e.key === 'Enter' && !e.shiftKey && menuLength > 0) {
+                  e.preventDefault();
+                  pickActive();
+                  return;
+                }
+              }
+              const action = composerKeyAction({
+                key: e.key,
+                shiftKey: e.shiftKey,
+                composing: e.nativeEvent.isComposing || e.keyCode === 229,
+                coarse: window.matchMedia?.('(pointer: coarse)')?.matches ?? false,
+                running,
+                stoppable: answering,
+                hasText: sendable,
+                canSteer: !!onSteer,
+                ghost: ghostShown,
+              });
+              if (!action) return;
+              e.preventDefault();
+              if (action === 'stop') onStop?.();
+              else if (action === 'accept') acceptGhost();
+              else if (action === 'send') void submit(false);
+              else if (action === 'steer') void submit(true);
+            }}
+            className="block w-full resize-none bg-transparent px-3 py-2 text-[14.5px] leading-6 outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed"
+          />
+          {ghostShown && (
+            <div className="pointer-events-none absolute inset-x-0 top-0 flex px-3 py-2 text-[14.5px] leading-6">
+              <span
+                id={ghostId}
+                data-action="composer.acceptGhost"
+                role="button"
+                tabIndex={-1}
+                onClick={acceptGhost}
+                className="pointer-events-auto flex min-w-0 cursor-pointer items-center text-muted-foreground/70"
+              >
+                <span className="truncate">{ghost}</span>
+                <kbd className="ml-1.5 shrink-0 rounded-[4px] border px-1 font-sans text-[11px] text-muted-foreground">
+                  {t('tab')}
+                </kbd>
+              </span>
+            </div>
+          )}
+        </div>
+        {/* One row under the text: ＋ / @ on the left, the microphone and Send on the right. */}
+        <div
+          data-slot="composer-controls"
+          className="flex items-center gap-1 pt-1.5 pr-2 pb-2 pl-2"
+        >
+          <button
+            type="button"
+            data-action="composer.openPlus"
+            aria-label={t('plus.label')}
+            aria-expanded={menu?.kind === 'plus'}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => openFromButton('plus')}
+            className={iconButton}
+          >
+            ＋
+          </button>
+          {!readOnly && (
+            <button
+              type="button"
+              data-action="composer.openSlash"
+              aria-label={t('slash.label')}
+              title={t('slash.label')}
+              aria-expanded={menu?.kind === 'slash'}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => openFromButton('slash')}
+              className={iconButton}
+            >
+              /
+            </button>
+          )}
+          <button
+            type="button"
+            data-action="composer.openRef"
+            aria-label={t('reference.label')}
+            title={t('reference.label')}
+            aria-expanded={menu?.kind === 'at'}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => openFromButton('at')}
+            className={iconButton}
+          >
+            @
+          </button>
+          <div
+            data-slot="composer-send-group"
+            className="ml-auto flex shrink-0 items-center gap-1.5"
+          >
+            <VoiceButton onText={addSpoken} onDeniedChange={setMicDenied} disabled={disabled} />
+            {(running || answering) && (
+              // While a question waits, Stop sits beside Send, outlined: Send answers.
+              <button
+                type="button"
+                data-action="composer.stop"
+                onClick={onStop}
+                aria-label={t('stop')}
+                title={t('stop')}
+                className={cn(
+                  'flex size-8 items-center justify-center rounded-[10px]',
+                  running ? 'bg-foreground text-background' : 'border hover:bg-muted',
+                )}
+              >
+                <i
+                  className={cn(
+                    'block size-2.5 rounded-[2px]',
+                    running ? 'bg-background' : 'bg-foreground',
+                  )}
+                  aria-hidden
+                />
+              </button>
+            )}
+            {!running && (
+              <button
+                type="button"
+                data-action="composer.send"
+                onClick={() => void submit(false)}
+                disabled={!sendable || sending || disabled || uploading || failedFiles || keyInText}
+                aria-label={t('send')}
+                title={t('send')}
+                className="flex size-8 items-center justify-center rounded-[10px] bg-foreground text-background disabled:cursor-not-allowed disabled:opacity-35"
+              >
+                <ArrowUp className="size-4" aria-hidden />
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+      {/*
+        One line under the box that keeps its height, all of it on the left (the owner's change
+        after testing it live, 2026-11-15): the run mode, or Read-only, and the model, by their
+        full names, then the run's status (two short lines at most, the whole text in its
+        tooltip). The menus open from the left, so they stay inside a narrow panel.
+      */}
+      <div data-slot="composer-under" className="mt-1 flex h-7 items-center gap-2">
+        <div data-slot="composer-settings" className="relative flex min-w-0 items-center gap-0.5">
+          {readOnly ? (
+            <Link
+              data-action="access.see"
+              href={ACCESS_HREF}
+              title={t('readOnlyTitle', { role: tRoles(role) })}
+              className="flex h-7 shrink-0 items-center rounded-lg px-1.5 text-xs whitespace-nowrap text-muted-foreground no-underline hover:bg-muted hover:text-foreground"
+            >
+              {t('readOnly', { role: tRoles(role) })}
+            </Link>
+          ) : (
+            <ModeMenu
+              mode={mode}
+              onChange={onModeChange}
+              fullAutoOpen={fullAutoOpen}
+              offByAdmin={fullAutoOffByAdmin}
+            />
+          )}
+          <span data-slot="composer-model" className="flex min-w-0">
+            {onModelChoice || onOpenModel ? (
+              <button
+                type="button"
+                data-action="model.openMenu"
+                onClick={onModelChoice ? () => setModelOpen((on) => !on) : onOpenModel}
+                aria-label={usageLabel ? t('modelWarn', { usage: usageLabel }) : t('model')}
+                aria-expanded={onModelChoice ? modelOpen : undefined}
+                title={usageLabel}
+                className="flex h-7 min-w-0 items-center gap-1 rounded-lg px-1.5 text-xs whitespace-nowrap hover:bg-muted aria-expanded:bg-muted"
+              >
+                <span className="truncate">{modelWords}</span> <span aria-hidden>▾</span>
+                {usageDot}
+              </button>
+            ) : (
+              <span
+                title={usageLabel}
+                className="flex h-7 min-w-0 items-center gap-1 px-1.5 text-xs whitespace-nowrap"
+              >
+                <span className="truncate">{modelWords}</span>
+                {usageDot}
+              </span>
+            )}
+            {modelOpen && onModelChoice && (
+              <ModelMenu
+                choice={modelChoice ?? AUTO_CHOICE}
+                onChange={onModelChoice}
+                onClose={() => setModelOpen(false)}
+                onOpenKeys={keyForm && canAdmin ? () => setKeysOpen(true) : undefined}
+              />
+            )}
+          </span>
+        </div>
+        <p
+          data-slot="composer-status"
+          title={status ?? undefined}
+          className="line-clamp-2 min-w-0 flex-1 px-0.5 text-[11.5px] leading-[14px] text-muted-foreground"
+        >
+          {status}
+        </p>
+      </div>
+      {keyInText && (
+        <p
+          role="alert"
+          data-slot="composer-key-paste"
+          className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-1.5 text-xs text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200"
+        >
+          <span className="min-w-0 flex-1">{t('keyPaste.line')}</span>
+          <button
+            type="button"
+            data-action="composer.removeKey"
+            onClick={() => putText(withoutApiKeys(text))}
+            className="font-medium underline underline-offset-2"
+          >
+            {t('keyPaste.remove')}
+          </button>
+          {saveKey && (
+            <button
+              type="button"
+              data-action="composer.saveKey"
+              onClick={() => saveKey(text)}
+              className="font-medium underline underline-offset-2"
+            >
+              {t('keyPaste.save')}
+            </button>
+          )}
+        </p>
+      )}
+      {micDenied && (
+        <p role="alert" className="mt-1.5 px-0.5 text-xs text-red-700 dark:text-red-400">
+          {t('voice.denied')}
+        </p>
+      )}
+      {fileProblem && (
+        <p role="alert" className="mt-1.5 px-0.5 text-xs text-red-700 dark:text-red-400">
+          {t(`files.${fileProblem}`)}
+        </p>
+      )}
+      {/* Send waits while a file didn't upload: × takes it off, Retry sends it again. */}
+      {failedFiles && (
+        <p
+          role="alert"
+          data-slot="composer-upload-failed"
+          className="mt-1.5 flex flex-wrap items-center gap-2 px-0.5 text-xs text-red-700 dark:text-red-400"
+        >
+          {failed.length === 1
+            ? t('files.failed', { name: failed[0].file.name })
+            : t('files.failedMany', { count: failed.length })}
+          <button
+            type="button"
+            data-action="composer.retryUpload"
+            onClick={retryFiles}
+            className="font-medium underline underline-offset-2"
+          >
+            {t('files.retry')}
+          </button>
+        </p>
+      )}
+    </div>
+  );
+}

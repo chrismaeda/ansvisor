@@ -4,8 +4,12 @@ import messages from '../../../messages/en.json';
 import type { ActionItem } from '@/lib/actions/action-center';
 import {
   comparePriority,
+  confidenceLevelOf,
+  confidenceNote,
   highestPriorityLevel,
+  isStale,
   parsePriorityReason,
+  priorityConfidenceText,
   priorityLevelOf,
   priorityReasonText,
   storedPriorityLevel,
@@ -35,6 +39,7 @@ const action = (over: Partial<ActionItem> = {}): ActionItem =>
 const reason = (over: Partial<PriorityReason> = {}): PriorityReason => ({
   change: 'lost',
   subject: { entity: 'prompts', count: 7 },
+  competitorGap: null,
   demand: 'high',
   commercial: true,
   heldBefore: true,
@@ -42,6 +47,7 @@ const reason = (over: Partial<PriorityReason> = {}): PriorityReason => ({
   sources: 1,
   realDemand: null,
   pastSuccess: null,
+  confidence: null,
   ...over,
 });
 
@@ -95,6 +101,52 @@ describe('parsePriorityReason', () => {
       demand: null,
     });
     expect(parsePriorityReason(null)).toBeNull();
+  });
+});
+
+describe('confidence', () => {
+  it('reads the factor as a level and says why, never the bare number', () => {
+    const one = parsePriorityReason({ kinds: 1, sources: 1, factors: { confidence: 0.3 } });
+    expect(one?.confidence).toEqual({ level: 'low', score: 0.3, kinds: 1, sources: 1 });
+    expect(priorityConfidenceText(one!.confidence!, t)).toBe(
+      'Low confidence — one kind of finding from one source.',
+    );
+    expect(confidenceNote(one!.confidence!)).toBe('one kind of finding from one source');
+
+    const two = parsePriorityReason({ kinds: 2, sources: 3, factors: { confidence: 0.9 } });
+    expect(priorityConfidenceText(two!.confidence!, t)).toBe(
+      'High confidence — 2 kinds of finding from 3 sources.',
+    );
+    expect(confidenceNote(two!.confidence!)).toBe('2 kinds of finding from 3 sources');
+  });
+
+  it('says when a person sent it, and is none from an older scorer', () => {
+    const sent = parsePriorityReason({ kinds: 0, sources: 0, factors: { confidence: 0.6 } });
+    expect(sent?.confidence?.level).toBe('medium');
+    expect(priorityConfidenceText(sent!.confidence!, t)).toBe(
+      'Medium confidence — rated from what it was sent with, not from detected findings.',
+    );
+    expect(parsePriorityReason({ factors: { impact: 1 } })?.confidence).toBeNull();
+  });
+
+  it('is High from 0.7 and Medium from 0.5', () => {
+    expect([0.3, 0.45, 0.5, 0.65, 0.7, 1].map(confidenceLevelOf)).toEqual([
+      'low',
+      'low',
+      'medium',
+      'medium',
+      'high',
+      'high',
+    ]);
+  });
+});
+
+describe('isStale', () => {
+  it('is a New action with the nightly stamp, never another status', () => {
+    expect(isStale({ status: 'new', staleAt: '2026-10-31T03:00:00Z' })).toBe(true);
+    expect(isStale({ status: 'new', staleAt: null })).toBe(false);
+    expect(isStale({ status: 'new' })).toBe(false);
+    expect(isStale({ status: 'in_progress', staleAt: '2026-10-31T03:00:00Z' })).toBe(false);
   });
 });
 
@@ -175,12 +227,28 @@ describe('priorityReasonText', () => {
         t,
       ),
     ).toBe('Lost ground on 7 high-demand prompts 2 days ago — previously visible.');
+    // Read from its play's track (AC plan P-4).
+    expect(
+      priorityReasonText(
+        reason({
+          commercial: false,
+          pastSuccess: { improved: 3, results: 4, points: 3.33, play: 'comparison' },
+        }),
+        t,
+      ),
+    ).toBe(
+      'Lost ground on 7 high-demand prompts 2 days ago — previously visible, 3 of 4 earlier actions with this play improved results here.',
+    );
   });
 
   it('reads a stored track defensively', () => {
     expect(
       parsePriorityReason({ pastSuccess: { improved: 2, results: 3, points: 1.4 } })?.pastSuccess,
     ).toEqual({ improved: 2, results: 3, points: 1.4 });
+    expect(
+      parsePriorityReason({ pastSuccess: { improved: 2, results: 3, points: 1.4, play: 'guide' } })
+        ?.pastSuccess,
+    ).toEqual({ improved: 2, results: 3, points: 1.4, play: 'guide' });
     expect(parsePriorityReason({ pastSuccess: { improved: 2 } })?.pastSuccess).toBeNull();
     expect(parsePriorityReason({})?.pastSuccess).toBeNull();
   });
@@ -242,6 +310,125 @@ describe('priorityReasonText', () => {
     });
     expect(stored?.realDemand).toBeNull();
     expect(priorityReasonText(stored!, t)).not.toContain('measured demand');
+  });
+
+  /** A topic gap sent from Visibility (VIS-010), as the server stores it. */
+  it('names the gap and the rival of a topic gap sent from Visibility', () => {
+    const stored = parsePriorityReason({
+      version: 1,
+      change: 'gap',
+      subject: { entity: 'prompts', count: 12 },
+      competitorGap: { points: 23.4, competitor: 'Northbound Roasters' },
+      demand: 'medium',
+      realDemand: null,
+      commercial: true,
+      heldBefore: false,
+      days: null,
+      kinds: 0,
+      sources: 0,
+      factors: { confidence: 0.6 },
+    });
+    expect(stored?.competitorGap).toEqual({ points: 23.4, competitor: 'Northbound Roasters' });
+    expect(priorityReasonText(stored!, t)).toBe(
+      'A 23.4-pt gap with Northbound Roasters on 12 prompts — commercial intent.',
+    );
+    // One decimal, as its title; high demand in the subject, as any gap's.
+    expect(
+      priorityReasonText(
+        reason({
+          change: 'gap',
+          subject: { entity: 'prompts', count: 1 },
+          competitorGap: { points: 20, competitor: 'Peec AI' },
+          commercial: false,
+          heldBefore: false,
+          days: null,
+        }),
+        t,
+      ),
+    ).toBe('A 20.0-pt gap with Peec AI on 1 high-demand prompt.');
+    // No count to name: the gap and rival alone.
+    expect(
+      priorityReasonText(
+        reason({
+          change: 'gap',
+          subject: { entity: 'prompts', count: null },
+          competitorGap: { points: 8.5, competitor: 'Peec AI' },
+          demand: null,
+          commercial: false,
+          heldBefore: false,
+          days: null,
+        }),
+        t,
+      ),
+    ).toBe('An 8.5-pt gap with Peec AI.');
+    // "An" where the number is said with a vowel first.
+    const lead = (points: number) =>
+      priorityReasonText(
+        reason({
+          change: 'gap',
+          subject: { entity: null, count: null },
+          competitorGap: { points, competitor: 'Peec AI' },
+          demand: null,
+          commercial: false,
+          heldBefore: false,
+          days: null,
+        }),
+        t,
+      ).split(' ')[0];
+    expect([8, 11, 18, 80, 86.2, 1, 12, 28, 81 / 10, 100].map(lead)).toEqual([
+      'An',
+      'An',
+      'An',
+      'An',
+      'An',
+      'A',
+      'A',
+      'A',
+      'An',
+      'A',
+    ]);
+  });
+
+  it('reads a stored topic gap defensively, and reads any other gap as before', () => {
+    for (const competitorGap of [
+      { points: 0, competitor: 'Peec AI' },
+      { points: 12, competitor: ' ' },
+      { points: '12', competitor: 'Peec AI' },
+      'Peec AI',
+      undefined,
+    ]) {
+      expect(parsePriorityReason({ change: 'gap', competitorGap })?.competitorGap).toBeNull();
+    }
+    expect(
+      priorityReasonText(
+        reason({
+          change: 'gap',
+          subject: { entity: 'prompts', count: 12 },
+          demand: null,
+          commercial: false,
+          heldBefore: false,
+          days: null,
+        }),
+        t,
+      ),
+    ).toBe('A gap to close on 12 prompts.');
+  });
+
+  it('says no "days ago" for a standing gap or room to grow', () => {
+    const standing = (change: 'gap' | 'opportunity') =>
+      priorityReasonText(
+        reason({
+          change,
+          subject: { entity: 'prompts', count: 3 },
+          demand: null,
+          commercial: true,
+          heldBefore: false,
+          days: 1,
+        }),
+        t,
+      );
+    expect(standing('opportunity')).toBe('Room to grow on 3 prompts — commercial intent.');
+    expect(standing('gap')).toBe('A gap to close on 3 prompts — commercial intent.');
   });
 
   it('falls back to a plain subject when the count is unknown', () => {

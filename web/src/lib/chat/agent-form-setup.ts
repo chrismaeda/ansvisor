@@ -1,0 +1,208 @@
+import { NextResponse } from 'next/server';
+import { PLANS } from '@/config/plans';
+import { readChosenTimeZone } from '@/lib/account-time-zone';
+import { supabaseAdmin } from '@/lib/supabase/admin';
+import type { AgentFormSetup } from './agent-form';
+import { ANSVISOR_SKILLS } from './agent-skills';
+import { readGoLiveSwitch } from './agent-go-live';
+import { AGENT_ENGINES, enginesDenial, modeDenial } from './agent-rules';
+import { readAgent, readAgentContext, type AgentContext, type AgentDetail } from './agents';
+import { OwnKeyUnreadableError, ownChatKeyProviders, resolveChatModelKey } from './key';
+import { modelChoiceOpen } from './models';
+import { chatActor } from './run-api';
+import { skillFlagOn } from './skills/flagged';
+
+/**
+ * What the create and edit pages of an agent (CHAT-21 §D) know before the
+ * form opens, read on the server for the signed-in person: their live role,
+ * the brands and topics a scope may name, the plan's engines, whether Full
+ * auto is open, locked by the plan or turned off in Settings › Chat, the
+ * workspace's Max per run and sharing rule, the names already taken, whose
+ * key Auto and a picked model run on, the time zone they picked in
+ * Settings › Account, and the Library skills an Admin approved that they
+ * may run. Never a price, a dollar or a key: shares and names only.
+ * Server only.
+ */
+
+/** owner/repo of a skill's GitHub source, or null. */
+function repoOf(url: string | null): string | null {
+  const match = url ? /^https:\/\/github\.com\/([^/]+)\/([^/#?]+)/.exec(url) : null;
+  return match ? `${match[1]}/${match[2]}` : null;
+}
+
+/**
+ * The workspace's skills added from the Library (W4-19) that the person may
+ * run now: approved by an Admin, on, and shared or theirs (as a run reads
+ * them: skills/store.ts skillUsableBy). A read that fails lists none.
+ */
+async function librarySkillsFor(
+  organizationId: string,
+  userId: string,
+): Promise<NonNullable<AgentFormSetup['librarySkills']>> {
+  const { data, error } = await supabaseAdmin
+    .from('chat_skills')
+    .select('name, title, source_url')
+    .eq('organization_id', organizationId)
+    .eq('source', 'library')
+    .eq('status', 'approved')
+    .eq('enabled', true)
+    .or(`visibility.eq.workspace,created_by.eq.${userId}`)
+    .order('name', { ascending: true });
+  if (error) {
+    console.error('[chat/agents] could not read the Library skills:', error.message);
+    return [];
+  }
+  return ((data ?? []) as { name: string; title: string; source_url: string | null }[]).map(
+    (row) => ({ name: row.name, title: row.title, repo: repoOf(row.source_url) }),
+  );
+}
+
+/** Topics a scope lists at most. */
+const TOPICS_MAX = 500;
+
+export async function agentFormSetupFor(ctx: AgentContext): Promise<AgentFormSetup> {
+  const org = ctx.actor.organizationId;
+  const [brands, agents, ownKeyProvider, ownKeyProviders, goLive, timeZone, librarySkills] =
+    await Promise.all([
+      supabaseAdmin.from('brands').select('id, name, is_demo').eq('organization_id', org),
+      supabaseAdmin
+        .from('chat_agents')
+        .select('id, name, visibility, owner_id, status, kind, demo_brand_id')
+        .eq('organization_id', org),
+      resolveChatModelKey(org)
+        .then((resolved) => (resolved?.source === 'own' ? resolved.config.provider : null))
+        .catch((err) => {
+          // A saved key that can't be read is still the one agents run on.
+          if (err instanceof OwnKeyUnreadableError) return err.provider;
+          console.error('[chat/agents] could not read whose key Chat runs on:', err);
+          return null;
+        }),
+      // The own keys a picked model may run on (resolvePickedModelKey's), read without decrypting one.
+      ownChatKeyProviders(org).catch((err): string[] => {
+        console.error('[chat/agents] could not read the own keys for Chat:', err);
+        return [];
+      }),
+      readGoLiveSwitch(org),
+      readChosenTimeZone(ctx.actor.userId),
+      librarySkillsFor(org, ctx.actor.userId),
+    ]);
+  if (brands.error) throw new Error(`Could not read the brands: ${brands.error.message}`);
+  if (agents.error) throw new Error(`Could not read the agents' names: ${agents.error.message}`);
+
+  const access = ctx.viewer.brandAccess;
+  // The demo brand runs nothing (00380); an Agency partner names only their shared brands.
+  const usable = ((brands.data ?? []) as { id: string; name: string; is_demo: boolean }[])
+    .filter((b) => !b.is_demo && (access === 'all' || access.includes(b.id)))
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map(({ id, name }) => ({ id, name }));
+
+  let topics: AgentFormSetup['topics'] = [];
+  if (usable.length > 0) {
+    const { data, error } = await supabaseAdmin
+      .from('topics')
+      .select('id, name, brand_id, is_active')
+      .in(
+        'brand_id',
+        usable.map((b) => b.id),
+      )
+      .limit(TOPICS_MAX);
+    if (error) throw new Error(`Could not read the topics: ${error.message}`);
+    topics = ((data ?? []) as { id: string; name: string; brand_id: string; is_active: boolean }[])
+      .filter((topic) => topic.is_active !== false)
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map((topic) => ({ id: topic.id, name: topic.name, brandId: topic.brand_id }));
+  }
+
+  const fullAutoDenial = modeDenial('full_auto', ctx.plan, ctx.settings, ctx.viewer.role);
+  const needs =
+    fullAutoDenial?.denial.code === 'plan_locked' ? fullAutoDenial.denial.needs : 'growth';
+  const me = ctx.actor.userId;
+  const admin = ctx.viewer.role === 'admin';
+  const visible = (
+    (agents.data ?? []) as {
+      id: string;
+      name: string;
+      visibility: string;
+      owner_id: string;
+      status: string;
+      kind?: string;
+      demo_brand_id?: string | null;
+    }[]
+  )
+    // Admins see every agent; others theirs and the workspace's (§K item 51).
+    .filter((a) => admin || a.visibility === 'workspace' || a.owner_id === me);
+  const seen = visible.map((a) => a.name);
+  // Can call's choices: the ones on or paused (CHAT-27 item 14), by name; never an AEO Operator.
+  const callable = visible
+    .filter((a) => (a.status === 'active' || a.status === 'paused') && a.kind !== 'operator')
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map(({ id, name }) => ({ id, name }));
+  // An AEO Operator's choices (AEO Operator plan §4.3, decision 4): on or paused, never an
+  // Operator nor a demo brand's sample agent; the person's own, or shared with the workspace.
+  // Never someone else's private agent, even for an Admin, who sees it.
+  const operatorAgents = visible
+    .filter(
+      (a) =>
+        (a.status === 'active' || a.status === 'paused') &&
+        a.kind !== 'operator' &&
+        !a.demo_brand_id &&
+        (a.owner_id === me || a.visibility === 'workspace'),
+    )
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((a) => ({
+      id: a.id,
+      name: a.name,
+      mine: a.owner_id === me,
+      workspace: a.visibility === 'workspace',
+    }));
+
+  return {
+    role: ctx.viewer.role,
+    brands: usable,
+    topics,
+    engines: AGENT_ENGINES.filter((id) => enginesDenial(ctx.plan, [id]) === null),
+    fullAuto: !fullAutoDenial
+      ? 'open'
+      : fullAutoDenial.denial.code === 'plan_locked'
+        ? 'plan'
+        : 'policy',
+    planName: ctx.plan.planName,
+    fullAutoPlan: PLANS[needs].name,
+    workspaceAgentsAdminsOnly: ctx.settings.workspaceAgentsAdminsOnly,
+    runShareDefault: ctx.settings.runShareDefault,
+    takenNames: seen,
+    ownKeyProvider,
+    ownKeyProviders,
+    modelChoiceOpen: modelChoiceOpen(ctx.plan),
+    goLive,
+    timeZone,
+    callable,
+    canCallLocked: !ctx.plan.fullAuto,
+    librarySkills,
+    offSkills: ANSVISOR_SKILLS.map((skill) => skill.id).filter((id) => !skillFlagOn(id, org)),
+    operatorAgents,
+  };
+}
+
+/** The person's agent context, or null when Chat is off for them or they can't act in the workspace. */
+async function contextNow(): Promise<AgentContext | null> {
+  const actor = await chatActor();
+  if (actor instanceof NextResponse) return null;
+  return readAgentContext(actor);
+}
+
+/** The new-agent page's setup, or null (the page is then not found). */
+export async function readAgentFormSetup(): Promise<AgentFormSetup | null> {
+  const ctx = await contextNow();
+  return ctx ? agentFormSetupFor(ctx) : null;
+}
+
+/** The edit page's setup and agent, or null when the person can't see the agent. */
+export async function readAgentEdit(
+  id: string,
+): Promise<{ setup: AgentFormSetup; agent: AgentDetail } | null> {
+  const ctx = await contextNow();
+  if (!ctx) return null;
+  const agent = await readAgent(ctx, id);
+  return agent ? { setup: await agentFormSetupFor(ctx), agent } : null;
+}

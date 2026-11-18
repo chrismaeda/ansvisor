@@ -15,8 +15,9 @@ import {
   ALWAYS_ON_SECTION,
   MENU_SECTIONS,
   hiddenMenuSections,
-  menuSectionOf,
+  menuSectionEntries,
 } from '@/lib/menu-access';
+import { useMenuSections } from '@/components/providers/menu-access-provider';
 import {
   setMemberMenu,
   setMenuManager,
@@ -25,13 +26,8 @@ import {
   type MenuRole,
 } from '@/lib/actions/menu-access';
 
-/** The menu's sections with their nav titles, in its order. */
-const SECTION_TITLES = dashboardNav
-  .flatMap((group) => group.items)
-  .flatMap((item) => {
-    const section = menuSectionOf(item.href);
-    return section ? [{ section, title: item.title }] : [];
-  });
+/** The menu's sections with their nav titles, in its order: Agents is "Agents · in Action Center". */
+const SECTION_TITLES = menuSectionEntries(dashboardNav.flatMap((group) => group.items));
 
 function initials(member: MenuMember): string {
   const source = member.fullName?.trim() || member.email;
@@ -174,6 +170,7 @@ export function MenuPeopleCard({ settings, onChange, onFailed }: Props) {
   const tSettings = useTranslations('settings');
   const tNav = useTranslations('nav');
   const [editing, setEditing] = useState<string | null>(null);
+  const sections = useMenuSections();
   const people = settings.members.filter((m) => m.role !== 'admin');
   const label = (section: string) =>
     getDashboardNavLabel(SECTION_TITLES.find((s) => s.section === section)?.title ?? section, tNav);
@@ -203,10 +200,10 @@ export function MenuPeopleCard({ settings, onChange, onFailed }: Props) {
             {people.map((member) => {
               const role = member.role as MenuRole;
               const roleHidden = settings.roles[role] ?? [];
-              const off = hiddenMenuSections({ ...member, role, roleHidden });
+              const off = hiddenMenuSections({ ...member, role, roleHidden }, sections);
               const changes = [
-                ...member.shown.map((s) => `+${label(s)}`),
-                ...member.hidden.map((s) => `−${label(s)}`),
+                ...member.shown.filter((s) => sections.includes(s)).map((s) => `+${label(s)}`),
+                ...member.hidden.filter((s) => sections.includes(s)).map((s) => `−${label(s)}`),
               ];
               const open = editing === member.userId;
               return (
@@ -240,8 +237,8 @@ export function MenuPeopleCard({ settings, onChange, onFailed }: Props) {
                       )}
                       <p className="mt-1 text-xs text-muted-foreground">
                         {t('sectionCount', {
-                          count: MENU_SECTIONS.length - off.size,
-                          total: MENU_SECTIONS.length,
+                          count: sections.length - off.size,
+                          total: sections.length,
                         })}
                       </p>
                     </div>
@@ -262,7 +259,7 @@ export function MenuPeopleCard({ settings, onChange, onFailed }: Props) {
                       </p>
                       <p className="text-xs text-muted-foreground">{t('personSectionsHint')}</p>
                       <div className="my-3 grid grid-cols-1 gap-x-4 gap-y-1.5 sm:grid-cols-2">
-                        {MENU_SECTIONS.map((section) => {
+                        {sections.map((section) => {
                           const always = section === ALWAYS_ON_SECTION;
                           const roleSees = !roleHidden.includes(section);
                           const sees =

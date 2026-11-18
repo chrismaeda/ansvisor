@@ -3,6 +3,14 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useLocale, useTranslations } from 'next-intl';
 import { useFailureToast } from '@/hooks/use-failure-toast';
+import {
+  ClampedText,
+  ClampedTextPreview,
+  ClampedTextTooltip,
+  createClampedTextHandle,
+  useTextCut,
+  type ClampedTextHandle,
+} from '@/components/prompts/clamped-text';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -60,6 +68,9 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useBrandStore } from '@/stores/use-brand-store';
+import { useChatPageContext } from '@/components/chat/panel/chat-panel-context';
+import type { ChatPageFilter } from '@/lib/chat/page-context';
+import { viewRows } from '@/lib/chat/page-view';
 import { useAssetTypeLabel } from '@/hooks/use-asset-type-label';
 import {
   generateOpportunitiesOnDemand,
@@ -83,9 +94,11 @@ import { NewContentDialog, type DialogPreset } from '@/components/content/new-co
 import { getOpportunityDrafts } from '@/lib/actions/content-drafts';
 import { getPlanPriorities, setPlanRowPriority } from '@/lib/actions/content-plan';
 import { OpportunityRowMenu } from '@/components/content/opportunity-row-menu';
+import { WriteThisDialog } from '@/components/content/write-this-dialog';
 import { useUserRole } from '@/hooks/use-user-role';
 import { useUpgradeGate } from '@/components/providers/upgrade-gate';
 import { bulkSendNotes } from '@/lib/content/bulk-send';
+import { newResultMessage } from '@/lib/content/new-result';
 import { contentEditorPath } from '@/lib/content/drafts';
 import { canWriteOpportunity, opportunityStart } from '@/lib/content/opportunity-start';
 import { siteTypeOf } from '@/lib/content/page-types';
@@ -121,7 +134,11 @@ import { LoadingDots } from '@/components/ui/loading-dots';
 import { PAGE_SIZE, TablePager, usePagination } from '@/components/table-pager';
 import { toCsv } from '@/lib/csv';
 import { readUrlChoice, writeUrlParams } from '@/lib/url-state';
+import { exportFileName } from '@/lib/white-label/export-name';
+import { actionCode } from '@/lib/action-center/action-ref';
 import { HeaderWithAiUsage } from '@/components/ai-usage/ai-usage-meter';
+import { FirstRunEmptyState } from '@/components/first-run/first-run-empty-state';
+import { useFirstRun } from '@/hooks/use-first-run';
 
 const GENERATION_STORAGE_KEY = 'aeo:content-generation';
 
@@ -316,7 +333,7 @@ function OpportunityScope({ opp }: { opp: ContentOpportunity }) {
         : t('groupNoTopic', { count: scope.count })
       : scope.kind === 'action'
         ? scope.actionNo !== null
-          ? t('action', { ref: `AC-${scope.actionNo}` })
+          ? t('action', { ref: actionCode({ ...scope, actionNo: scope.actionNo }) })
           : t('actionNoRef')
         : t('single');
   return (
@@ -334,6 +351,94 @@ function OpportunityScope({ opp }: { opp: ContentOpportunity }) {
   );
 }
 
+/**
+ * The Action cell: title and description clamp to one line each. Hover or
+ * keyboard focus shows the cut text in the shared tooltip; when either line
+ * is cut, the row also gets a preview button that opens both in full without
+ * opening the opportunity itself.
+ */
+function OpportunityTextCell({
+  opp,
+  handle,
+  onOpen,
+}: {
+  opp: ContentOpportunity;
+  handle: ClampedTextHandle;
+  onOpen: () => void;
+}) {
+  const t = useTranslations('content');
+  const [titleRef, titleCut] = useTextCut<HTMLParagraphElement>();
+  const [descriptionRef, descriptionCut] = useTextCut<HTMLParagraphElement>();
+  return (
+    <div className="flex items-start gap-1">
+      <button
+        type="button"
+        onClick={onOpen}
+        className="block min-w-0 flex-1 text-left hover:underline"
+      >
+        <ClampedText
+          handle={handle}
+          text={opp.title}
+          render={
+            <p
+              ref={titleRef}
+              className="text-sm font-medium line-clamp-1 wrap-break-word whitespace-normal"
+            />
+          }
+        >
+          {opp.sourceData?.reopened && opp.status === 'new' && (
+            <Badge
+              variant="outline"
+              className="mr-1.5 border-amber-500/30 bg-amber-500/10 text-[10px] text-amber-700 dark:text-amber-400"
+            >
+              {t('newSignal')}
+            </Badge>
+          )}
+          {/* Before the title, which is clamped to one line. */}
+          {opp.sourceData?.alternativeOf && (
+            <Badge
+              variant="outline"
+              className="mr-1.5 align-middle text-[10px] font-normal text-muted-foreground"
+              title={t('alternative.of') + ' ' + opp.sourceData.alternativeOf.title}
+            >
+              {t('alternative.badge')}
+            </Badge>
+          )}
+          {opp.source && opp.source !== 'system' && (
+            <Badge
+              variant="outline"
+              className="mr-1.5 align-middle text-[10px] font-normal text-muted-foreground"
+              title={t(`sourceHint.${opp.source}`)}
+            >
+              {t(`source.${opp.source}`)}
+            </Badge>
+          )}
+          {opp.title}
+        </ClampedText>
+        {/* Some opportunities carry no description; then there is nothing to clamp. */}
+        {opp.description ? (
+          <ClampedText
+            handle={handle}
+            text={opp.description}
+            render={
+              <p
+                ref={descriptionRef}
+                className="text-xs text-muted-foreground line-clamp-1 wrap-break-word whitespace-normal mt-0.5"
+              />
+            }
+          >
+            <OpportunityScope opp={opp} />
+            {opp.description}
+          </ClampedText>
+        ) : null}
+      </button>
+      {titleCut || descriptionCut ? (
+        <ClampedTextPreview label={t('showFullText')} heading={opp.title} body={opp.description} />
+      ) : null}
+    </div>
+  );
+}
+
 const ALL_PROMPTS = '__all__';
 
 interface PromptFilterItem {
@@ -346,6 +451,7 @@ interface PromptFilterItem {
 export default function ContentPage() {
   const t = useTranslations('content');
   const failureToast = useFailureToast();
+  const fullText = useMemo(() => createClampedTextHandle(), []);
   const assetTypeLabel = useAssetTypeLabel();
   const tCommon = useTranslations('common');
   const locale = useLocale();
@@ -355,6 +461,8 @@ export default function ContentPage() {
   // actions open the upgrade dialog instead; filters and Export stay open.
   const { guard, isLocked, openUpgrade } = useUpgradeGate();
   const tActions = useTranslations('readOnly.actions');
+  const tManagers = useTranslations('managersOnly');
+  const tChat = useTranslations('chatPanel.suggest');
   // The bulk bar's Dismiss and Delete ask first: the upgrade dialog instead.
   const confirmUnlessLocked =
     (action: string) => (open: boolean, details: { cancel: () => void }) => {
@@ -518,6 +626,8 @@ export default function ContentPage() {
   const router = useRouter();
   const activeBrand = useBrandStore((s) => s.brands.find((b) => b.id === s.activeBrandId));
   const [contentPreset, setContentPreset] = useState<DialogPreset | null>(null);
+  // Write this from a row: the brief and the page in one go.
+  const [writeThis, setWriteThis] = useState<ContentOpportunity | null>(null);
   // The drafts being written for the rows on screen, which open instead. A
   // failed read is not "no draft": the rows offer to check again, so Start
   // never writes a second draft for the same opportunity.
@@ -730,11 +840,25 @@ export default function ContentPage() {
               clearGenerationJob();
               setGenerating(false);
               setPendingCount(0);
-              const generated = status.result?.generated ?? 0;
-              const duplicates = status.result?.duplicates ?? 0;
-              if (status.result?.limited) toast.error(t('newLimitReached'));
-              else if (generated === 0 && duplicates === 0) toast(t('newNothing'));
-              else toast.success(t('newDone', { generated, duplicates }));
+              // How many were created and, when fewer than asked for, why.
+              const message = newResultMessage(status.result ?? { generated: 0 });
+              const existingId = message.existingId;
+              const title = t(message.title.key, message.title.values);
+              const description = message.reasons.map((r) => t(r.key, r.values)).join(' ');
+              if (message.tone === 'error') toast.error(title);
+              // A request for one prompt that an open opportunity answers.
+              else if (existingId)
+                toast(title, {
+                  action: {
+                    label: t('openExisting'),
+                    onClick: () => selectOpportunity(existingId),
+                  },
+                });
+              else
+                (message.tone === 'success' ? toast.success : toast)(
+                  title,
+                  description ? { description } : undefined,
+                );
               loadData();
               loadPromptOptions();
               setUsageVersion((v) => v + 1);
@@ -769,7 +893,7 @@ export default function ContentPage() {
 
       poll();
     },
-    [loadData, loadPromptOptions, t],
+    [loadData, loadPromptOptions, selectOpportunity, t],
   );
   // Restore generation state from localStorage on mount
   useEffect(() => {
@@ -818,7 +942,9 @@ export default function ContentPage() {
       const link = document.createElement('a');
       const date = new Date().toISOString().slice(0, 10);
       link.href = url;
-      link.download = `ansvisor_${activeBrandSlug ?? 'brand'}_content-opportunities_${date}.csv`;
+      link.download = await exportFileName(
+        `${activeBrandSlug ?? 'brand'}_content-opportunities_${date}.csv`,
+      );
       link.click();
       URL.revokeObjectURL(url);
     } catch (err) {
@@ -882,17 +1008,20 @@ export default function ContentPage() {
         timeZone: 'UTC',
       })
     : '';
-  const newButton = (
+  // Generating opportunities costs AI: admins and managers start it, and
+  // anyone else reads who can.
+  const newButton = canManage ? (
     <Button
       onClick={guard(() => setNewOpen(true), { action: tActions('generateOpportunities') })}
       disabled={generating || loading || limitReached}
-      size="sm"
       className="gap-2"
       title={limitReached ? t('newLimitTooltip', { date: resetsOn }) : undefined}
     >
       {generating ? <LoadingDots /> : <Plus className="h-4 w-4" />}
       {generating ? t('generating') : t('new')}
     </Button>
+  ) : (
+    <span className="text-xs text-muted-foreground">{tManagers('generateOpportunities')}</span>
   );
 
   const handleSendWebhook = async (id: string) => {
@@ -1059,6 +1188,50 @@ export default function ContentPage() {
     setSearch('');
   };
 
+  // Chat's side panel sees the page (W1-08): its filters, and the
+  // high-impact opportunity on top of the list.
+  const pageFilters: ChatPageFilter[] = [];
+  if (typeFilter !== 'all') {
+    pageFilters.push({ key: 'type', label: t(`type.${typeFilter}`), value: typeFilter });
+  }
+  if (impactFilter !== 'all') {
+    pageFilters.push({ key: 'impact', label: t(`impact.${impactFilter}`), value: impactFilter });
+  }
+  if (statusFilter !== 'all') {
+    pageFilters.push({ key: 'status', label: t(`status.${statusFilter}`), value: statusFilter });
+  }
+  const topOpportunity = opportunities.find((o) => o.impact === 'high');
+  useChatPageContext(
+    activeBrandId
+      ? {
+          filters: pageFilters,
+          suggestions: [
+            ...(topOpportunity ? [tChat('opportunityStart', { title: topOpportunity.title })] : []),
+            tChat('opportunitiesFirst'),
+            tChat('actions'),
+          ],
+          // And what else it shows (the owner's plan, item 8): the sort, the search, and once
+          // read, the page of opportunities on screen with how many match.
+          view: {
+            sort: { key: sortOrder, dir: sortOrder === 'oldest' ? 'asc' : 'desc' },
+            ...(search.trim() ? { search: search.trim() } : {}),
+            ...(loading
+              ? {}
+              : {
+                  rows: viewRows(opportunities, (o) => ({ ref: o.id, label: o.title })),
+                  total,
+                }),
+          },
+        }
+      : null,
+  );
+
+  // The brand's first tracking run while it goes on, read only for the empty
+  // list: opportunities come from tracking data, so it says they are on their way.
+  const firstRun = useFirstRun({
+    enabled: !loading && opportunities.length === 0 && !hasActiveFilters,
+  });
+
   if (!activeBrandId) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
@@ -1070,7 +1243,7 @@ export default function ContentPage() {
   return (
     <div className="space-y-6">
       <HeaderWithAiUsage>
-        <div className="flex items-center justify-between gap-4 flex-wrap">
+        <div className="flex flex-wrap items-start justify-between gap-4">
           <div>
             <h1 className="text-2xl font-bold tracking-tight">{t('title')}</h1>
             <p className="text-muted-foreground text-sm">{t('description')}</p>
@@ -1081,18 +1254,12 @@ export default function ContentPage() {
               onClick={handleExportCsv}
               disabled={exporting || loading || total === 0}
               variant="outline"
-              size="sm"
               className="gap-2"
             >
               {exporting ? <LoadingDots /> : <Download className="h-4 w-4" />}
               {tCommon('exportCsv')}
             </Button>
-            <Button
-              onClick={() => setWebhookOpen(true)}
-              variant="outline"
-              size="sm"
-              className="gap-2"
-            >
+            <Button onClick={() => setWebhookOpen(true)} variant="outline" className="gap-2">
               <Settings2 className="h-4 w-4" />
               {t('webhook.title')}
             </Button>
@@ -1112,10 +1279,14 @@ export default function ContentPage() {
         <Card>
           <CardContent className="flex flex-col items-center justify-center py-16 gap-4">
             <Lightbulb className="h-12 w-12 text-muted-foreground/40" />
-            <div className="text-center space-y-1">
-              <p className="text-sm font-medium">{t('noOpportunities')}</p>
-              <p className="text-xs text-muted-foreground">{t('noOpportunitiesHint')}</p>
-            </div>
+            {firstRun ? (
+              <FirstRunEmptyState run={firstRun} className="max-w-xl" />
+            ) : (
+              <div className="text-center space-y-1">
+                <p className="text-sm font-medium">{t('noOpportunities')}</p>
+                <p className="text-xs text-muted-foreground">{t('noOpportunitiesHint')}</p>
+              </div>
+            )}
             {newButton}
             <p className="text-xs text-muted-foreground">{t('autoGeneratedHint')}</p>
           </CardContent>
@@ -1158,7 +1329,7 @@ export default function ContentPage() {
             />
           </div>
 
-          <Card>
+          <Card data-tour="content">
             <CardHeader className="pb-3">
               {/* The search sits on the title's line, right-aligned and larger,
                   so the filters below keep a line of their own. */}
@@ -1420,102 +1591,110 @@ export default function ContentPage() {
                   {t('bulk.selected', { count: selectedIds.size })}
                 </span>
                 <div className="flex items-center gap-1 ml-auto">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-7 text-xs gap-1.5"
-                    onClick={guard(handleBulkSend, { action: tActions('sendToWorkflow') })}
-                    disabled={bulkSending}
-                  >
-                    {bulkSending ? <LoadingDots /> : <Send className="h-3 w-3" />}
-                    {t('bulk.sendAll')}
-                  </Button>
+                  {/* Sending to the webhook, bulk changes, dismissing and deleting are
+                      for admins and managers, as the server and the database allow them. */}
+                  {canManage && (
+                    <>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-7 text-xs gap-1.5"
+                        onClick={guard(handleBulkSend, { action: tActions('sendToWorkflow') })}
+                        disabled={bulkSending}
+                      >
+                        {bulkSending ? <LoadingDots /> : <Send className="h-3 w-3" />}
+                        {t('bulk.sendAll')}
+                      </Button>
 
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-7 text-xs gap-1.5"
-                    onClick={guard(handleBulkDone, { action: tActions('markOpportunitiesDone') })}
-                    disabled={bulkSending}
-                  >
-                    <Check className="h-3 w-3" />
-                    {t('status.done')}
-                  </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-7 text-xs gap-1.5"
+                        onClick={guard(handleBulkDone, {
+                          action: tActions('markOpportunitiesDone'),
+                        })}
+                        disabled={bulkSending}
+                      >
+                        <Check className="h-3 w-3" />
+                        {t('status.done')}
+                      </Button>
 
-                  <Dialog onOpenChange={confirmUnlessLocked(tActions('dismissOpportunities'))}>
-                    <DialogTrigger
-                      render={
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          className="h-7 text-xs gap-1.5 text-muted-foreground"
-                          disabled={bulkSending}
-                        />
-                      }
-                    >
-                      <X className="h-3 w-3" />
-                      {t('bulk.dismissAll')}
-                    </DialogTrigger>
-                    <DialogContent className="sm:max-w-sm">
-                      <DialogHeader>
-                        <DialogTitle>{t('bulk.dismissAllTitle')}</DialogTitle>
-                        <DialogDescription>
-                          {t('bulk.dismissAllConfirm', { count: selectedIds.size })}
-                        </DialogDescription>
-                      </DialogHeader>
-                      <DialogFooter>
-                        <DialogClose render={<Button variant="outline" />}>
-                          {t('cancel')}
-                        </DialogClose>
-                        <DialogClose
-                          render={<Button variant="destructive" onClick={handleBulkDismiss} />}
+                      <Dialog onOpenChange={confirmUnlessLocked(tActions('dismissOpportunities'))}>
+                        <DialogTrigger
+                          render={
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-7 text-xs gap-1.5 text-muted-foreground"
+                              disabled={bulkSending}
+                            />
+                          }
                         >
+                          <X className="h-3 w-3" />
                           {t('bulk.dismissAll')}
-                        </DialogClose>
-                      </DialogFooter>
-                    </DialogContent>
-                  </Dialog>
+                        </DialogTrigger>
+                        <DialogContent className="sm:max-w-sm">
+                          <DialogHeader>
+                            <DialogTitle>{t('bulk.dismissAllTitle')}</DialogTitle>
+                            <DialogDescription>
+                              {t('bulk.dismissAllConfirm', { count: selectedIds.size })}
+                            </DialogDescription>
+                          </DialogHeader>
+                          <DialogFooter>
+                            <DialogClose render={<Button variant="outline" />}>
+                              {t('cancel')}
+                            </DialogClose>
+                            <DialogClose
+                              render={<Button variant="destructive" onClick={handleBulkDismiss} />}
+                            >
+                              {t('bulk.dismissAll')}
+                            </DialogClose>
+                          </DialogFooter>
+                        </DialogContent>
+                      </Dialog>
 
-                  {/* Last in the row, and the only destructive-styled trigger:
-                      this one does not move a row, it removes it. */}
-                  <Dialog onOpenChange={confirmUnlessLocked(tActions('deleteOpportunities'))}>
-                    <DialogTrigger
-                      render={
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          className="h-7 text-xs gap-1.5 text-destructive hover:text-destructive"
-                          disabled={bulkSending}
-                        />
-                      }
-                    >
-                      <Trash2 className="h-3 w-3" />
-                      {t('bulk.deleteAll')}
-                    </DialogTrigger>
-                    <DialogContent className="sm:max-w-sm">
-                      <DialogHeader>
-                        <DialogTitle>{t('bulk.deleteAllTitle')}</DialogTitle>
-                        <DialogDescription>
-                          {t('bulk.deleteAllConfirm', { count: selectedIds.size })}
-                          {selectedWithBrief > 0 && (
-                            <span className="mt-2 block font-medium text-foreground">
-                              {t('bulk.deleteAllBriefWarning', { count: selectedWithBrief })}
-                            </span>
-                          )}
-                        </DialogDescription>
-                      </DialogHeader>
-                      <DialogFooter>
-                        <DialogClose render={<Button variant="outline" />}>
-                          {t('cancel')}
-                        </DialogClose>
-                        <DialogClose
-                          render={<Button variant="destructive" onClick={handleBulkDelete} />}
+                      {/* Last in the row, and the only destructive-styled trigger:
+                          this one does not move a row, it removes it. */}
+                      <Dialog onOpenChange={confirmUnlessLocked(tActions('deleteOpportunities'))}>
+                        <DialogTrigger
+                          render={
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-7 text-xs gap-1.5 text-destructive hover:text-destructive"
+                              disabled={bulkSending}
+                            />
+                          }
                         >
+                          <Trash2 className="h-3 w-3" />
                           {t('bulk.deleteAll')}
-                        </DialogClose>
-                      </DialogFooter>
-                    </DialogContent>
-                  </Dialog>
+                        </DialogTrigger>
+                        <DialogContent className="sm:max-w-sm">
+                          <DialogHeader>
+                            <DialogTitle>{t('bulk.deleteAllTitle')}</DialogTitle>
+                            <DialogDescription>
+                              {t('bulk.deleteAllConfirm', { count: selectedIds.size })}
+                              {selectedWithBrief > 0 && (
+                                <span className="mt-2 block font-medium text-foreground">
+                                  {t('bulk.deleteAllBriefWarning', { count: selectedWithBrief })}
+                                </span>
+                              )}
+                            </DialogDescription>
+                          </DialogHeader>
+                          <DialogFooter>
+                            <DialogClose render={<Button variant="outline" />}>
+                              {t('cancel')}
+                            </DialogClose>
+                            <DialogClose
+                              render={<Button variant="destructive" onClick={handleBulkDelete} />}
+                            >
+                              {t('bulk.deleteAll')}
+                            </DialogClose>
+                          </DialogFooter>
+                        </DialogContent>
+                      </Dialog>
+                    </>
+                  )}
                 </div>
               </div>
             )}
@@ -1526,17 +1705,21 @@ export default function ContentPage() {
               <Table className="min-w-[720px] table-fixed">
                 <TableHeader>
                   <TableRow>
+                    {/* Every bulk action is for admins and managers, so the others
+                        get no boxes to tick; the column stays for the layout. */}
                     <TableHead className="w-10 pl-4">
-                      <Checkbox
-                        checked={filtered.length > 0 && selectedIds.size === filtered.length}
-                        onCheckedChange={(checked) => {
-                          if (checked) {
-                            setSelectedIds(new Set(filtered.map((o) => o.id)));
-                          } else {
-                            setSelectedIds(new Set());
-                          }
-                        }}
-                      />
+                      {canManage && (
+                        <Checkbox
+                          checked={filtered.length > 0 && selectedIds.size === filtered.length}
+                          onCheckedChange={(checked) => {
+                            if (checked) {
+                              setSelectedIds(new Set(filtered.map((o) => o.id)));
+                            } else {
+                              setSelectedIds(new Set());
+                            }
+                          }}
+                        />
+                      )}
                     </TableHead>
                     {/* The other columns are sized to fit their badges and buttons;
                         the action takes what is left, so nothing spills into its
@@ -1584,59 +1767,24 @@ export default function ContentPage() {
                   {filtered.map((opp) => (
                     <TableRow key={opp.id} className="hover:bg-muted/50">
                       <TableCell className="w-10 pl-4">
-                        <Checkbox
-                          checked={selectedIds.has(opp.id)}
-                          onCheckedChange={(checked) => {
-                            const next = new Set(selectedIds);
-                            if (checked) next.add(opp.id);
-                            else next.delete(opp.id);
-                            setSelectedIds(next);
-                          }}
-                        />
+                        {canManage && (
+                          <Checkbox
+                            checked={selectedIds.has(opp.id)}
+                            onCheckedChange={(checked) => {
+                              const next = new Set(selectedIds);
+                              if (checked) next.add(opp.id);
+                              else next.delete(opp.id);
+                              setSelectedIds(next);
+                            }}
+                          />
+                        )}
                       </TableCell>
                       <TableCell className="pl-6 max-w-0">
-                        <button
-                          type="button"
-                          onClick={() => selectOpportunity(opp.id)}
-                          className="block w-full text-left hover:underline"
-                        >
-                          <p className="text-sm font-medium line-clamp-1">
-                            {opp.sourceData?.reopened && opp.status === 'new' && (
-                              <Badge
-                                variant="outline"
-                                className="mr-1.5 border-amber-500/30 bg-amber-500/10 text-[10px] text-amber-700 dark:text-amber-400"
-                              >
-                                {t('newSignal')}
-                              </Badge>
-                            )}
-                            {/* Before the title, which is clamped to one line. */}
-                            {opp.sourceData?.alternativeOf && (
-                              <Badge
-                                variant="outline"
-                                className="mr-1.5 align-middle text-[10px] font-normal text-muted-foreground"
-                                title={
-                                  t('alternative.of') + ' ' + opp.sourceData.alternativeOf.title
-                                }
-                              >
-                                {t('alternative.badge')}
-                              </Badge>
-                            )}
-                            {opp.source && opp.source !== 'system' && (
-                              <Badge
-                                variant="outline"
-                                className="mr-1.5 align-middle text-[10px] font-normal text-muted-foreground"
-                                title={t(`sourceHint.${opp.source}`)}
-                              >
-                                {t(`source.${opp.source}`)}
-                              </Badge>
-                            )}
-                            {opp.title}
-                          </p>
-                          <p className="text-xs text-muted-foreground line-clamp-1 mt-0.5">
-                            <OpportunityScope opp={opp} />
-                            {opp.description}
-                          </p>
-                        </button>
+                        <OpportunityTextCell
+                          opp={opp}
+                          handle={fullText}
+                          onOpen={() => selectOpportunity(opp.id)}
+                        />
                       </TableCell>
                       <TableCell className="hidden whitespace-nowrap text-xs text-muted-foreground xl:table-cell">
                         <SuggestedCell
@@ -1709,6 +1857,9 @@ export default function ContentPage() {
                             onStart: guard(() => setContentPreset(opportunityStart(opp)), {
                               action: tActions('createContent'),
                             }),
+                            onWriteThis: guard(() => setWriteThis(opp), {
+                              action: tActions('createContent'),
+                            }),
                             onOpenDraft: (draftId) => router.push(contentEditorPath(draftId)),
                           }}
                           // The Plan lists owned work still open; its marks are
@@ -1727,7 +1878,7 @@ export default function ContentPage() {
                               : null
                           }
                           workflow={
-                            opp.status === 'new'
+                            canManage && opp.status === 'new'
                               ? {
                                   sending: sendingId === opp.id,
                                   onSend: guard(() => void handleSendWebhook(opp.id), {
@@ -1738,7 +1889,7 @@ export default function ContentPage() {
                           }
                           pageHref={`/dashboard/content/${opp.id}`}
                           onDismiss={
-                            opp.status === 'new'
+                            canManage && opp.status === 'new'
                               ? guard(() => void handleDismiss(opp.id), {
                                   action: tActions('dismissOpportunities'),
                                 })
@@ -1750,6 +1901,7 @@ export default function ContentPage() {
                   ))}
                 </TableBody>
               </Table>
+              <ClampedTextTooltip handle={fullText} />
               {filtered.length === 0 && (
                 <div className="flex flex-col items-center gap-3 py-10 text-center">
                   <p className="text-sm text-muted-foreground">{t('noResults')}</p>
@@ -1783,6 +1935,11 @@ export default function ContentPage() {
           preset={contentPreset}
         />
       )}
+      <WriteThisDialog
+        opportunity={writeThis}
+        onOpenChange={(open) => !open && setWriteThis(null)}
+        siteType={siteTypeOf(activeBrand ?? {})}
+      />
       <Sheet
         open={openOpportunityId !== null}
         onOpenChange={(open) => {
@@ -1817,6 +1974,7 @@ export default function ContentPage() {
         max={requestMax}
         remaining={contentUsage?.opportunities.remaining ?? -1}
         onSubmit={handleNew}
+        onOpenExisting={selectOpportunity}
       />
     </div>
   );

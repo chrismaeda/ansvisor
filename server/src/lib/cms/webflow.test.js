@@ -15,6 +15,8 @@ const {
   getItem,
   listCollections,
   listSites,
+  publishItem,
+  unpublishItem,
   suggestFieldMap,
   updateItem,
 } = await import('./webflow.js');
@@ -170,6 +172,29 @@ describe('suggestFieldMap', () => {
 });
 
 describe('checkFieldMap', () => {
+  it('maps the reviewer to a plain-text field without making it universally required', () => {
+    const reviewer = {
+      slug: 'reviewed-by',
+      name: 'Reviewed by',
+      type: 'PlainText',
+      required: false,
+    };
+    const fields = [...blog, reviewer];
+    expect(suggestFieldMap(fields).reviewer).toBe('reviewed-by');
+    expect(checkFieldMap({ body: 'post-body', reviewer: 'reviewed-by' }, fields)).toEqual({
+      ok: true,
+      map: { body: 'post-body', reviewer: 'reviewed-by' },
+    });
+    const required = fields.map((field) =>
+      field.slug === 'reviewed-by' ? { ...field, required: true } : field,
+    );
+    expect(
+      checkFieldMap({ body: 'post-body', reviewer: 'reviewed-by' }, required).problems,
+    ).toEqual([
+      'The collection requires Reviewed by, which Send to CMS doesn’t fill: make it optional in Webflow, or pick another collection',
+    ]);
+  });
+
   it('keeps a map that fits the collection', () => {
     expect(
       checkFieldMap({ body: 'post-body', metaDescription: 'post-summary', jsonLd: '' }, blog),
@@ -370,5 +395,37 @@ describe('where pages live', () => {
     expect(await getItem(account, 'c1', 'i1')).toBeNull();
     executeWebflowTool.mockRejectedValueOnce(new Error('401 Unauthorized'));
     await expect(getItem(account, 'c1', 'i1')).rejects.toMatchObject({ code: 'auth_failed' });
+  });
+});
+
+describe('publishItem (AUTONOMOUS-GO-LIVE PR 9)', () => {
+  it('takes the item out of draft, then publishes it alone', async () => {
+    executeWebflowTool.mockResolvedValue({});
+    expect(await publishItem(account, 'col_1', 'item_1')).toBe('item_1');
+    expect(executeWebflowTool.mock.calls.map(([slug, , args]) => [slug, args])).toEqual([
+      [
+        'WEBFLOW_UPDATE_COLLECTION_ITEM_V2',
+        { collection_id: 'col_1', item_id: 'item_1', isDraft: false },
+      ],
+      ['WEBFLOW_PUBLISH_COLLECTION_ITEMS', { collection_id: 'col_1', item_ids: ['item_1'] }],
+    ]);
+  });
+
+  it('says why Webflow refused, and publishes nothing after a refused update', async () => {
+    executeWebflowTool.mockRejectedValueOnce(new Error('403 Forbidden'));
+    await expect(publishItem(account, 'col_1', 'item_1')).rejects.toBeInstanceOf(WebflowError);
+    expect(executeWebflowTool).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('unpublishItem (AUTONOMOUS-GO-LIVE PR 10)', () => {
+  it('unpublishes the one live item', async () => {
+    executeWebflowTool.mockResolvedValue({});
+    expect(await unpublishItem(account, 'col_1', 'item_1')).toBe('item_1');
+    expect(executeWebflowTool.mock.calls.map(([slug, , args]) => [slug, args])).toEqual([
+      ['WEBFLOW_UNPUBLISH_LIVE_COLLECTION_ITEM', { collection_id: 'col_1', item_id: 'item_1' }],
+    ]);
+    executeWebflowTool.mockRejectedValueOnce(new Error('403 Forbidden'));
+    await expect(unpublishItem(account, 'col_1', 'item_1')).rejects.toBeInstanceOf(WebflowError);
   });
 });

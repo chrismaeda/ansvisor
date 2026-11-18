@@ -168,8 +168,12 @@ beforeEach(async () => {
     const actual = await importOriginal();
     return {
       ...actual,
-      readAllRpcRows: async (name, page) =>
-        name === 'brands' ? { data: brandRows, error: null } : actual.readAllRpcRows(name, page),
+      readAllRpcRows: async (name, page) => {
+        if (name !== 'brands') return actual.readAllRpcRows(name, page);
+        // The brands' query is built (and recorded) but answered here.
+        await page(0, 999);
+        return { data: brandRows, error: null };
+      },
     };
   });
   vi.doMock('../plan-guard.js', () => ({
@@ -226,12 +230,19 @@ describe('sweepAutoAudits', () => {
     });
     expect(claim.opts).toMatchObject({ ignoreDuplicates: true });
     expect(ids.update.audit_ids).toHaveLength(5);
+    // Never a demo brand (00380).
+    expect(ops.find((op) => op.table === 'brands').filters).toContainEqual([
+      'eq',
+      'is_demo',
+      false,
+    ]);
     expect(done.update).toMatchObject({ status: 'completed', finished_at: expect.any(String) });
 
     expect(sendAutoAuditEmail).toHaveBeenCalledWith('org-1', {
       brands: [
-        { name: 'Acme Coffee', pages: 3, completed: 2, criticalIssues: 3 },
-        { name: 'Acme Tea', pages: 2, completed: 2, criticalIssues: 3 },
+        // Each brand by its id too: the e-mail lists to each person the brands they see.
+        { id: 'brand-a', name: 'Acme Coffee', pages: 3, completed: 2, criticalIssues: 3 },
+        { id: 'brand-b', name: 'Acme Tea', pages: 2, completed: 2, criticalIssues: 3 },
       ],
       nextRunAt: '2026-10-14T00:00:00.000Z',
     });

@@ -1,0 +1,244 @@
+---
+title: See and run your agents in Action Center › Agents
+route: /dashboard/agents
+keywords: [agents, aeo operator, operator, daily budget, agents a day, daily plan, approve the plan, skip the plan, agent center, chat agents, ready to use, ready-to-use agents, use this agent, your agents, new agent, create agent, edit agent, delete agent, run now, pause agent, resume agent, archive agent, agent ai use, by agent, top agent, ai use by agent, agent runs, triggers, max per run, schedule, signal trigger, needs you, stopped at its limit, run agent on an action, agent connections, required connection, agent skills, follow-on skills, library skills in an agent, buyer questions, rival brief, listing gaps, site audit fixes, business type, for your role, for your site type, agent packs, e-commerce agents, b2b agents, b2c agents, mobile app agents, ceo brief, publish on its own, go live on its own, daily limit, went live notice, can call, run another agent, called by, sub-agents, agent calls agent, send to webhook, what this agent did, agent impact, changes shipped by an agent, agent results, onboarding, onboarding & help, onboarding agent, help agent, setup guide, /setup, recommended agents, which agents should i use, fan-out gap filler, fan-out gaps, prompt portfolio manager, prompts to add, prompts to pause, content plan builder, /content-plan, seasonal prompt planner, /seasonal, ai traffic signups, ai traffic, sign-ups, /traffic, when a brand is added, brand added, new brand trigger, goal, role, filter agents, agent work, i approve first, agent starts on its own]
+synonyms: [my agents, saved agents, automations, scheduled agents, agent templates, ready-made agents, agent gallery, agent history, what does this agent cost, make an agent, change an agent, remove an agent, publish without a click, agent sends to cms, agent runs an agent, chain agents, helper agent, agents for me, agent recommendations, setup help, new member setup, what did my agent do, did my agent work, run an agent on a new brand, agent for new brands, content plan, weekly plan, what to write this week, seasonal prompts, holiday prompts, black friday, ai traffic report, ai visitors who sign up]
+plan: all
+updated: 2026-11-18
+last_checked: 2026-11-15
+owner: Cihan
+app_version: 0.3.0
+approved: true
+sources: [web/messages/en.json, web/src/config/dashboard.ts, web/src/lib/chat/agent-rules.ts, web/src/lib/chat/agent-form.ts, web/src/lib/chat/agent-triggers.ts, web/src/lib/chat/agent-driver.ts, web/src/lib/chat/agent-skills.ts, web/src/lib/chat/agent-connections.ts, web/src/lib/chat/agents/catalog.ts, web/src/lib/content/page-types.ts, web/src/lib/menu-access.ts, web/src/lib/chat/agent-go-live.ts, web/src/lib/chat/go-live.ts, web/src/lib/chat/precedence.ts, web/src/lib/chat/agent-calls.ts, web/src/lib/chat/agent-impact.ts, web/src/lib/chat/untrusted.ts, web/src/lib/chat/key.ts, skills/setup/SKILL.md, skills/content-plan/SKILL.md, skills/seasonal/SKILL.md, skills/traffic/SKILL.md, web/src/lib/mcp/ready-agents.ts, web/src/lib/actions/brand.ts, web/src/lib/billing/ai-usage-agents.ts]
+---
+An agent is a saved skill, mode, connections and model that runs in Chat again and again: on a schedule, when Action Center finds a signal, when a KPI changes, when a brand is added, or when someone clicks **Run now**. **Agents**, a tab of the **Action Center** (formerly Agent Center), lists every agent you can see and offers ready-to-use agents, and each agent has its own page with its triggers, its runs and how much of your monthly AI limit it uses.
+
+## Open Agents
+
+Click **Agents** under **Action Center** on the left menu. It is also in the chat menu, under **Inbox**, as **Agents**, with **New** until you first open it. Old links to Agent Center still open it.
+
+**Your agents** comes first, with **Ready to use** under it. **Ask Chat to make one** opens Chat with a request filled in for you to send; **New agent** opens the form. In **Your agents**, the filters above the list show how many agents each holds:
+
+- **Mine**: the agents you own.
+- **Workspace**: the agents shared with everyone in your workspace. Admins also see their teammates' private agents here.
+- **Paused** and **Archived**: agents that are off.
+
+Type in **Search by name or skill** to find an agent by its name or by a skill it uses.
+
+## Ready-to-use agents
+
+**Ready to use** shows agents set up for common jobs, such as **Visibility Watch**, **Citation Win-back**, **Weekly Report** and **Onboarding & Help**, and agents made for a kind of site or a team, such as **Product Answer Pages** for e-commerce or **CEO Brief** for founders. Each card says what the agent does, its skills, what starts it and its mode.
+
+Admins and Managers click **Use this agent**. **New agent** opens with its skills, triggers, mode and connections filled in, for the brand you have open. Change what you like, then click **Save as draft** or **Turn on**. Nothing turns on by itself.
+
+If your plan doesn't include an agent's mode, its card says which plan does, and the agent opens on **Auto, ask before changes**. Cards marked **Soon** say what they're waiting for and can't be used yet.
+
+## Fan-out Gap Filler
+
+**Fan-out Gap Filler** runs every Monday at 09:00 on **Auto, ask before changes**. It reads the sub-questions AI engines searched while answering your tracked prompts, finds the ones where no answer named your brand, and drafts an answer-first section for each in a Content draft, which **Answer-first rewrite** then goes over. Its answer lists each sub-question with the engines that searched it and the competitors named instead. Sending the draft to your CMS and publishing it stay yours. In Chat, the same skill is **/fanout**.
+## Filter ready-to-use agents
+Above the cards, **Goal**, **Business type** and **Role** sit side by side, each with an arrow. Click one to open its list right under it, then pick an option: the list closes and only the matching agents show. The header then shows your pick, such as **Goal: Content**, so you can see what is filtered. Filters add up: **Goal: Content** with **Business type: B2C** shows the agents that match both. Pick **All** to clear that filter. One list is open at a time; press Esc or click elsewhere to close it. A filter shows once an agent has one of its options.
+
+## Agents for your site and your work
+
+Agents made for the site type of the brand you have open are marked **For your site type**, and agents made for one of your work areas **For your role**. They come first among the agents you can use, and first among the **Soon** ones. A brand's site type is **E-commerce**, **B2B SaaS** or **B2C**, under **Site type** in the brand's settings; until someone sets it, Ansvisor guesses it. Change your work areas in **Settings › Account › Your work areas**. **Mobile app** agents show under **Business type** only: a brand can't be set to Mobile app yet.
+
+## Onboarding & Help
+
+**Onboarding & Help** gets a new brand or a new teammate going. Its skill is **Setup guide** (**/setup**). It starts on **All brands** with **When a brand is added**: once it's on, each brand someone adds gets one run, which acts as the agent's owner and shows in their Inbox. You can also click **Run now** on its page. Each run says how many set-up steps are done, lists the open ones with a link to each page, then recommends 3 to 5 ready-to-use agents for the brand's site type and your work areas, each linked to its card in **Ready to use**. It never turns an agent on: you click **Use this agent**, then **Turn on**. It runs on **Ask me first**, so it asks before every change, such as adding competitors. Ask it how to do something in Ansvisor, and Chat answers from Help.
+
+## Prompt Portfolio Manager
+
+**Prompt Portfolio Manager** runs every Monday at 09:00 on **Ask me first**. It is made for the **AEO/GEO & Audit** work area. It proposes prompts to track, from your prompt suggestions, the sub-questions AI engines searched and your Search Console queries, and prompts to pause: ones tracked for 8 weeks or more whose answers never named or cited your brand in that time, with little or no known search demand. Each proposal shows its evidence and is a card: nothing is added or paused until you approve it, and the **Activity** log can undo each change. A prompt counts as out of scope only when you say so. Search Console is optional. In Chat, the same skill is **/prompts**.
+
+## Content Plan Builder
+
+**Content Plan Builder** runs every Monday at 09:00 on **Auto, ask before changes**. It is made for the **Content** work area. It reads your content opportunities, the sub-questions AI engines searched where your brand is missing, your open Action Center actions and your drafts. Then it plans three to five pages for the week, in order: what to write or update, for which prompts and topics, and why, with a brief for each page. It starts with what changed since last week, and leaves out a page that an open action or a draft already covers. Starting a draft or sending an action is a card you approve. In Chat, the same skill is **/content-plan**.
+
+## Seasonal Prompt Planner
+
+**Seasonal Prompt Planner** runs on the 1st of each month at 09:00 on **Ask me first**. It is made for **E-commerce** brands. It looks at the events and seasons coming in the next three months for your markets and products, and proposes prompts to track before them and the pages to prepare, with the evidence from your data, such as Search Console queries. It dates only fixed days, such as Christmas Day. Events that move, such as Black Friday or back-to-school, get a date only when you give one: add it to the agent's instructions. Each prompt it adds is a card you approve. Search Console is optional. In Chat, the same skill is **/seasonal**.
+
+## AI Traffic → Signups
+
+**AI Traffic → Signups** runs every Monday at 09:00 on **Auto, ask before changes**. It is made for the **Growth** work area. It reports the visits AI assistants sent to your site last week, by assistant and by landing page, against the week before. With Google Analytics connected, it adds the key events, such as sign-ups, and the sessions that came from AI. Without it, sign-ups show as **Not measured**. Sign-ups by assistant or by page, and the prompt behind a visit, aren't measured, and the report says so. Sending a page to the Action Center is a card you approve. Google Analytics is optional. In Chat, the same skill is **/traffic**.
+
+## What each card shows
+
+In **Your agents**, each agent has a card with:
+
+- Its state: **Active**, **Paused** with the reason, **Draft** or **Archived**. While it is on, a dot as in the main menu shows beside it: grey and pulsing while it runs, yellow while it waits for your OK, and red with a **!** when its last run failed. A paused agent has no dot.
+- Its skills, its mode and the person who owns it.
+- **Trigger**: what starts it, for example "Every Mon 09:00 · New Recover signal", and **Next run**.
+- **Scope**: the brand it works on, or how many brands.
+- **Last run**: when it last ran, and **Outcomes · 30 days**.
+- **AI use · 30 days**: its share of your monthly AI limit, with a thin bar. Hover over it to see its runs, the average share a run and its cap a run.
+
+Usage is always shown as a share of your monthly AI limit.
+
+## Runs open in Chat
+
+Each card's first button opens its run in Chat: **Open the run in Chat** while it runs, **Review in Chat** when it waits for your OK, and **Open the last run** otherwise. Recurring work you set up in Chat is listed under your agents too, marked as made in Chat, with the same dots.
+
+## An agent's page
+
+Click **Open** or the agent's name. The top shows its state, its owner, whether it is private or shared, and **This period**: what it used of this month's AI limit, with its monthly cap when one is set. Under it you see its skills, mode, connections and model.
+
+**Triggers** lists what starts it and when it runs next, and **What this agent did** what its runs took live in the last 30 days. **Run history** lists its last 50 runs: when each started, its trigger and brand, its result, its outcome and its **AI use**, for example "3.2% of 10%": what the run used and the most one run may use. Filter them with **All**, **Improved**, **Pending** and **Stopped**, and click a run to open its chat.
+
+On the right, **Access**, **Scope** and **AI use** show who owns it, what it may reach and its limits.
+
+## Which agent used the most AI
+
+To compare agents, open **Settings › Billing**. Under **This period's AI usage**, **By agent** lists the 5 agents that used the most this period, highest first, then **Other agents** and what used the rest: **Chat (no agent)**, the Content Editor, the Action Center and Improve. Click an agent to open its page. A deleted agent's use shows as **Deleted agent**, and an agent you can't see counts in **Other agents**. The AI usage meter's panel names the top one, for example **Top agent this period: Weekly report · 12%**.
+
+## What this agent did
+
+On an agent's page, **What this agent did** covers the last 30 days. **Changes shipped** counts the pages that went live from its runs. **Improved** says how many of those with a verdict improved, counting only Medium and High confidence verdicts, as **Reports** does. A **Pending** change gets its first verdict 14 days after it goes live.
+
+Each change shows the run it came from, its outcome and its next check, and how it went live: **on its own**, **you approved** when you sent or published it on a card in the run's chat, or **by** and the name of the teammate who did. A line counts the agent's drafts that aren't live yet: drafts aren't measured until they go live. You see only the brands you have access to. **Open in Reports** opens **What Ansvisor did for you**, where each change has its details.
+
+## What a run's outcome means
+
+A run's **Outcome** in **Run history** shows what the pages it took live did in AI answers, measured as in **What Ansvisor did for you**. A page counts for the run once it is live, when the agent sent or published it on its own, or when you approved sending or publishing it on a card in the run's chat. A page you send or publish later from the Content Editor or the Library counts as yours, not the agent's.
+
+A run that took nothing live shows "—". Once the run has ended and one of its pages is live, it shows **Pending**. Day 14 gives the first verdict, such as **Improved** or **No meaningful change**, and days 30 and 90 can change it. A finished run is never **Improved** by itself.
+
+## Run, pause and archive
+
+Admins and Managers see the buttons they may use:
+
+- **Run now** starts a run for each brand in its scope. A second click within a minute doesn't start another one.
+- **Pause** stops its triggers until you click **Resume**. **Activate** turns on a draft.
+- Under **⋯**: **Duplicate** makes a copy as a draft. **Archive** turns it off; its triggers stop and runs waiting to start are cancelled. Admins can also **Take over** an agent, so its triggered runs act as them.
+- An archived agent has **Restore**, which brings it back paused.
+
+Managers change their own agents and can run agents shared with the workspace. Admins can do this for every agent.
+
+The demo brand's sample agents show their runs, but running or changing one opens the plan dialog. Other agents can't call them.
+
+## Create an agent
+
+Admins and Managers click **New agent** on **Agents**. Four steps open, with a summary of the agent on the right:
+
+1. **Skill**: pick what it does, add up to 2 follow-on skills, and write instructions if you like.
+2. **Trigger**: add up to 5, such as **Schedule** or **Signal created**. Each shows its next run or when it fires. **Manual** is always on: **Run now**. Next to **FOR**, pick its brands, and narrow it to platforms, topics, prompt tags or URLs.
+3. **Mode & approvals**: how much it may do without asking.
+4. **Connections & model**: then its name, **Private** or **Workspace**, and **Max per run**, the most one run may use of your monthly AI limit. Admins can also set a **Monthly cap**.
+
+Click **Save as draft** to keep it off, or **Turn on**. If something needs fixing, its step opens and says what to change.
+
+## Skills an agent can use
+
+Step 1 lists the same skills Chat offers. Besides **Win back lost citations**, **Weekly report** and the other content and reporting skills, there are the skills for what you focus on: **Buyer questions**, **How AI compares us**, **No clear leader**, **Who AI recommends by market**, **Listing gaps**, **Rival brief** and **Site audit fixes**. Each card says which connections it uses. These seven work from your Ansvisor data and public pages, so they need no connection. An agent can run up to 2 follow-on skills after its first one, for example **Comparison page** after **How AI compares us**.
+
+**Library** lists the skills your workspace added from the Library that an Admin approved and you may run: the shared ones and your own. Pick one to start the agent on it.
+
+## Connections
+
+Step 4 lists the connections the agent's skills use. **Any CMS** counts Webflow, WordPress, Framer, Wix or a workflow webhook. **Any catalog source** counts Merchant Center, a product feed, an upload or a store.
+
+A **Required** connection is one a skill can't work without, such as a CMS for **Ready to publish**. If the brand doesn't have it, the run doesn't start: **Run now** and **Run agent** say which brand lacks it, and an agent that runs on its own pauses with "A required connection is off". **Resume** doesn't turn the agent back on until every brand in its scope has its Required connections: it says which brand lacks which one. An **Optional** one, such as Search Console for **Weekly report**, helps but isn't needed: without it, the agent does everything else and says what it couldn't use.
+
+## Edit or delete an agent
+
+On an agent's page, click **Edit** to open the same four steps with its current settings. An agent that is on or paused has **Save changes**; a draft has **Save as draft** and **Turn on**. A change to what it does saves a new version, and a run that already started keeps the version it started with. If someone saved the agent after you opened it, click **Reload** to see their change first.
+
+Managers edit their own agents, and Admins every agent. If your Admin keeps workspace agents to Admins, Managers can't change their agents shared with the workspace either. Analysts and Agency partners see a read-only line with **Ask your Admin** instead.
+
+To delete an agent, archive it first. Then open **⋯** on its page and click **Delete**. Chat asks first; its past runs and files stay.
+
+## When an agent runs by itself
+
+A **Schedule** trigger runs at its time on the clock of its time zone, summer time included. A time missed while the agent was paused isn't made up later. A **Signal** trigger runs when Action Center finds a new signal of its category, definitions, pages and engines. **When a brand is added** runs once for each brand someone adds, never the demo brand, on an agent with **All brands** whose owner can use that brand. **KPI changed** and **Watch rule** triggers are saved, but don't start runs yet.
+
+Signals within 15 minutes join one run, a brand gets at most one signal run every 6 hours, and your plan sets how many signal and new-brand runs an agent may start a day. A fire that had to wait is listed in the agent's next run, and in **Run history** as **Skipped** with the reason.
+
+## A schedule's time zone
+
+A new **Schedule** trigger starts on your time zone from **Settings › Account** (your browser's when that's **Automatic**), shown beside its time. Changing your time zone later doesn't move a trigger you already have.
+
+## How a run works
+
+Each run works on one brand, in a chat of its own. A run a trigger started acts as the agent's owner, with their role; **Run now** acts as the person who clicked it. The chat shows in that person's Inbox.
+
+A run may use only its share of your monthly AI limit. A run a trigger started ends **Stopped at its limit** when it reaches it; a **Run now** run pauses there instead. After 3 failed runs in a row the agent pauses. When the monthly AI limit is used up, the agent pauses and starts again by itself once the limit resets.
+
+## Let an agent run other agents
+
+On Growth and up, an agent can run up to 5 of your other agents. Pick them under **Can call** on the agent's last step. A paused agent isn't run until you resume it.
+
+A run may run other agents up to 3 times and asks you first each time: the card names the agent, what it asks and its share of your monthly AI limit. The other agent works on the same brand, in a chat of its own, and asks before most changes. It gets only what is left of the first run's **Max per run**, and can't run agents itself. It stops when the first run stops, or after 4 minutes.
+
+In **Run history**, its run shows **Called by** and the first agent. Click the first run's agent count for each one's result and AI use. One you can't see shows as **An agent you can't see**.
+
+## AEO Operator
+
+On Growth and up, the **AEO Operator** picks which of your agents to run on one brand, on its schedule's days (weekdays at 07:00 to start).
+
+Each morning it sends one card: the agents, why each, and the AI they may use. It starts them only after you **Approve**, in Chat, from **Inbox**, or in Slack. **Skip** runs nothing that day, and a card left unanswered ends at midnight.
+
+Its **Daily budget** is 5% of the monthly AI limit by default, from 1% to 10%, and it plans less as the month's use grows. It runs at most 5 agents a day (up to 8), from all your active agents or ones you pick.
+
+Once every agent has finished or waits on you, or 8 hours after you approve, a summary shows in its chat, in **Inbox** (**Open summary**), and by email or Slack per your notify setting.
+
+## When a run asks before a change
+
+A **Run now** that starts as you click it follows the agent's mode, so in **Full auto** it makes changes without asking. A run that starts without you, from a trigger or after waiting for a free slot, asks before most changes, whatever its mode. Some still follow the mode, with the role and access of the person the run acts as: creating and changing Content drafts, reviewing or dismissing content opportunities, dismissing prompt suggestions, **Send to Action Center** and setting an Action Center task **Ready for review**. In **Full auto** the run makes them without asking; in **Ask me first** it asks. The run reads the agent's mode again before each change. Every change is in the **Activity** log, with **Undo**. When a change needs approval, the run shows **Waiting for your OK** and waits. After 7 days without an answer it stops with **No answer in 7 days**.
+
+## See a draft before you approve it
+
+On a card that asks you to publish a draft, send it to your CMS or send it to your webhook, **Show full text** opens the draft's whole text, read-only, so you can read it before you approve. Click it again to close it. Approving works as before.
+
+When two or more of your agents each wait on a change to the same draft, **Needs you** in your **Inbox** shows one card for it: “N changes from M agents”, with each agent's change. **Approve all** makes every change and says how many were made; a change that wasn't made is listed on the card. When more than one change rewrites the page, they would overwrite each other, so the card says **Approve these one by one**: click each change to open its chat and approve it there.
+
+## Agent work: who starts agent work
+
+Your workspace's **Agent work** setting decides whether an agent's mode counts. An Admin sets it from the gear on Action Center's **Today** card or in **Settings › Chat**.
+
+- **I approve first**, where every workspace starts: every change an agent's run makes asks first, in any mode, even a change **Full auto** or a tool set to **Always** would make on its own. The run shows **Waiting for your OK** and waits.
+- **Agent starts on its own**: each agent's mode applies, as above.
+
+Going live isn't affected: **Let an agent publish on its own** below works the same with either choice.
+
+## When outside text makes a run ask
+
+Once a run has read text from outside your workspace, such as AI answers, citations or a web page, every change asks first, in any mode. Reading your own drafts and reports doesn't do that. Action Center actions and tasks can quote AI answers, so reading them does. If one of them holds instructions aimed at the AI, the run ignores them and asks before every change.
+
+## Let an agent publish on its own
+
+Where your workspace has it, Admins on Growth and up can let chosen agents publish new pages on Webflow, WordPress and Wix, and send pages to your CMS or webhook, without a click. It takes two switches: **Agents that publish on their own** in **Settings › Chat**, and **Publish and send on its own** on the agent's **Mode & approvals** step, in **Full auto**. Managers see the agent's switch read-only, with **Ask your Admin**.
+
+**At most a day** caps its pages in 24 hours: 1 to 20, 5 by default. A page still waits for your click, and its card says why, when the run read text that tried to instruct it, the agent reached its limit, or the page fails Quality or your approved brand facts, has hidden text or outside links, or is live already.
+
+Changing what the agent does turns this off until an Admin allows it again.
+
+## When an agent sends a page on its own
+
+Its owner and the people it notifies get a notice at the top of their **Inbox**'s **Needs you**, and an e-mail unless their Chat settings say Inbox only: the agent, the page and where it went, with **Open page** (the live page, once published) and **Open run**. A published page's notice also has **Take down**, for Admins and Managers; a webhook send can't be taken back. The notice leaves Needs you once you open it. A page someone took down never goes live on its own again. In the **Content Library**, the page's last send says the agent sent it on its own, and an action the page works on lists it in its History.
+
+When an edit turns it off, the Admin who allowed it and the agent's owner get a notice with **Open agent**, unless they made the edit themselves.
+
+## On your own AI key
+
+When your workspace runs Chat on its own AI key, agents on **Auto** run on it too. An agent set to another model, such as **Fast** or **Best writing**, runs on your key for that model's provider first, then on your OpenRouter key, then on your monthly AI limit. On your own key, the provider bills your account, and your monthly AI limit doesn't move. **Max per run** and **Monthly cap** still apply: what a run uses is measured at the providers' list prices.
+
+## Run an agent from Action Center
+
+Admins and Managers can also start an agent from an open action in Action Center: **Run agent** on the action's row or at the top of the open action lists the agents that work on its brand. The run works on that action alone, acts as the person who clicked, and opens beside the action. Its chat is named after the agent and the action, and **Run history** shows its trigger as **Run agent from an action**.
+
+The run never adds targets to the action and never closes its tasks. If the action is completed or dismissed, the run stops with **The action was closed**. The action's **History** shows **Agent run started** and **Agent run completed**.
+
+## Your key's monthly agent limit
+
+When your workspace runs on its own AI key, all agents together may spend at most a monthly limit on it: $250 unless an Admin sets another, from $10 to $10,000. It is measured at the providers' list prices, and it can't be turned off. Once agents reach it, each agent pauses when it next runs, with **Key's monthly agent limit reached**, and **Run now** and **Run agent** are refused. They start again by themselves when the month renews, or when an Admin raises the limit in **Settings › AI Providers**. Chats you start yourself don't count toward it.
+
+## Read-only roles
+
+Analysts and Agency partners see agents but can't create, run or change them. Agency partners see only agents that work on brands shared with them. The list says you see agents read-only, with **Ask your Admin** to send a request. If a button is refused, for example by your role or your plan, Chat shows why, who can do it and what to do next.
+
+## When your AI key fails
+
+When your workspace runs on its own AI key and the key fails (the provider turns it down, the account is out of credit, or the key can't reach its model), a run ends **Stopped · AI key not working**. An agent a trigger started pauses with **Your AI key isn't working**. These runs don't count toward 3 failed runs in a row.
+
+While the key fails, **Agents** says so at the top, and **Run now**, **Run agent**, **Turn on** and **Resume** are refused before anything starts. Admins get **Fix in AI Providers**; others read that an Admin can fix it there.

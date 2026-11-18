@@ -24,12 +24,21 @@ import {
   openlyCoveredClusterIds,
   opportunityScore,
   pickClusters,
+  requestScope,
   scoreComponents,
 } from './opportunity-limits.js';
 import { loadClusterOpportunities, loadOpportunityBaskets } from './open-opportunities.js';
 import { basket, duplicateThreshold, findDuplicate, storedBasket } from './opportunity-dedup.js';
+import {
+  candidateOf,
+  clustersOf,
+  findSameQuestion,
+  isOpen,
+  mergeOpportunity,
+} from './opportunity-same-question.js';
 import { loadClusters } from './prompt-clusters.js';
 import { cleanOpportunityText } from './opportunity-text.js';
+import { yearRule } from './current-year.js';
 import {
   focusClusters,
   loadPageFocus,
@@ -37,6 +46,12 @@ import {
   pickPageCluster,
 } from './opportunity-page-focus.js';
 import { reopenStrengthened } from './opportunity-reopen.js';
+import {
+  NIGHTLY_ANGLES,
+  angleCandidates,
+  angleLine,
+  recentNightlyAngle,
+} from './opportunity-angles.js';
 import {
   claimOpportunitySlots,
   linkOpportunitySlots,
@@ -50,6 +65,8 @@ import {
   candidatePages,
 } from './page-matching.js';
 import { SITE_TYPE_NAMES, sitePageTypeLines, siteTypeOf } from './content-page-types.js';
+import { brandRulesSection } from './brand-rules.js';
+import { readBrandRules } from './brand-rules-read.js';
 
 /** Existing opportunities shown to the model for the cross-topic check. */
 const EXISTING_SHOWN = 60;
@@ -67,7 +84,7 @@ const SYSTEM_PROMPT = `You are an AEO content strategist. Each cluster below is 
 
 Rules:
 - One opportunity per cluster, for the content that answers all of its prompts. Name the need, not a single prompt.
-- Be concrete and actionable, and reference the data: volume, visibility, the strongest competitor's visibility, competitors.
+- Be concrete and actionable, and reference the data: visibility, the strongest competitor's visibility, competitors. Don't state a search volume: it is an estimate the page shows with its source.
 - Categorize as "owned" (content the brand controls) or "earned" (third-party content, PR, reviews).
 - Existing opportunities from other topics are listed. If a cluster needs the same content as one of them — the same user need and the same piece of content, answering the cluster's prompts without becoming a different page — set sameAs to its bracketed E index. Otherwise set sameAs to null. Sharing words, a topic or a product category is not enough.
 - Decide what the content is, given the brand's pages listed under each cluster:
@@ -82,7 +99,9 @@ Rules:
 - Add supporting assets only when the data calls for them, up to ${MAX_SUPPORTING_ASSETS}, each a different piece of work. Owned ones are of the brand's content types too. For example: a comparison or alternatives page when people compare named products; a definition or FAQ page for a term the main content relies on; an earned third-party article when competitors are visible and the brand is not; a backlink when the brand's page exists but is not cited. Give each a short title saying what to make or do. Most opportunities need none or one.
 - Earned assets (third_party_article, backlink) live on other sites: set their channel to "earned", decision to "create" and pageIndexes to empty.
 - Write for the brand's marketing team: do not use the words "cluster" or "prompt" in titles or descriptions.
-- Refer to clusters and existing opportunities only through clusterIndex and sameAs. Never mention a bracketed index in a title or description.`;
+- Titles and descriptions follow the year rule given with the clusters: a year in them goes stale on New Year's Day.
+- Refer to clusters and existing opportunities only through clusterIndex and sameAs. Never mention a bracketed index in a title or description.
+- When BRAND RULES are given, every opportunity follows them: shape it to fit a rule, and when no opportunity for a cluster can, write the closest one that does, never one against a rule.`;
 
 /** @param {string[]} types - what an asset can be on the brand's site (assetTypes) */
 function buildSchema(count, types) {
@@ -132,7 +151,10 @@ function sourceData({ clusters, topicName, metrics, components, queries }) {
     topicName: topicName(primary),
     relatedTopics: related.map(topicName),
     prompts: clusters.flatMap((c) => c.promptTexts),
+    // What the score's demand adds up; the opportunity's volume is its
+    // question's (questionVolume), as the page shows it.
     estAiVolume: metrics.demand,
+    questionVolume: metrics.representative?.volume ?? 0,
     visibilityScore: metrics.visibility,
     topCompetitorVisibility: metrics.topCompetitorVisibility,
     competitorGap: metrics.competitorGap,
@@ -172,9 +194,9 @@ const BASKET_CHUNK = 10;
  * DISMISSED_BLOCK_DAYS it may be suggested again. Returns how many were
  * skipped.
  */
-async function skipDuplicates(brandId, open, { clusterById, basketRows, covered }) {
+async function skipDuplicates(brandId, open, { rows, clusterById, basketRows, covered }) {
   if (!open.length) return 0;
-  const existing = (await loadOpportunityBaskets(brandId)).map((row) => ({
+  const existing = rows.map((row) => ({
     ...row,
     basket: storedBasket(row.source_data),
   }));
@@ -220,6 +242,89 @@ async function skipDuplicates(brandId, open, { clusterById, basketRows, covered 
   }
   if (skipped) logger.info({ brandId, skipped }, '[opportunities] duplicates skipped');
   return skipped;
+}
+
+/**
+ * One open opportunity per question (opportunity-same-question.js): a cluster
+ * whose question an open opportunity already answers joins that one, with its
+ * prompts, AI searches and signal, instead of being written. Like a basket
+ * duplicate it costs neither a model call nor a slot of the quota. The
+ * clusters taken in leave `open` and become covered; returns which
+ * opportunity each went to.
+ *
+ * A cluster an open opportunity already holds (its cluster or a related one)
+ * joined it before and isn't merged again. An opportunity with no cluster of
+ * its own, as Send to Content and a task make, doesn't make its clusters
+ * covered (loadClusterOpportunities reads only rows with one), so the same
+ * cluster comes back every night; merging it again would add its times
+ * searched again (N, 2N, 3N…).
+ *
+ * @returns {Promise<Map<string, string>>} cluster id → opportunity id
+ */
+export async function mergeSameQuestion(
+  open,
+  rows,
+  { clusterById, basketRows, covered, topicName, source },
+) {
+  const into = new Map();
+  let merged = 0;
+  for (const cand of [...open]) {
+    const c = clusterById.get(cand.id);
+    const question = cand.metrics.representative;
+    const holder = rows.find((row) => isOpen(row) && clustersOf(row).includes(c.id));
+    const target =
+      holder ??
+      findSameQuestion(
+        { question: question?.text, promptId: question?.id, clusterIds: [c.id] },
+        rows,
+      );
+    if (!target) continue;
+    into.set(c.id, target.id);
+    covered.add(c.id);
+    open.splice(open.indexOf(cand), 1);
+    // Already in it: its AI searches count once.
+    if (holder) continue;
+    const update = mergeOpportunity(
+      target,
+      {
+        cluster_id: c.id,
+        opportunity_score: cand.score,
+        source_data: sourceData({
+          clusters: [c],
+          topicName,
+          metrics: cand.metrics,
+          components: cand.components,
+          queries: basketSummary([c.id], basketRows),
+        }),
+      },
+      { source, clusterId: c.id, question: question?.text ?? null },
+    );
+    const { error } = await supabaseAdmin
+      .from('content_opportunities')
+      .update({ ...update, updated_at: new Date().toISOString() })
+      .eq('id', target.id);
+    if (error) throw new Error(error.message);
+    // A later cluster in this run may land on the same one.
+    Object.assign(target, update);
+    merged += 1;
+  }
+  if (merged) logger.info({ merged }, '[opportunities] same question merged');
+  return into;
+}
+
+/** The fan-out baskets of the given clusters. */
+async function loadBaskets(clusterIds) {
+  const { data, error } = await selectInChunks(
+    clusterIds,
+    (chunk) =>
+      supabaseAdmin
+        .from('prompt_cluster_queries')
+        .select('cluster_id, query, times_searched, included')
+        .in('cluster_id', chunk),
+    BASKET_CHUNK,
+  );
+  if (error) throw new Error(error.message);
+  return data || [];
 }
 
 async function loadPromptTexts(promptIds) {
@@ -272,6 +377,7 @@ export const IDEA_MAX_LENGTH = 500;
  *   alternativeOf?: { id: string, title: string, description?: string|null, decision?: string|null, clusterId: string } | null,
  *   explicit?: boolean,
  *   pagePath?: string | null,
+ *   nightly?: boolean,
  * }} [opts] - `count`, the focus (`topicId` / `promptId`) and `idea` come from
  *   an on-demand request (CONTENT-003); the nightly run passes none of them.
  *   `alternativeOf` asks for one more opportunity on that opportunity's
@@ -286,7 +392,16 @@ export const IDEA_MAX_LENGTH = 500;
  *   from the clusters about that page (opportunity-page-focus.js), like an
  *   explicit request, with the page first among the candidate pages; with no
  *   such cluster nothing is written and `noMatch` says so.
- * @returns {Promise<{ generated: number, merged: number, reopened?: number, duplicates?: number, limited?: boolean, noMatch?: boolean, opportunityIds?: string[], existingId?: string }>}
+ *   Every request but `alternativeOf` adds a cluster whose question an open
+ *   opportunity already answers to that one instead (opportunity-same-question.js).
+ *   `scope` (every request but `alternativeOf`) says what the request could
+ *   draw on (requestScope), so the page can say why fewer came back.
+ *   A New request (`count`, no prompt or page) that runs out of needs with
+ *   no opportunity writes the rest as another angle on needs the brand is
+ *   still barely seen for (opportunity-angles.js); `angles` names them.
+ *   `nightly` marks the nightly cron run (tracking-worker.js): only it may
+ *   write an angle with no count, at most NIGHTLY_ANGLES a night.
+ * @returns {Promise<{ generated: number, merged: number, reopened?: number, duplicates?: number, sameQuestion?: number, limited?: boolean, noMatch?: boolean, opportunityIds?: string[], existingId?: string, angles?: { need: string, of: string }[], scope?: { focus: string, requested: number, needs: number, covered: number, noAnswers: number } }>}
  */
 export async function generateContentOpportunities(
   brandId,
@@ -301,6 +416,7 @@ export async function generateContentOpportunities(
     alternativeOf = null,
     explicit = false,
     pagePath = null,
+    nightly = false,
   } = {},
 ) {
   // The user asked for this cluster, or this page, by name: the duplicate
@@ -315,6 +431,11 @@ export async function generateContentOpportunities(
     .eq('id', brandId)
     .single();
   if (!brand) return { generated: 0, merged: 0 };
+  // The brand's rules (00450): they shape the opportunities, not their scores.
+  const brandRules = brandRulesSection(
+    await readBrandRules(brandId),
+    "BRAND RULES (the brand's own; follow every one):",
+  );
 
   const clusters = await loadClusters(brandId);
   if (!clusters.length) return { generated: 0, merged: 0 };
@@ -396,7 +517,13 @@ export async function generateContentOpportunities(
   let reopened = 0;
   if (!targeted) {
     try {
-      reopened = await reopenStrengthened(brandId, existing, measure);
+      // Not while another open opportunity answers its question.
+      const answeredElsewhere = (opp) =>
+        !!findSameQuestion(
+          candidateOf(opp),
+          existing.filter((o) => o.id !== opp.id),
+        );
+      reopened = await reopenStrengthened(brandId, existing, measure, { skip: answeredElsewhere });
     } catch (err) {
       logger.error({ err, brandId }, '[opportunities] re-opening finished opportunities failed');
     }
@@ -416,6 +543,21 @@ export async function generateContentOpportunities(
     (!promptId || clusterById.get(c.id).prompt_ids.includes(promptId)) &&
     (!focusIds || focusIds.includes(c.id));
   const open = openCandidates(candidates, { covered, inFocus, alternativeOf });
+  // Coverage before this run's own checks merge anything: another angle is
+  // only for needs whose opportunity has had its chance.
+  const coveredBefore = new Set(covered);
+  // What the request could draw on, so the page can say why fewer came back
+  // than were asked for. Another angle is for one known need.
+  const scope = alternativeOf
+    ? {}
+    : {
+        scope: requestScope(candidates, {
+          covered,
+          inFocus,
+          requested: count ?? OPPORTUNITIES_PER_RUN,
+          focus: pagePath ? 'page' : promptId ? 'prompt' : topicId ? 'topic' : 'auto',
+        }),
+      };
   // A page's request goes to its best-matching cluster that has an open
   // opportunity, which it points at, or answers, which it writes from.
   if (focusIds) {
@@ -425,16 +567,21 @@ export async function generateContentOpportunities(
     }
     open.splice(0, open.length, ...open.filter((c) => c.id === pick?.write));
   }
-  const { data: basketRows, error: basketErr } = await selectInChunks(
-    open.map((c) => c.id),
-    (chunk) =>
-      supabaseAdmin
-        .from('prompt_cluster_queries')
-        .select('cluster_id, query, times_searched, included')
-        .in('cluster_id', chunk),
-    BASKET_CHUNK,
-  );
-  if (basketErr) throw new Error(basketErr.message);
+  const basketRows = await loadBaskets(open.map((c) => c.id));
+
+  // A cluster whose question an open opportunity answers joins it. An asked-
+  // for one too: a prompt's or a page's request then points at it. Only
+  // "Another angle" is a second take on purpose.
+  const rows = alternativeOf ? [] : await loadOpportunityBaskets(brandId);
+  const sameQuestion = alternativeOf
+    ? new Map()
+    : await mergeSameQuestion(open, rows, {
+        clusterById,
+        basketRows: basketRows || [],
+        covered,
+        topicName,
+        source,
+      });
 
   // CONTENT-004: a cluster whose baskets match an existing opportunity is
   // that opportunity again. It is never written, so it costs neither a model
@@ -443,29 +590,78 @@ export async function generateContentOpportunities(
   const duplicates = targeted
     ? 0
     : await skipDuplicates(brandId, open, {
+        rows,
         clusterById,
         basketRows: basketRows || [],
         covered,
       });
 
-  const wanted = targeted
+  const fresh = targeted
     ? open.slice(0, count ?? 1)
     : pickClusters(open, covered, count ?? OPPORTUNITIES_PER_RUN, {
         fill: count !== undefined,
       });
+  // A New request that runs out of needs without an opportunity writes the
+  // rest as another angle on needs the brand is still barely seen for
+  // (opportunity-angles.js); the nightly cron run with no need left writes
+  // at most NIGHTLY_ANGLES, and none when one was written in the last
+  // NIGHTLY_ANGLE_GAP_HOURS (a retry, or two runs finishing together). Other
+  // runs without a count (on-demand tracking, a new prompt's first run, the
+  // legacy generate route) write none. A prompt's or a page's request is for
+  // its need.
+  const atNight = count === undefined && nightly;
+  const angleRoom =
+    targeted || promptId
+      ? 0
+      : count !== undefined
+        ? count - fresh.length
+        : atNight && !fresh.length && !recentNightlyAngle(rows)
+          ? NIGHTLY_ANGLES
+          : 0;
+  const angles =
+    angleRoom > 0
+      ? angleCandidates(candidates, existing, {
+          covered: coveredBefore,
+          inFocus,
+          nightly: atNight,
+          openRows: rows,
+        }).slice(0, angleRoom)
+      : [];
+  const wanted = [...fresh, ...angles];
+  // Their own baskets, for the prompt and the new opportunity's searches.
+  if (angles.length) basketRows.push(...(await loadBaskets(angles.map((c) => c.id))));
   if (!wanted.length) {
     logger.info(
-      { brandId, clusters: clusters.length, opportunities: existing.length, reopened, duplicates },
+      {
+        brandId,
+        clusters: clusters.length,
+        opportunities: existing.length,
+        reopened,
+        duplicates,
+        sameQuestion: sameQuestion.size,
+      },
       '[opportunities] every cluster with answers already has an opportunity',
     );
     // A request for one prompt that an open opportunity already answers
     // points at it (PROMPT-006): regrouping or another run may have covered
-    // the prompt since the request was checked.
+    // the prompt since the request was checked, or its question is answered
+    // by another one. A page's request points at the one its cluster joined.
     const promptCluster = promptId
       ? clusters.find((c) => c.prompt_ids.includes(promptId))?.id
       : null;
-    const existingId = openOpportunityOn(existing, promptCluster);
-    return { generated: 0, merged: 0, reopened, duplicates, ...(existingId ? { existingId } : {}) };
+    const existingId =
+      sameQuestion.get(promptCluster) ??
+      openOpportunityOn(existing, promptCluster) ??
+      (targeted ? ([...sameQuestion.values()][0] ?? null) : null);
+    return {
+      generated: 0,
+      merged: 0,
+      reopened,
+      duplicates,
+      sameQuestion: sameQuestion.size,
+      ...scope,
+      ...(existingId ? { existingId } : {}),
+    };
   }
 
   // Each new opportunity takes one of the organization's monthly slots
@@ -475,7 +671,7 @@ export async function generateContentOpportunities(
   const picked = slots.unlimited ? wanted : wanted.slice(0, slots.ids.length);
   if (!picked.length) {
     logger.info({ brandId }, '[opportunities] monthly opportunity limit reached');
-    return { generated: 0, merged: 0, reopened, limited: true };
+    return { generated: 0, merged: 0, reopened, limited: true, ...scope };
   }
   const releaseAll = () =>
     releaseOpportunitySlots(slots.ids).catch((err) =>
@@ -523,9 +719,9 @@ ${c.promptTexts
   .map((t) => `- ${t}`)
   .join('\n')}
 Searches AI engines ran for these prompts: ${basket.top.map((q) => q.query).join('; ') || 'none recorded'}
-Est. AI volume: ${m.demand}/mo | Brand visibility: ${m.visibility}% | Strongest competitor: ${m.topCompetitorVisibility}% | Competitors visible: ${m.competitorsCited.join(', ') || 'none'}
+Brand visibility: ${m.visibility}% | Strongest competitor: ${m.topCompetitorVisibility}% | Competitors visible: ${m.competitorsCited.join(', ') || 'none'}
 Brand pages that may cover this need:
-${pages.map(pageLine).join('\n') || 'none found'}`;
+${pages.map(pageLine).join('\n') || 'none found'}${cand.angleOf ? `\n${angleLine(cand.angleOf)}` : ''}`;
   };
 
   // The content types follow the brand's kind of site, as the Content Editor's
@@ -541,7 +737,7 @@ ${pages.map(pageLine).join('\n') || 'none found'}`;
 Industry: ${brand.industry || 'Not specified'}
 Domain: ${(domainsRes.data || []).map((d) => d.domain).join(', ') || 'N/A'}
 Site type: ${SITE_TYPE_NAMES[siteType]}
-
+${brandRules ? `\n${brandRules}\n` : ''}
 Content types for the brand's site (owned assets):
 ${sitePageTypeLines(siteType)}
 
@@ -557,7 +753,10 @@ ${alternativeOf ? `${alternativeInstruction(alternativeOf)}\n\n` : ''}${
     idea
       ? `The user asked for ideas around: "${idea.slice(0, IDEA_MAX_LENGTH)}". Shape the opportunities toward it wherever the clusters' prompts allow; never invent a need the data doesn't show.\n\n`
       : ''
-  }Write every title and description in ${getLanguageName(brand.language)}.`;
+  }Year rule for titles and descriptions:
+${yearRule()}
+
+Write every title and description in ${getLanguageName(brand.language)}.`;
 
   onProgress?.({ phase: 'analyzing', message: 'Generating opportunities with AI...' });
   const { object } = await generateObject({
@@ -599,7 +798,8 @@ ${alternativeOf ? `${alternativeInstruction(alternativeOf)}\n\n` : ''}${
       title: clean(a.title),
     }));
 
-    const target = Number.isInteger(opp.sameAs) ? shown[opp.sameAs] : null;
+    // Another angle is its own opportunity, never folded into one.
+    const target = !cand.angleOf && Number.isInteger(opp.sameAs) ? shown[opp.sameAs] : null;
     if (target) {
       // Related clusters deleted by a re-clustering since are dropped here.
       const ids = [target.cluster_id, ...(target.related_cluster_ids || []), cand.id].filter((id) =>
@@ -669,8 +869,13 @@ ${alternativeOf ? `${alternativeInstruction(alternativeOf)}\n\n` : ''}${
         }),
         targetPages: primary.pages,
         assets,
-        ...(alternativeOf
-          ? { alternativeOf: { id: alternativeOf.id, title: alternativeOf.title } }
+        ...(alternativeOf || cand.angleOf
+          ? {
+              alternativeOf: {
+                id: (alternativeOf || cand.angleOf).id,
+                title: (alternativeOf || cand.angleOf).title,
+              },
+            }
           : {}),
         // Asked for from AI Traffic's Pages section, for this page.
         ...(focus ? { forPage: { path: pagePath, url: focus.page.url } } : {}),
@@ -698,7 +903,15 @@ ${alternativeOf ? `${alternativeInstruction(alternativeOf)}\n\n` : ''}${
     await releaseOpportunitySlots(slots.ids.slice(created.length));
   }
   logger.info(
-    { brandId, generated: inserts.length, merged, reopened, duplicates, clusters: clusters.length },
+    {
+      brandId,
+      generated: inserts.length,
+      merged,
+      reopened,
+      duplicates,
+      sameQuestion: sameQuestion.size,
+      clusters: clusters.length,
+    },
     '[opportunities] generated',
   );
   // The new rows' ids, so a caller that asked for one can open it.
@@ -707,6 +920,12 @@ ${alternativeOf ? `${alternativeInstruction(alternativeOf)}\n\n` : ''}${
     merged,
     reopened,
     duplicates,
+    sameQuestion: sameQuestion.size,
+    ...scope,
+    // The needs written as another angle, for the toast to name.
+    angles: picked
+      .filter((p) => p.angleOf && inserts.some((row) => row.cluster_id === p.id))
+      .map((p) => ({ need: clusterById.get(p.id).label, of: p.angleOf.title })),
     opportunityIds: created.map((row) => row.id),
   };
 }

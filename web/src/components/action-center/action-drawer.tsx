@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslations } from 'next-intl';
 import { useRouter } from '@/i18n/navigation';
 import { toast } from 'sonner';
-import { ChevronRight, Plus, Trash2 } from 'lucide-react';
+import { ChevronRight, Paperclip, Plus, Trash2 } from 'lucide-react';
 import { RemovedNote } from '@/components/action-center/removed-note';
 import { useUpgradeGate } from '@/components/providers/upgrade-gate';
 import { Badge } from '@/components/ui/badge';
@@ -32,6 +32,7 @@ import {
   assignAction,
   deleteTask,
   getActionDetail,
+  keepActionRelevant,
   setActionDueDate,
   updateActionStatus,
   updateTaskDetails,
@@ -62,10 +63,16 @@ import {
 import { signalTexts } from '@/lib/signals/display';
 import { isKpiKey } from '@/lib/kpis/registry';
 import { isSuperseded, SignalStatusBadge } from './signal-table';
-import { ActionIcon, PriorityBadge } from './action-table';
-import { priorityReasonText } from '@/lib/action-center/priority';
+import { ActionIcon, PriorityBadge, StalePill } from './action-table';
+import {
+  STALE_AFTER_DAYS,
+  isStale,
+  priorityConfidenceText,
+  priorityReasonText,
+} from '@/lib/action-center/priority';
 import { OpportunityContext } from './opportunity-context';
 import { ActionExportButtons } from './action-export-buttons';
+import { RunAgentButton } from './run-agent-button';
 import { SupportingSignals } from './supporting-signals';
 import { AffectedTab } from './affected-tab';
 import { affectedChips, affectedTotal } from '@/lib/action-center/affected';
@@ -77,7 +84,11 @@ import { MentionReviewContext } from './mention-review-context';
 import { TrafficPagesContext } from './traffic-pages-context';
 import { ContentDraftContext } from './content-draft-context';
 import { ShoppingLinksContext } from './shopping-links-context';
+import { BridgeLinksContext } from './bridge-links-context';
+import { ProductPagesContext } from './product-pages-context';
 import { AuditPageContext } from './audit-page-context';
+import { ChatFindingContext } from './chat-finding-context';
+import { BusinessHubContext } from './business-hub-context';
 import {
   TaskDetailForm,
   TaskDetailView,
@@ -88,9 +99,19 @@ import {
   useMissingText,
 } from './task-detail';
 import { hasActiveWebhook, sendActionTask } from '@/lib/actions/action-task-send';
+import { useUserRole } from '@/hooks/use-user-role';
 import { checkActionTask } from '@/lib/actions/action-task-check';
 import { getActionDrafts, startDraftFromAction } from '@/lib/actions/content-drafts';
-import { actionPages, draftMethodForTask, type ActionDraft } from '@/lib/content/action-drafts';
+import {
+  actionPages,
+  draftMethodForTask,
+  startNowWork,
+  type ActionDraft,
+} from '@/lib/content/action-drafts';
+import { StartNowBlock } from './start-now';
+import { PlaySection } from './play-section';
+import { actionPlay } from '@/lib/action-center/play';
+import { actionCode, previousActionCode } from '@/lib/action-center/action-ref';
 import { contentEditorPath } from '@/lib/content/drafts';
 import { RegenerateTasks, taskWriterEnabled } from './regenerate-tasks';
 import {
@@ -104,6 +125,9 @@ import {
 import { ImproveOutcomeCard } from './improve-outcome-card';
 import { improvePlatformLabels } from '@/lib/improve-outcome';
 import { cn } from '@/lib/utils';
+import { useDotViewer } from '@/components/layout/menu-dot';
+import { PageDot } from '@/components/layout/page-dot';
+import { actionDots, localDay, pickDot } from '@/lib/page-dots';
 
 type DrawerTab = 'overview' | 'affected' | 'tasks' | 'signals' | 'history';
 const TABS: DrawerTab[] = ['overview', 'tasks', 'signals', 'history'];
@@ -148,6 +172,7 @@ export function ActionDrawer({
   const tSignalTexts = useTranslations('actionCenter.signalTexts');
   const tCategories = useTranslations('actionCenter.actionCategories');
   const tRegistry = useTranslations('actionCenter.registry');
+  const dotViewer = useDotViewer();
   const tTasks = useTranslations('actionCenter.actionTasks');
   const tTaskStatus = useTranslations('actionCenter.taskStatus');
   const tPriority = useTranslations('actionCenter.actionsPage.priority');
@@ -174,6 +199,7 @@ export function ActionDrawer({
   // Whether a task can go to the brand's webhook (AC-004). Best effort: no
   // answer is no button.
   const [webhookReady, setWebhookReady] = useState(false);
+  const { canManage } = useUserRole();
   useEffect(() => {
     let cancelled = false;
     hasActiveWebhook(brandId).then(
@@ -266,6 +292,26 @@ export function ActionDrawer({
         }))
       : [];
   const relatedKpis: string[] = action.kpiKeys.filter(isKpiKey);
+  // Start now (AC-ACTION-PLAN spec §10): an open action's writing work, at the top of Overview.
+  const startNow =
+    detail && action.status !== 'completed' && action.status !== 'dismissed'
+      ? startNowWork(detail.tasks, action.payload)
+      : null;
+  const startNowBlock = startNow ? (
+    <StartNowBlock
+      brandId={brandId}
+      action={{
+        id: action.id,
+        actionNo: action.actionNo,
+        brandNo: action.brandNo,
+        title: texts.title,
+      }}
+      work={startNow}
+      drafts={drafts}
+    />
+  ) : null;
+  // The page its prompts pick, on G15, G16 and C09 (AC-ACTION-PLAN spec §5).
+  const play = actionPlay(action.payload);
   // Sent by a person from Content Optimization (#857): its evidence is the
   // opportunity, not detection signals.
   const opportunityId =
@@ -296,7 +342,9 @@ export function ActionDrawer({
           ? tSend('sentToWebhook')
           : result.created
             ? tSend('sentToContent')
-            : tSend('alreadyInContent'),
+            : result.merged
+              ? tSend('mergedInContent')
+              : tSend('alreadyInContent'),
       );
       await load();
       onChanged();
@@ -388,7 +436,8 @@ export function ActionDrawer({
    * A failed save says so and reads the list again, back to what was saved.
    */
   const changeField = async (patch: Partial<ActionItem>, save: () => Promise<void>) => {
-    onPatched(action.id, { ...patch, updatedAt: new Date().toISOString() });
+    // Any change is someone working on it: no longer stale (00432).
+    onPatched(action.id, { ...patch, staleAt: null, updatedAt: new Date().toISOString() });
     try {
       await save();
     } catch {
@@ -424,7 +473,9 @@ export function ActionDrawer({
       <SheetContent className="flex flex-col gap-0 p-0 data-[side=right]:w-full data-[side=right]:sm:max-w-xl">
         {/* pt-3: the top row's buttons line up with the sheet's close button. */}
         <SheetHeader className="border-b px-6 pt-3 pb-4 pr-12">
-          <div className="flex flex-wrap items-center gap-2 text-xs">
+          {/* One row at 1024px too (W2-17): beside Run agent the action's number
+              alone, its "Action ID" label kept for hover and screen readers. */}
+          <div className="group/top flex flex-wrap items-center gap-2 text-xs">
             <Badge variant="outline" className="text-[10px]">
               {tCategories(action.category)}
             </Badge>
@@ -432,6 +483,7 @@ export function ActionDrawer({
               <PriorityBadge score={action.priorityScore} level={action.priorityLevel} />
             )}
             <div className="ml-auto flex items-center gap-2">
+              <RunAgentButton action={action} title={texts.title} variant="drawer" />
               <ActionExportButtons
                 action={action}
                 detail={ready ? detail : null}
@@ -439,9 +491,20 @@ export function ActionDrawer({
                 volumes={volumes}
                 story={story}
               />
-              <span className="text-muted-foreground">
-                {t('drawer.actionId')}: AC-{action.actionNo}
+              <span
+                className="whitespace-nowrap text-muted-foreground"
+                title={`${t('drawer.actionId')}: ${actionCode(action)}`}
+              >
+                <span className="group-has-[[data-run-agent]]/top:sr-only">
+                  {t('drawer.actionId')}:{' '}
+                </span>
+                {actionCode(action)}
               </span>
+              {previousActionCode(action) && (
+                <span className="whitespace-nowrap text-xs text-muted-foreground/70">
+                  {t('drawer.previousCode', { code: previousActionCode(action)! })}
+                </span>
+              )}
             </div>
           </div>
           <div className="flex items-start gap-3">
@@ -453,7 +516,15 @@ export function ActionDrawer({
               />
             </div>
             <div className="min-w-0">
-              <SheetTitle>{texts.title}</SheetTitle>
+              <SheetTitle className="flex items-center gap-2">
+                {texts.title}
+                <PageDot
+                  dot={pickDot(
+                    actionDots(action, action.dotFacts, localDay(new Date())),
+                    dotViewer,
+                  )}
+                />
+              </SheetTitle>
               <SheetDescription>
                 {ready ? (story?.why ?? texts.description) : null}
               </SheetDescription>
@@ -477,8 +548,29 @@ export function ActionDrawer({
                   </Badge>
                 ))}
             <RemovedNote payload={action.payload ?? {}} />
+            {isStale(action) && <StalePill />}
           </div>
         </SheetHeader>
+
+        {isStale(action) && (
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-amber-500/30 bg-amber-500/10 px-6 py-2.5 text-xs">
+            <p className="min-w-0 flex-1 text-amber-700 dark:text-amber-400">
+              {t('stale.notice', { days: STALE_AFTER_DAYS })}
+            </p>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 text-xs"
+              onClick={guard(
+                () =>
+                  void changeField({ staleAt: null }, () => keepActionRelevant(brandId, action.id)),
+                { action: tActions('changeActionStatus') },
+              )}
+            >
+              {t('stale.keep')}
+            </Button>
+          </div>
+        )}
 
         {/* Who has it, where it stands and by when: ahead of the tabs, so they
             read and change without scrolling past the content. */}
@@ -619,11 +711,22 @@ export function ActionDrawer({
             </div>
           ) : tab === 'overview' ? (
             <>
+              {(play || startNow) && (
+                <>
+                  {play ? <PlaySection play={play}>{startNowBlock}</PlaySection> : startNowBlock}
+                  <Separator />
+                </>
+              )}
               {action.priorityReason && (
                 <>
                   <section>
                     <p className="text-xs font-medium text-muted-foreground">{t('priority.why')}</p>
                     <p className="mt-1">{priorityReasonText(action.priorityReason, tPriority)}</p>
+                    {action.priorityReason.confidence && (
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        {priorityConfidenceText(action.priorityReason.confidence, tPriority)}
+                      </p>
+                    )}
                   </section>
                   <Separator />
                 </>
@@ -713,10 +816,45 @@ export function ActionDrawer({
                   <Separator />
                   <ShoppingLinksContext payload={action.payload ?? {}} />
                 </>
+              ) : action.kind === 'business_hub_setup' || action.kind === 'business_hub_numbers' ? (
+                <>
+                  <Separator />
+                  <BusinessHubContext
+                    payload={action.payload ?? {}}
+                    reminder={action.kind === 'business_hub_numbers'}
+                  />
+                </>
+              ) : action.kind === 'bridge_links' ? (
+                <>
+                  <Separator />
+                  <BridgeLinksContext payload={action.payload ?? {}} />
+                </>
+              ) : action.kind === 'product_pages_optimize' ? (
+                <>
+                  <Separator />
+                  <ProductPagesContext
+                    payload={action.payload ?? {}}
+                    brandId={brandId}
+                    actionId={action.id}
+                    editable={action.status !== 'completed' && action.status !== 'dismissed'}
+                    onChanged={async () => {
+                      await load();
+                      onChanged();
+                    }}
+                  />
+                </>
               ) : action.kind === 'audit_page' ? (
                 <>
                   <Separator />
                   <AuditPageContext payload={action.payload ?? {}} />
+                </>
+              ) : action.kind === 'chat_finding' ? (
+                <>
+                  <Separator />
+                  <ChatFindingContext
+                    payload={action.payload ?? {}}
+                    chatHref={detail.chatHref ?? null}
+                  />
                 </>
               ) : opportunityId ? (
                 <>
@@ -772,7 +910,8 @@ export function ActionDrawer({
                       send={{
                         // A content task, unless the action itself came from Content.
                         content: task.details?.type === 'content' && !opportunityId,
-                        webhook: webhookReady,
+                        // The webhook is for admins and managers, as the server allows it.
+                        webhook: canManage && webhookReady,
                         onSend: guard(
                           (to: 'content' | 'webhook') =>
                             void sendTask(task.id, taskText(task, tTasks), to),
@@ -802,9 +941,13 @@ export function ActionDrawer({
                 onAdd={(title) => void mutate(() => addTask(brandId, action.id, title))}
               />
               {/* Written from the action's evidence (AC-004): not for an
-                  action a person sent, which carries its own, nor a closed one. */}
+                  action a person sent, which carries its own, nor a closed one;
+                  nor a bridge links action, whose tasks are its pairs', nor a
+                  product pages action, whose tasks are its plan's. */}
               {taskWriterEnabled() &&
                 action.kind !== 'prompt_improve' &&
+                action.kind !== 'bridge_links' &&
+                action.kind !== 'product_pages_optimize' &&
                 !opportunityId &&
                 action.status !== 'completed' &&
                 action.status !== 'dismissed' &&
@@ -838,9 +981,15 @@ export function ActionDrawer({
                               ? t('drawer.noSignalsAuditPage')
                               : action.kind === 'shopping_links'
                                 ? t('drawer.noSignalsShoppingLinks')
-                                : opportunityId
-                                  ? t('drawer.noSignalsOpportunity')
-                                  : t('drawer.noSignals')}
+                                : action.kind === 'chat_finding'
+                                  ? t('drawer.noSignalsChat')
+                                  : action.kind === 'business_hub_setup'
+                                    ? t('drawer.noSignalsBusinessHub')
+                                    : action.kind === 'business_hub_numbers'
+                                      ? t('drawer.noSignalsBusinessHubNumbers')
+                                      : opportunityId
+                                        ? t('drawer.noSignalsOpportunity')
+                                        : t('drawer.noSignals')}
                 </p>
               )}
               {detail.signals.map((signal) => {
@@ -987,6 +1136,19 @@ function TaskRow({
             {task.position}. {text}
           </span>
         </button>
+        {(task.attachments?.length ?? 0) > 0 && (
+          <span
+            role="img"
+            aria-label={t('drawer.task.attachedFromChat.count', {
+              count: task.attachments!.length,
+            })}
+            title={t('drawer.task.attachedFromChat.count', { count: task.attachments!.length })}
+            className="mt-1.5 inline-flex shrink-0 items-center gap-0.5 text-[11px] text-muted-foreground"
+          >
+            <Paperclip className="h-3 w-3" aria-hidden />
+            {task.attachments!.length}
+          </span>
+        )}
         <div className="mt-1.5 shrink-0">
           <TaskTypeBadge type={task.details?.type ?? null} />
         </div>
@@ -1050,6 +1212,9 @@ function TaskRow({
             send={send}
             check={check}
             draftWork={draftWork}
+            competitor={task.competitorFindings}
+            winning={task.winningFindings}
+            attachments={task.attachments}
           />
         ))}
 

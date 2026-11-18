@@ -1,6 +1,7 @@
 'use server';
 
 import { createClient } from '@/lib/supabase/server';
+import { dbClient } from '@/lib/supabase/scoped';
 import { API_BASE_URL } from '@/config/api';
 import { GOOGLE_PAGES_MIN_IMPRESSIONS, googlePagesWindow } from '@/lib/traffic-google-pages';
 import { TRAFFIC_PAGE_SIZE, countTrafficLogs, scanTrafficLogs } from '@/lib/traffic-scan';
@@ -8,7 +9,9 @@ import { expandDateToEndOfDay, utcDay } from '@/lib/dates';
 import { isHourlyWindow, listUtcHours, utcHourKey } from '@/lib/traffic-buckets';
 import { CONVERSIONS_FALLBACK_DAYS, widensToLast30Days } from '@/lib/traffic-conversions';
 import { getSuggestionSourceStates, type SourceState } from '@/lib/actions/integrations';
+import { readSnippet } from '@/lib/traffic-snippet';
 import { isPlatformSurface, type PlatformSurface } from '@/lib/traffic-platforms';
+import { NO_TOPICS } from '@/lib/topics-required';
 
 export interface TrafficDateWindow {
   dateFrom?: string;
@@ -89,30 +92,30 @@ export interface TrafficTrendPoint {
 export interface TrafficSources {
   /** The snippet's newest visit, or null when it has never sent one. */
   snippetLastVisitAt: string | null;
+  /** When the home page check last found the snippet (00433); null when it didn't, or none ran. */
+  snippetFoundAt: string | null;
+  /** When the home page was last checked for the snippet; null when never. */
+  snippetCheckedAt: string | null;
   ga: SourceState;
   gsc: SourceState;
 }
 
 /**
  * The tracking snippet, Google Analytics and Google Search Console as the
- * strip shows them, in one call: the snippet's last visit beside each
- * Google source's connection, the brand's property and its last sync.
+ * strip shows them, in one call: the snippet's last visit and its home
+ * page check beside each Google source's connection, the brand's property
+ * and its last sync.
  */
 export async function getTrafficSources(brandId: string): Promise<TrafficSources> {
   const supabase = await createClient();
-  const [states, lastVisit] = await Promise.all([
+  const [states, snippet] = await Promise.all([
     getSuggestionSourceStates(brandId),
-    supabase
-      .from('ai_traffic_logs')
-      .select('created_at')
-      .eq('brand_id', brandId)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle(),
+    readSnippet(supabase, brandId),
   ]);
-  if (lastVisit.error) throw new Error(lastVisit.error.message);
   return {
-    snippetLastVisitAt: (lastVisit.data?.created_at as string | undefined) ?? null,
+    snippetLastVisitAt: snippet.lastVisitAt,
+    snippetFoundAt: snippet.foundAt,
+    snippetCheckedAt: snippet.checkedAt,
     ga: states.ga,
     gsc: states.gsc,
   };
@@ -260,7 +263,7 @@ export async function getTrafficSummary(
   /** The page shows the top 10 landing pages; an export takes them all. */
   opts?: { topPages?: number },
 ): Promise<TrafficSummary> {
-  const supabase = await createClient();
+  const supabase = await dbClient();
   const { from, to, prevFrom, prevTo } = resolveTrafficWindow(window);
   const hasPrev = Boolean(prevFrom && prevTo);
 
@@ -366,7 +369,7 @@ export async function getTrafficTrend(
   brandId: string,
   window?: TrafficDateWindow,
 ): Promise<TrafficTrendPoint[]> {
-  const supabase = await createClient();
+  const supabase = await dbClient();
   const { from, to } = resolveTrafficWindow(window);
   // A day or less reads hour by hour (AT-017); longer windows by day.
   const hourly = Boolean(from && to && isHourlyWindow(from, to));
@@ -459,7 +462,7 @@ export async function getTrafficLogs(
     dateTo?: string;
   },
 ): Promise<{ logs: TrafficLog[]; total: number; pageviews: number }> {
-  const supabase = await createClient();
+  const supabase = await dbClient();
   const limit = opts?.limit ?? 20;
   const offset = opts?.offset ?? 0;
   const platform = opts?.platform;
@@ -779,7 +782,10 @@ export async function sendTrafficPagesToActionCenter(
   window: TrafficDateWindow | undefined,
   pages: string[],
   reason: TrafficPagesReason,
-): Promise<{ actionId: string; actionNo: number; created: boolean } | { error: string }> {
+): Promise<
+  | { actionId: string; actionNo: number; brandNo?: number | null; created: boolean }
+  | { error: string }
+> {
   const supabase = await createClient();
   const {
     data: { session },
@@ -825,13 +831,14 @@ export interface PagePromptSuggestions {
  * "Add prompts" on the Pages section (AT-006 part B2): prompts whose best
  * answer is this page, written from what the page says, its figures over the
  * page's range and the brand's Search Console queries that share its words.
- * Nothing is stored until the person tracks some.
+ * Nothing is stored until the person tracks some. A brand with no topic yet
+ * gets `no_topics` before anything is written: prompts go under topics.
  */
 export async function suggestPagePrompts(
   brandId: string,
   window: TrafficDateWindow | undefined,
   page: string,
-): Promise<PagePromptSuggestions | { error: string }> {
+): Promise<PagePromptSuggestions | { error: string; code?: typeof NO_TOPICS }> {
   const supabase = await createClient();
   const {
     data: { session },
@@ -854,7 +861,8 @@ export async function suggestPagePrompts(
   // Returned, not thrown: a thrown error's message is masked in production.
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    return { error: body.message || body.error || `Server error: ${res.status}` };
+    const error: string = body.message || body.error || `Server error: ${res.status}`;
+    return body.code === NO_TOPICS ? { error, code: NO_TOPICS } : { error };
   }
   return res.json();
 }
@@ -954,7 +962,7 @@ export async function getTrafficConversions(
   window: TrafficDateWindow | undefined,
   { limit = 10 }: { limit?: number } = {},
 ): Promise<TrafficConversions> {
-  const supabase = await createClient();
+  const supabase = await dbClient();
   const { from, to } = resolveTrafficWindow(window);
   const inRange = await readConversions(
     supabase,
@@ -974,6 +982,110 @@ export async function getTrafficConversions(
     limit,
   );
   return { ...last30, widened: true };
+}
+
+/**
+ * AI Traffic's "AI-sourced pipeline" (#2140, 00520): the brand's AI-sourced
+ * HubSpot contacts, deals and revenue by AI engine and landing page, as
+ * brand_ai_pipeline reads them from the daily HubSpot sync. `connected` and
+ * `contactsConsent` say whether there is anything to read; amounts are in
+ * the HubSpot account's currency.
+ */
+export interface TrafficAiPipelineTotals {
+  contacts: number;
+  /** The period before, as long; null for a range without both ends. */
+  contactsPrev: number | null;
+  deals: number;
+  wonDeals: number;
+  wonRevenue: number;
+  wonRevenuePrev: number | null;
+  openDeals: number;
+  openPipeline: number;
+}
+
+export interface TrafficAiPipeline {
+  connected: boolean;
+  contactsConsent: boolean;
+  currency: string | null;
+  syncedAt: string | null;
+  syncError: string | null;
+  totals: TrafficAiPipelineTotals;
+  byEngine: {
+    source: string;
+    contacts: number;
+    deals: number;
+    wonDeals: number;
+    wonRevenue: number;
+    openPipeline: number;
+  }[];
+  byPage: {
+    page: string;
+    contacts: number;
+    deals: number;
+    wonRevenue: number;
+    topSource: string | null;
+  }[];
+  /** HubSpot's own AI Referrals contacts on the brand's domains, Ansvisor didn't mark. */
+  hubspotNative: { contacts: number; deals: number; wonRevenue: number };
+}
+
+export async function getTrafficAiPipeline(
+  brandId: string,
+  window: TrafficDateWindow | undefined,
+): Promise<TrafficAiPipeline | null> {
+  const supabase = await dbClient();
+  const { from, to } = resolveTrafficWindow(window);
+  const { data, error } = await supabase.rpc('brand_ai_pipeline', {
+    p_brand_id: brandId,
+    p_since: utcDay(from) ?? null,
+    p_until: utcDay(to) ?? null,
+  });
+  if (error) throw new Error(error.message);
+  if (!data) return null;
+  const raw = data as Record<string, unknown>;
+  const n = (v: unknown) => Number(v) || 0;
+  const maybe = (v: unknown) => (v === null || v === undefined ? null : n(v));
+  const text = (v: unknown) => (typeof v === 'string' && v ? v : null);
+  const list = (v: unknown) => (Array.isArray(v) ? (v as Record<string, unknown>[]) : []);
+  const totals = (raw.totals ?? {}) as Record<string, unknown>;
+  const native = (raw.hubspotNative ?? {}) as Record<string, unknown>;
+  return {
+    connected: raw.connected === true,
+    contactsConsent: raw.contactsConsent === true,
+    currency: text(raw.currency),
+    syncedAt: text(raw.syncedAt),
+    syncError: text(raw.syncError),
+    totals: {
+      contacts: n(totals.contacts),
+      contactsPrev: maybe(totals.contactsPrev),
+      deals: n(totals.deals),
+      wonDeals: n(totals.wonDeals),
+      wonRevenue: n(totals.wonRevenue),
+      wonRevenuePrev: maybe(totals.wonRevenuePrev),
+      openDeals: n(totals.openDeals),
+      openPipeline: n(totals.openPipeline),
+    },
+    byEngine: list(raw.byEngine).map((r) => ({
+      source: String(r.source ?? 'unknown'),
+      contacts: n(r.contacts),
+      deals: n(r.deals),
+      wonDeals: n(r.wonDeals),
+      wonRevenue: n(r.wonRevenue),
+      openPipeline: n(r.openPipeline),
+    })),
+    byPage: list(raw.byPage).map((r) => ({
+      page: String(r.page ?? ''),
+      contacts: n(r.contacts),
+      deals: n(r.deals),
+      wonRevenue: n(r.wonRevenue),
+      topSource: text(r.topSource),
+    })),
+    hubspotNative: {
+      contacts: n(native.contacts),
+      deals: n(native.deals),
+      wonRevenue: n(native.wonRevenue),
+    },
+  };
 }
 
 /** Analytics' engagement figures for one group of sessions (AT-005). */
@@ -1028,7 +1140,7 @@ export async function getTrafficGoogleTotals(
     gscLatestDays: number | null;
   },
 ): Promise<TrafficGoogleTotals> {
-  const supabase = await createClient();
+  const supabase = await dbClient();
   // Both sources store whole days, so the range goes as its first and last.
   const since = utcDay(window.dateFrom) ?? null;
   const until = utcDay(window.dateTo) ?? new Date().toISOString().slice(0, 10);
@@ -1171,7 +1283,7 @@ export async function getTrafficGooglePages(
   window: TrafficDateWindow | undefined,
   { limit = 10 }: { limit?: number } = {},
 ): Promise<TrafficGooglePages> {
-  const supabase = await createClient();
+  const supabase = await dbClient();
   const { from, to } = resolveTrafficWindow(window);
   const { since, until } = googlePagesWindow(from, to);
 
@@ -1336,7 +1448,7 @@ export async function getTrafficBots(
   window: TrafficDateWindow | undefined,
   { limit = 10 }: { limit?: number } = {},
 ): Promise<TrafficBots> {
-  const supabase = await createClient();
+  const supabase = await dbClient();
   const { from, to } = resolveTrafficWindow(window);
   const { data, error } = await supabase.rpc('ai_bot_report', {
     p_brand_id: brandId,

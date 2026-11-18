@@ -387,6 +387,44 @@ describe('getInsightsSummary', () => {
 
     expect(summary).toMatchObject({ netSentiment: null, avgPosition: null, citationRate: null });
   });
+
+  it('reads the window and the one before it in one round trip, the window once', async () => {
+    rpcByName = false;
+    rpcCalls = [];
+    let answer = () => {};
+    const answered = new Promise<void>((resolve) => (answer = resolve));
+    rpcMock = vi.fn(async () => {
+      await answered;
+      return { data: insightsAggregatesRow, error: null };
+    });
+    const { getInsightsSummary } = await import('./tracking');
+
+    const summary = getInsightsSummary('brand-id', {
+      days: { dayFrom: '2026-10-13', dayTo: '2026-10-19' },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // Both sent before either answered; the change's current window is the window itself.
+    expect(rpcCalls.map((call) => [call.args.p_day_from, call.args.p_day_to])).toEqual([
+      ['2026-10-13', '2026-10-19'],
+      ['2026-10-06', '2026-10-12'],
+    ]);
+    answer();
+    expect(await summary).toMatchObject({ totalResults: 427, visibilityChange: 0 });
+  });
+
+  it('reads All time and the last two weeks side by side', async () => {
+    rpcByName = false;
+    rpcCalls = [];
+    rpcMock = vi.fn(async () => ({ data: insightsAggregatesRow, error: null }));
+    const { getInsightsSummary } = await import('./tracking');
+
+    await getInsightsSummary('brand-id', { days: {} });
+    // The unbounded window, then the trailing 7 days and the 7 before, for the change.
+    expect(rpcCalls).toHaveLength(3);
+    expect(rpcCalls[0].args.p_day_from).toBeUndefined();
+    expect(rpcCalls[1].args.p_day_from).toBeDefined();
+    expect(rpcCalls[2].args.p_day_to).toBeDefined();
+  });
 });
 
 describe('topic-filtered reads (00164)', () => {
@@ -468,6 +506,26 @@ describe('topic-filtered reads (00164)', () => {
       expect(call.name).toMatch(/_daily$/);
       expect(call.args.p_topic_id).toBe('topic-1');
     }
+  });
+
+  it('reads a preset window once and its previous window beside it', async () => {
+    rpcByName = true;
+    const { getCompetitorComparison } = await import('./tracking');
+
+    await getCompetitorComparison('brand-id', {
+      days: { dayFrom: '2026-09-01', dayTo: '2026-09-30' },
+    });
+
+    // The displayed window is the delta's current window: one read for both,
+    // and the previous window's read already sent (the brand has no rows, so
+    // the page stops after the displayed read).
+    const windows = rpcCalls
+      .filter((c) => c.name === 'competitor_aggregates_daily')
+      .map((c) => [c.args.p_day_from, c.args.p_day_to]);
+    expect(windows).toEqual([
+      ['2026-08-02', '2026-08-31'],
+      ['2026-09-01', '2026-09-30'],
+    ]);
   });
 
   it('leaves brand-level reads unscoped', async () => {

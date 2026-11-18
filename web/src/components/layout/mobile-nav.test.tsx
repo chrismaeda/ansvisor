@@ -16,27 +16,57 @@ vi.mock('@/i18n/navigation', () => ({
     </a>
   ),
 }));
+const gate = vi.hoisted(() => ({ isCloud: false }));
 vi.mock('@/hooks/use-feature-gate', () => ({
-  useFeatureGate: () => ({ canUse: () => true, requiredPlanFor: () => null, isCloud: false }),
+  useFeatureGate: () => ({
+    canUse: () => true,
+    requiredPlanFor: () => null,
+    isCloud: gate.isCloud,
+  }),
 }));
-vi.mock('@/hooks/use-agent-key-status', () => ({ useAgentKeyStatus: () => 'configured' }));
+// The org's provider key for Chat: there, unless a test says otherwise.
+const agentKey = vi.hoisted(() => ({ status: 'configured' as 'configured' | 'missing' }));
+const useAgentKeyStatus = vi.hoisted(() =>
+  vi.fn((probe: boolean) => (probe ? agentKey.status : 'configured')),
+);
+vi.mock('@/hooks/use-agent-key-status', () => ({ useAgentKeyStatus }));
 vi.mock('@/components/layout/brand-switcher', () => ({ BrandSwitcher: () => null }));
 vi.mock('@/components/layout/user-profile-nav-item', () => ({ UserProfileNavItem: () => null }));
 vi.mock('@/components/layout/theme-toggle', () => ({ ThemeToggle: () => null }));
 vi.mock('@/config/dashboard', () => {
   const Icon = () => <svg />;
-  return {
+  const config = {
     dashboardNav: [
+      {
+        items: [
+          { title: 'Chat', href: '/dashboard/agent', icon: Icon },
+          {
+            title: 'Agent Center',
+            href: '/dashboard/agents',
+            icon: Icon,
+            requiresChatAgentic: true,
+          },
+        ],
+      },
       {
         title: 'Analytics',
         items: [
           { title: 'Action Center', href: '/dashboard/action-center', icon: Icon },
           { title: 'Prompts', href: '/dashboard/prompts', icon: Icon },
           { title: 'Mentions', href: '/dashboard/mentions', icon: Icon },
+          {
+            title: 'Ads',
+            href: '/dashboard/ads',
+            icon: Icon,
+            requiresAds: true,
+            newPill: true,
+          },
         ],
       },
     ],
   };
+  // The simplified menu (SIMPLE_NAV) has tests of its own, on the real menus.
+  return { ...config, simpleDashboardNav: [], navFor: () => config.dashboardNav };
 });
 
 // The brand store keeps its state in localStorage, which this jsdom lacks.
@@ -49,11 +79,15 @@ vi.stubGlobal('localStorage', {
 
 const { MobileNav } = await import('./mobile-nav');
 const { MenuAccessProvider } = await import('@/components/providers/menu-access-provider');
+const { ChatAgenticProvider } = await import('@/components/providers/chat-agentic-provider');
+const { AdsProvider } = await import('@/components/providers/ads-provider');
 const { useBrandStore } = await import('@/stores/use-brand-store');
+const { DemoBrandContext } = await import('@/components/providers/demo-brand-provider');
 
 /**
- * The mobile menu leaves the viewer's hidden sections off, the active brand's
- * Prompts link with the Prompts section.
+ * The mobile menu leaves the viewer's hidden sections off. The brand's
+ * prompts are managed on the Prompts page, which the menu's Prompts item
+ * opens: there is no second Prompts link to the brand's old page.
  */
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT =
@@ -63,6 +97,9 @@ let container: HTMLDivElement;
 let root: Root;
 
 beforeEach(() => {
+  gate.isCloud = false;
+  agentKey.status = 'configured';
+  useAgentKeyStatus.mockClear();
   useBrandStore.setState({ activeBrandId: 'brand-1', brands: [] });
   container = document.createElement('div');
   document.body.appendChild(container);
@@ -74,13 +111,21 @@ afterEach(() => {
   document.body.innerHTML = '';
 });
 
-async function open(hidden: string[]) {
+async function open(hidden: string[], chatOn = false, isDemo = false, adsOn = false) {
   await act(async () => {
     root.render(
       <NextIntlClientProvider locale="en" messages={messages} timeZone="UTC">
-        <MenuAccessProvider hidden={hidden} canManageMenus={false}>
-          <MobileNav />
-        </MenuAccessProvider>
+        <DemoBrandContext.Provider
+          value={{ isDemo, demoBrand: null, offer: 'trial', neverSubscribed: true }}
+        >
+          <MenuAccessProvider hidden={hidden} canManageMenus={false}>
+            <ChatAgenticProvider enabled={chatOn}>
+              <AdsProvider enabled={adsOn}>
+                <MobileNav />
+              </AdsProvider>
+            </ChatAgenticProvider>
+          </MenuAccessProvider>
+        </DemoBrandContext.Provider>
       </NextIntlClientProvider>,
     );
   });
@@ -91,18 +136,90 @@ async function open(hidden: string[]) {
 const link = (href: string) => document.querySelector(`a[href="${href}"]`);
 
 describe('MobileNav', () => {
-  it('shows every section, and the brand’s prompts, when nothing is hidden', async () => {
+  it('shows every section when nothing is hidden, the brand’s prompts on the Prompts page', async () => {
     await open([]);
     expect(link('/dashboard/prompts')).not.toBeNull();
     expect(link('/dashboard/mentions')).not.toBeNull();
-    expect(link('/dashboard/brands/brand-1/prompts')).not.toBeNull();
+    expect(link('/dashboard/brands/brand-1/prompts')).toBeNull();
+    // One Prompts entry, the menu's own.
+    const prompts = [...document.querySelectorAll('a')].filter((a) => a.textContent === 'Prompts');
+    expect(prompts.map((a) => a.getAttribute('href'))).toEqual(['/dashboard/prompts']);
   });
 
-  it('leaves hidden sections off, the brand’s prompts with Prompts', async () => {
+  it('leaves hidden sections off', async () => {
     await open(['prompts', 'mentions']);
     expect(link('/dashboard/action-center')).not.toBeNull();
     expect(link('/dashboard/prompts')).toBeNull();
     expect(link('/dashboard/mentions')).toBeNull();
     expect(link('/dashboard/brands/brand-1/prompts')).toBeNull();
+  });
+
+  it('opens Visibility on its first shown tab when Overview is hidden, as the desktop menu does', async () => {
+    await open(['insights']);
+    expect(link('/dashboard/insights')).toBeNull();
+    expect(link('/dashboard/mentions')).not.toBeNull();
+  });
+
+  it('lists Agent Center under Chat with the new Chat on', async () => {
+    await open([], true);
+    expect(link('/dashboard/chat')).not.toBeNull();
+    expect(link('/dashboard/agents')?.textContent).toBe('Agent Center');
+  });
+
+  it('leaves Agent Center off with the new Chat off', async () => {
+    await open([]);
+    expect(link('/dashboard/agent')).not.toBeNull();
+    expect(link('/dashboard/agents')).toBeNull();
+  });
+
+  it('leaves Agent Center off when the viewer’s menu hides it', async () => {
+    await open(['agents'], true);
+    expect(link('/dashboard/chat')).not.toBeNull();
+    expect(link('/dashboard/agents')).toBeNull();
+  });
+
+  it('leaves Ads off with Ads off', async () => {
+    await open([]);
+    expect(link('/dashboard/ads')).toBeNull();
+    expect(link('/dashboard/mentions')).not.toBeNull();
+  });
+
+  it('lists Ads, with its New pill, with Ads on', async () => {
+    await open([], false, false, true);
+    const ads = link('/dashboard/ads');
+    expect(ads?.textContent).toBe('AdsNew');
+    expect(ads?.querySelector('[data-slot="new-pill"]')).not.toBeNull();
+  });
+
+  it('leaves Ads off when the viewer’s menu hides it', async () => {
+    await open(['ads'], false, false, true);
+    expect(link('/dashboard/ads')).toBeNull();
+    expect(link('/dashboard/mentions')).not.toBeNull();
+  });
+
+  it('says Chat needs setting up without a key, with the new Chat off', async () => {
+    gate.isCloud = true;
+    agentKey.status = 'missing';
+    await open([]);
+    expect(useAgentKeyStatus).toHaveBeenCalledWith(true);
+    expect(link('/dashboard/agent')?.textContent).toBe('ChatSet up');
+  });
+
+  it('gives Chat no Set up badge with the new Chat on, and never asks for the key', async () => {
+    gate.isCloud = true;
+    agentKey.status = 'missing';
+    await open([], true);
+    expect(link('/dashboard/chat')?.textContent).toBe('Chat');
+    expect(useAgentKeyStatus).not.toHaveBeenCalledWith(true);
+  });
+
+  // The demo brand's Chat is the real one, locked as the rest of the demo.
+  it.each([
+    [false, '/dashboard/agent'],
+    [true, '/dashboard/chat'],
+  ])('gives the demo brand the Chat item any brand has (new Chat %s)', async (chatOn, href) => {
+    await open([], chatOn, true);
+    expect(link(href)?.textContent).toBe('Chat');
+    expect(document.body.textContent).not.toContain('Soon');
   });
 });

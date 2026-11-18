@@ -12,6 +12,7 @@
 
 import { readEntityCounts, withEntityCounts } from '@/lib/action-center/entity-counts';
 import { createClient } from '@/lib/supabase/server';
+import { dbClient } from '@/lib/supabase/scoped';
 import { after } from 'next/server';
 import { API_BASE_URL } from '@/config/api';
 import {
@@ -77,6 +78,7 @@ export async function getSignals(brandId: string, filters: SignalFilters): Promi
 export interface SignalAction {
   id: string;
   actionNo: number;
+  brandNo?: number | null;
   kind: string;
   status: ActionStatus;
   payload: Record<string, unknown>;
@@ -93,7 +95,7 @@ export async function getSignalActions(brandId: string, signalId: string): Promi
   const supabase = await createClient();
   const { data, error } = await supabase
     .from('action_signals')
-    .select('actions!inner(id, action_no, kind, status, payload)')
+    .select('actions!inner(id, action_no, brand_no, kind, status, payload)')
     .eq('signal_id', signalId)
     .eq('actions.brand_id', brandId)
     .order('linked_at', { ascending: false });
@@ -107,6 +109,7 @@ export async function getSignalActions(brandId: string, signalId: string): Promi
   return rows.map((row) => ({
     id: row.id,
     actionNo: Number(row.action_no),
+    brandNo: row.brand_no,
     kind: row.kind,
     status: row.status as ActionStatus,
     payload: withEntityCounts((row.payload ?? {}) as Record<string, unknown>, counts.get(row.id)),
@@ -140,7 +143,8 @@ export async function getSignalsSummary(
   dayFrom: string,
   dayTo: string,
 ): Promise<SignalsSummary> {
-  const supabase = await createClient();
+  // The person's own client, or Chat's (get_signals_summary: the service role, after its brand check).
+  const supabase = await dbClient();
   const { data, error } = await supabase.rpc('signals_summary', {
     p_brand_id: brandId,
     p_from: `${dayFrom}T00:00:00.000Z`,
@@ -182,18 +186,6 @@ export async function getSignalsSummary(
 }
 
 /**
- * Untriaged signals for the Action Center tab badge, counted the way the list
- * shows them: copies of one finding count once (signals_new_count, 00141).
- * One number back, immune to the row cap.
- */
-export async function getNewSignalCount(brandId: string): Promise<number> {
-  const supabase = await createClient();
-  const { data, error } = await supabase.rpc('signals_new_count', { p_brand_id: brandId });
-  if (error) throw new Error(error.message);
-  return Number(data ?? 0);
-}
-
-/**
  * Triage: any org member can move signals through their lifecycle (RLS
  * enforces membership). Several at once for a group's menu, which acts on
  * every copy. Resolving stamps resolved_at; leaving the resolved state
@@ -204,7 +196,7 @@ export async function updateSignalStatus(
   signalIds: string[],
   status: SignalStatus,
 ): Promise<void> {
-  await assertWritable();
+  await assertWritable({ brandId });
   if (signalIds.length === 0) return;
   const supabase = await createClient();
   const { data: before } = await supabase

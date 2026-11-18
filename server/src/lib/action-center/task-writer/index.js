@@ -24,10 +24,13 @@ import { resolveModel } from '../../ai-provider.js';
 import { withRetry } from '../../retry.js';
 import { generationCostUsd } from '../../improve-cost.js';
 import { PlanLimitError, reserveAiBudget } from '../../plan-guard.js';
+import { siteTypeOf } from '../../content-page-types.js';
 import { loadDefinitions } from '../definitions/index.js';
 import { getTask } from '../tasks/registry.js';
 import { IMPROVE_ACTION_KIND } from '../from-prompt-improve.js';
 import { OPPORTUNITY_ACTION_KIND } from '../from-opportunity.js';
+import { BRIDGE_LINKS_KIND } from '../definitions/g20-bridge-links.js';
+import { PRODUCT_PAGES_KIND } from '../definitions/g21-optimize-product-pages.js';
 import { buildEvidence, evidenceForPrompt, hasTargets } from './evidence.js';
 import { loadPastRounds } from './history.js';
 import {
@@ -56,8 +59,19 @@ export function taskWriterModelId() {
   );
 }
 
-/** Actions a person sent carry the tasks they were sent with. */
-const SENT_KINDS = new Set([IMPROVE_ACTION_KIND, OPPORTUNITY_ACTION_KIND]);
+/**
+/**
+ * Actions that carry their tasks: a person's sent with them, a bridge links
+ * action's from its pairs (AC plan P-10), each page and link named, and a
+ * product pages action's (AC plan P-6), whose optimize task Start now opens
+ * its pages' drafts from.
+ */
+const SENT_KINDS = new Set([
+  IMPROVE_ACTION_KIND,
+  OPPORTUNITY_ACTION_KIND,
+  BRIDGE_LINKS_KIND,
+  PRODUCT_PAGES_KIND,
+]);
 const CLOSED = new Set(['completed', 'dismissed']);
 
 /**
@@ -120,7 +134,7 @@ async function loadAction(actionId) {
   const [brandRes, domainsRes, signalsRes, definitions] = await Promise.all([
     supabaseAdmin
       .from('brands')
-      .select('id, name, description, organization_id')
+      .select('id, name, description, organization_id, site_type, industry, shopping_mode_enabled')
       .eq('id', action.brand_id)
       .single(),
     supabaseAdmin.from('brand_domains').select('domain').eq('brand_id', action.brand_id),
@@ -195,8 +209,9 @@ function sift(tasks, evidence, kept) {
  * Whether anyone has worked on the action's tasks: moved one on, added one,
  * renamed, edited or sent one. The night writes only untouched plans; a
  * person rewrites theirs with "Regenerate tasks". A library task's details
- * from its template (AC-010, tasks/templates.js) aren't anyone's work; an
- * edit in the drawer drops their mark.
+ * from its template (AC-010, tasks/templates.js), and its title from its
+ * action's facts (tasks/concrete.js), aren't anyone's work; an edit in the
+ * drawer drops their mark.
  */
 export function isTouched(rows) {
   return rows.some(
@@ -204,7 +219,7 @@ export function isTouched(rows) {
       row.status !== 'todo' ||
       (!row.task_key && row.details?.source !== 'ai') ||
       (row.task_key &&
-        (row.title || (row.details && (row.details.source !== 'template' || row.details.sent)))),
+        (row.details ? row.details.source !== 'template' || row.details.sent : Boolean(row.title))),
   );
 }
 
@@ -310,7 +325,17 @@ async function compose({ action, brand, domains, signals, name, trigger, userId,
     }
     const base = buildTaskWriterPrompt({
       action: { name, category: action.category },
-      brand: { name: brand.name, description: brand.description, domains },
+      brand: {
+        name: brand.name,
+        description: brand.description,
+        domains,
+        // The kind of site, chosen, detected or guessed: tasks speak its language.
+        siteType: siteTypeOf({
+          siteType: brand.site_type,
+          industry: brand.industry,
+          shoppingModeEnabled: brand.shopping_mode_enabled,
+        }),
+      },
       evidence: shown,
       history,
     });
@@ -501,19 +526,21 @@ const SWEEP_LIMIT = 20;
  */
 export async function sweepActionTasks({ brandId, now = new Date(), limit = SWEEP_LIMIT } = {}) {
   if (!isTaskWriterEnabled()) return { skipped: 'disabled' };
+  // Never a demo brand's actions (00380): they are sample data.
   let query = supabaseAdmin.from('actions');
   query = isCloud()
     ? query
         .select(
-          'id, brand_id, kind, status, brands!inner(organizations!inner(subscription_status))',
+          'id, brand_id, kind, status, brands!inner(is_demo, organizations!inner(subscription_status))',
         )
         .in('brands.organizations.subscription_status', ACTIVE_SUBSCRIPTION_STATUSES)
-    : query.select('id, brand_id, kind, status');
+    : query.select('id, brand_id, kind, status, brands!inner(is_demo)');
   query = query
+    .eq('brands.is_demo', false)
     .is('tasks_generated_at', null)
     .gte('created_at', new Date(now.getTime() - SWEEP_WINDOW_MS).toISOString())
     .not('status', 'in', '("completed","dismissed")')
-    .not('kind', 'in', `("${IMPROVE_ACTION_KIND}","${OPPORTUNITY_ACTION_KIND}")`)
+    .not('kind', 'in', `(${[...SENT_KINDS].map((kind) => `"${kind}"`).join(',')})`)
     .order('created_at', { ascending: false })
     .limit(limit);
   if (brandId) query = query.eq('brand_id', brandId);

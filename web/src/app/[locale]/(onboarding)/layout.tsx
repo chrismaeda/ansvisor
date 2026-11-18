@@ -2,9 +2,12 @@ import { redirect } from 'next/navigation';
 import { createClient } from '@/lib/supabase/server';
 import { AuthProvider } from '@/components/providers/auth-provider';
 import { OnboardingSignOutButton } from '@/components/auth/onboarding-sign-out-button';
+import { NewUserTheme } from '@/components/theme/new-user-theme';
 import { isCloud } from '@/config/plans';
 import { evaluateSubscriptionAccess } from '@/lib/billing/subscription-access';
+import { planLapsed } from '@/lib/onboarding/setup-after-purchase';
 import type { TeamRole } from '@/components/providers/role-provider';
+import { sendSignupEventOnce } from '@/lib/signup-event';
 
 export default async function OnboardingLayout({ children }: { children: React.ReactNode }) {
   const supabase = await createClient();
@@ -16,12 +19,21 @@ export default async function OnboardingLayout({ children }: { children: React.R
     redirect('/sign-in');
   }
 
+  // The sign-up events, as the dashboard's layout sends them, for a new
+  // account whose first page is the wizard (lib/signup-event.ts: once per
+  // account).
+  sendSignupEventOnce(user);
+
   // An already-onboarded member whose org subscription has lapsed must not
   // re-enter the wizard (they could re-create the brand / competitors on the
   // org's existing setup): the dashboard opens read-only for them, and admins
   // choose a plan in Billing. Only an admin of a new account that never had a
-  // subscription keeps the plan step; not-yet-onboarded users (new org
-  // creators) pass through.
+  // subscription keeps the plan step. Someone whose onboarding isn't finished
+  // passes through (new org creators, setup after purchase), unless the plan
+  // lapsed after a subscription (a trial canceled or a payment failed before
+  // setup's Finish): setup's writes refuse it, so the dashboard opens
+  // read-only for them too, Billing included (planLapsed, as the dashboard's
+  // layout lets them in).
   if (isCloud()) {
     const { data: profile } = await supabase
       .from('profiles')
@@ -29,20 +41,26 @@ export default async function OnboardingLayout({ children }: { children: React.R
       .eq('id', user.id)
       .single();
 
-    if (profile?.onboarding_completed && profile.organization_id) {
+    if (profile?.organization_id) {
       const { data: org } = await supabase
         .from('organizations')
         .select('subscription_status, stripe_subscription_id')
         .eq('id', profile.organization_id)
         .single();
-      const access = await evaluateSubscriptionAccess(
-        supabase,
-        profile.organization_id,
-        (profile.role ?? 'analyst') as TeamRole,
-        (org?.subscription_status as string | null) ?? null,
-        Boolean(org?.stripe_subscription_id),
-      );
-      if (access.state === 'read_only') {
+      const subscriptionStatus = (org?.subscription_status as string | null) ?? null;
+      const everSubscribed = Boolean(org?.stripe_subscription_id);
+      if (profile.onboarding_completed) {
+        const access = await evaluateSubscriptionAccess(
+          supabase,
+          profile.organization_id,
+          (profile.role ?? 'analyst') as TeamRole,
+          subscriptionStatus,
+          everSubscribed,
+        );
+        if (access.state === 'read_only') {
+          redirect('/dashboard');
+        }
+      } else if (org && planLapsed({ cloud: true, subscriptionStatus, everSubscribed })) {
         redirect('/dashboard');
       }
     }
@@ -51,6 +69,9 @@ export default async function OnboardingLayout({ children }: { children: React.R
   return (
     <>
       <AuthProvider user={user} />
+      {/* Onboarding: also a new person signed up with Google from the
+          sign-in page, or invited (config/theme.ts). */}
+      <NewUserTheme />
       <OnboardingSignOutButton />
       {children}
     </>

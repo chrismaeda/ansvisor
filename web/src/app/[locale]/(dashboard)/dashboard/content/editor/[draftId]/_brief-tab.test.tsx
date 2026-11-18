@@ -118,7 +118,7 @@ describe('the Brief tab', () => {
     // The card first: the brief is there, so Rebuild brief, the secondary button.
     expect(container.textContent).toContain('Brief ready · 2 H2s');
     expect(button('Rebuild brief').className).not.toContain('bg-primary');
-    expect(button('What Run Agent does')).toBeDefined();
+    expect(button('What it does')).toBeDefined();
     expect(fields()).toEqual({
       'Page type': 'Buying guide',
       'Target URL': '/guides/espresso',
@@ -165,6 +165,26 @@ describe('the Brief tab', () => {
     );
   });
 
+  it('says what the cited pages have, from the same read (learning C2)', async () => {
+    await render({
+      status: 'ready',
+      brief: {
+        ...brief,
+        citedLength: { characters: 4300, pages: 3 },
+        citedFeatures: {
+          pages: 3,
+          checks: [
+            { key: 'faq-schema', label: 'FAQ schema', pages: 3 },
+            { key: 'tables', label: 'Tables', pages: 2 },
+          ],
+        },
+      },
+    });
+    expect(fields()['Cited pages have']).toBe(
+      "FAQ schema (3 of 3) · Tables (2 of 3)Site Audit's checks on the same cited pages",
+    );
+  });
+
   it('offers Run Agent for a new page without a brief, or H2s added by hand', async () => {
     await render(
       { status: 'ready', brief: null },
@@ -178,10 +198,12 @@ describe('the Brief tab', () => {
       Audience: 'Not set yet',
       Length: '1,200 characters · ~200 wordsFrom the rules',
     });
-    expect(container.textContent).toContain('Empty. Run Agent to draft one, or add H2s yourself.');
+    expect(container.textContent).toContain(
+      'Empty. Build brief to draft one, or add H2s yourself.',
+    );
     // Run Agent is the black primary while there's nothing to rebuild.
-    expect(button('Run Agent').className).toContain('bg-primary');
-    await act(async () => button('Run Agent').click());
+    expect(button('Build brief').className).toContain('bg-primary');
+    await act(async () => button('Build brief').click());
     expect(onRebuild).toHaveBeenCalled();
 
     // Or the person writes the H2s.
@@ -239,7 +261,7 @@ describe('the Brief tab', () => {
       status: 'ready',
       brief: { ...brief, goal: '', audience: '', outline: [], origin: 'edit' },
     });
-    await act(async () => button('Run Agent').click());
+    await act(async () => button('Build brief').click());
     expect(container.querySelector('[role="alert"]')).toBeNull();
     expect(onRebuild).toHaveBeenCalledTimes(1);
   });

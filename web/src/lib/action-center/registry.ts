@@ -39,7 +39,8 @@ export type ActionOutcome =
   | 'not_measurable';
 
 /** A kind this build has copy for — the V1 library's sixty-two definitions, plus
- *  the kinds a person sends from another page. */
+ *  the kinds a person sends from another page, and the ones raised by a check
+ *  of their own (the catalog's, Business Hub's). */
 export type ActionKind =
   | 'capture_ai_traffic'
   | 'convert_mentions'
@@ -60,6 +61,10 @@ export type ActionKind =
   | 'optimize_content_for_ai'
   | 'earn_third_party_presence'
   | 'earn_third_party_citations'
+  // Links from pages AI sends readers to, to pages that convert (G20, AC plan P-10).
+  | 'bridge_links'
+  // An online store's product pages AI asks about, in groups of 3, 5 or 10 (G21, AC plan P-6).
+  | 'product_pages_optimize'
   | 'protect_visibility'
   | 'protect_valuable_citations'
   | 'protect_ai_traffic_pages'
@@ -84,6 +89,8 @@ export type ActionKind =
   | 'fix_low_scores'
   | 'fix_crawler_access'
   | 'fix_structured_data'
+  // Canonical tags missing or pointing where they shouldn't (F14, AC plan P-11).
+  | 'fix_canonical_tags'
   | 'fix_content_gaps'
   | 'fix_outdated_content'
   | 'fix_entity_signals'
@@ -124,7 +131,15 @@ export type ActionKind =
   | 'shopping_category'
   // Raised by the catalog check for a live page linking products that no
   // longer sell (shopping path, part 7), and closed by it once fixed.
-  | 'shopping_links';
+  | 'shopping_links'
+  // Sent by a person from Chat: a finding and its tasks, as approved (CHAT-09 §E).
+  | 'chat_finding'
+  // Raised once per brand by the nightly pass: set up its ChatGPT Business
+  // Hub profile (BUSINESS_HUB_ENABLED).
+  | 'business_hub_setup'
+  // Raised each week a brand's Business Hub numbers are 7 days old, and
+  // closed when they are entered.
+  | 'business_hub_numbers';
 
 export type TaskStatus =
   | 'todo'
@@ -182,6 +197,20 @@ export function dismissReasonOf(value: unknown): ActionDismissReason | null {
     : null;
 }
 
+/**
+ * The error a database without 00366 gives for naming dismiss_reason:
+ * PGRST204 from PostgREST's schema cache on a write, 42703 from Postgres.
+ * Only that one, so a missing column of any other name still fails.
+ */
+export function missingDismissReason(
+  error: { code?: string; message?: string } | null | undefined,
+): boolean {
+  return (
+    (error?.code === 'PGRST204' || error?.code === '42703') &&
+    (error.message ?? '').includes('dismiss_reason')
+  );
+}
+
 /** An action whose cycle is over: it is history, and its kind's slot is free. */
 export const CLOSED_ACTION_STATUSES: readonly ActionStatus[] = ['completed', 'dismissed'];
 
@@ -232,6 +261,8 @@ export const ACTION_KINDS: readonly ActionKind[] = [
   'optimize_content_for_ai',
   'earn_third_party_presence',
   'earn_third_party_citations',
+  'bridge_links',
+  'product_pages_optimize',
   'protect_visibility',
   'protect_valuable_citations',
   'protect_ai_traffic_pages',
@@ -256,6 +287,7 @@ export const ACTION_KINDS: readonly ActionKind[] = [
   'fix_low_scores',
   'fix_crawler_access',
   'fix_structured_data',
+  'fix_canonical_tags',
   'fix_content_gaps',
   'fix_outdated_content',
   'fix_entity_signals',
@@ -286,6 +318,9 @@ export const ACTION_KINDS: readonly ActionKind[] = [
   'shopping_product',
   'shopping_category',
   'shopping_links',
+  'chat_finding',
+  'business_hub_setup',
+  'business_hub_numbers',
 ];
 
 /**
@@ -303,10 +338,3 @@ export const FROM_PRODUCTS_KINDS: readonly string[] = ['shopping_product', 'shop
 export function isActionKind(value: string): value is ActionKind {
   return (ACTION_KINDS as readonly string[]).includes(value);
 }
-
-/**
- * Sort orders the toolbar offers. Priority is the server's score (AC-006),
- * which already weighs impact in, so impact is not an order of its own.
- */
-export type ActionSort = 'priority' | 'newest' | 'due_date' | 'updated';
-export const ACTION_SORTS: readonly ActionSort[] = ['priority', 'newest', 'due_date', 'updated'];

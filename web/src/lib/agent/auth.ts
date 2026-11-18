@@ -1,6 +1,7 @@
 import { createClient } from '@/lib/supabase/server';
-import { supabaseAdmin } from '@/lib/supabase/admin';
+import { brandAccessOf, readAccessProfile } from '@/lib/brand-access';
 import type { McpAuthContext } from '@/lib/mcp-auth';
+import type { UserRole } from '@/types';
 
 /**
  * Resolve the current dashboard session into the same shape the MCP data
@@ -18,22 +19,20 @@ export async function resolveAgentAuth(): Promise<McpAuthContext | null> {
   } = await supabase.auth.getUser();
   if (!user) return null;
 
-  const { data: profile } = await supabaseAdmin
-    .from('profiles')
-    .select('organization_id')
-    .eq('id', user.id)
-    .maybeSingle();
-
+  const profile = await readAccessProfile(user.id);
   if (!profile?.organization_id) return null;
 
   return {
     userId: user.id,
     email: user.email ?? '',
     organizationId: profile.organization_id,
+    role: (profile.role as UserRole | null | undefined) ?? null,
     // The MCP-auth shape expects an apiKeyId — the agent isn't behind an
     // API key, this is just a marker so downstream code that switches on
     // the field knows the call came from the in-product agent rather than
     // an external MCP client.
     apiKeyId: 'agent-internal',
+    // The brands they may use (BRAND-ACCESS §5.3), read once for this request's tools.
+    brandAccess: await brandAccessOf(profile, user.id, profile.organization_id),
   };
 }

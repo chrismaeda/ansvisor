@@ -20,17 +20,24 @@ const brandActions = vi.hoisted(() => ({
 vi.mock('@/lib/actions/brand', () => brandActions);
 vi.mock('@/lib/actions/brand-domain', () => ({ syncDomains: vi.fn() }));
 vi.mock('@/lib/actions/topic', () => ({ createTopics: vi.fn() }));
-vi.mock('@/lib/actions/prompt', () => ({ getPromptCapacity: vi.fn(), savePromptSet: vi.fn() }));
+const promptActions = vi.hoisted(() => ({ getPromptCapacity: vi.fn(), savePromptSet: vi.fn() }));
+vi.mock('@/lib/actions/prompt', () => promptActions);
 vi.mock('@/lib/actions/competitor', () => ({ addCompetitor: vi.fn() }));
 vi.mock('@/lib/actions/tracking', () => ({ triggerTrackingCheck: vi.fn() }));
 vi.mock('@/lib/actions/volumes', () => ({ bootstrapBrandVolumes: vi.fn() }));
 const suggestTopics = vi.hoisted(() => vi.fn());
+const detectSiteType = vi.hoisted(() => vi.fn());
+const generatePromptsFromTopics = vi.hoisted(() => vi.fn());
+const suggestCompetitors = vi.hoisted(() => vi.fn());
 vi.mock('@/lib/ai-brand-setup', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/ai-brand-setup')>()),
   suggestTopics,
-  generatePromptsFromTopics: vi.fn(),
-  suggestCompetitors: vi.fn(),
+  detectSiteType,
+  generatePromptsFromTopics,
+  suggestCompetitors,
 }));
+const analytics = vi.hoisted(() => ({ track: vi.fn() }));
+vi.mock('@/lib/analytics', () => analytics);
 // The org's row: no plan read here, the user and their organization only.
 const single = async () => ({ data: { organization_id: 'org-1' } });
 vi.mock('@/lib/supabase/client', () => ({
@@ -66,6 +73,7 @@ beforeEach(() => {
     brand: { id: 'b1', name: 'Acme', domains: [{ domain: 'acme.com', isPrimary: true }] },
   });
   suggestTopics.mockResolvedValue({ topics: [] });
+  detectSiteType.mockResolvedValue({ siteType: null, industry: null });
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);
@@ -97,10 +105,11 @@ async function type(id: string, value: string) {
     input.dispatchEvent(new Event('input', { bubbles: true }));
   });
 }
-const clickContinue = () =>
+const clickButton = (label: string) =>
   act(async () =>
-    [...container.querySelectorAll('button')].find((b) => b.textContent === 'Continue')!.click(),
+    [...container.querySelectorAll('button')].find((b) => b.textContent === label)!.click(),
   );
+const clickContinue = () => clickButton('Continue');
 
 /** Fills the first step and goes on to the second, which creates the brand. */
 async function reachCreate() {
@@ -117,6 +126,7 @@ describe('the new brand page', () => {
     expect(openUpgrade).toHaveBeenCalledExactlyOnceWith('Adding brands needs a plan');
     expect(brandActions.createBrand).not.toHaveBeenCalled();
     expect(suggestTopics).not.toHaveBeenCalled();
+    expect(detectSiteType).not.toHaveBeenCalled();
   });
 
   it('creates the brand on an active plan', async () => {
@@ -127,5 +137,128 @@ describe('the new brand page', () => {
       expect.objectContaining({ organizationId: 'org-1', name: 'Acme' }),
     );
     expect(openUpgrade).not.toHaveBeenCalled();
+    // Its kind of site is read from its home page (Step 0), in the background.
+    expect(detectSiteType).toHaveBeenCalledExactlyOnceWith('b1');
+  });
+
+  it('takes the detected site type into the brand', async () => {
+    detectSiteType.mockResolvedValue({ siteType: 'ecommerce', industry: 'E-commerce & Retail' });
+    await render(false);
+    await reachCreate();
+    await clickContinue();
+    expect(store.updateBrand).toHaveBeenCalledWith('b1', {
+      siteType: 'ecommerce',
+      siteTypeSource: 'auto',
+      industry: 'E-commerce & Retail',
+    });
+  });
+
+  it('goes on to the topics when the detection fails', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    detectSiteType.mockRejectedValue(new Error('down'));
+    await render(false);
+    await reachCreate();
+    await clickContinue();
+    expect(suggestTopics).toHaveBeenCalled();
+    expect(store.updateBrand).not.toHaveBeenCalledWith(
+      'b1',
+      expect.objectContaining({ siteType: expect.anything() }),
+    );
+  });
+});
+
+describe("the new brand page's prompts step", () => {
+  async function reachPrompts() {
+    suggestTopics.mockResolvedValue({ topics: ['Coffee'] });
+    generatePromptsFromTopics.mockResolvedValue({
+      topicPrompts: [
+        { topic: 'Coffee', prompts: ['best coffee beans', 'cheapest coffee grinder'] },
+      ],
+    });
+    promptActions.getPromptCapacity.mockResolvedValue({ maxPrompts: 50, used: 0 });
+    promptActions.savePromptSet.mockResolvedValue({ promptSet: { id: 'ps1' } });
+    suggestCompetitors.mockResolvedValue({ competitors: [], isEcommerce: false });
+    await render(false);
+    await reachCreate();
+    await clickContinue();
+    await clickButton('Looks good');
+  }
+  const boxes = () => container.querySelectorAll<HTMLButtonElement>('[role="checkbox"]');
+
+  it('offers the prompts as a checklist, all ticked within the plan', async () => {
+    await reachPrompts();
+    expect(container.textContent).toContain('2 of 2 prompts ticked');
+    expect([...boxes()].map((b) => b.getAttribute('aria-checked'))).toEqual(['true', 'true']);
+  });
+
+  it('saves only the ticked prompts', async () => {
+    await reachPrompts();
+    await act(async () => boxes()[1].click());
+    expect(container.textContent).toContain('1 of 2 prompts ticked');
+    await clickContinue();
+    const { prompts } = promptActions.savePromptSet.mock.calls[0][0];
+    expect(prompts.map((p: { text: string }) => p.text)).toEqual(['best coffee beans']);
+  });
+
+  it('cannot continue with nothing ticked', async () => {
+    await reachPrompts();
+    await act(async () => boxes()[0].click());
+    await act(async () => boxes()[1].click());
+    const next = [...container.querySelectorAll('button')].find(
+      (b) => b.textContent === 'Continue',
+    );
+    expect(next!.disabled).toBe(true);
+  });
+});
+
+describe("the new brand page's brand_add flow", () => {
+  const flows = () =>
+    analytics.track.mock.calls.filter(([event]) => String(event).startsWith('flow_'));
+
+  it('starts as the page opens and completes at Finish, never sending the brand', async () => {
+    suggestTopics.mockResolvedValue({ topics: ['Coffee'] });
+    generatePromptsFromTopics.mockResolvedValue({
+      topicPrompts: [{ topic: 'Coffee', prompts: ['best coffee beans'] }],
+    });
+    promptActions.getPromptCapacity.mockResolvedValue({ maxPrompts: 50, used: 0 });
+    promptActions.savePromptSet.mockResolvedValue({ promptSet: { id: 'ps1' } });
+    suggestCompetitors.mockResolvedValue({ competitors: [], isEcommerce: false });
+    await render(false);
+    expect(flows()).toEqual([['flow_started', { flow: 'brand_add' }]]);
+    await reachCreate();
+    await clickContinue();
+    await clickButton('Looks good');
+    await clickContinue();
+    await clickButton('Skip & start tracking');
+    expect(flows()).toEqual([
+      ['flow_started', { flow: 'brand_add' }],
+      ['flow_completed', { flow: 'brand_add' }],
+    ]);
+    expect(JSON.stringify(analytics.track.mock.calls)).not.toMatch(/Acme|acme\.com|coffee/i);
+  });
+
+  it('fails with the plan limit’s code when the brand isn’t created', async () => {
+    brandActions.createBrand.mockResolvedValue({
+      error: 'Your plan allows 1 brand.',
+      code: 'plan_limit',
+    });
+    await render(false);
+    await reachCreate();
+    await clickContinue();
+    expect(flows()).toEqual([
+      ['flow_started', { flow: 'brand_add' }],
+      ['flow_failed', { flow: 'brand_add', error_code: 'plan_limit' }],
+    ]);
+  });
+
+  it('fails with no code when saving the brand broke', async () => {
+    brandActions.createBrand.mockRejectedValue(new Error('Server error: 500'));
+    await render(false);
+    await reachCreate();
+    await clickContinue();
+    expect(flows()).toEqual([
+      ['flow_started', { flow: 'brand_add' }],
+      ['flow_failed', { flow: 'brand_add', error_code: null }],
+    ]);
   });
 });

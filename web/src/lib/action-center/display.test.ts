@@ -54,8 +54,87 @@ describe('actionTexts', () => {
     expect(() => actionGoal(kind, t)).not.toThrow();
   });
 
-  it("holds copy for all sixty-two definitions, the ten person-sent kinds and the catalog check's", () => {
-    expect(ACTION_KINDS).toHaveLength(73);
+  it("holds copy for all sixty-two definitions and the AC plan's, the eleven person-sent kinds, the catalog check's and Business Hub's two", () => {
+    expect(ACTION_KINDS).toHaveLength(79);
+  });
+
+  it('names the weekly Business Hub reminder after the last entry’s days, with no signals tag', () => {
+    expect(
+      actionTexts(
+        action({
+          kind: 'business_hub_numbers',
+          payload: { lastEnd: '2026-11-03', lastDays: 7 },
+        }),
+        t,
+      ),
+    ).toEqual({
+      title: "Enter this week's ChatGPT Business Hub numbers",
+      description:
+        "Your last Business Hub numbers cover the 7 days to 2026-11-03. Business Hub shows only the last 7 or 28 days, so a week that isn't entered is gone from it.",
+    });
+    expect(actionTexts(action({ kind: 'business_hub_numbers', payload: {} }), t).description).toBe(
+      messages.actionCenter.actionTexts.business_hub_numbers.descriptionGeneric,
+    );
+    expect(
+      actionContextTags(action({ kind: 'business_hub_numbers', signalCount: 0, payload: {} }), t),
+    ).toEqual([]);
+  });
+
+  it('names the ChatGPT Business Hub setup for where claiming is open, or the waitlist, with its evidence', () => {
+    const evidence = { answers: 120, named: 34, cited: 9, since: '2026-10-13T03:00:00.000Z' };
+    const open = actionTexts(
+      action({ kind: 'business_hub_setup', payload: { variant: 'open', evidence } }),
+      t,
+    );
+    expect(open).toEqual({
+      title: 'Set up your ChatGPT Business Hub profile',
+      // Plurals read as their `other` branch here (see `t` above).
+      description:
+        'ChatGPT named you in 34 of 120 tracked answers in the last 30 days; your site was cited in 9.',
+    });
+    const waitlist = actionTexts(
+      action({ kind: 'business_hub_setup', payload: { variant: 'waitlist', evidence } }),
+      t,
+    );
+    expect(waitlist.title).toBe('Get your business into ChatGPT Business Hub');
+    // No evidence on it: no "0 of 0".
+    expect(actionTexts(action({ kind: 'business_hub_setup', payload: {} }), t).description).toBe(
+      messages.actionCenter.actionTexts.business_hub_setup.descriptionGeneric,
+    );
+    // Raised once from its answers, not from signals: no "0 signals".
+    expect(
+      actionContextTags(
+        action({
+          kind: 'business_hub_setup',
+          signalCount: 0,
+          payload: { targetEntity: 'platforms', targetCount: 1 },
+        }),
+        (key, values) => `${key}:${values?.count ?? ''}`,
+      ),
+    ).toEqual(['tags.platforms:1']);
+  });
+
+  it('says a store’s topic action optimizes its category page when that is its play (AC plan P-7)', () => {
+    const topic = (play: string) =>
+      action({
+        kind: 'create_content_for_topics',
+        payload: { targetEntity: 'topics', targetCount: 0, play: { id: play } },
+      });
+    expect(actionTexts(topic('category_page'), t)).toEqual({
+      title: 'Optimize a category page for a topic gap',
+      description:
+        "You barely appear in this topic, and its category page is live: optimizing that page answers the topic's questions.",
+    });
+    expect(actionGoal('create_content_for_topics', t, { play: { id: 'category_page' } })).toBe(
+      'Make your category page the answer for this topic.',
+    );
+    // A buying guide is a new page: the topic action's own words.
+    expect(actionTexts(topic('buying_guide'), t).description).toBe(
+      'You barely appear in this topic, and new content is needed rather than edits.',
+    );
+    expect(actionGoal('create_content_for_topics', t, { play: { id: 'buying_guide' } })).toBe(
+      'Build coverage for a topic you are missing.',
+    );
   });
 
   it('names a product or category sent from Product Visibility after it (ECOM-013)', () => {
@@ -196,6 +275,13 @@ describe('actionTexts', () => {
       t,
     );
     expect(texts.title).toBe('Expand the tool list');
+    // Its year as Content shows it: a past one reads as this year.
+    const year = new Date().getUTCFullYear();
+    const dated = actionTexts(
+      action({ kind: 'content_opportunity', payload: { title: 'Best tools of 2025' } }),
+      t,
+    );
+    expect(dated.title).toBe(`Best tools of ${Math.max(year, 2025)}`);
   });
 
   it('names a draft sent from the Content Editor after its page (CE-015)', () => {
@@ -316,6 +402,32 @@ describe('actionTexts for a page sent from Site Audit', () => {
   });
 });
 
+describe('actionTexts for a finding sent from Chat', () => {
+  it('reads the title and the finding the person approved, and its goal', () => {
+    const sent = action({
+      kind: 'chat_finding',
+      payload: {
+        source: 'chat',
+        title: 'Win back pricing citations on /pricing',
+        why: 'Google AI Overviews stopped citing /pricing for 2 prompts.',
+        goal: 'Get /pricing cited again for pricing prompts.',
+      },
+    });
+    expect(actionTexts(sent, t)).toEqual({
+      title: 'Win back pricing citations on /pricing',
+      description: 'Google AI Overviews stopped citing /pricing for 2 prompts.',
+    });
+    expect(actionGoal('chat_finding', t, sent.payload)).toBe(
+      'Get /pricing cited again for pricing prompts.',
+    );
+    expect(actionGoal('chat_finding', t, {})).toBe(
+      'Do the tasks, so the prompts and pages this finding names move in AI answers.',
+    );
+    // No detection signals: no "0 signals" chip.
+    expect(actionContextTags({ ...sent, signalCount: 0 }, t)).toEqual([]);
+  });
+});
+
 describe('humanizeKind', () => {
   it('reads a definition id as the phrase it was written to be', () => {
     expect(humanizeKind('expand_platform_visibility')).toBe('Expand platform visibility');
@@ -428,6 +540,74 @@ describe('actionEventText', () => {
     expect(actionEventText(event('task_sent', { to: 'webhook', title: 'x' }), tPage, t)).toBe(
       'Sent to the webhook: x',
     );
+    // Added to the open opportunity on its question instead of a second one.
+    expect(
+      actionEventText(event('task_sent', { to: 'content', merged: true, title: 'x' }), tPage, t),
+    ).toBe('Added to the open Content opportunity for the same question: x');
+  });
+
+  it('says a stale action was kept (00432)', () => {
+    expect(actionEventText(event('still_relevant', {}), tPage, t)).toBe(
+      'Kept as still relevant: no longer stale',
+    );
+  });
+
+  it('names a Chat agent run on the action, how it ended, and Run with Chat (W2-17)', () => {
+    expect(
+      actionEventText(
+        event('agent_run_started', { source: 'chat', agent: 'Citation win-back' }),
+        tPage,
+        t,
+      ),
+    ).toBe('Agent run started · Citation win-back');
+    expect(
+      actionEventText(
+        event('agent_run_completed', { agent: 'Citation win-back', to: 'done' }),
+        tPage,
+        t,
+      ),
+    ).toBe('Agent run completed · Citation win-back');
+    expect(
+      actionEventText(
+        event('agent_run_completed', {
+          agent: 'Citation win-back',
+          to: 'stopped',
+          stop_reason: 'action_closed',
+        }),
+        tPage,
+        t,
+      ),
+    ).toBe('Agent run stopped · Citation win-back · action closed');
+    expect(actionEventText(event('chat_started', { source: 'chat' }), tPage, t)).toBe(
+      'Chat started on this action',
+    );
+    // A page the agent sent out on its own (AUTONOMOUS-GO-LIVE §6.4).
+    expect(
+      actionEventText(
+        event('agent_went_live', {
+          source: 'chat',
+          agent: 'Publisher',
+          title: 'Pricing FAQ',
+          to: 'Webflow',
+        }),
+        tPage,
+        t,
+      ),
+    ).toBe('Publisher sent “Pricing FAQ” to Webflow on its own');
+    expect(
+      actionEventText(
+        event('agent_went_live', { agent: null, title: 'Pricing FAQ', to: 'Wix' }),
+        tPage,
+        t,
+      ),
+    ).toBe('An agent sent “Pricing FAQ” to Wix on its own');
+    // A deleted agent's lines end without a name, and without an empty separator.
+    expect(actionEventText(event('agent_run_started', { agent: null }), tPage, t)).toBe(
+      'Agent run started',
+    );
+    expect(
+      actionEventText(event('agent_run_completed', { agent: null, to: 'failed' }), tPage, t),
+    ).toBe('Agent run failed');
   });
 
   it('reads the 30-day position result with its counts', () => {
@@ -451,6 +631,76 @@ describe('actionEventText', () => {
         t,
       ),
     ).toBe('Checked automatically and done: Refresh the pricing page');
+  });
+
+  /** What Chat did, from its History events (CHAT-09 §D–E; the owner's decision of 2026-10-31). */
+  it('says an action came from Chat, and what Chat attached, added or finished', () => {
+    expect(actionEventText(event('created', { source: 'chat' }), tPage, t)).toBe(
+      'Action created from Chat',
+    );
+    expect(actionEventText(event('created', { source: 'ads' }), tPage, t)).toBe(
+      'Action created from Ads',
+    );
+    expect(actionEventText(event('created', { source: 'traffic_pages' }), tPage, t)).toBe(
+      'Action created',
+    );
+    expect(actionEventText(event('created', {}), tPage, t)).toBe('Action created');
+    expect(
+      actionEventText(
+        event('file_attached', {
+          source: 'chat',
+          task: null,
+          title: 'Add a pricing FAQ block to /pricing',
+          file: 'Pricing FAQ',
+        }),
+        tPage,
+        t,
+      ),
+    ).toBe('Attached from Chat to Add a pricing FAQ block to /pricing: “Pricing FAQ”');
+    // A library task is named by its template, once.
+    expect(
+      actionEventText(
+        event('task_ready_for_review', { source: 'chat', task: 'refresh_content', title: null }),
+        tPage,
+        t,
+      ),
+    ).toBe('Ready for review, from Chat: Refresh outdated content');
+    expect(
+      actionEventText(
+        event('evidence_attached', { source: 'chat', finding: 'Lost 6 citations on /pricing.' }),
+        tPage,
+        t,
+      ),
+    ).toBe('Finding added from Chat: “Lost 6 citations on /pricing.”');
+    // Undo of an action Chat sent, by who clicked it (CHAT-20 §10b).
+    expect(
+      actionEventText(event('cancelled', { source: 'chat', via: 'undo', by: 'Cihan' }), tPage, t),
+    ).toBe('Cancelled from Chat by Cihan · undo');
+    expect(actionEventText(event('cancelled', { source: 'chat', by: null }), tPage, t)).toBe(
+      'Cancelled from Chat by a teammate · undo',
+    );
+    // A finding added with its note and sources, and which one was withdrawn.
+    expect(
+      actionEventText(
+        event('evidence_attached', {
+          source: 'chat',
+          finding: 'Lost 6 citations.',
+          note: 'Same pages as this action',
+          sources: ['Citations', '/pricing'],
+        }),
+        tPage,
+        t,
+      ),
+    ).toBe(
+      'Finding added from Chat: “Lost 6 citations.” · Note: Same pages as this action · From: Citations, /pricing',
+    );
+    expect(
+      actionEventText(
+        event('evidence_withdrawn', { source: 'chat', finding: 'Lost 6 citations.' }),
+        tPage,
+        t,
+      ),
+    ).toBe('Finding from Chat withdrawn with Undo: “Lost 6 citations.”');
   });
 
   it("passes a task's own title and the measured verdict", () => {
@@ -502,6 +752,19 @@ describe('History events', () => {
     ])
     .map((match) => match[1] ?? match[2]);
 
+  // Chat writes its own (CHAT-09 §D–E): its changes, and their Undo.
+  const chatWritten = [
+    '../actions/chat-action-center.ts',
+    './ready-for-review.ts',
+    '../chat/undo-action-center.ts',
+  ].flatMap((file) =>
+    [
+      ...readFileSync(join(__dirname, file), 'utf8').matchAll(
+        /event: '(\w+)'|historyEvent\([^,]+,\s*'(\w+)'/g,
+      ),
+    ].map((match) => match[1] ?? match[2]),
+  );
+
   const tPage = createTranslator({
     locale: 'en',
     messages,
@@ -523,6 +786,10 @@ describe('History events', () => {
     reviews: 0,
     day: 0,
     final: 'no',
+    source: '',
+    finding: 'Lost 6 citations',
+    file: 'Pricing FAQ',
+    by: 'Cihan',
   };
   const eventText = (event: string, data: Partial<typeof values> = {}) =>
     tPage(`drawer.events.${event}` as Parameters<typeof tPage>[0], { ...values, ...data });
@@ -549,9 +816,24 @@ describe('History events', () => {
     );
   });
 
-  it.each([...new Set([...logged, ...written])])('has a History line for %s', (event) => {
-    expect(() => eventText(event)).not.toThrow();
+  it("reads the events Chat writes, and their Undo's", () => {
+    expect(chatWritten.sort()).toEqual([
+      'cancelled',
+      'evidence_attached',
+      'evidence_withdrawn',
+      'file_attached',
+      'file_detached',
+      'task_ready_for_review',
+      'task_review_withdrawn',
+    ]);
   });
+
+  it.each([...new Set([...logged, ...written, ...chatWritten])])(
+    'has a History line for %s',
+    (event) => {
+      expect(() => eventText(event)).not.toThrow();
+    },
+  );
 
   /** Tasks the writer left for review are said after the ones it wrote (AC-010). */
   it('says how many tasks wait for review, when any do', () => {
@@ -641,5 +923,75 @@ describe('assigneeLabel and labelInitials', () => {
     expect(labelInitials('ada.lovelace@acme.example')).toBe('AL');
     expect(labelInitials('cg@acme.example')).toBe('C');
     expect(labelInitials('Grace Brewster Hopper')).toBe('GB');
+  });
+});
+
+describe('actionTexts naming what the action is about', () => {
+  const tx = createTranslator({
+    locale: 'en',
+    messages,
+    namespace: 'actionCenter.actionTexts',
+  }) as unknown as (key: string, values?: Record<string, string | number>) => string;
+  const item = (kind: string, payload: Record<string, unknown>) =>
+    ({ kind, payload }) as Pick<ActionItem, 'kind' | 'payload'>;
+
+  it('names the competitor, and the prompt it leads most on', () => {
+    const payload = {
+      targetEntity: 'competitors',
+      targetCount: 1,
+      targets: [{ id: 'c1', label: 'Northbound Roasters' }],
+    };
+    expect(actionTexts(item('close_competitor_gap', payload), tx).title).toBe(
+      'Close the visibility gap with Northbound Roasters',
+    );
+    expect(
+      actionTexts(
+        item('close_competitor_gap', {
+          ...payload,
+          leadPrompt: { id: 'p1', text: 'best coffee subscription' },
+        }),
+        tx,
+      ).title,
+    ).toBe('Close the gap with Northbound Roasters, starting with “best coffee subscription”');
+  });
+
+  it('names the first prompt and how many more', () => {
+    const payload = {
+      targetEntity: 'prompts',
+      targetCount: 3,
+      targets: [{ id: 'p1', label: 'best decaf coffee beans' }, { id: 'p2' }],
+    };
+    expect(actionTexts(item('expand_prompt_visibility', payload), tx).title).toBe(
+      'Get into AI answers on “best decaf coffee beans” and 2 more prompts',
+    );
+    expect(
+      actionTexts(item('recover_lost_mentions', { ...payload, targetCount: 1 }), tx).title,
+    ).toBe('Win back mentions on “best decaf coffee beans”');
+    // Its first prompt removed since (AC-009): counted, not named.
+    expect(
+      actionTexts(item('protect_visibility', { ...payload, removedKeys: ['p1'] }), tx).title,
+    ).toBe('Protect visibility across 3 prompts');
+  });
+
+  it('says why a content opportunity matters instead of where it came from', () => {
+    const payload = {
+      title: 'Answer whether a subscription is worth it',
+      decision: 'optimize',
+      pages: ['https://brewline.example/subscriptions'],
+      targetEntity: 'prompts',
+      targetCount: 2,
+      targets: [{ id: 'p1', text: 'Is a coffee subscription worth it?' }],
+    };
+    expect(actionTexts(item('content_opportunity', payload), tx).description).toBe(
+      'An update to /subscriptions that answers “Is a coffee subscription worth it?” and 1 more prompt.',
+    );
+    expect(
+      actionTexts(item('content_opportunity', { ...payload, decision: 'create', pages: [] }), tx)
+        .description,
+    ).toBe('A new page that answers “Is a coffee subscription worth it?” and 1 more prompt.');
+    // Sent without prompts: its kind's sentence.
+    expect(
+      actionTexts(item('content_opportunity', { title: 'X', targetCount: 0 }), tx).description,
+    ).toBe(messages.actionCenter.actionTexts.content_opportunity.description);
   });
 });

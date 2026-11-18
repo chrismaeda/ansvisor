@@ -24,6 +24,7 @@ export interface TaskReview {
   id: string;
   actionId: string;
   actionNo: number | null;
+  brandNo?: number | null;
   title: string;
   details: ActionTaskDetails | null;
   /** What it was written without. */
@@ -42,7 +43,7 @@ export async function getTaskReviews(brandId: string): Promise<TaskReview[]> {
   const { data, error } = await supabase
     .from('action_task_reviews')
     .select(
-      'id, action_id, title, details, missing, created_at, actions!inner(action_no, brand_id, status, deleted_at)',
+      'id, action_id, title, details, missing, created_at, actions!inner(action_no, brand_no, brand_id, status, deleted_at)',
     )
     .eq('actions.brand_id', brandId)
     .is('actions.deleted_at', null)
@@ -52,11 +53,13 @@ export async function getTaskReviews(brandId: string): Promise<TaskReview[]> {
   return (data ?? []).map((row) => {
     const action = (Array.isArray(row.actions) ? row.actions[0] : row.actions) as {
       action_no: number | null;
+      brand_no: number | null;
     } | null;
     return {
       id: row.id,
       actionId: row.action_id,
       actionNo: action?.action_no ?? null,
+      brandNo: action?.brand_no ?? null,
       title: row.title,
       details: parseTaskDetails(row.details),
       missing: (row.missing ?? []).filter((field: string): field is TaskReviewField =>
@@ -92,7 +95,7 @@ export async function approveTaskReview(
   reviewId: string,
   edit: TaskDetailsEdit & { title: string },
 ): Promise<ApproveTaskReviewResult> {
-  await assertWritable();
+  await assertWritable({ brandId });
   if (!isTaskDetailsEdit(edit) || typeof edit.title !== 'string') return { error: 'invalid' };
   const supabase = await createClient();
   const { data: row, error: readError } = await supabase
@@ -125,7 +128,7 @@ export async function approveTaskReview(
 
 /** A task waiting for review dropped: it never reaches the action. */
 export async function dismissTaskReview(brandId: string, reviewId: string): Promise<void> {
-  await assertWritable();
+  await assertWritable({ brandId });
   const supabase = await createClient();
   const { data: row, error: readError } = await supabase
     .from('action_task_reviews')

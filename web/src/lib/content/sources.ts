@@ -1,4 +1,5 @@
 import { classifyDomain, normalizeDomain, type SourceCategory } from '@/lib/citations/classify';
+import { parseHtml } from './dom';
 
 /**
  * The editor's Sources tab (Content Editor CE-008, spec §10): every source a
@@ -42,6 +43,8 @@ export interface DraftSourcesData {
   gscQueries: { query: string; clicks: number; impressions: number }[];
   brandDomains: string[];
   competitorDomains: string[];
+  /** The sites the brand trusts (00449), read with the draft's brand; none before it. */
+  trustedDomains?: string[];
 }
 
 /** A person's choice on one source: left out, or added by hand. */
@@ -78,7 +81,7 @@ export function normalizeQuery(query: string): string {
   return query.trim().replace(/\s+/g, ' ').toLowerCase();
 }
 
-const STOP_WORDS = new Set(
+export const STOP_WORDS = new Set(
   (
     'the and for with what which how are is was were you your our from that this does do did can ' +
     'vs not but has have had who why when where will would should could into about than then there ' +
@@ -135,7 +138,8 @@ export interface DraftDoc {
 
 /** Reads the draft's headings, paragraphs and links from its HTML. */
 export function readDraftDoc(html: string): DraftDoc {
-  const doc = new DOMParser().parseFromString(html, 'text/html');
+  // The content DOM's parser (dom.ts): the browser's, or jsdom's on the server (W4-14).
+  const doc = parseHtml(html);
   const headings = [...doc.querySelectorAll('h1, h2, h3')].map((h) => {
     const text = (h.textContent ?? '').trim();
     return { level: Number(h.tagName.slice(1)), text, words: new Set(wordsOf(text)) };

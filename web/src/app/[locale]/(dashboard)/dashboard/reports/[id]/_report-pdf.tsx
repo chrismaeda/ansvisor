@@ -7,10 +7,16 @@
  *
  * Inter is embedded from /public/fonts so Turkish characters (ş, ğ, ı…) in
  * brand names and prompt texts render correctly — the built-in Helvetica
- * only covers WinAnsi.
+ * only covers WinAnsi. It is registered for each PDF (reportPdf): one Inter
+ * for every PDF of a tab lost letters from the second PDF on.
+ *
+ * With a white label kit in use (00429) it is the agency's: its logo and
+ * "Prepared for" the brand with the client's logo on top, its color, its
+ * footer line and its name as the author. Without one, Ansvisor's as before.
  */
 
 import {
+  pdf,
   Document,
   Page,
   Text,
@@ -21,21 +27,19 @@ import {
   Path,
   Polyline,
   Line,
+  Image,
 } from '@react-pdf/renderer';
 import type { Report, ReportPromptPerf } from '@/lib/actions/reports';
-import { formatDate } from '@/lib/format';
+import { formatDate, formatMoney, percentChange } from '@/lib/format';
+import { getPlatformName } from '@/lib/traffic-platforms';
+import { withInter } from '@/lib/pdf-font';
+import { auditScoreView } from '@/lib/reports/audit-score';
+import type { ScoreRange } from '@/lib/audit/score-range';
+import { reportLook, type ReportBranding } from '@/lib/white-label/kit';
 
-Font.register({
-  family: 'Inter',
-  fonts: [
-    { src: '/fonts/Inter-Regular.ttf', fontWeight: 400 },
-    { src: '/fonts/Inter-Bold.ttf', fontWeight: 700 },
-  ],
-});
 // Word-splitting hyphenation looks broken in tables; wrap whole words only.
 Font.registerHyphenationCallback((word) => [word]);
 
-const INDIGO = '#6366f1';
 const SLATE = '#94a3b8';
 const TEXT = '#111827';
 const MUTED = '#6b7280';
@@ -45,7 +49,6 @@ const RED = '#dc2626';
 
 const styles = StyleSheet.create({
   page: {
-    fontFamily: 'Inter',
     fontSize: 9,
     color: TEXT,
     paddingTop: 40,
@@ -54,7 +57,16 @@ const styles = StyleSheet.create({
   },
   title: { fontSize: 16, fontWeight: 700 },
   subtitle: { fontSize: 9, color: MUTED, marginTop: 4 },
-  rule: { height: 2, backgroundColor: INDIGO, marginTop: 10, marginBottom: 16 },
+  rule: { height: 2, marginTop: 10, marginBottom: 16 },
+  coverRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 14,
+  },
+  coverLogo: { height: 28, maxWidth: 160, objectFit: 'contain' },
+  coverCompany: { fontSize: 11, fontWeight: 700 },
+  preparedFor: { fontSize: 10, marginTop: 4 },
   section: { marginBottom: 16 },
   sectionTitle: { fontSize: 11, fontWeight: 700, marginBottom: 6 },
   paragraph: { fontSize: 9, lineHeight: 1.5, color: TEXT },
@@ -90,7 +102,7 @@ const styles = StyleSheet.create({
     borderRadius: 2.5,
     overflow: 'hidden',
   },
-  barFill: { height: 5, backgroundColor: INDIGO, borderRadius: 2.5 },
+  barFill: { height: 5, borderRadius: 2.5 },
   barValue: { width: 40, fontSize: 8, textAlign: 'right' },
   tableHeader: {
     flexDirection: 'row',
@@ -122,7 +134,23 @@ const styles = StyleSheet.create({
   footerText: { fontSize: 7, color: MUTED },
 });
 
-function DeltaText({ value, zeroBaseCount }: { value: number | null; zeroBaseCount?: number }) {
+/** What a Site Audit score's "± 2" means, as the audit report's `audit.range` strings say it. */
+function scoreRangeSentence(range: ScoreRange): string {
+  return range.low === range.high
+    ? `This page's last ${range.audits} audits all scored ${range.low}.`
+    : `This page's last ${range.audits} audits scored ${range.low} to ${range.high}, changes to the page included.`;
+}
+
+function DeltaText({
+  value,
+  zeroBaseCount,
+  unit = '%',
+}: {
+  value: number | null;
+  zeroBaseCount?: number;
+  /** '%' for a percentage change; '' for points, such as the Site Audit score's. */
+  unit?: '%' | '';
+}) {
   if (zeroBaseCount !== undefined) {
     return <Text style={[styles.delta, { color: GREEN }]}>+{zeroBaseCount} new</Text>;
   }
@@ -131,7 +159,8 @@ function DeltaText({ value, zeroBaseCount }: { value: number | null; zeroBaseCou
   return (
     <Text style={[styles.delta, { color: up ? GREEN : RED }]}>
       {up ? '+' : ''}
-      {value}%
+      {value}
+      {unit}
     </Text>
   );
 }
@@ -141,10 +170,12 @@ function TrendSvg({
   data,
   width,
   height,
+  color,
 }: {
   data: { date: string; score: number; competitors: number | null }[];
   width: number;
   height: number;
+  color: string;
 }) {
   const scores = data.flatMap((d) => [d.score, ...(d.competitors !== null ? [d.competitors] : [])]);
   const yMax = Math.max(...scores, 1) * 1.25;
@@ -173,8 +204,8 @@ function TrendSvg({
           strokeWidth={0.5}
         />
       ))}
-      <Path d={areaPath} fill={INDIGO} fillOpacity={0.12} />
-      <Polyline points={brandPoints} fill="none" stroke={INDIGO} strokeWidth={1.5} />
+      <Path d={areaPath} fill={color} fillOpacity={0.12} />
+      <Polyline points={brandPoints} fill="none" stroke={color} strokeWidth={1.5} />
       {hasCompetitors && (
         <Polyline
           points={compPoints}
@@ -189,12 +220,27 @@ function TrendSvg({
   );
 }
 
-function HBar({ label, pct, value }: { label: string; pct: number; value: string }) {
+function HBar({
+  label,
+  pct,
+  value,
+  color,
+}: {
+  label: string;
+  pct: number;
+  value: string;
+  color: string;
+}) {
   return (
     <View style={styles.barRow}>
       <Text style={styles.barLabel}>{label}</Text>
       <View style={styles.barTrack}>
-        <View style={[styles.barFill, { width: `${Math.min(Math.max(pct, 0), 100)}%` }]} />
+        <View
+          style={[
+            styles.barFill,
+            { width: `${Math.min(Math.max(pct, 0), 100)}%`, backgroundColor: color },
+          ]}
+        />
       </View>
       <Text style={styles.barValue}>{value}</Text>
     </View>
@@ -229,8 +275,21 @@ function PromptTable({ title, prompts }: { title: string; prompts: ReportPromptP
   );
 }
 
-export function ReportPdfDocument({ report }: { report: Report }) {
+export function ReportPdfDocument({
+  report,
+  branding = null,
+  fontFamily,
+}: {
+  report: Report;
+  /** The kit in use, its logos as PNG or JPEG; null for Ansvisor's look. */
+  branding?: ReportBranding | null;
+  /** The Inter registered for this PDF (withInter). */
+  fontFamily: string;
+}) {
   const { payload } = report;
+  // The Site Audit score in points; older reports stored it on a 0–1 scale.
+  const auditScore = payload.auditScore ? auditScoreView(payload.auditScore) : null;
+  const look = reportLook(branding);
   // Every metric field is optional — templates only gather their own
   // sections, so each block below guards on its payload field.
   const maxSov = Math.max(...(payload.shareOfVoice?.byPlatform.map((p) => p.sov) ?? []), 1);
@@ -309,15 +368,36 @@ export function ReportPdfDocument({ report }: { report: Report }) {
   );
 
   return (
-    <Document title={report.title} author="Ansvisor" creator="Ansvisor">
-      <Page size="A4" style={styles.page}>
+    <Document title={report.title} author={look.author} creator={look.author}>
+      <Page size="A4" style={[styles.page, { fontFamily }]}>
+        {/* The kit's cover: the agency, and the client it is prepared for. */}
+        {branding && (
+          <View style={styles.coverRow}>
+            {branding.logo ? (
+              // eslint-disable-next-line jsx-a11y/alt-text -- a PDF image has no alt text
+              <Image src={branding.logo} style={styles.coverLogo} />
+            ) : (
+              <Text style={styles.coverCompany}>{branding.companyName ?? ''}</Text>
+            )}
+            {branding.clientLogo && (
+              // eslint-disable-next-line jsx-a11y/alt-text -- a PDF image has no alt text
+              <Image src={branding.clientLogo} style={styles.coverLogo} />
+            )}
+          </View>
+        )}
+
         {/* Header */}
         <Text style={styles.title}>{report.title}</Text>
+        {branding && (
+          <Text style={[styles.preparedFor, { color: look.textAccent }]}>
+            Prepared for {payload.brandName}
+          </Text>
+        )}
         <Text style={styles.subtitle}>
           {payload.brandName} · {formatDate(report.dateFrom)} — {formatDate(report.dateTo)} ·
           Generated on {formatDate(report.createdAt)}
         </Text>
-        <View style={styles.rule} />
+        <View style={[styles.rule, { backgroundColor: look.accent }]} />
 
         {/* Executive summary */}
         <View style={styles.section}>
@@ -350,14 +430,14 @@ export function ReportPdfDocument({ report }: { report: Report }) {
         {trend.length > 1 && (
           <View style={styles.section} wrap={false}>
             <Text style={styles.sectionTitle}>Visibility Trend</Text>
-            <TrendSvg data={trend} width={515} height={110} />
+            <TrendSvg data={trend} width={515} height={110} color={look.accent} />
             <View style={styles.axisLabelRow}>
               <Text style={styles.axisLabel}>{trend[0].date}</Text>
               <Text style={styles.axisLabel}>{trend[trend.length - 1].date}</Text>
             </View>
             <View style={styles.legendRow}>
               <View style={styles.legendItem}>
-                <View style={[styles.legendSwatch, { backgroundColor: INDIGO }]} />
+                <View style={[styles.legendSwatch, { backgroundColor: look.accent }]} />
                 <Text style={styles.legendText}>Your Brand</Text>
               </View>
               {hasCompetitorTrend && (
@@ -382,6 +462,7 @@ export function ReportPdfDocument({ report }: { report: Report }) {
                 label={p.provider}
                 pct={(p.sov / maxSov) * 100}
                 value={`${p.sov}%`}
+                color={look.accent}
               />
             ))}
           </View>
@@ -412,7 +493,7 @@ export function ReportPdfDocument({ report }: { report: Report }) {
                   style={[
                     styles.cell,
                     { flex: 1, paddingRight: 8 },
-                    c.isOwnBrand ? { fontWeight: 700, color: INDIGO } : {},
+                    c.isOwnBrand ? { fontWeight: 700, color: look.textAccent } : {},
                   ]}
                 >
                   {c.name}
@@ -578,6 +659,116 @@ export function ReportPdfDocument({ report }: { report: Report }) {
           </View>
         )}
 
+        {/* HubSpot's AI-sourced pipeline (#2140) */}
+        {payload.aiPipeline && (
+          <View style={styles.section} wrap={false}>
+            <Text style={styles.sectionTitle}>AI-sourced pipeline (HubSpot)</Text>
+            <View style={styles.kpiRow}>
+              {[
+                {
+                  label: 'AI-sourced contacts',
+                  value: String(payload.aiPipeline.totals.contacts),
+                  change: percentChange(
+                    payload.aiPipeline.totals.contacts,
+                    payload.aiPipeline.totals.contactsPrev,
+                  ),
+                },
+                {
+                  label: 'AI-influenced deals',
+                  value: String(payload.aiPipeline.totals.deals),
+                  change: null,
+                },
+                {
+                  label: 'Open pipeline',
+                  value: formatMoney(
+                    payload.aiPipeline.totals.openPipeline,
+                    payload.aiPipeline.currency,
+                  ),
+                  change: null,
+                },
+                {
+                  label: 'Won revenue',
+                  value: formatMoney(
+                    payload.aiPipeline.totals.wonRevenue,
+                    payload.aiPipeline.currency,
+                  ),
+                  change: percentChange(
+                    payload.aiPipeline.totals.wonRevenue,
+                    payload.aiPipeline.totals.wonRevenuePrev,
+                  ),
+                },
+              ].map((kpi) => (
+                <View key={kpi.label} style={styles.kpiBox}>
+                  <Text style={styles.kpiLabel}>{kpi.label}</Text>
+                  <View style={styles.kpiValueRow}>
+                    <Text style={styles.kpiValue}>{kpi.value}</Text>
+                    <DeltaText value={kpi.change} />
+                  </View>
+                </View>
+              ))}
+            </View>
+            {payload.aiPipeline.byEngine.length > 0 && (
+              <View style={{ marginTop: 6 }}>
+                <View style={styles.tableHeader}>
+                  <Text style={[styles.tableHeaderCell, { flex: 1 }]}>AI engine</Text>
+                  <Text style={[styles.tableHeaderCell, { width: 60, textAlign: 'right' }]}>
+                    Contacts
+                  </Text>
+                  <Text style={[styles.tableHeaderCell, { width: 80, textAlign: 'right' }]}>
+                    Won revenue
+                  </Text>
+                </View>
+                {payload.aiPipeline.byEngine.map((e) => (
+                  <View key={e.source} style={styles.tableRow}>
+                    <Text style={[styles.cell, { flex: 1 }]}>{getPlatformName(e.source)}</Text>
+                    <Text style={[styles.cell, { width: 60, textAlign: 'right' }]}>
+                      {e.contacts}
+                    </Text>
+                    <Text style={[styles.cell, { width: 80, textAlign: 'right' }]}>
+                      {formatMoney(e.wonRevenue, payload.aiPipeline!.currency)}
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            )}
+            {payload.aiPipeline.byPage.length > 0 && (
+              <View style={{ marginTop: 6 }}>
+                <View style={styles.tableHeader}>
+                  <Text style={[styles.tableHeaderCell, { flex: 1 }]}>Landing page</Text>
+                  <Text style={[styles.tableHeaderCell, { width: 80, textAlign: 'right' }]}>
+                    Won revenue
+                  </Text>
+                </View>
+                {payload.aiPipeline.byPage.map((p) => (
+                  <View key={p.page} style={styles.tableRow}>
+                    <Text style={[styles.cell, { flex: 1, paddingRight: 8 }]}>{p.page}</Text>
+                    <Text style={[styles.cell, { width: 80, textAlign: 'right' }]}>
+                      {formatMoney(p.wonRevenue, payload.aiPipeline!.currency)}
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            )}
+            {payload.aiPipeline.hubspotNative.contacts > 0 && (
+              <Text style={{ fontSize: 8, color: MUTED, marginTop: 6 }}>
+                HubSpot also counts {payload.aiPipeline.hubspotNative.contacts} contacts from its
+                own AI Referrals source on the brand&apos;s domains, with{' '}
+                {payload.aiPipeline.hubspotNative.deals} deals and{' '}
+                {formatMoney(
+                  payload.aiPipeline.hubspotNative.wonRevenue,
+                  payload.aiPipeline.currency,
+                )}{' '}
+                won. They aren&apos;t in the figures above.
+              </Text>
+            )}
+            <Text style={{ fontSize: 8, color: MUTED, marginTop: 4 }}>
+              A deal counts once, in full, credited to its earliest contact who came from an AI
+              answer. Won revenue: deals closed won in the period. Open pipeline: deals open when
+              the report was made.
+            </Text>
+          </View>
+        )}
+
         {/* Product Visibility */}
         {payload.shoppingVisibility && (
           <View style={styles.section} wrap={false}>
@@ -609,29 +800,30 @@ export function ReportPdfDocument({ report }: { report: Report }) {
         )}
 
         {/* Site audit score */}
-        {payload.auditScore && (
+        {payload.auditScore && auditScore && (
           <View style={styles.section} wrap={false}>
             <Text style={styles.sectionTitle}>Site Audit Score</Text>
             <View style={{ flexDirection: 'row', alignItems: 'flex-end', gap: 8 }}>
-              <Text style={{ fontSize: 18, fontWeight: 700 }}>
-                {payload.auditScore.totalScore ?? '—'}
-              </Text>
-              {payload.auditScore.totalScore !== null &&
-                payload.auditScore.previousScore !== null && (
-                  <View style={{ marginBottom: 2 }}>
-                    <DeltaText
-                      value={
-                        Math.round(
-                          (payload.auditScore.totalScore - payload.auditScore.previousScore) * 10,
-                        ) / 10
-                      }
-                    />
-                  </View>
-                )}
+              <Text style={{ fontSize: 18, fontWeight: 700 }}>{auditScore.score}</Text>
+              {auditScore.range && (
+                <Text style={{ fontSize: 10, color: MUTED, marginBottom: 2 }}>
+                  ± {auditScore.range.plusMinus}
+                </Text>
+              )}
+              {auditScore.change !== null && (
+                <View style={{ marginBottom: 2 }}>
+                  <DeltaText value={auditScore.change} unit="" />
+                </View>
+              )}
               <Text style={[styles.cell, { color: MUTED, marginBottom: 2 }]}>
                 {payload.auditScore.url} · audited {formatDate(payload.auditScore.auditedAt)}
               </Text>
             </View>
+            {auditScore.range && (
+              <Text style={[styles.cell, { color: MUTED, marginTop: 4 }]}>
+                {scoreRangeSentence(auditScore.range)}
+              </Text>
+            )}
           </View>
         )}
 
@@ -701,7 +893,8 @@ export function ReportPdfDocument({ report }: { report: Report }) {
 
         {/* Footer */}
         <View style={styles.footer} fixed>
-          <Text style={styles.footerText}>Generated with Ansvisor · www.ansvisor.com</Text>
+          {/* Ansvisor's line, the kit's own, or none. */}
+          <Text style={styles.footerText}>{look.footer ?? ''}</Text>
           <Text
             style={styles.footerText}
             render={({ pageNumber, totalPages }) => `${pageNumber} / ${totalPages}`}
@@ -709,5 +902,20 @@ export function ReportPdfDocument({ report }: { report: Report }) {
         </View>
       </Page>
     </Document>
+  );
+}
+
+/**
+ * The report's PDF, with Inter of its own (see withInter): a second PDF in the
+ * same tab, another report's or this one again, keeps every letter. `fontDir`
+ * holds Inter-Regular.ttf and Inter-Bold.ttf: the app's /fonts in the browser.
+ */
+export function reportPdf(
+  report: Report,
+  branding: ReportBranding | null,
+  fontDir = '/fonts',
+): Promise<Blob> {
+  return withInter('Inter', fontDir, (fontFamily) =>
+    pdf(<ReportPdfDocument report={report} branding={branding} fontFamily={fontFamily} />).toBlob(),
   );
 }

@@ -12,6 +12,7 @@ interface Call {
   op: string;
   value?: unknown;
   filters: [string, string, unknown][];
+  columns?: string;
 }
 let calls: Call[];
 // What the next update returns: its row, or none (RLS, or not found).
@@ -30,6 +31,8 @@ let upsertError: { code: string; message: string } | null;
 let queue: Record<string, unknown>[][];
 // A read that fails, when a test needs one.
 let readError: string | null;
+// A column the database doesn't have yet (the web ahead of its migration).
+let missingColumn: string | null;
 
 vi.mock('@/lib/action-center/assignees', () => ({ readAssignees: vi.fn(async () => new Map()) }));
 vi.mock('@/lib/supabase/admin', () => ({ supabaseAdmin: {} }));
@@ -50,14 +53,28 @@ vi.mock('@/lib/supabase/server', () => ({
     from: () => {
       const call: Call = { op: 'select', filters: [] };
       calls.push(call);
+      // As PostgREST answers a column it doesn't know: 42703 on a read, PGRST204 on a write.
+      const unknownColumn = () =>
+        missingColumn !== null &&
+        (call.op === 'update'
+          ? Object.hasOwn(call.value as object, missingColumn)
+          : (call.columns ?? '').includes(missingColumn));
       const result = () =>
-        call.op === 'update'
-          ? { data: updates.length ? updates.shift()! : updated, error: null }
-          : call.op === 'insert'
-            ? { data: { id: 'new-draft' }, error: null }
-            : { data: row, error: null };
+        unknownColumn()
+          ? {
+              data: null,
+              error: {
+                code: call.op === 'update' ? 'PGRST204' : '42703',
+                message: `column content_drafts.${missingColumn} does not exist`,
+              },
+            }
+          : call.op === 'update'
+            ? { data: updates.length ? updates.shift()! : updated, error: null }
+            : call.op === 'insert'
+              ? { data: { id: 'new-draft' }, error: null }
+              : { data: row, error: null };
       const chain: Record<string, unknown> = {
-        select: () => chain,
+        select: (columns?: string) => (call.op === 'select' && (call.columns = columns), chain),
         eq: (col: string, v: unknown) => (call.filters.push(['eq', col, v]), chain),
         in: (col: string, v: unknown) => (call.filters.push(['in', col, v]), chain),
         gte: (col: string, v: unknown) => (call.filters.push(['gte', col, v]), chain),
@@ -104,6 +121,7 @@ vi.mock('@/lib/supabase/server', () => ({
 const {
   createContentDraft,
   fixDraftRules,
+  suggestDraftChanges,
   handOffDraft,
   decideDraftSuggestions,
   getDraftSuggestions,
@@ -116,10 +134,12 @@ const {
   classifyDraftSources,
   keepDraftSource,
   markContentDraftReady,
+  setContentDraftReady,
   restoreDraftVersion,
   saveContentDraft,
   setContentDraftAuthor,
   confirmDraftAuthor,
+  setDraftSchemaLeftOut,
   setContentDraftPageType,
   unmarkContentDraftReady,
   confirmOwnImage,
@@ -140,6 +160,7 @@ beforeEach(() => {
   upsertError = null;
   queue = [];
   readError = null;
+  missingColumn = null;
   rpcCalls = [];
   rpcResult = { data: 'v-new', error: null };
   completeDraftTasks.mockReset().mockResolvedValue(0);
@@ -542,6 +563,21 @@ describe('keepDraftSource (Quality CE-046)', () => {
   });
 });
 
+describe('setContentDraftReady (Chat’s Mark ready, W4-12b)', () => {
+  it('marks the draft ready as the editor does, its errors as values', async () => {
+    updated = { status: 'ready' };
+    await expect(setContentDraftReady(DRAFT)).resolves.toEqual({
+      ok: true,
+      status: 'ready',
+      tasksDone: 0,
+    });
+    await expect(setContentDraftReady('not-a-draft')).resolves.toMatchObject({
+      ok: false,
+      reason: 'invalid',
+    });
+  });
+});
+
 describe('unmarkContentDraftReady', () => {
   it('moves a ready draft back to review, and only a ready one', async () => {
     updated = { status: 'in_review' };
@@ -905,6 +941,95 @@ describe('getContentDraft', () => {
     await expect(getContentDraft(DRAFT)).resolves.toMatchObject({ siteType: 'ecommerce' });
   });
 
+  it('opens a draft on a database before 00448, its Article schema not left out', async () => {
+    row = {
+      id: DRAFT,
+      brand_id: 'b1',
+      title: '',
+      page_type: 'guide',
+      method: 'create',
+      body_html: '',
+    };
+    missingColumn = 'schema_left_out';
+    await expect(getContentDraft(DRAFT)).resolves.toMatchObject({ schemaLeftOut: false });
+    // Asked with the column, then again without it (the brand's rules and the opening aside).
+    expect(
+      calls
+        .filter((c) => c.columns?.startsWith('id, brand_id'))
+        .map((c) => c.columns?.includes('schema_left_out')),
+    ).toEqual([true, false]);
+
+    missingColumn = null;
+    row = { ...row, schema_left_out: true };
+    await expect(getContentDraft(DRAFT)).resolves.toMatchObject({ schemaLeftOut: true });
+  });
+
+  it('says whether the chat that made the draft is the member’s own (W4-16)', async () => {
+    const base = {
+      id: DRAFT,
+      brand_id: 'b1',
+      title: '',
+      page_type: 'guide',
+      method: 'create',
+      body_html: '',
+    };
+    row = { ...base, conversation: { id: 'c1', title: 'Pricing FAQ', user_id: 'u1' } };
+    await expect(getContentDraft(DRAFT)).resolves.toMatchObject({
+      conversation: { id: 'c1', title: 'Pricing FAQ', mine: true },
+    });
+    expect(calls[0].columns).toContain('(id, title, user_id)');
+    row = { ...base, conversation: { id: 'c1', title: 'Pricing FAQ', user_id: 'u2' } };
+    await expect(getContentDraft(DRAFT)).resolves.toMatchObject({
+      conversation: { id: 'c1', mine: false },
+    });
+  });
+
+  it('reads its brand’s banned phrases through the draft, none when it has none', async () => {
+    const base = { id: DRAFT, brand_id: 'b1', title: '', method: 'create', body_html: '' };
+    row = { ...base, brands: { content_rules: { bannedPhrases: ['cheap', ' best  price '] } } };
+    await expect(getContentDraft(DRAFT)).resolves.toMatchObject({
+      bannedPhrases: ['cheap', 'best price'],
+    });
+    const read = calls.find((c) => c.columns === 'brands(content_rules)');
+    expect(read?.filters).toEqual([['eq', 'id', DRAFT]]);
+    row = { ...base, brands: { content_rules: null } };
+    await expect(getContentDraft(DRAFT)).resolves.toMatchObject({ bannedPhrases: [] });
+  });
+
+  it('says whether the agent card shows as the editor opens, and the author’s name (no jump)', async () => {
+    const base = { id: DRAFT, brand_id: 'b1', title: '', method: 'create', body_html: '' };
+    const batch = (status: string, at = '2026-11-09T10:00:00Z') => [
+      { batch_id: 'b2', status, created_at: at },
+      { batch_id: 'b1', status: 'open', created_at: '2026-11-01T10:00:00Z' },
+    ];
+    // The latest batch, all decided, from before a restore: closed, as the editor closes it.
+    row = { ...base, page_author: { name: 'Ada Lovelace' }, restored_at: '2026-11-10T10:00:00Z' };
+    list = batch('accepted');
+    await expect(getContentDraft(DRAFT)).resolves.toMatchObject({
+      agentCardShown: false,
+      authorName: 'Ada Lovelace',
+    });
+    expect(calls.find((c) => c.columns === 'batch_id, status, created_at')?.filters).toEqual([
+      ['eq', 'draft_id', DRAFT],
+    ]);
+    // One open still shows; so does a decided batch after the last restore, or with none.
+    list = batch('open');
+    await expect(getContentDraft(DRAFT)).resolves.toMatchObject({ agentCardShown: true });
+    list = batch('rejected', '2026-11-11T10:00:00Z');
+    await expect(getContentDraft(DRAFT)).resolves.toMatchObject({ agentCardShown: true });
+    row = { ...base, restored_at: null };
+    list = batch('accepted');
+    await expect(getContentDraft(DRAFT)).resolves.toMatchObject({
+      agentCardShown: true,
+      authorName: null,
+    });
+    // No batch, or one that can't be read: nothing kept ahead, and the draft still opens.
+    list = [];
+    await expect(getContentDraft(DRAFT)).resolves.toMatchObject({ agentCardShown: false });
+    readError = 'timeout';
+    await expect(getContentDraft(DRAFT)).resolves.toMatchObject({ agentCardShown: false });
+  });
+
   it('reads nothing for a malformed id', async () => {
     await expect(getContentDraft('../etc')).resolves.toBeNull();
     expect(calls).toEqual([]);
@@ -969,7 +1094,8 @@ describe('agent suggestions', () => {
       id: 's1',
       batchId: 'new',
       actionId: 'a1',
-      actionNo: 214,
+      // The number its code shows: the old one until its brand is numbered (00534).
+      actionNo: '214',
       kind: 'replace',
       blockText: 'Our forecasting is very accurate.',
       beforeText: 'very accurate',
@@ -1132,6 +1258,32 @@ describe('fixDraftRules', () => {
     vi.unstubAllGlobals();
   });
 
+  it('sends the room the Length leaves, to Fix and to a hand-off (#2092 review)', async () => {
+    const fetchMock = vi.fn<(url: string, init?: RequestInit) => Promise<Response>>(async () =>
+      Response.json({ count: 1 }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const lengthCap = { count: 4_800, max: 6_000 };
+    await fixDraftRules(DRAFT, BRAND, { ...request, lengthCap });
+    await handOffDraft(DRAFT, BRAND, {
+      items: [{ key: 'readability:longSentences', detail: '' }],
+      textRules: [],
+      locked: [],
+      origin: 'person',
+      lengthCap,
+    });
+    const [fix, handOff] = fetchMock.mock.calls.map(
+      ([, init]) => JSON.parse(init?.body as string) as Record<string, unknown>,
+    );
+    expect(fix).toEqual({ brandId: BRAND, ...request, lengthCap });
+    expect(handOff.lengthCap).toEqual(lengthCap);
+    // With no Length on, none is sent.
+    fetchMock.mockClear();
+    await fixDraftRules(DRAFT, BRAND, request);
+    expect(JSON.parse(fetchMock.mock.calls[0][1]?.body as string)).not.toHaveProperty('lengthCap');
+    vi.unstubAllGlobals();
+  });
+
   it('names the budget and the empty page, and anything else as failed', async () => {
     for (const [body, error] of [
       [{ code: 'ai_budget' }, 'ai_budget'],
@@ -1259,5 +1411,86 @@ describe('getCatalogMatch (Quality CE-053)', () => {
     // Two products by that name: whose page this is isn't sure.
     queue = [[{ brand_id: 'b1', source_url: null }], [{ id: 'p0' }], [{ id: 'p1' }, { id: 'p2' }]];
     expect(await getCatalogMatch(DRAFT, 'Ridge 28')).toEqual({ connected: true, product: null });
+  });
+});
+
+describe('setDraftSchemaLeftOut (00448)', () => {
+  it('keeps the choice on the draft, and says false when it can’t, never throwing', async () => {
+    updated = { id: DRAFT };
+    await expect(setDraftSchemaLeftOut(DRAFT, true)).resolves.toBe(true);
+    expect(calls.at(-1)).toMatchObject({ op: 'update', value: { schema_left_out: true } });
+    // The web ahead of 00448: not saved, the editor puts it back.
+    missingColumn = 'schema_left_out';
+    await expect(setDraftSchemaLeftOut(DRAFT, false)).resolves.toBe(false);
+    // Not found (RLS) or a malformed id: not saved either.
+    missingColumn = null;
+    updated = null;
+    await expect(setDraftSchemaLeftOut(DRAFT, false)).resolves.toBe(false);
+    await expect(setDraftSchemaLeftOut('nope', true)).resolves.toBe(false);
+  });
+});
+
+describe('suggestDraftChanges (Chat beside the editor, W4-14)', () => {
+  const draftRow = {
+    id: DRAFT,
+    brand_id: '9a1b2c3d-4e5f-4a6b-8c7d-0e1f2a3b4c5d',
+    title: 'Pricing FAQ',
+    page_type: null,
+    method: 'create',
+    status: 'draft',
+    body_html: '<h2>Can I change plans?</h2><p>Yes, any time.</p>',
+    author: 'user',
+    updated_at: '2026-11-03T09:00:00Z',
+  };
+
+  it('asks the agent with the request as its one rule, from the page as saved', async () => {
+    row = draftRow;
+    rpcResult = { data: null, error: null };
+    const fetchMock = vi.fn(async () => Response.json({ count: 2, batchId: 'b' }));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(suggestDraftChanges(DRAFT, '  Make answer 3 shorter  ')).resolves.toEqual({
+      ok: true,
+      count: 2,
+    });
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toMatch(new RegExp(`/api/content-drafts/${DRAFT}/suggestions$`));
+    expect(JSON.parse(init.body as string)).toMatchObject({
+      brandId: draftRow.brand_id,
+      rules: [
+        { key: 'chat', name: 'The person’s request in Chat', detail: 'Make answer 3 shorter' },
+      ],
+      textRules: [],
+      locked: [],
+    });
+    vi.unstubAllGlobals();
+  });
+
+  it('says the agent’s refusals in Chat’s words, and asks nothing for no request', async () => {
+    row = draftRow;
+    rpcResult = { data: null, error: null };
+    for (const [code, reason] of [
+      ['open_suggestions', 'conflict'],
+      ['running', 'conflict'],
+      ['published', 'live_item'],
+      ['ai_budget', 'quota_exceeded'],
+      ['teapot', 'failed'],
+    ] as const) {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => Response.json({ code }, { status: 409 })),
+      );
+      await expect(suggestDraftChanges(DRAFT, 'Shorter')).resolves.toMatchObject({
+        ok: false,
+        reason,
+      });
+    }
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(suggestDraftChanges(DRAFT, '   ')).resolves.toMatchObject({
+      ok: false,
+      reason: 'invalid',
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
   });
 });

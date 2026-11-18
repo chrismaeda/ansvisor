@@ -51,7 +51,7 @@ const firstAnswer = [
     signalKey: 'case-study-evidence',
     priority: 'medium',
     recommendation: 'Add one real customer result next to the plans.',
-    draft: "Join brands like TechFlow, which saw a 34% increase in 'Recommended' citations.",
+    draft: "Join brands like TechFlow. TechFlow saw a 34% increase in 'Recommended' citations.",
     code: null,
   },
   {
@@ -78,7 +78,7 @@ beforeEach(() => {
 });
 
 describe('generateRecommendations', () => {
-  it('replaces invented facts, rewrites the long item once and keeps the rest', async () => {
+  it('takes invented figures out, leaves the brand its own facts, rewrites the long item once and keeps the rest', async () => {
     modelReturns(firstAnswer, [
       {
         ref: '1',
@@ -97,8 +97,8 @@ describe('generateRecommendations', () => {
     expect(recs[0]).toMatchObject({
       label: expect.any(String),
       category: 'eeat',
-      draft:
-        "Join brands like [customer name], which saw a [real metric] increase in 'Recommended' citations.",
+      // The customer is the brand's to name; the figure no page has goes with its sentence.
+      draft: 'Join brands like [customer name].',
       code: null,
     });
     expect(recs[1]).toMatchObject({
@@ -118,7 +118,7 @@ describe('generateRecommendations', () => {
     expect(rewritePrompt).not.toContain('FAQPage", "mainEntity');
 
     expect(logger.info).toHaveBeenCalledWith(
-      expect.objectContaining({ auditId: 'a1', facts: 3, tooLong: 1, rewritten: 1, cuts: 0 }),
+      expect.objectContaining({ auditId: 'a1', facts: 5, tooLong: 1, rewritten: 1, cuts: 0 }),
       expect.any(String),
     );
   });
@@ -130,23 +130,58 @@ describe('generateRecommendations', () => {
     const { system, prompt } = generateObject.mock.calls[0][0];
     expect(system).toContain('Never invent customers');
     expect(system).toContain(`at most ${MAX_COPY_CHARS} characters`);
-    expect(system).toContain('[customer name], [real metric], [price], [date], [source URL]');
+    // A fact anyone could look up is never left to the person; the brand's own may be, three at most.
+    expect(system).toContain('is never a placeholder: write the sentence without it');
+    expect(system).toContain('[your customer name], [your price], [your result]. At most 3');
+    expect(system).not.toContain('[source URL]');
     expect(prompt).toContain('BRAND DATA');
     expect(prompt).toContain('- Name: Ansvisor');
     expect(prompt).toContain('- Description: AI visibility platform');
     expect(prompt).toContain('- Domains: ansvisor.com');
   });
 
-  it('tells the model which side of 50–70 a page reads, to rewrite it that way', async () => {
+  it("gives the model the brand's rules on any page it audits, and none without (00450)", async () => {
     modelReturns([]);
     await generateRecommendations(ctx, {
-      results: [{ key: 'readability', status: 'fail', evidence: { fleschReadingEase: 86 } }],
+      results,
+      brand: null,
+      rules: ['No topics comparing us with a named competitor.'],
+    });
+    const { system, prompt } = generateObject.mock.calls[0][0];
+    expect(system).toContain('When BRAND RULES are given, every recommendation');
+    expect(prompt).toContain(
+      "BRAND RULES (the brand's own; follow every one):\n- No topics comparing us with a named competitor.",
+    );
+    modelReturns([]);
+    await generateRecommendations(ctx, { results, brand });
+    expect(generateObject.mock.calls[1][0].prompt).not.toContain('BRAND RULES');
+  });
+
+  it('tells the model the page’s reading score and its aim, to rewrite it that way', async () => {
+    modelReturns([]);
+    await generateRecommendations(ctx, {
+      results: [
+        {
+          key: 'readability',
+          status: 'warn',
+          evidence: { language: 'en', formula: 'flesch', readingScore: 86 },
+        },
+        {
+          key: 'readability',
+          status: 'warn',
+          evidence: { language: 'tr', formula: 'atesman', readingScore: 42 },
+        },
+      ],
       brand,
     });
     const { system, prompt } = generateObject.mock.calls[0][0];
-    expect(prompt).toContain('- readability [fail, impact: standard]');
-    expect(prompt).toContain('| finding: Flesch Reading Ease 86');
-    expect(system).toContain('fuller sentences with the detail readers expect when it is over 70');
+    expect(prompt).toContain('- readability [warn, impact: standard]');
+    expect(prompt).toContain('| finding: Flesch Reading Ease 86 (language en; aim for 50–70)');
+    expect(prompt).toContain('| finding: Ateşman 42 (language tr; aim for 50 or more)');
+    expect(system).toContain(
+      'fuller sentences with the detail readers expect when a Flesch score is over 70',
+    );
+    expect(system).toContain("in the page's language");
   });
 
   it('sends no brand data for another site, and the brand name there is unknown', async () => {

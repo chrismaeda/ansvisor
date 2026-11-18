@@ -25,6 +25,7 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { LoadingDots } from '@/components/ui/loading-dots';
 import { NewContentDialog } from '@/components/content/new-content-dialog';
 import { PublishDialog } from '@/components/content/publish-dialog';
+import { TakeDownDialog, type TakeDownPage } from '@/components/content/take-down-dialog';
 import { SendDialog } from '@/components/content/send-to-cms-dialog';
 import { useUserRole } from '@/hooks/use-user-role';
 import { useUpgradeGate } from '@/components/providers/upgrade-gate';
@@ -41,22 +42,31 @@ import {
   readCmsStatuses,
   refreshFramerPublished,
   refreshWebflowPublished,
+  refreshWixPublished,
+  refreshHubspotPublished,
   refreshWordPressPublished,
   type CmsStatus,
 } from '@/lib/content/cms-send-client';
+import { readFirstAiCrawls } from '@/lib/content/first-ai-crawl';
 import {
   AGENT_POLL_MS,
   CREATED_RANGES,
+  DRAFT_STATUSES,
+  LIBRARY_ACTION_PARAM,
   LIBRARY_TABS,
+  MADE_IN_FILTERS,
   SEND_FILTERS,
   contentEditorPath,
   draftsCreatedIn,
   draftsInTab,
   draftsLastSent,
+  draftsMadeIn,
+  draftsOfAction,
   type ContentDraftListItem,
   type CreatedRange,
   type DraftStatus,
   type LibraryTab,
+  type MadeInFilter,
   type SendFilter,
 } from '@/lib/content/drafts';
 import { siteTypeOf } from '@/lib/content/page-types';
@@ -67,9 +77,11 @@ import {
 } from '@/lib/content/shopping-check';
 import { formatNumber } from '@/lib/format';
 import { readUrlChoice, readUrlParam, writeUrlParams } from '@/lib/url-state';
+import { useChatPageContext } from '@/components/chat/panel/chat-panel-context';
+import { viewRows } from '@/lib/chat/page-view';
 import { useBrandStore } from '@/stores/use-brand-store';
 import { BulkSendDialog } from './_bulk-send-dialog';
-import { readCmsSources } from './_cms-sources';
+import { readCmsSources } from '@/lib/content/cms-sources';
 import { LibraryExportMenu, useLibraryExport } from './_library-export';
 import { LibraryTable, type LibraryRowActions, type LibrarySelection } from './_library-table';
 import { HeaderWithAiUsage } from '@/components/ai-usage/ai-usage-meter';
@@ -95,16 +107,20 @@ interface LibraryRead {
  */
 export default function ContentLibraryPage() {
   const t = useTranslations('contentEditor.library');
+  const tMadeIn = useTranslations('contentEditor.library.madeIn');
   const router = useRouter();
   const activeBrandId = useBrandStore((s) => s.activeBrandId);
   const activeBrand = useBrandStore((s) => s.brands.find((b) => b.id === s.activeBrandId));
   const [tab, setTab] = useState<LibraryTab>('all');
   // When the drafts listed (and exported) were created: ?created=30d.
   const [created, setCreated] = useState<CreatedRange>('all');
+  const [madeIn, setMadeIn] = useState<MadeInFilter>('all');
   // How the listed drafts' last send to the CMS stands (#1331): ?sent=failed.
   const [sent, setSent] = useState<SendFilter>('all');
   // Which shopping paths are listed, on an online shop: ?shopping=attention.
   const [shoppingFilter, setShoppingFilter] = useState<ShoppingFilter>('all');
+  // One Action Center action's drafts, as its Start now's several pages open: ?action=<id>.
+  const [actionFilter, setActionFilter] = useState<string | null>(null);
   const [read, setRead] = useState<LibraryRead | null>(null);
   const [attempt, setAttempt] = useState(0);
   const [starting, setStarting] = useState(false);
@@ -123,6 +139,8 @@ export default function ContentLibraryPage() {
   const [sending, setSending] = useState<{ brandId: string; source: CmsSource } | null>(null);
   // Mark published open, on a draft (CE-013).
   const [publishing, setPublishing] = useState<string | null>(null);
+  // Take down open, on a page published through Ansvisor (AUTONOMOUS-GO-LIVE PR 10).
+  const [takingDown, setTakingDown] = useState<TakeDownPage | null>(null);
   // Each draft's last send, beside its status; read with the list.
   const [cms, setCms] = useState<ReadonlyMap<string, CmsStatus>>(new Map());
   // The drafts the sends above were read for, in any order.
@@ -144,8 +162,10 @@ export default function ContentLibraryPage() {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- one read of the URL after mount
     setTab(readUrlChoice('tab', LIBRARY_TABS, 'all'));
     setCreated(readUrlChoice('created', CREATED_RANGES, 'all'));
+    setMadeIn(readUrlChoice('madeIn', MADE_IN_FILTERS, 'all'));
     setSent(readUrlChoice('sent', SEND_FILTERS, 'all'));
     setShoppingFilter(readUrlChoice('shopping', SHOPPING_FILTERS, 'all'));
+    setActionFilter(readUrlParam(LIBRARY_ACTION_PARAM) || null);
     // Once: closed, it doesn't open again on a reload. Read-only, it doesn't open.
     if (readUrlParam('new') === '1') {
       if (!isLocked) setStarting(true);
@@ -183,15 +203,38 @@ export default function ContentLibraryPage() {
 
   // The sends of the drafts read, after each read of the list.
   const readIds = read?.drafts?.map((draft) => draft.id).join(',') ?? '';
+  const readBrandId = read?.brandId ?? null;
   const [cmsAttempt, setCmsAttempt] = useState(0);
   useEffect(() => {
     if (!readIds) return;
     let cancelled = false;
     readCmsStatuses(readIds.split(','))
-      .then((statuses) => {
+      .then(async (statuses) => {
         if (cancelled) return;
         setCms(statuses);
         setCmsReadFor(new Set(readIds.split(',')));
+        // Then each published page's first AI crawl (#2142), from the brand's own bot logs.
+        const published = [...statuses]
+          .filter(([, sent]) => sent.status === 'published' && sent.publishedUrl)
+          .map(([draftId, sent]) => ({ draftId, url: sent.publishedUrl!, at: sent.at }));
+        if (!readBrandId || published.length === 0) return;
+        const crawls = await readFirstAiCrawls(readBrandId, published);
+        if (cancelled) return;
+        setCms(
+          new Map(
+            [...statuses].map(([draftId, sent]) => [
+              draftId,
+              sent.status === 'published' &&
+              sent.publishedUrl &&
+              (crawls.byDraft.has(draftId) || !crawls.logs)
+                ? {
+                    ...sent,
+                    firstAiCrawl: { logs: crawls.logs, crawl: crawls.byDraft.get(draftId) ?? null },
+                  }
+                : sent,
+            ]),
+          ),
+        );
       })
       .catch((err) => {
         console.error('Failed to read the pages’ sends:', err);
@@ -201,7 +244,7 @@ export default function ContentLibraryPage() {
     return () => {
       cancelled = true;
     };
-  }, [readIds, cmsAttempt]);
+  }, [readIds, readBrandId, cmsAttempt]);
   // While a page is on its way to the CMS (a bulk send going on), its row's
   // send is read again now and then, as the list is while the agent writes.
   const cmsGoing = [...cms.values()].some((status) => status.status === 'queued');
@@ -211,8 +254,8 @@ export default function ContentLibraryPage() {
     return () => clearTimeout(timer);
   }, [cmsGoing, cms]);
 
-  // Pages in Webflow or Framer as draft items, or in WordPress as draft
-  // posts: the CMS says when one goes live, so the API reads them once as
+  // Pages in Webflow or Framer as draft items, or in WordPress or Wix as
+  // draft posts: the CMS says when one goes live, so the API reads them once as
   // the Library opens for the brand (and daily); the list is read again when
   // it marked any published.
   const sentTo = (target: CmsStatus['target']) =>
@@ -220,9 +263,13 @@ export default function ContentLibraryPage() {
   const inWebflow = sentTo('webflow');
   const inWordPress = sentTo('wordpress');
   const inFramer = sentTo('framer');
+  const inWix = sentTo('wix');
+  const inHubspot = sentTo('hubspot');
   const webflowRead = useRef(new Set<string>());
   const wordpressRead = useRef(new Set<string>());
   const framerRead = useRef(new Set<string>());
+  const wixRead = useRef(new Set<string>());
+  const hubspotRead = useRef(new Set<string>());
   useEffect(() => {
     if (isLocked || !inWebflow || !activeBrandId || webflowRead.current.has(activeBrandId)) return;
     webflowRead.current.add(activeBrandId);
@@ -250,6 +297,24 @@ export default function ContentLibraryPage() {
       if (published.length) setAttempt((n) => n + 1);
     });
   }, [isLocked, inFramer, activeBrandId]);
+  useEffect(() => {
+    if (isLocked || !inWix || !activeBrandId || wixRead.current.has(activeBrandId)) return;
+    wixRead.current.add(activeBrandId);
+    // As Webflow's: not cancelled with the effect.
+    void refreshWixPublished(activeBrandId).then((published) => {
+      if (published.length) setAttempt((n) => n + 1);
+    });
+  }, [isLocked, inWix, activeBrandId]);
+  useEffect(() => {
+    if (isLocked || !inHubspot || !activeBrandId || hubspotRead.current.has(activeBrandId)) {
+      return;
+    }
+    hubspotRead.current.add(activeBrandId);
+    // As Webflow's: not cancelled with the effect.
+    void refreshHubspotPublished(activeBrandId).then((published) => {
+      if (published.length) setAttempt((n) => n + 1);
+    });
+  }, [isLocked, inHubspot, activeBrandId]);
 
   const reload = () => setAttempt((n) => n + 1);
   const titleOf = (draft: ContentDraftListItem) => draft.title.trim() || t('untitled');
@@ -336,6 +401,14 @@ export default function ContentLibraryPage() {
     onSend: guard((draft: ContentDraftListItem) => void openSend(draft), {
       action: tActions('sendToCms'),
     }),
+    // Open while read-only, as the API keeps it: it only lowers what is live.
+    onTakeDown: (draft, sent) =>
+      setTakingDown({
+        draftId: draft.id,
+        title: titleOf(draft),
+        url: sent.publishedUrl,
+        target: sent.target,
+      }),
   };
 
   const confirmDelete = async () => {
@@ -363,6 +436,11 @@ export default function ContentLibraryPage() {
     clearPicked();
     writeUrlParams({ created: next }, { created: 'all' });
   };
+  const changeMadeIn = (next: MadeInFilter) => {
+    setMadeIn(next);
+    clearPicked();
+    writeUrlParams({ madeIn: next }, { madeIn: 'all' });
+  };
   const changeSent = (next: SendFilter) => {
     setSent(next);
     clearPicked();
@@ -374,20 +452,19 @@ export default function ContentLibraryPage() {
     writeUrlParams({ shopping: next }, { shopping: 'all' });
   };
 
-  if (!activeBrandId) {
-    return (
-      <div className="flex min-h-[400px] items-center justify-center">
-        <p className="text-muted-foreground">{t('selectBrand')}</p>
-      </div>
-    );
-  }
-
   // A read for another brand (just switched) counts as still loading.
   const current = read?.brandId === activeBrandId ? read : null;
   const drafts = current?.drafts ?? null;
   const counts = current?.counts ?? null;
   const inTab = drafts ? draftsInTab(drafts, tab) : [];
-  const createdIn = draftsCreatedIn(inTab, created);
+  const ofAction = draftsOfAction(inTab, actionFilter);
+  const createdIn = draftsMadeIn(draftsCreatedIn(ofAction, created), madeIn);
+  // The action's number, as its drafts name it; none listed yet, none shown.
+  const actionNo = actionFilter
+    ? (drafts?.find((draft) => draft.action?.id === actionFilter)?.action?.number ?? null)
+    : null;
+  // Made in shows once the brand's drafts come from more than one place, or while the URL names one.
+  const anyMadeElsewhere = !!drafts?.some((draft) => draft.origin !== 'editor');
   // Shopping paths are an online shop's (shopping path, 00351).
   const isShop = siteTypeOf(activeBrand ?? {}) === 'ecommerce';
   const shopped = isShop ? draftsByShopping(createdIn, shoppingFilter) : createdIn;
@@ -396,6 +473,76 @@ export default function ContentLibraryPage() {
   // to export or pick.
   const sendsRead = sent === 'all' || !drafts || drafts.every((draft) => cmsReadFor.has(draft.id));
   const listed = sendsRead ? draftsLastSent(shopped, cms, sent) : [];
+
+  // Chat's side panel sees the page (the owner's plan of 2026-11-16, step 9): the tab (a draft
+  // status, which list_drafts takes), the other filters as words, and once read the drafts
+  // listed by id, with how many.
+  const unfiltered =
+    created === 'all' &&
+    madeIn === 'all' &&
+    sent === 'all' &&
+    shoppingFilter === 'all' &&
+    !actionFilter;
+  const isStatus = (DRAFT_STATUSES as readonly string[]).includes(tab);
+  useChatPageContext(
+    activeBrandId
+      ? {
+          pageName: t('title'),
+          filters: [
+            ...(isStatus ? [{ key: 'status', label: t(`tabs.${tab}`), value: tab }] : []),
+            ...(created !== 'all'
+              ? [
+                  {
+                    key: 'created',
+                    label: `${t('created.label')}: ${t(`created.${created}`)}`,
+                    value: created,
+                  },
+                ]
+              : []),
+            ...(madeIn !== 'all'
+              ? [{ key: 'madeIn', label: `${tMadeIn('label')}: ${tMadeIn(madeIn)}`, value: madeIn }]
+              : []),
+            ...(sent !== 'all'
+              ? [
+                  {
+                    key: 'sent',
+                    label: `${t('lastSend.label')}: ${t(`lastSend.${sent}`)}`,
+                    value: sent,
+                  },
+                ]
+              : []),
+            ...(shoppingFilter !== 'all'
+              ? [
+                  {
+                    key: 'shopping',
+                    label: `${t('shopping.label')}: ${t(`shopping.filters.${shoppingFilter}`)}`,
+                    value: shoppingFilter,
+                  },
+                ]
+              : []),
+          ],
+          view: {
+            tab,
+            ...(drafts && sendsRead
+              ? {
+                  rows: viewRows(listed, (draft) => ({ ref: draft.id, label: titleOf(draft) })),
+                  total:
+                    unfiltered && counts ? Math.max(counts[tab], listed.length) : listed.length,
+                }
+              : {}),
+          },
+        }
+      : null,
+  );
+
+  if (!activeBrandId) {
+    return (
+      <div className="flex min-h-[400px] items-center justify-center">
+        <p className="text-muted-foreground">{t('selectBrand')}</p>
+      </div>
+    );
+  }
+
   // Any of this brand's drafts sent: the sends of the last brand don't count.
   const anySent = !!drafts?.some((draft) => cms.has(draft.id));
   // Picked rows still listed (a read may have moved some), never archived ones.
@@ -449,6 +596,26 @@ export default function ContentLibraryPage() {
         onSent={() => setAttempt((n) => n + 1)}
       />
 
+      {actionFilter && (
+        <div className="flex flex-wrap items-center gap-2 rounded-lg border bg-muted/40 px-3 py-2 text-sm">
+          <span className="text-muted-foreground">
+            {actionNo !== null ? t('actionFilter.of', { no: actionNo }) : t('actionFilter.one')}
+          </span>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-7 text-xs"
+            onClick={() => {
+              setActionFilter(null);
+              clearPicked();
+              writeUrlParams({ [LIBRARY_ACTION_PARAM]: null });
+            }}
+          >
+            {t('actionFilter.showAll')}
+          </Button>
+        </div>
+      )}
+
       <div className="flex flex-wrap items-end justify-between gap-3">
         <Tabs value={tab} onValueChange={(v) => changeTab(v as LibraryTab)}>
           <TabsList variant="line" aria-label={t('tabsLabel')}>
@@ -479,6 +646,27 @@ export default function ContentLibraryPage() {
                 {SEND_FILTERS.map((filter) => (
                   <SelectItem key={filter} value={filter}>
                     {t(`lastSend.${filter}`)}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+          {(anyMadeElsewhere || madeIn !== 'all') && (
+            <Select
+              value={madeIn}
+              onValueChange={(value) => changeMadeIn(value as MadeInFilter)}
+              items={MADE_IN_FILTERS.map((filter) => ({
+                value: filter,
+                label: `${tMadeIn('label')}: ${tMadeIn(filter)}`,
+              }))}
+            >
+              <SelectTrigger size="sm" aria-label={tMadeIn('label')} data-action="library.madeIn">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent align="end">
+                {MADE_IN_FILTERS.map((filter) => (
+                  <SelectItem key={filter} value={filter}>
+                    {tMadeIn(filter)}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -586,11 +774,13 @@ export default function ContentLibraryPage() {
           ) : listed.length === 0 && inTab.length > 0 ? (
             <p className="px-6 py-12 text-center text-sm text-muted-foreground">
               {t(
-                createdIn.length === 0
-                  ? 'created.empty'
-                  : shopped.length === 0
-                    ? 'shopping.empty'
-                    : 'lastSend.empty',
+                ofAction.length === 0
+                  ? 'actionFilter.empty'
+                  : createdIn.length === 0
+                    ? 'created.empty'
+                    : shopped.length === 0
+                      ? 'shopping.empty'
+                      : 'lastSend.empty',
               )}
             </p>
           ) : (
@@ -629,6 +819,17 @@ export default function ContentLibraryPage() {
         />
       )}
 
+      {takingDown && (
+        <TakeDownDialog
+          page={takingDown}
+          onClose={() => setTakingDown(null)}
+          // A draft in its CMS again: the row's status and send are read again.
+          onDone={() => {
+            reload();
+            setCmsAttempt((n) => n + 1);
+          }}
+        />
+      )}
       {sending && (
         <SendDialog
           draftId={sending.source.draftId}
@@ -637,6 +838,7 @@ export default function ContentLibraryPage() {
           html={sending.source.html}
           sourceUrl={sending.source.sourceUrl}
           author={sending.source.author}
+          reviewer={sending.source.reviewer}
           teamByline={sending.source.teamByline}
           byline={sending.source.byline}
           // Placeholders are filled in the editor.

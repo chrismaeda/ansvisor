@@ -25,6 +25,13 @@ import { recordSignalsForBrand } from './record.js';
 import { generateActionsForBrand } from '../action-center/generate.js';
 import { rescoreBrandActions } from '../action-center/priority-data.js';
 import { sweepActionTasks } from '../action-center/task-writer/index.js';
+import { sweepStaleActions } from '../action-center/stale.js';
+import {
+  syncBusinessHubNumbersAction,
+  syncBusinessHubSetupAction,
+} from '../action-center/from-business-hub.js';
+import { businessHubEnabled } from '../business-hub/flag.js';
+import { resolve } from '../../config/action-engine.js';
 
 /**
  * How far back the sweep looks. Long enough to cover a missed night plus the
@@ -66,6 +73,48 @@ async function rescoreSkippedNight(brandId, now) {
 }
 
 /**
+ * Actions left New with no one on them for a month are marked stale every
+ * night (action-center/stale.js), skipped nights too. Best effort: a list
+ * that can't be marked is no reason to fail the pass.
+ */
+async function markStaleActions(brandId, now) {
+  try {
+    return await sweepStaleActions(brandId, { now });
+  } catch (err) {
+    logger.warn({ brandId, err: err.message }, '[actions] stale sweep failed');
+    return null;
+  }
+}
+
+/**
+ * The ChatGPT Business Hub actions (action-center/from-business-hub.js),
+ * behind BUSINESS_HUB_ENABLED: the setup action, once per brand, then the
+ * weekly reminder to enter the numbers. Each takes one of the day's new
+ * actions, so it opens only while tonight's generator left one. Best effort,
+ * each on its own, as the stale sweep: an action that can't be raised
+ * tonight is tried again the next night, and is no reason to fail the pass.
+ * Null when the flag is off or both failed.
+ */
+const BUSINESS_HUB_SYNCS = [
+  ['setup', syncBusinessHubSetupAction],
+  ['numbers', syncBusinessHubNumbersAction],
+];
+
+async function syncBusinessHub(brandId, generated, now) {
+  if (!businessHubEnabled()) return null;
+  const open = (generated?.created ?? 0) < resolve().noise.maxNewActionsPerDay;
+  const done = {};
+  for (const [name, sync] of BUSINESS_HUB_SYNCS) {
+    try {
+      done[name] = await sync(brandId, { now, open });
+    } catch (err) {
+      logger.warn({ brandId, err: err.message, sync: name }, '[actions] business hub sync failed');
+    }
+  }
+  return Object.keys(done).length ? done : null;
+}
+
+/**
  * Record signals and consolidate them into actions for one brand, then log
  * the pass against the run it covered.
  *
@@ -95,6 +144,8 @@ export async function runSignalPass(brandId, { runAt, now = new Date() } = {}) {
   const generated = recorded.skipped
     ? await rescoreSkippedNight(brandId, now)
     : await generateActionsForBrand(brandId, { now });
+  const stale = await markStaleActions(brandId, now);
+  const businessHub = await syncBusinessHub(brandId, generated, now);
 
   const { error } = await supabaseAdmin.from('signal_runs').upsert(
     {
@@ -102,7 +153,12 @@ export async function runSignalPass(brandId, { runAt, now = new Date() } = {}) {
       tracking_run_at: trackingRunAt,
       ran_at: now.toISOString(),
       outcome: recorded.skipped ? 'skipped' : 'recorded',
-      detail: { signals: recorded, actions: generated },
+      detail: {
+        signals: recorded,
+        actions: generated,
+        stale,
+        ...(businessHub ? { businessHub } : {}),
+      },
     },
     { onConflict: 'brand_id,tracking_run_at' },
   );
@@ -116,7 +172,7 @@ export async function runSignalPass(brandId, { runAt, now = new Date() } = {}) {
     });
   }
 
-  return { trackingRunAt, signals: recorded, actions: generated };
+  return { trackingRunAt, signals: recorded, actions: generated, stale };
 }
 
 /**

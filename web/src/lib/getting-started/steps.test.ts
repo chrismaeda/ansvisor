@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { sectionFromPath } from '@/lib/prompts-routes';
 import {
   GETTING_STARTED_STEPS,
   buildGettingStarted,
@@ -10,9 +11,8 @@ import {
 } from './steps';
 
 /**
- * Getting started (AC-ALT2 §4): seventeen fixed steps whose state follows
- * from the brand's data. Steps unlock when their data is ready, optional
- * steps can be skipped, and Ready waits for everything above it.
+ * Getting started: the 7 set-up steps, whose state follows from the brand's
+ * data. Optional steps can be skipped.
  */
 
 const facts = (over: Partial<GettingStartedFacts> = {}): GettingStartedFacts => ({
@@ -44,59 +44,39 @@ const step = (f: GettingStartedFacts, key: GettingStartedStepKey) =>
   buildGettingStarted(f).steps.find((s) => s.key === key)!;
 
 describe('the step list', () => {
-  it('has the seventeen steps in order, by stage', () => {
+  it('has the 7 set-up steps in order, the AI Traffic snippet first, with no Ready step', () => {
     expect(GETTING_STARTED_STEPS.map((s) => `${s.stage}:${s.key}`)).toEqual([
+      'setup:snippet',
       'setup:kpis',
       'setup:competitors',
       'setup:topics',
       'setup:prompts',
       'setup:gsc',
       'setup:ga',
-      'setup:snippet',
-      'explore:visibility',
-      'explore:answers',
-      'explore:data_prompts',
-      'explore:mentions',
-      'explore:citations',
-      'explore:traffic',
-      'act:pick_content',
-      'act:create_content',
-      'act:optimize_page',
-      'ready:ready',
     ]);
     expect(GETTING_STARTED_STEPS.filter((s) => s.optional).map((s) => s.key)).toEqual([
       'gsc',
       'ga',
     ]);
   });
+
+  it('opens topics and prompts on the Prompts page, and no step on a brand’s own pages', () => {
+    const href = (key: GettingStartedStepKey) =>
+      GETTING_STARTED_STEPS.find((s) => s.key === key)!.href;
+    expect(href('topics')).toBe('/dashboard/prompts/topics');
+    expect(href('prompts')).toBe('/dashboard/prompts/suggestions');
+    expect(sectionFromPath(href('topics'))?.tab).toBe('topics');
+    expect(sectionFromPath(href('prompts'))).toMatchObject({ tab: 'all', view: 'suggestions' });
+    expect(GETTING_STARTED_STEPS.filter((s) => s.href.startsWith('/dashboard/brands'))).toEqual([]);
+  });
 });
 
 describe('buildGettingStarted', () => {
-  it('opens a new brand on the setup steps, with the rest waiting for data', () => {
+  it('opens a new brand on the 7 set-up steps, each to do', () => {
     const status = buildGettingStarted(facts());
     expect(status.active).toBe(true);
-    expect(status.total).toBe(17);
-    expect(status.done).toBe(0);
-    const states = Object.fromEntries(status.steps.map((s) => [s.key, s.state]));
-    expect(states).toEqual({
-      kpis: 'new',
-      competitors: 'new',
-      topics: 'new',
-      prompts: 'new',
-      gsc: 'new',
-      ga: 'new',
-      snippet: 'new',
-      visibility: 'waiting',
-      answers: 'waiting',
-      data_prompts: 'waiting',
-      mentions: 'waiting',
-      citations: 'waiting',
-      traffic: 'waiting',
-      pick_content: 'waiting',
-      create_content: 'waiting',
-      optimize_page: 'waiting',
-      ready: 'waiting',
-    });
+    expect(status).toMatchObject({ done: 0, total: 7 });
+    expect(status.steps.every((s) => s.state === 'new')).toBe(true);
   });
 
   it('counts KPIs saved from the KPI screen, or set up before the start', () => {
@@ -126,6 +106,21 @@ describe('buildGettingStarted', () => {
     expect(step(facts({ topicPrompts: [0, 0, 0] }), 'topics').state).toBe('done');
   });
 
+  it('counts topics and prompts from the brand’s data, wherever they were added: no page visit', () => {
+    // Added on the Prompts page (Topics, Tracked Prompts, Prompt Suggestions),
+    // in Chat or at setup: the data finishes the steps, with no record kept.
+    const added = facts({ topicPrompts: [3, 3, 3] });
+    expect(step(added, 'topics')).toMatchObject({ state: 'done', updatedAt: null });
+    expect(step(added, 'prompts')).toMatchObject({ state: 'done', updatedAt: null });
+    // Opening a page finishes neither, the Prompts page's or any other.
+    expect(pageOpenedStep('/dashboard/prompts/topics')).toBeNull();
+    expect(pageOpenedStep('/dashboard/prompts/suggestions')).toBeNull();
+    expect(pageOpenedStep('/dashboard/brands/b1/prompts')).toBeNull();
+    const opened = facts({ records: { topics: 'opened', prompts: 'opened' } });
+    expect(step(opened, 'topics').state).toBe('new');
+    expect(step(opened, 'prompts').state).toBe('new');
+  });
+
   it('wants three prompts in every topic, and at least three topics of them', () => {
     // Two full topics of three: 6/9 until a third topic has its prompts.
     expect(step(facts({ topicPrompts: [3, 4] }), 'prompts')).toMatchObject({
@@ -148,99 +143,28 @@ describe('buildGettingStarted', () => {
     expect(step(skipped, 'gsc').state).toBe('skipped');
     expect(step(skipped, 'ga').state).toBe('skipped');
     expect(step({ ...skipped, gsc: true }, 'gsc').state).toBe('done');
-    expect(buildGettingStarted(skipped).done).toBe(3); // both, and the step that needs them
+    expect(buildGettingStarted(skipped).done).toBe(2);
   });
 
   it('marks the snippet done on the first AI visit', () => {
+    expect(step(facts(), 'snippet').state).toBe('new');
     expect(step(facts({ firstVisit: true }), 'snippet').state).toBe('done');
   });
 
-  it('unlocks the explore pages with the first answers, done once opened', () => {
-    expect(step(facts({ records: { mentions: 'opened' } }), 'mentions').state).toBe('done');
-    const answered = facts({ firstAnswer: true });
-    expect(step(answered, 'visibility').state).toBe('new');
-    expect(step({ ...answered, records: { visibility: 'opened' } }, 'visibility').state).toBe(
-      'done',
-    );
-    expect(step(answered, 'traffic').state).toBe('new');
-  });
-
-  it('waits for prompt suggestions from Search Console or Analytics, done at five tracked', () => {
-    const connected = facts({ firstAnswer: true, gsc: true });
-    expect(step(connected, 'data_prompts')).toMatchObject({
-      state: 'waiting',
-      progress: { value: 0, target: 5 },
-    });
-    expect(
-      step({ ...connected, dataSuggestions: 12, dataTracked: 2 }, 'data_prompts'),
-    ).toMatchObject({ state: 'new', progress: { value: 2, target: 5 } });
-    expect(step({ ...connected, dataSuggestions: 12, dataTracked: 6 }, 'data_prompts').state).toBe(
-      'done',
-    );
-  });
-
-  it('goes with both sources when both are skipped, but not with one', () => {
-    expect(step(facts({ records: { gsc: 'skipped', ga: 'skipped' } }), 'data_prompts').state).toBe(
-      'skipped',
-    );
-    expect(step(facts({ records: { gsc: 'skipped' } }), 'data_prompts').state).toBe('waiting');
-    // Skipped, then connected after all: the suggestions can still come.
-    expect(
-      step(facts({ ga: true, records: { gsc: 'skipped', ga: 'skipped' } }), 'data_prompts').state,
-    ).toBe('waiting');
-  });
-
-  it('unlocks the act steps with the first content suggestions', () => {
-    const suggested = facts({ contentSuggestions: 4 });
-    expect(step(suggested, 'pick_content').state).toBe('new');
-    expect(step(suggested, 'create_content').state).toBe('new');
-    expect(step(suggested, 'optimize_page').state).toBe('new');
-    expect(step({ ...suggested, contentPicked: 1 }, 'pick_content').state).toBe('done');
-    expect(step({ ...suggested, contentCreated: 1 }, 'create_content').state).toBe('done');
-    // Done counts before the unlock: an audit run before the suggestions came.
-    expect(step(facts({ audits: 1 }), 'optimize_page').state).toBe('done');
-  });
-
-  it('opens the Content Plan’s top rows, and counts a draft made ready there (00234)', () => {
-    const href = (key: string) => GETTING_STARTED_STEPS.find((s) => s.key === key)!.href;
-    expect(href('create_content')).toBe('/dashboard/content/plan?start=create');
-    expect(href('optimize_page')).toBe('/dashboard/content/plan?start=optimize');
-
-    const suggested = facts({ contentSuggestions: 4 });
-    expect(step({ ...suggested, draftsCreated: 1 }, 'create_content').state).toBe('done');
-    expect(step({ ...suggested, draftsOptimized: 1 }, 'optimize_page').state).toBe('done');
-    // A draft of the other method completes neither.
-    expect(step({ ...suggested, draftsOptimized: 1 }, 'create_content').state).toBe('new');
-    expect(step({ ...suggested, draftsCreated: 1 }, 'optimize_page').state).toBe('new');
-  });
-
-  it('is ready once every other step is done or skipped', () => {
-    const all = facts({
-      records: {
-        kpis: 'done',
-        ga: 'skipped',
-        visibility: 'opened',
-        answers: 'opened',
-        mentions: 'opened',
-        citations: 'opened',
-        traffic: 'opened',
-      },
-      competitors: 5,
-      topicPrompts: [3, 3, 3],
-      gsc: true,
-      firstAnswer: true,
-      firstVisit: true,
-      dataSuggestions: 8,
-      dataTracked: 5,
-      contentSuggestions: 3,
-      contentPicked: 1,
-      contentCreated: 1,
-      audits: 2,
-    });
-    const status = buildGettingStarted(all);
-    expect(step(all, 'ready').state).toBe('done');
-    expect(status.done).toBe(17);
-    expect(step({ ...all, audits: 0 }, 'ready').state).toBe('waiting');
+  it("puts the snippet among a new brand's first two open steps, and the next one once it's done", () => {
+    // Today's card lists the first two steps still open (setup-section.tsx).
+    const nextTwo = (f: GettingStartedFacts) =>
+      buildGettingStarted(f)
+        .steps.filter((s) => s.state === 'new')
+        .slice(0, 2)
+        .map((s) => s.key);
+    expect(nextTwo(facts())).toEqual(['snippet', 'kpis']);
+    // Onboarding's competitors, topics and prompts saved: still first.
+    expect(nextTwo(facts({ competitors: 3, topicPrompts: [3, 3, 3] }))).toEqual([
+      'snippet',
+      'kpis',
+    ]);
+    expect(nextTwo(facts({ firstVisit: true }))).toEqual(['kpis', 'competitors']);
   });
 
   it('dates the steps a person acted on, and only those', () => {
@@ -283,6 +207,48 @@ describe('buildGettingStarted', () => {
     ]) {
       expect(buildGettingStarted(facts({ ...complete, ...gap })).needsSetup).toBe(true);
     }
+  });
+});
+
+describe('the 7 set-up steps', () => {
+  const setup = (f: GettingStartedFacts) => buildGettingStarted(f);
+
+  it('carries over what a brand already did, from its data and records', () => {
+    const status = setup(
+      facts({
+        startedAt: null,
+        confirmedAt: null,
+        kpiSetupAt: '2026-09-01T00:00:00Z',
+        competitors: 4,
+        topicPrompts: [3, 5, 3],
+        gsc: true,
+        firstVisit: true,
+        // Explore records still count where they are kept, but aren't listed.
+        records: { visibility: 'opened', ga: 'skipped' },
+      }),
+    );
+    expect(status.steps.map((s) => [s.key, s.state])).toEqual([
+      ['snippet', 'done'],
+      ['kpis', 'done'],
+      ['competitors', 'done'],
+      ['topics', 'done'],
+      ['prompts', 'done'],
+      ['gsc', 'done'],
+      ['ga', 'skipped'],
+    ]);
+    expect(status).toMatchObject({ done: 7, total: 7 });
+  });
+
+  it('counts a skipped optional step as complete, and leaves the rest to do', () => {
+    const status = setup(facts({ competitors: 3, records: { gsc: 'skipped' } }));
+    expect(status.done).toBe(2);
+    expect(status.steps.filter((s) => s.state === 'new').map((s) => s.key)).toEqual([
+      'snippet',
+      'kpis',
+      'topics',
+      'prompts',
+      'ga',
+    ]);
   });
 });
 

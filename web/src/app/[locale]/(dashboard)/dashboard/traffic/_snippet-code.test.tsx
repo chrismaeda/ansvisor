@@ -4,11 +4,21 @@ import { NextIntlClientProvider } from 'next-intl';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import messages from '../../../../../../messages/en.json';
 
-/** The tracking snippet's dialog (AT-001): the whole tag, wrapped in its box, and a copy button. */
+/**
+ * The tracking snippet's dialog (AT-001): the whole tag, wrapped in its box,
+ * and a copy button; and its banner while the code isn't seen on the site,
+ * with the steps and Check again (00433).
+ */
 
 vi.mock('@/config/api', () => ({ getPublicApiBaseUrl: () => 'https://api.example.com' }));
+const checkTrackingSnippet = vi.fn();
+vi.mock('@/lib/traffic-snippet-client', () => ({
+  checkTrackingSnippet: (...a: unknown[]) => checkTrackingSnippet(...a),
+}));
+const track = vi.fn();
+vi.mock('@/lib/analytics', () => ({ track: (...a: unknown[]) => track(...a) }));
 
-const { SnippetDialog } = await import('./_snippet-code');
+const { SnippetBanner, SnippetDialog } = await import('./_snippet-code');
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT =
   true;
@@ -20,6 +30,8 @@ const writeText = vi.fn();
 beforeEach(() => {
   Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
   writeText.mockReset();
+  checkTrackingSnippet.mockReset();
+  track.mockReset();
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);
@@ -66,5 +78,176 @@ describe('SnippetDialog', () => {
     expect(document.body.querySelector('pre')!.textContent).toMatch(
       /window\.ansvisor=window\.ansvisor\|\|[\s\S]*<script src="https:\/\/api\.example\.com\/t\.js" data-t="t_abc123" data-c="1" data-consent="wait" defer><\/script>$/,
     );
+  });
+});
+
+describe('the message for the developer', () => {
+  const tag = '<script src="https://api.example.com/t.js" data-t="t_abc123" defer></script>';
+  const email = () =>
+    [...document.body.querySelectorAll('a')].find(
+      (a) => a.textContent === 'Email this to my developer',
+    )!;
+  const copyMessage = () =>
+    [...document.body.querySelectorAll('button')].find((b) =>
+      ['Copy message', 'Message copied'].includes(b.textContent ?? ''),
+    )!;
+  /** The subject and body the mail app opens with. */
+  const mail = () => {
+    const url = new URL(email().getAttribute('href')!);
+    return {
+      to: url.pathname,
+      subject: url.searchParams.get('subject'),
+      body: url.searchParams.get('body'),
+    };
+  };
+
+  it('opens the mail app with the tag and the steps for the domain, and counts it', async () => {
+    await act(async () => {
+      root.render(
+        <NextIntlClientProvider locale="en" messages={messages}>
+          <SnippetDialog trackingCode="t_abc123" domain="acme.com" open onOpenChange={() => {}} />
+        </NextIntlClientProvider>,
+      );
+    });
+    expect(mail().to).toBe('');
+    expect(mail().subject).toBe('Please add the Ansvisor tracking code to acme.com');
+    expect(mail().body).toContain('Could you add the Ansvisor tracking code to acme.com?');
+    expect(mail().body).toContain(`\r\n\r\n${tag}\r\n\r\n`);
+    expect(mail().body).toContain('just before the closing </head> tag on every page');
+
+    email().addEventListener('click', (e) => e.preventDefault());
+    await act(async () => email().click());
+    expect(track).toHaveBeenCalledWith('traffic_snippet_emailed');
+  });
+
+  it('copies the same message, and counts the copy', async () => {
+    await act(async () => {
+      root.render(
+        <NextIntlClientProvider locale="en" messages={messages}>
+          <SnippetDialog trackingCode="t_abc123" domain="acme.com" open onOpenChange={() => {}} />
+        </NextIntlClientProvider>,
+      );
+    });
+    await act(async () => copyMessage().click());
+    expect(writeText).toHaveBeenCalledWith(mail().body!.replace(/\r\n/g, '\n'));
+    expect(writeText.mock.calls[0][0]).toMatch(/^Hi,\n\nCould you add/);
+    expect(copyMessage().textContent).toBe('Message copied');
+    expect(track).toHaveBeenCalledWith('traffic_snippet_message_copied');
+  });
+
+  it('shows on the banner too, naming "our website" when the domain is unknown', async () => {
+    await act(async () => {
+      root.render(
+        <NextIntlClientProvider locale="en" messages={messages}>
+          <SnippetBanner trackingCode="t_abc123" />
+        </NextIntlClientProvider>,
+      );
+    });
+    expect(mail().subject).toBe('Please add the Ansvisor tracking code to our website');
+    expect(copyMessage()).toBeDefined();
+  });
+});
+
+describe('SnippetBanner', () => {
+  const onFound = vi.fn();
+  const renderBanner = async (check?: {
+    domain?: string;
+    checkedAt?: string | null;
+    busy?: boolean;
+  }) => {
+    onFound.mockReset();
+    await act(async () => {
+      root.render(
+        <NextIntlClientProvider locale="en" messages={messages} timeZone="UTC">
+          <SnippetBanner
+            trackingCode="t_abc123"
+            check={
+              check
+                ? {
+                    brandId: 'b1',
+                    domain: check.domain,
+                    checkedAt: check.checkedAt ?? null,
+                    busy: check.busy,
+                    onFound,
+                  }
+                : undefined
+            }
+          />
+        </NextIntlClientProvider>,
+      );
+    });
+  };
+  const button = () =>
+    [...container.querySelectorAll('button')].find((b) => b.textContent === 'Check again')!;
+  const status = () => container.querySelector('[role="status"]')?.textContent ?? null;
+
+  it('says the code isn’t on the domain, how to add it, and checks again', async () => {
+    await renderBanner({ domain: 'ansvisor.com' });
+    expect(container.textContent).toContain('Tracking code not detected on ansvisor.com');
+    expect([...container.querySelectorAll('ol li')].map((li) => li.textContent)).toEqual([
+      'Copy the snippet below.',
+      'Paste it before the closing </head> tag on every page, your 404 page included.',
+      'Publish the change, then click Check again.',
+    ]);
+    checkTrackingSnippet.mockResolvedValue({
+      ok: true,
+      status: 'found',
+      domain: 'ansvisor.com',
+      checkedAt: new Date().toISOString(),
+    });
+    await act(async () => button().click());
+    expect(checkTrackingSnippet).toHaveBeenCalledWith('b1');
+    expect(onFound).toHaveBeenCalledTimes(1);
+  });
+
+  it('says what the check saw when it didn’t find it, or couldn’t read the page', async () => {
+    await renderBanner({ domain: 'ansvisor.com' });
+    checkTrackingSnippet.mockResolvedValue({
+      ok: true,
+      status: 'not_found',
+      domain: 'ansvisor.com',
+      checkedAt: new Date().toISOString(),
+    });
+    await act(async () => button().click());
+    expect(status()).toBe("Not found on ansvisor.com's home page yet.");
+    checkTrackingSnippet.mockResolvedValue({
+      ok: true,
+      status: 'unreachable',
+      domain: 'ansvisor.com',
+      checkedAt: null,
+    });
+    await act(async () => button().click());
+    expect(status()).toBe("Couldn't read ansvisor.com's home page. Try again in a few minutes.");
+    checkTrackingSnippet.mockResolvedValue({ ok: false });
+    await act(async () => button().click());
+    expect(status()).toBe("The check didn't run. Try again.");
+    expect(onFound).not.toHaveBeenCalled();
+  });
+
+  it('waits while the page’s first check runs, then says when it checked', async () => {
+    await renderBanner({ domain: 'ansvisor.com', busy: true });
+    const waiting = [...container.querySelectorAll('button')].find(
+      (b) => b.textContent === 'Checking…',
+    );
+    expect(waiting?.disabled).toBe(true);
+    expect(status()).toBeNull();
+
+    await renderBanner({ domain: 'ansvisor.com', checkedAt: new Date().toISOString() });
+    expect(button().disabled).toBe(false);
+    expect(status()).toMatch(/^Last checked /);
+  });
+
+  it('asks for a domain before a brand without one can be checked', async () => {
+    await renderBanner({});
+    expect(container.textContent).toContain('Tracking code not detected');
+    expect(button().disabled).toBe(true);
+    expect(status()).toBe("Add your website's domain in the brand's settings to check it.");
+  });
+
+  it('keeps the plain title, with no check, when the state couldn’t be read', async () => {
+    await renderBanner();
+    expect(container.textContent).toContain('Add this snippet to your website');
+    expect(container.querySelector('ol')).toBeNull();
+    expect(container.textContent).not.toContain('Check again');
   });
 });

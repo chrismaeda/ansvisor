@@ -16,6 +16,18 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import type { AuditResult, AuditSignal, AuditRecommendation } from '@/lib/actions/audits';
+import {
+  firstPersonEvidence,
+  languageName,
+  readingEvidence,
+  type ReadingEvidence,
+} from '@/lib/audit/reading-evidence';
+import { scoreRange, type ScoreRange } from '@/lib/audit/score-range';
+import { AUTHORITY_SIGNAL, AuthoritySources } from './authority-sources';
+import { BOT_ACCESS_SIGNAL, BotAccess } from './bot-access';
+import { NO_JS_SIGNAL, NoJsFinding, noJsEvidence } from './no-js-finding';
+import { ScoreRangeMark, useScoreRangeTip } from './score-range';
+import { ScoreFormula } from './score-formula';
 import { formatMonthDay } from '@/lib/format';
 import { cn } from '@/lib/utils';
 
@@ -54,6 +66,14 @@ const STATUS_ICON = {
   na: Minus,
 } as const;
 
+// Strong evidence stands out; the hygiene and informational levels stay quiet (SA-010).
+const EVIDENCE_VARIANT = {
+  strong: 'default',
+  likely: 'secondary',
+  hygiene: 'outline',
+  informational: 'outline',
+} as const;
+
 const STATUS_COLOR = {
   pass: 'text-green-600',
   warn: 'text-amber-500',
@@ -68,7 +88,14 @@ function gradeKey(score: number | null): 'good' | 'needsWork' | 'poor' | null {
   return 'poor';
 }
 
-export function ScoreGauge({ score }: { score: number | null }) {
+/** The score out of 100 on a ring, with its range ("64 ± 2") when it has one. */
+export function ScoreGauge({
+  score,
+  range = null,
+}: {
+  score: number | null;
+  range?: ScoreRange | null;
+}) {
   const p = pct(score) ?? 0;
   const radius = 52;
   const circ = 2 * Math.PI * radius;
@@ -97,8 +124,13 @@ export function ScoreGauge({ score }: { score: number | null }) {
         />
       </svg>
       <div className="absolute inset-0 flex flex-col items-center justify-center">
-        <span className={cn('text-4xl font-bold tabular-nums', scoreColor(score))}>
-          {pct(score) ?? '—'}
+        <span className="flex items-baseline gap-1">
+          <span className={cn('text-4xl font-bold tabular-nums', scoreColor(score))}>
+            {pct(score) ?? '—'}
+          </span>
+          {range && score !== null && (
+            <ScoreRangeMark range={range} spoken={false} className="text-sm tabular-nums" />
+          )}
         </span>
         <span className="text-[11px] text-muted-foreground">/ 100</span>
       </div>
@@ -106,7 +138,9 @@ export function ScoreGauge({ score }: { score: number | null }) {
   );
 }
 
-// A value the user fills in, e.g. "[customer name]" or "[price]".
+// A value only the brand knows, for the user to fill in ("Your input
+// needed"), e.g. "[customer name]" or "[your price]". The guard takes out a
+// figure the page doesn't have: none is left to research.
 const PLACEHOLDER = /(\[[A-Za-z][A-Za-z ]{1,38}\])/;
 
 function hasPlaceholder(text: string | null | undefined): boolean {
@@ -137,6 +171,7 @@ function DraftBlock({ text, copyLabel }: { text: string; copyLabel: string }) {
           i % 2 === 1 ? (
             <mark
               key={i}
+              title={t('inputNeeded')}
               className="rounded bg-amber-100 px-0.5 font-medium text-amber-900 dark:bg-amber-500/20 dark:text-amber-200"
             >
               {part}
@@ -165,6 +200,81 @@ function PasteBlocks({ rec }: { rec: AuditRecommendation }) {
   );
 }
 
+/** Readability's finding in parts: its score by the language's formula, then sentences, words and paragraphs. */
+function ReadingFinding({ evidence }: { evidence: ReadingEvidence }) {
+  const t = useTranslations('audit');
+  const tFormula = useTranslations('contentEditor.editor.quality.formulas');
+  const language = languageName(evidence.language);
+  return (
+    <div>
+      <p>
+        <span className="font-medium text-foreground">{t('finding')}: </span>
+        {evidence.formula && evidence.readingScore !== null
+          ? t('evidence.reading', {
+              score: evidence.readingScore,
+              formula: tFormula(evidence.formula),
+              language,
+            })
+          : t('evidence.readingNoFormula', { language })}
+      </p>
+      <ul className="mt-1 list-disc space-y-0.5 pl-5">
+        <li>{t('evidence.sentences', { words: evidence.wordsPerSentence })}</li>
+        <li>
+          {evidence.syllablesPerWord !== null
+            ? t('evidence.words', {
+                syllables: evidence.syllablesPerWord,
+                letters: evidence.lettersPerWord,
+              })
+            : t('evidence.wordsLetters', { letters: evidence.lettersPerWord })}
+        </li>
+        {evidence.wordsPerParagraph !== null && evidence.mobileLinesPerParagraph !== null && (
+          <li>
+            {t('evidence.paragraphs', {
+              words: evidence.wordsPerParagraph,
+              lines: evidence.mobileLinesPerParagraph,
+            })}
+          </li>
+        )}
+      </ul>
+    </div>
+  );
+}
+
+/** What a check found, from its evidence: its reason, or readability's and first person's counts. */
+function Finding({ signal }: { signal: AuditSignal }) {
+  const t = useTranslations('audit');
+  const evidence = signal.evidence ?? {};
+  if (typeof evidence.reason === 'string' && evidence.reason) {
+    return (
+      <p>
+        <span className="font-medium text-foreground">{t('finding')}: </span>
+        {evidence.reason}
+      </p>
+    );
+  }
+  // AI bot access: each bot's answer, from robots.txt and the live test (SA-008).
+  if (signal.key === BOT_ACCESS_SIGNAL) return <BotAccess signal={signal} />;
+  // Main text without JavaScript: how much a bot misses, and where (SA-009).
+  const noJs = signal.key === NO_JS_SIGNAL ? noJsEvidence(evidence) : null;
+  if (noJs) return <NoJsFinding evidence={noJs} />;
+  const reading = signal.key === 'readability' ? readingEvidence(evidence) : null;
+  if (reading) return <ReadingFinding evidence={reading} />;
+  const told = signal.key === 'first-person' ? firstPersonEvidence(evidence) : null;
+  if (told) {
+    return (
+      <p>
+        <span className="font-medium text-foreground">{t('finding')}: </span>
+        {t('evidence.firstPerson', {
+          count: told.firstPersonSentences,
+          total: told.sentences,
+          language: languageName(told.language),
+        })}
+      </p>
+    );
+  }
+  return null;
+}
+
 function SignalRow({
   signal,
   recommendation,
@@ -187,12 +297,17 @@ function SignalRow({
       >
         <Icon className={cn('h-4 w-4 shrink-0', STATUS_COLOR[signal.status])} />
         <span className="flex-1 text-sm font-medium">{signal.label}</span>
-        {signal.impactTier && (
+        {signal.evidenceLevel === 'informational' && (
+          <span className="hidden text-[11px] text-muted-foreground sm:inline">
+            {t('notScored')}
+          </span>
+        )}
+        {signal.evidenceLevel && (
           <Badge
-            variant={signal.impactTier === 'high' ? 'default' : 'secondary'}
-            className="text-[10px]"
+            variant={EVIDENCE_VARIANT[signal.evidenceLevel] ?? 'outline'}
+            className="whitespace-nowrap text-[10px] font-medium"
           >
-            {signal.impactTier}
+            {t(`evidenceLevel.${signal.evidenceLevel}`)}
           </Badge>
         )}
         <ChevronDown
@@ -204,17 +319,23 @@ function SignalRow({
           id={`signal-panel-${signal.key}`}
           className="space-y-2 pb-4 pl-7 text-sm text-muted-foreground"
         >
-          {typeof signal.evidence?.reason === 'string' && signal.evidence.reason && (
-            <p>
-              <span className="font-medium text-foreground">{t('finding')}: </span>
-              {signal.evidence.reason as string}
-            </p>
+          <Finding signal={signal} />
+          {signal.key === AUTHORITY_SIGNAL ? (
+            <AuthoritySources signal={signal} />
+          ) : (
+            signal.what && <p>{signal.what}</p>
           )}
-          {signal.what && <p>{signal.what}</p>}
           {signal.why && (
             <p>
               <span className="font-medium text-foreground">{t('why')}: </span>
               {signal.why}
+            </p>
+          )}
+          {signal.evidenceNote && (
+            <p>
+              <span className="font-medium text-foreground">{t('evidenceNote')}: </span>
+              {signal.evidenceNote}
+              {signal.evidenceLevel === 'informational' && ` ${t('notScored')}.`}
             </p>
           )}
           {/* Prefer the page-specific AI recommendation when we have one; fall
@@ -277,6 +398,8 @@ export function AuditReport({ audit }: { audit: AuditResult }) {
   );
   const hasIssues = counts.fail + counts.warn > 0;
   const grade = gradeKey(audit.totalScore);
+  const range = audit.partial ? null : scoreRange(audit.pageTrend);
+  const rangeTip = useScoreRangeTip();
   const scoreDelta =
     audit.totalScore !== null && audit.previousScore != null
       ? Math.round(audit.totalScore * 100) - Math.round(audit.previousScore * 100)
@@ -296,7 +419,7 @@ export function AuditReport({ audit }: { audit: AuditResult }) {
       {/* Headline: gauge + grade + pass/warn/fail summary */}
       <Card>
         <CardContent className="flex flex-col items-center gap-6 py-6 sm:flex-row sm:items-center">
-          <ScoreGauge score={audit.totalScore} />
+          <ScoreGauge score={audit.totalScore} range={range} />
           <div className="flex-1 space-y-2 text-center sm:text-left">
             <div className="text-sm font-medium break-all">{audit.finalUrl || audit.url}</div>
             {grade && (
@@ -337,6 +460,19 @@ export function AuditReport({ audit }: { audit: AuditResult }) {
             <div className="text-xs text-muted-foreground">
               {audit.signalsEvaluated}/{audit.signalsTotal} {t('signalsEvaluated')}
             </div>
+            {/* What the gauge's "± 2" means, written out for touch screens and screen readers. */}
+            {range && audit.totalScore !== null && (
+              <p className="text-xs text-muted-foreground">{rangeTip(range)}</p>
+            )}
+            {audit.partial && (
+              <p className="flex items-start justify-center gap-1.5 text-xs text-amber-700 sm:justify-start dark:text-amber-400">
+                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                <span>
+                  {t('partialNote')}
+                  <span className="block">{t('partialNoCredit')}</span>
+                </span>
+              </p>
+            )}
           </div>
         </CardContent>
       </Card>
@@ -362,8 +498,14 @@ export function AuditReport({ audit }: { audit: AuditResult }) {
 
       {/* Category breakdown */}
       <Card>
-        <CardHeader>
+        <CardHeader className="flex flex-row items-center justify-between space-y-0">
           <CardTitle className="text-base">{t('categoryBreakdown')}</CardTitle>
+          <ScoreFormula
+            categories={CATEGORY_META}
+            notScored={audit.signals
+              .filter((s) => s.evidenceLevel === 'informational')
+              .map((s) => s.label)}
+          />
         </CardHeader>
         <CardContent className="space-y-4">
           {CATEGORY_META.map((cat) => {

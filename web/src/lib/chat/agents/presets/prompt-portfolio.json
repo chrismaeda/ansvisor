@@ -1,0 +1,28 @@
+{
+  "id": "prompt-portfolio",
+  "goal": "visibility",
+  "businessTypes": [],
+  "industries": [],
+  "roles": [
+    "aeo"
+  ],
+  "skills": [
+    "prompts"
+  ],
+  "triggers": [
+    {
+      "kind": "schedule",
+      "repeat": "MO",
+      "time": "09:00"
+    }
+  ],
+  "mode": "ask_first",
+  "connections": [
+    {
+      "key": "google_search_console",
+      "required": false
+    }
+  ],
+  "status": "ready",
+  "needs": []
+}

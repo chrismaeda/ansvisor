@@ -17,7 +17,7 @@
 
 Ansvisor is an **open-source, agentic AI Search Execution Platform**. It shows how your brand appears in AI answers, finds where you can win, and turns that into work your team can ship. Agents find opportunities, turn signals into prioritized actions and draft the fixes. You approve what goes live.
 
-Connect business data and traditional search signals with AI Search behavior across ChatGPT, Google AI Overviews, Google AI Mode, Gemini, Claude, Perplexity, Microsoft Copilot, Grok, and other AI platforms to discover opportunities, prioritize what matters, and improve brand visibility.
+Connect business data and traditional search signals with AI Search behavior across ChatGPT, Google AI Overviews, Google AI Mode, Gemini, Claude, Grok, and other AI platforms to discover opportunities, prioritize what matters, and improve brand visibility.
 
 Track prompts, mentions, citations, competitors, AI traffic, and the sources AI systems rely on. Then act on them in the same place: plan content, let the Content Agent draft and fix pages, and follow every action against your AI Search KPIs.
 
@@ -52,18 +52,21 @@ Agents do the groundwork. They surface opportunities, prepare briefs and drafts,
 With Ansvisor, you can:
 
 - [**AI Search Execution Platform**](https://www.ansvisor.com/platform) — Bring AI visibility, prompts, citations, competitors, AI traffic, content, and execution workflows together in one platform.
-- [**Action Center**](https://www.ansvisor.com/features/ai-search-actions-kpis-action-center) — Turn signals across your workspace and connected data sources into prioritized actions and tasks aligned with your AI Search KPIs.
-- [**Agentic Content Editor**](https://www.ansvisor.com/features/agentic-content-editor) — The Content Agent writes and fixes pages from your prompts, query fan-outs, and cited pages, checks them against your content rules, and waits for your approval before anything changes.
+- [**Action Center**](https://www.ansvisor.com/features/ai-search-actions-kpis-action-center) — Turn signals across your workspace and connected data sources into prioritized actions and tasks aligned with your AI Search KPIs. **Today** shows what changed overnight, your three focus actions and what waits for your OK; **Signals** lists what changed and **History** measures what each finished action did.
+- **Chat** — Ask questions about your data and do the work step by step. Chat reads the same data as every page, shows a live status line while it works, and asks before it changes anything. Approve changes in Chat or in Slack, and use **Approve all** when several agents changed the same draft.
+- **Agents** — Save a skill, mode and connections as an agent. Pick one from the ready-to-use catalog, run it on a schedule, on a signal, or with **Run now**, and, on Growth and up, let it call other agents. Agent work waits for your approval until an Admin allows otherwise.
+- [**Agentic Content Editor**](https://www.ansvisor.com/features/agentic-content-editor) — The Content Agent writes and fixes pages from your prompts, query fan-outs, and cited pages, checks them against your brand facts and content rules (banned phrases, allowed and blocked sources), and waits for your approval before anything changes. Brand facts can apply to one destination, operator or route.
 - [**Answer Engine Insights & AI Visibility**](https://www.ansvisor.com/features/answer-engine-insights) — Track how your brand appears, performs, and is represented across leading AI platforms.
 - [**AI Brand Mentions & Sentiment**](https://www.ansvisor.com/features/ai-brand-mentions-sentiment) — See how AI platforms describe your brand: the exact quotes, the sentiment, and where you appear in each answer, compared with your competitors.
-- [**Prompt Monitoring & Volumes**](https://www.ansvisor.com/features/prompt-monitoring-volumes) — Discover and track relevant prompts, analyze demand, and measure how your visibility changes over time.
-- [**AI Citation Monitoring**](https://www.ansvisor.com/features/citations-monitoring) — Discover which domains, URLs, competitors, and third-party sources AI systems cite.
+- [**Prompt Monitoring & Volumes**](https://www.ansvisor.com/features/prompt-monitoring-volumes) — Ansvisor opens on the Prompts page. Track prompts, review suggestions from your data, group them into topics, and see estimated AI search volume and intent under Insights.
+- [**AI Citation Monitoring**](https://www.ansvisor.com/features/citations-monitoring) — Discover which domains, URLs, competitors, and third-party sources AI systems cite, and which third-party domains cite your competitors but not you (Competitor Gaps).
 - [**Competitor Tracking & Benchmarking**](https://www.ansvisor.com/features/competitor-tracking-benchmarking) — Compare your visibility, citations, mentions, and share of voice with competitors.
-- [**AI Traffic Analytics**](https://www.ansvisor.com/features/ai-traffic-analytics) — Connect AI Search visibility with visits and performance on your website.
-- [**Query Fan-Out**](https://www.ansvisor.com/features/query-fan-out) — Explore the supporting queries AI systems may generate and use before producing an answer.
+- [**AI Traffic Analytics**](https://www.ansvisor.com/features/ai-traffic-analytics) — Connect AI Search visibility with visits, conversions and revenue on your website.
+- **Ads** (preview) — For each buying-intent prompt, decide whether to earn the AI answer with content, pay for an ad, or both. Ad drafts are written from your approved brand facts. Nothing is sent to an ad platform.
+- [**Query Fan-Out**](https://www.ansvisor.com/features/query-fan-out) — Explore the supporting queries AI systems may generate and use before producing an answer, per prompt and across the brand.
 - [**Content Intelligence & Optimization**](https://www.ansvisor.com/features/content-intelligence-optimization) — Identify content gaps, optimization opportunities, and topics based on AI Search behavior.
 - [**AI Visibility Site Audit**](https://www.ansvisor.com/features/ai-visibility-site-audit) — Analyze technical and content signals that can affect how AI systems discover, understand, and retrieve your website.
-- [**MCP Server**](https://docs.ansvisor.com/guides/mcp-server) — Connect Ansvisor's AI Search intelligence with AI assistants and agent workflows through the Model Context Protocol (MCP).
+- [**MCP Server**](https://docs.ansvisor.com/guides/mcp-server) — Connect Ansvisor's AI Search intelligence with AI assistants and agent workflows through the Model Context Protocol (MCP). Claude and ChatGPT connect by signing in; other clients use an API key.
 
 The result is a clearer path from fragmented data to shipped improvements in AI visibility.
 
@@ -98,8 +101,6 @@ Ansvisor helps you monitor and analyze brand visibility across:
 - [**Google AI Mode Rank Tracker**](https://www.ansvisor.com/features/google-ai-mode-visibility-tracker)
 - [**Gemini AI Visibility Tracker**](https://www.ansvisor.com/features/gemini-visibility-tracker)
 - [**Claude AI Visibility Tracker**](https://www.ansvisor.com/features/claude-ai-visibility-tracker)
-- [**Perplexity AI Visibility Tracker**](https://www.ansvisor.com/features/perplexity-visibility-tracker)
-- [**Microsoft Copilot AI Visibility Tracker**](https://www.ansvisor.com/features/microsoft-copilot-visibility-tracker)
 - [**Grok AI Visibility Tracker**](https://www.ansvisor.com/features/grok-visibility-tracker)
 - [**ChatGPT AI Shopping Tracker**](https://www.ansvisor.com/features/ai-shopping-analytics)
 - and other AI-powered discovery experiences
@@ -152,7 +153,7 @@ Deploy Ansvisor on your own infrastructure and maintain control over your enviro
 |---------|---------|--------------|
 | **Supabase** | Database, Auth, API | [supabase.com](https://supabase.com/) |
 | **AI Provider** (at least one) | Brand tracking across AI engines | [OpenAI](https://platform.openai.com/) / [Google Gemini](https://ai.google.dev/) / [Anthropic](https://console.anthropic.com/) |
-| **Cloro** | Web scraping for AI platform responses | [cloro.ai](https://cloro.ai/) |
+| **Cloro** | Web scraping for AI platform responses | [cloro.dev](https://cloro.dev/?utm_source=ansvisor&utm_medium=byok) |
 
 ### Optional Services
 
@@ -160,7 +161,7 @@ Deploy Ansvisor on your own infrastructure and maintain control over your enviro
 |---------|---------|--------------|
 | **DataForSEO** | Keyword volume data for prompt analysis | [dataforseo.com](https://dataforseo.com/) |
 | **Scrape.do** | Page fetching for Site Audit (proxy + JS render); required only if you use Site Audit | [scrape.do](https://scrape.do/) |
-| **Stripe** | Payments (cloud mode only, not needed for self-hosted) | [stripe.com](https://stripe.com/) |
+| **Stripe** | Payments, including the email sent 3 days before a trial ends (cloud mode only, not needed for self-hosted) | [stripe.com](https://stripe.com/) |
 
 ### Setup
 
@@ -255,12 +256,12 @@ ansvisor/
 
 What we're planning to build next. React with 👍 on the linked issue (or open a new one) to push something up the list. PRs welcome on any of these.
 
-- [x] **Ansvisor MCP server** — expose insights through a Model Context Protocol server so Claude Desktop, Claude Code, Cursor, Zed, and any other MCP client can query your brand visibility directly. Remote (Streamable HTTP) endpoint at `/api/mcp` — zero install, paste a URL + API key into your client and you're done. Ships with `list_brands` and `get_visibility_summary` today; more tools landing as we go.
+- [x] **Ansvisor MCP server** — expose insights through a Model Context Protocol server so Claude Desktop, Claude Code, Cursor, Zed, and any other MCP client can query your brand visibility directly. Remote (Streamable HTTP) endpoint at `/api/mcp` — zero install, paste a URL + API key into your client and you're done. Tools read visibility, prompts, citations, mentions, AI traffic, shopping, the Action Center and more, and can create content drafts and actions. Claude and ChatGPT can also connect by signing in, with no key.
 - [x] **Anthropic Skills** — opinionated AEO knowledge that turns Claude into an analyst on your account. Ships in two flavours: an MCP-tool flavour for Claude Desktop / Claude Code / Cursor / Zed, and a standalone REST flavour for claude.ai web (no MCP required). First skill (`ansvisor-aeo-coach`) is live — see [`skills/`](./skills). More (page-audit, rewrite-for-aeo, content-brief) on the way.
 - [x] **In-product conversational AI assistant** — chat with your dashboard about visibility trends, competitor moves, and content gaps without leaving the page
 - [ ] **ScrapeLLM integration** — add ScrapeLLM as an alternative scraping backend alongside Cloro for users who prefer it or need a fallback
 - [x] **PostHog integration** — pipe AI-referred sessions and tracking events into PostHog for users already running it as their product analytics layer
-- [x] **Daily Pulse** — a per-brand daily digest email after each tracking run: KPI strip, highlights (first citations, prompt gains, leaderboard overtakes) and anomaly warnings (sharp visibility drops, competitor surges, lost citations), plus a `daily_pulse.created` webhook event for Slack/Notion delivery ([#540](https://github.com/ansvisor/ansvisor/issues/540))
+- [x] **Daily Pulse** — a per-brand daily digest email after each tracking run: KPI strip, highlights (first citations, prompt gains, leaderboard overtakes) and anomaly warnings (sharp visibility drops, competitor surges, lost citations), plus a `daily_pulse.created` webhook event and an optional Slack post ([#540](https://github.com/ansvisor/ansvisor/issues/540))
 - [ ] **BYO LLM keys** — bring your own OpenAI / Anthropic / Gemini API key for tracking and content generation, so you control cost and data handling
 - [ ] **Webhook recipe library** — one-click Notion / Linear / Asana / Slack templates so a Content Brief can land in your editorial workflow with zero glue code
 

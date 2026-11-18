@@ -26,7 +26,7 @@ import {
 import type { ContentDraftListItem } from '@/lib/content/drafts';
 import { CmsTargetPicker, CmsTargetUnchecked, useCmsTarget } from '@/components/content/cms-target';
 import { useUpgradeGate } from '@/components/providers/upgrade-gate';
-import { readCmsSources } from './_cms-sources';
+import { readCmsSources } from '@/lib/content/cms-sources';
 
 /** How often the sends going on in the background are read. */
 const POLL_MS = 2_000;
@@ -119,6 +119,8 @@ export function BulkSendDialog({
     webflow,
     wordpress,
     framer,
+    wix,
+    hubspot,
     target,
     pick,
     sent: keepTarget,
@@ -133,6 +135,8 @@ export function BulkSendDialog({
   const framerCollection = framer?.ready
     ? framer.collection || tEditor('send.target.framer.collection')
     : '';
+  const wixSite = wix?.ready ? wix.site : '';
+  const hubspotBlog = hubspot?.ready ? hubspot.blog : '';
 
   useEffect(() => {
     let cancelled = false;
@@ -322,14 +326,27 @@ export function BulkSendDialog({
           ? 'inProgressWordPress'
           : to === 'framer'
             ? 'inProgressFramer'
-            : 'inProgress',
+            : to === 'wix'
+              ? 'inProgressWix'
+              : to === 'hubspot'
+                ? 'inProgressHubspot'
+                : 'inProgress',
       );
     }
     // No CMS ready sent the pages to the webhook: what to fix is the one connected.
-    if (code === 'no_webhook' && !webflow?.ready && !wordpress?.ready && !framer?.ready) {
+    if (
+      code === 'no_webhook' &&
+      !webflow?.ready &&
+      !wordpress?.ready &&
+      !framer?.ready &&
+      !wix?.ready &&
+      !hubspot?.ready
+    ) {
       if (webflow) return tEditor('send.errors.no_webhookWebflow');
       if (wordpress) return tEditor('send.errors.no_webhookWordPress');
       if (framer) return tEditor('send.errors.no_webhookFramer');
+      if (wix) return tEditor('send.errors.no_webhookWix');
+      if (hubspot) return tEditor('send.errors.no_webhookHubspot');
     }
     return tEditor(`send.errors.${code}`);
   };
@@ -359,17 +376,23 @@ export function BulkSendDialog({
                   ? t('descriptionWordPress', { site })
                   : target === 'framer'
                     ? t('descriptionFramer', { collection: framerCollection })
-                    : t('description')}
+                    : target === 'wix'
+                      ? t('descriptionWix', { site: wixSite })
+                      : target === 'hubspot'
+                        ? t('descriptionHubspot', { blog: hubspotBlog })
+                        : t('description')}
           </DialogDescription>
         </DialogHeader>
 
         {/* Where the pages go, before they go: a CMS once Settings has it ready. */}
-        {(webflow || wordpress || framer) && target && !after && (
+        {(webflow || wordpress || framer || wix || hubspot) && target && !after && (
           <CmsTargetPicker
             value={target}
             webflow={webflow}
             wordpress={wordpress}
             framer={framer}
+            wix={wix}
+            hubspot={hubspot}
             disabled={phase.kind === 'sending'}
             onChange={(next) => {
               pick(next);

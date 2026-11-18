@@ -31,8 +31,11 @@
  */
 
 import supabaseAdmin from '../../../config/supabase.js';
+import { brandConnection, composioTarget } from '../../brand-integrations.js';
 import { runGaReport } from '../../composio.js';
 import { resolve } from '../../../config/action-engine.js';
+import { analyzeCompetitorPages } from '../competitor-pages.js';
+import { analyzeWinningPages } from '../winning-pages.js';
 
 const DAY_MS = 86_400_000;
 
@@ -42,14 +45,40 @@ function utcDay(date) {
   return date.toISOString().slice(0, 10);
 }
 
-/** One connection per organization per provider (#577). */
-function entityIdFor(organizationId) {
-  return `org_${organizationId}`;
-}
-
 const tool = (id, spec) => Object.freeze({ id, version: 1, writesExternally: false, ...spec });
 
 export const TOOLS = Object.freeze({
+  /**
+   * What the competitor pages AI answers cite for the action's prompts have
+   * that the brand's page doesn't (learning C1): read free from the public
+   * pages its own answers cited, through Site Audit's rule checks. Reading a
+   * public page changes nothing, so no approval.
+   */
+  competitor_page_features: tool('competitor_page_features', {
+    source: 'competitors',
+    description:
+      "What the competitor pages AI answers cite for the action's prompts have that the brand's page doesn't.",
+
+    async run({ brandId, payload, now }) {
+      return analyzeCompetitorPages({ brandId, payload, now });
+    },
+  }),
+
+  /**
+   * What the brand's winning pages have that its other pages don't (learning
+   * C4): through Site Audit's rule checks, the other pages from their audits,
+   * a winning page without one read free like a cited page. Reading changes
+   * nothing, so no approval.
+   */
+  winning_page_features: tool('winning_page_features', {
+    source: 'site_audits',
+    description: "What the brand's winning pages have that its other audited pages don't.",
+
+    async run({ brandId, payload, now }) {
+      return analyzeWinningPages({ brandId, payload, now });
+    },
+  }),
+
   /**
    * The AI Visibility Score over the validation window and the one before it
    * — what `validate` asks for, read from the daily rollups rather than the
@@ -112,11 +141,14 @@ export const TOOLS = Object.freeze({
     async run({ brandId, payload, now }) {
       const { data: brand, error } = await supabaseAdmin
         .from('brands')
-        .select('organization_id, ga_property_id')
+        .select('ga_property_id')
         .eq('id', brandId)
         .single();
       if (error) throw new Error(error.message);
       if (!brand?.ga_property_id) throw new Error('brand has no analytics property configured');
+      // The Google sign-in the brand uses (00470).
+      const connection = await brandConnection(brandId, 'google-analytics');
+      if (!connection?.connected) throw new Error('brand has no analytics connection');
 
       const length = validation.windowDays;
       const startDate = utcDay(new Date(now.getTime() - (length - 1) * DAY_MS));
@@ -124,7 +156,7 @@ export const TOOLS = Object.freeze({
       const previousEnd = utcDay(new Date(Date.parse(startDate) - DAY_MS));
       const previousStart = utcDay(new Date(Date.parse(startDate) - length * DAY_MS));
 
-      const report = await runGaReport(entityIdFor(brand.organization_id), brand.ga_property_id, {
+      const report = await runGaReport(composioTarget(connection), brand.ga_property_id, {
         dateRanges: [
           { startDate, endDate, name: 'current' },
           { startDate: previousStart, endDate: previousEnd, name: 'previous' },

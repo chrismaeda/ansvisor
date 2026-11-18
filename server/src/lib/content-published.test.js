@@ -30,7 +30,12 @@ function query(name) {
   };
   const chain = {
     select: () => ((returning = true), chain),
-    eq: (col, value) => (filters.push((row) => row[col] === value), chain),
+    // A JSON field's text too (`payload->>draftId`), as PostgREST reads it.
+    eq: (col, value) => {
+      const [column, field] = col.split('->>');
+      filters.push((row) => (field ? row[column]?.[field] : row[column]) === value);
+      return chain;
+    },
     neq: (col, value) => (filters.push((row) => row[col] !== value), chain),
     is: (col, value) => (filters.push((row) => (row[col] ?? null) === value), chain),
     in: (col, values) => (filters.push((row) => values.includes(row[col])), chain),
@@ -57,11 +62,40 @@ vi.mock('../config/supabase.js', () => ({
     },
   },
 }));
+const assertBrandAccess = vi.fn(async () => ({ orgId: 'org1' }));
+vi.mock('./access.js', () => ({ assertBrandAccess: (...args) => assertBrandAccess(...args) }));
 vi.mock('./logger.js', () => ({
   logger: { warn: (...args) => events.push(args), error: () => {} },
 }));
+const shipped = [];
+const closed = [];
+vi.mock('./impact-ledger/ship.js', () => ({
+  shipCmsPublish: async (args) => {
+    shipped.push(args);
+    return { id: 'ship-1', created: true, failed: false };
+  },
+  closeTakenDown: async (args) => {
+    closed.push(args);
+    return 1;
+  },
+}));
 
-const { liveAddress, markDeliveryPublished, publishDraft } = await import('./content-published.js');
+// IndexNow (#2142): told once a page went live; what it does is indexnow.test.js's.
+const announced = [];
+vi.mock('./indexnow.js', () => ({
+  announcePublishedPage: async (page) => {
+    announced.push(page);
+    return 'pinged';
+  },
+}));
+
+const {
+  liveAddress,
+  markDeliveryPublished,
+  markDeliveryTakenDown,
+  publishDraft,
+  publishDraftForKeyUser,
+} = await import('./content-published.js');
 
 const LIVE = 'https://www.acme.example/blog/cold-brew';
 
@@ -96,6 +130,8 @@ beforeEach(() => {
   };
   rpcs.length = 0;
   events.length = 0;
+  shipped.length = 0;
+  closed.length = 0;
 });
 
 describe('liveAddress', () => {
@@ -282,6 +318,84 @@ describe('publishDraft', () => {
   });
 });
 
+describe('publishDraftForKeyUser', () => {
+  // The fake database reads the embedded organization as a column of its own.
+  const ofOrg = (org) => Object.assign(tables.content_drafts[0], { 'brands.organization_id': org });
+
+  it('publishes the organization’s draft as the key’s user, as the route does', async () => {
+    ofOrg('org1');
+    expect(
+      await publishDraftForKeyUser({ draftId: 'dr1', url: LIVE, userId: 'u1', orgId: 'org1' }),
+    ).toMatchObject({ publishedUrl: LIVE, taskCompleted: false, onBrandDomain: true });
+    expect(tables.content_drafts[0]).toMatchObject({ status: 'published', published_url: LIVE });
+  });
+
+  it('leaves a draft of a brand the key’s user wasn’t given alone, as not there', async () => {
+    ofOrg('org1');
+    assertBrandAccess.mockRejectedValueOnce(
+      Object.assign(new Error("You don't have access to this brand"), {
+        status: 403,
+        code: 'no_brand_access',
+      }),
+    );
+    expect(
+      await publishDraftForKeyUser({ draftId: 'dr1', url: LIVE, userId: 'u1', orgId: 'org1' }),
+    ).toBeNull();
+    expect(assertBrandAccess).toHaveBeenLastCalledWith(tables.content_drafts[0].brand_id, 'u1');
+    expect(tables.content_drafts[0].status).not.toBe('published');
+
+    assertBrandAccess.mockRejectedValueOnce(new Error('connection reset'));
+    await expect(
+      publishDraftForKeyUser({ draftId: 'dr1', url: LIVE, userId: 'u1', orgId: 'org1' }),
+    ).rejects.toThrow('connection reset');
+  });
+
+  it('leaves another organization’s draft, and an archived one, alone', async () => {
+    ofOrg('org2');
+    expect(
+      await publishDraftForKeyUser({ draftId: 'dr1', url: LIVE, userId: 'u1', orgId: 'org1' }),
+    ).toBeNull();
+    ofOrg('org1');
+    tables.content_drafts[0].archived_at = '2026-10-20T10:00:00Z';
+    expect(
+      await publishDraftForKeyUser({ draftId: 'dr1', url: LIVE, userId: 'u1', orgId: 'org1' }),
+    ).toBeNull();
+    expect(tables.content_drafts[0].published_url ?? null).toBeNull();
+  });
+
+  it('changes nothing for a page already published at the address, its live-since kept', async () => {
+    ofOrg('org1');
+    const since = '2026-10-21T08:00:00Z';
+    Object.assign(tables.content_drafts[0], {
+      status: 'published',
+      published_url: LIVE,
+      published_at: since,
+      action_id: 'a1',
+    });
+    tables.action_tasks = [task('t1', 'publish_content')];
+    const before = clone(tables);
+
+    expect(
+      await publishDraftForKeyUser({ draftId: 'dr1', url: LIVE, userId: 'u1', orgId: 'org1' }),
+    ).toEqual({
+      publishedUrl: LIVE,
+      publishedAt: since,
+      taskCompleted: false,
+      onBrandDomain: true,
+    });
+    expect(tables).toEqual(before);
+    expect(rpcs).toEqual([]);
+
+    // At another address, it moves, as the editor's Mark published moves it.
+    const moved = 'https://www.acme.example/blog/cold-brew-at-home';
+    expect(
+      await publishDraftForKeyUser({ draftId: 'dr1', url: moved, userId: 'u1', orgId: 'org1' }),
+    ).toMatchObject({ publishedUrl: moved });
+    expect(tables.content_drafts[0].published_url).toBe(moved);
+    expect(tables.content_drafts[0].published_at).not.toBe(since);
+  });
+});
+
 describe('markDeliveryPublished', () => {
   it('tells the action of a page its CMS published, as a person’s publish does', async () => {
     tables.content_drafts[0].action_id = 'a1';
@@ -295,5 +409,124 @@ describe('markDeliveryPublished', () => {
     expect(tables.actions[0].payload.publishedPages).toEqual({ dr1: LIVE });
     expect(tables.action_tasks[0].status).toBe('completed');
     expect(tables.action_events[0].actor_id).toBeNull();
+  });
+
+  it('tells IndexNow of the page once it is published, never for an older send or a repeat (#2142)', async () => {
+    announced.length = 0;
+    // The page's latest send first, as its newest-first read answers.
+    tables.content_draft_deliveries = [
+      { id: 'x1', draft_id: 'dr1', status: 'sent', created_at: '2026-10-02T00:00:00Z' },
+      { id: 'x0', draft_id: 'dr1', status: 'sent', created_at: '2026-10-01T00:00:00Z' },
+    ];
+    await markDeliveryPublished(
+      { id: 'x1', draft_id: 'dr1', status: 'sent', published_url: null },
+      LIVE,
+    );
+    expect(announced).toEqual([{ draftId: 'dr1', url: LIVE }]);
+    // An older send's late word moves nothing: no announcement either.
+    await markDeliveryPublished(
+      { id: 'x0', draft_id: 'dr1', status: 'sent', published_url: null },
+      LIVE,
+    );
+    // The same send confirmed again at the same address.
+    await markDeliveryPublished(
+      { id: 'x1', draft_id: 'dr1', status: 'published', published_url: LIVE },
+      LIVE,
+    );
+    expect(announced).toHaveLength(1);
+  });
+
+  it('puts the publish into the impact ledger once the delivery is published, and not again', async () => {
+    tables.content_draft_deliveries = [{ id: 'x1', draft_id: 'dr1', status: 'sent' }];
+    await markDeliveryPublished(
+      { id: 'x1', draft_id: 'dr1', status: 'sent', published_url: null },
+      LIVE,
+    );
+    expect(shipped).toEqual([
+      { deliveryId: 'x1', url: LIVE, publishedAt: tables.content_draft_deliveries[0].published_at },
+    ]);
+    // Confirmed again at the same address: nothing new shipped.
+    await markDeliveryPublished(
+      { id: 'x1', draft_id: 'dr1', status: 'published', published_url: LIVE },
+      LIVE,
+    );
+    expect(shipped).toHaveLength(1);
+  });
+});
+
+describe('markDeliveryTakenDown (AUTONOMOUS-GO-LIVE PR 10)', () => {
+  const AT = '2026-11-02T12:00:00.000Z';
+  const send = (over = {}) => ({
+    id: 'x1',
+    draft_id: 'dr1',
+    target: 'webflow',
+    status: 'published',
+    published_url: LIVE,
+    ...over,
+  });
+  beforeEach(() => {
+    Object.assign(tables.content_drafts[0], {
+      status: 'published',
+      published_url: LIVE,
+      published_at: '2026-11-01T10:00:00Z',
+    });
+    tables.content_draft_deliveries = [send()];
+    tables.chat_agent_go_live_events = [
+      { id: 'e1', content_draft_id: 'dr1', target: 'webflow', kind: 'publish', status: 'done' },
+      { id: 'e2', content_draft_id: 'dr1', target: 'webflow', kind: 'cms_draft', status: 'done' },
+    ];
+    tables.chat_notices = [
+      {
+        id: 'n1',
+        kind: 'agent_went_live',
+        payload: { draftId: 'dr1', kind: 'publish', url: LIVE },
+        resolved_at: null,
+      },
+      {
+        id: 'n2',
+        kind: 'agent_went_live',
+        payload: { draftId: 'dr1', kind: 'cms_draft' },
+        resolved_at: null,
+      },
+    ];
+  });
+
+  it('marks the send taken down, the page back to Ready without its address, and tells the rest', async () => {
+    expect(await markDeliveryTakenDown(send(), { userId: 'u1', at: AT })).toBe(true);
+    expect(tables.content_draft_deliveries[0]).toMatchObject({
+      status: 'taken_down',
+      taken_down_at: AT,
+      taken_down_by: 'u1',
+      published_url: LIVE,
+    });
+    expect(tables.content_drafts[0]).toMatchObject({
+      status: 'ready',
+      published_url: null,
+      published_at: null,
+    });
+    // The publish on its own is taken down; the draft it sent before stays done.
+    expect(tables.chat_agent_go_live_events.map((e) => e.status)).toEqual(['taken_down', 'done']);
+    expect(tables.chat_agent_go_live_events[0]).toMatchObject({
+      taken_down_at: AT,
+      taken_down_by: 'u1',
+    });
+    expect(tables.chat_notices[0].resolved_at).toBe(AT);
+    expect(tables.chat_notices[1].resolved_at).toBeNull();
+    expect(closed).toEqual([{ draftId: 'dr1', at: AT }]);
+  });
+
+  it('changes nothing for a send that isn’t published, and leaves a page live at another send’s address', async () => {
+    tables.content_draft_deliveries[0].status = 'sent';
+    expect(await markDeliveryTakenDown(send(), { userId: 'u1', at: AT })).toBe(false);
+    expect(tables.content_drafts[0].published_url).toBe(LIVE);
+    expect(closed).toEqual([]);
+
+    tables.content_draft_deliveries[0].status = 'published';
+    tables.content_drafts[0].published_url = 'https://www.acme.example/blog/cold-brew-2';
+    expect(await markDeliveryTakenDown(send(), { userId: 'u1', at: AT })).toBe(true);
+    expect(tables.content_drafts[0]).toMatchObject({
+      status: 'published',
+      published_url: 'https://www.acme.example/blog/cold-brew-2',
+    });
   });
 });

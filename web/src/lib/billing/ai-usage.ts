@@ -10,7 +10,22 @@ import { USAGE_WARNING_RATIO, type UsageTone } from '@/lib/content-usage';
  * only decides how they read.
  */
 
-export const AI_USAGE_FEATURES = ['improve', 'content', 'action_center', 'other'] as const;
+/**
+ * The meter's rows, in order: Chat's (00405) only with Chat on for the
+ * workspace, its agents, scheduled runs and images as they come; Ads' ad
+ * drafts (00532) only with Ads on.
+ */
+export const AI_USAGE_FEATURES = [
+  'improve',
+  'content',
+  'action_center',
+  'chat',
+  'agent',
+  'schedule',
+  'image',
+  'ads',
+  'other',
+] as const;
 export type AiUsageFeature = (typeof AI_USAGE_FEATURES)[number];
 
 export interface AiUsage {
@@ -30,6 +45,42 @@ export interface AiUsage {
    * percent comes as 0, read with featurePercentLabel.
    */
   features: { feature: AiUsageFeature; percent: number }[];
+  /**
+   * Chat draws on the allowance too (CHAT_AGENTIC on for the workspace;
+   * missing from an older API: off). Off, it runs on the workspace's own key.
+   */
+  chatMetered?: boolean;
+  /**
+   * This period's use by agent (CHAT-27 item 27), with Chat metered and
+   * outside the trial: each agent's share of the allowance, highest first (a
+   * null agentId is the deleted agents' runs together), and Chat's outside
+   * any agent's run. `name` is set on the web, for the agents the person may
+   * see (ai-usage-agents.ts nameAgents). Missing: no By agent list.
+   */
+  byAgent?: {
+    agents: { agentId: string | null; percent: number; name?: string }[];
+    chat: number;
+  };
+  /**
+   * Purchased AI credits are left (CHAT-18 §F, with Chat on): AI calls go on
+   * running on them past 100% of the allowance. Missing: none.
+   */
+  creditsLeft?: boolean;
+  /**
+   * What work a page asks about before it runs typically takes, as shares of
+   * the allowance to a tenth (customer priorities item 9): Write this's brief
+   * and page, and a draft's AI checks for its Site Audit estimate. Missing
+   * from an older API: the page says nothing of it.
+   */
+  estimates?: {
+    writeThis?: number;
+    auditAiChecks?: number;
+    /** The Content Editor's agent runs, for the Next step window (the user, 2026-11-03). */
+    editorBrief?: number;
+    editorFix?: number;
+    editorRewrite?: number;
+    editorWrite?: number;
+  };
 }
 
 /** A count against its plan's limit this period. */
@@ -92,10 +143,13 @@ export function aiUsageFromApi(raw: AiUsage): AiUsage {
   };
 }
 
-/** Warning from 80% of the allowance, used up at 100%. */
+/**
+ * Warning from 80% of the allowance, used up at 100%, unless purchased AI
+ * credits are left: the calls run on them then, so it stays a warning.
+ */
 export function aiUsageTone(usage: AiUsage): UsageTone {
   if (usage.unlimited || usage.percentUsed === null) return 'unlimited';
-  if (usage.percentUsed >= 100) return 'exhausted';
+  if (usage.percentUsed >= 100) return usage.creditsLeft ? 'warning' : 'exhausted';
   return usage.percentUsed >= USAGE_WARNING_RATIO * 100 ? 'warning' : 'normal';
 }
 

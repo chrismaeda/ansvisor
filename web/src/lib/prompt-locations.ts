@@ -32,25 +32,30 @@ export function promptLocationCount(regions: readonly unknown[] | null | undefin
 }
 
 export interface OrgLocationUsage {
-  /** Active locations across every prompt in the org; paused prompts don't count (00128). */
+  /**
+   * Active locations across every prompt in the org, whatever brands the
+   * caller can see; paused prompts don't count (00128).
+   */
   total: number;
   /**
-   * Tracked locations per brand — for replace-style saves (savePromptSet
-   * swaps a brand's whole set, so that brand's current locations don't count
-   * against its own re-save) and for the wizards' capacity display.
+   * Tracked locations per brand the caller can access — for replace-style
+   * saves (savePromptSet swaps a brand's whole set, so that brand's current
+   * locations don't count against its own re-save) and for the wizards'
+   * capacity display.
    */
   byBrand: Map<string, number>;
 }
 
 /** Pure aggregation half of {@link getOrgLocationUsage}, split out for tests. */
 export function summarizeLocationRows(
-  rows: { brand_id: string; locations: number }[],
+  rows: { brand_id: string | null; locations: number }[],
 ): OrgLocationUsage {
   const byBrand = new Map<string, number>();
   let total = 0;
   for (const row of rows) {
     total += row.locations;
-    byBrand.set(row.brand_id, row.locations);
+    // The brands the caller can't access come as one row with no brand (00390).
+    if (row.brand_id) byBrand.set(row.brand_id, row.locations);
   }
   return { total, byBrand };
 }
@@ -61,8 +66,10 @@ export function summarizeLocationRows(
  * would look equivalent but isn't: PostgREST silently caps an un-paginated
  * select at 1000 rows (the #427/#450/#464 trap), and a truncated sum
  * UNDER-counts — the guard would wave an over-limit org through with no
- * error anywhere. The RPC is security invoker, so RLS scopes it to orgs the
- * caller belongs to.
+ * error anywhere. The RPC is security definer (00390): it counts the whole
+ * organization for its members (and the server), so a person who sees only
+ * some of its brands can't get past the plan's limit, and nothing for anyone
+ * else.
  */
 export async function getOrgLocationUsage(
   supabase: ServerSupabase,
@@ -111,6 +118,48 @@ export function locationLimitMessage(plan: Plan, used: number, adding: number): 
     `would use ${total} (${used} in place + ${adding} added). Remove or pause ${over} ` +
     `location${over === 1 ? '' : 's'} to continue, or upgrade your plan.`
   );
+}
+
+// ─── Waiting for a spot (00535) ──────────────────────────────────────────────
+
+/**
+ * How many of these new prompts, taken in order, the plan has room to track,
+ * each costing its locations (`costs`, promptLocationCount). The rest are
+ * saved waiting for a spot instead of being refused (Simplify PR 15). As import_prompts does with p_over_limit 'wait' (00535): once
+ * one doesn't fit, it and every one after it wait, so a smaller prompt
+ * further down never jumps the order the person gave. Same rules as
+ * locationLimitMessage: unlimited plans fit everything, landing exactly on
+ * the cap fits, and `used` counts the whole organization's active
+ * locations, across its brands (getOrgLocationUsage).
+ */
+export function promptsThatFit(plan: Plan, used: number, costs: readonly number[]): number {
+  let total = used;
+  for (let i = 0; i < costs.length; i++) {
+    total += costs[i];
+    if (locationLimitMessage(plan, used, total - used) !== null) return i;
+  }
+  return costs.length;
+}
+
+/**
+ * Where one new prompt goes: tracked when the plan has room for its
+ * locations, otherwise kept waiting for a spot.
+ */
+export function placeNewPrompt(plan: Plan, used: number, locations: number): 'track' | 'wait' {
+  return promptsThatFit(plan, used, [locations]) === 1 ? 'track' : 'wait';
+}
+
+/**
+ * The columns a prompt saved waiting for a spot gets: not active (so not
+ * tracked and not counted), with the time it started waiting. The database
+ * refuses a waiting prompt that is active (prompts_waiting_not_active_check),
+ * so whatever makes one active clears waiting_since in the same write.
+ */
+export function waitingPromptColumns(now: Date = new Date()): {
+  is_active: false;
+  waiting_since: string;
+} {
+  return { is_active: false, waiting_since: now.toISOString() };
 }
 
 // ─── Bulk retargeting ────────────────────────────────────────────────────────
@@ -167,13 +216,16 @@ export function planBulkLocationChange(
   const wanted = [...new Set(locations.map((code) => code.trim().toUpperCase()))].filter(Boolean);
   const plan: BulkLocationPlan = { changes: [], unchanged: 0, blocked: 0, delta: 0 };
   if (wanted.length === 0) return plan;
+  // A removal's codes aren't checked against the known locations, so the
+  // list can be long: look each one up rather than scan it per prompt.
+  const removing = new Set(wanted);
 
   for (const prompt of prompts) {
     const current = prompt.regions ?? [];
     const next =
       action === 'add'
         ? [...current, ...wanted.filter((code) => !current.includes(code))]
-        : current.filter((code) => !wanted.includes(code));
+        : current.filter((code) => !removing.has(code));
 
     if (next.length === current.length) {
       plan.unchanged++;

@@ -25,13 +25,22 @@ export interface Brand {
   language?: string;
   trackingCode?: string;
   shoppingModeEnabled: boolean;
-  /** b2b, ecommerce or b2c (Content Editor page types); unset = guessed (siteTypeOf). */
+  /** b2b, ecommerce, b2c or app (Content Editor page types); unset = guessed (siteTypeOf). */
   siteType?: string;
+  /** auto = detected from the brand's site at setup or by its catalog; manual = a person chose it (00379). */
+  siteTypeSource?: 'auto' | 'manual';
   /** The snippet follows AI visitors to conversions (CE-017, 00286); off by default. */
   conversionsEnabled?: boolean;
   /** 'wait' keeps the snippet's visitor id only after the site's consent, 'always' at once. */
   conversionsConsent?: 'wait' | 'always';
   isActive: boolean;
+  /**
+   * The workspace's demo brand: sample data in the real tables, shown as the
+   * product is, with every action opening the plan dialog (00380).
+   */
+  isDemo?: boolean;
+  /** When an admin hid the demo brand (after buying a plan); it is never deleted. */
+  demoHiddenAt?: string | null;
   domains: BrandDomain[];
   createdAt: string;
   updatedAt: string;
@@ -63,6 +72,8 @@ export interface Prompt {
   platforms: AIPlatform[];
   regions: string[];
   models: string[];
+  /** Cross-cutting custom labels (#2151), orthogonal to the topic. */
+  tags: string[];
   isActive: boolean;
   /** Workflow state (#463 follow-up): null = no status set. */
   workStatus: 'todo' | 'in_progress' | 'done' | null;
@@ -71,6 +82,11 @@ export interface Prompt {
   /** Target URLs cited by at least one answer. */
   citedUrlCount: number;
   createdAt: string;
+  /**
+   * When it started waiting for a spot on the plan (00535): saved past the
+   * limit, inactive and not tracked. Absent when it isn't waiting.
+   */
+  waitingSince?: string | null;
 }
 
 export interface Topic {
@@ -160,6 +176,12 @@ export interface Competitor {
   brandId: string;
   name: string;
   domain: string;
+  /**
+   * What kind of competitor it is (00542): a generic type's key ('direct',
+   * 'marketplace', 'publisher', 'other') or the brand's own label; null for
+   * none. competitorTypeLabel (lib/competitor-types) says how it reads.
+   */
+  type: string | null;
 }
 
 export interface PromptVolume {
@@ -233,23 +255,38 @@ export interface ContentOpportunitySourceData {
     intent: number;
   };
   windowDays?: number;
+  /**
+   * Its question's estimated AI volume when it was made: what its volume
+   * reads as (question-volume.ts). `estAiVolume` is its prompts' sum, which
+   * the score's demand weighs.
+   */
+  questionVolume?: number;
   targetPages?: OpportunityPage[];
   assets?: OpportunityAsset[];
   /** Action Center actions sent from this opportunity, by asset key ('all' for the whole). */
   actions?: Record<string, string>;
-  /** Actions from before the opportunity was re-opened. */
+  /** Actions from before the opportunity was re-opened, or of one merged into it. */
   pastActions?: string[];
   /**
    * Duplicates folded into this opportunity instead of being created
    * (CONTENT-004): clusters whose prompt and fan-out baskets matched its own.
    */
   duplicatesMerged?: number;
+  /**
+   * What joined this opportunity because it answers the same question: a
+   * cluster, a task or an opportunity merged into it, the latest last.
+   */
+  merged?: OpportunityMerge[];
+  /** An opportunity merged into another one on the same question: that one. */
+  mergedInto?: string;
   /** The opportunity this one is another angle on (CONTENT-006). */
   alternativeOf?: { id: string; title: string };
   /** Sent from an Action Center task (AC-004): the action, and what the task says. */
   fromAction?: {
     actionId: string;
     actionNo: number | null;
+    /** Its number in its brand (00534) when sent; the code reads it (actionCode). */
+    brandNo?: number | null;
     taskId: string;
     task?: {
       /** The exact page, and the change to make there (AC-010). */
@@ -274,6 +311,19 @@ export interface ContentOpportunitySourceData {
     visibilityAfter: number | null;
     visibility: number;
   };
+}
+
+export interface OpportunityMerge {
+  at: string;
+  source: 'system' | 'manual' | 'prompt' | 'action';
+  clusterId?: string;
+  question?: string | null;
+  opportunityId?: string;
+  title?: string;
+  actionId?: string;
+  actionNo?: number | null;
+  brandNo?: number | null;
+  taskId?: string;
 }
 
 export interface OpportunityPage {

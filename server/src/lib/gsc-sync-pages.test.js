@@ -19,6 +19,19 @@ vi.mock('./composio.js', () => ({
   },
 }));
 vi.mock('./logger.js', () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
+// The brand uses the Account's Google sign-in (00470).
+vi.mock('./brand-integrations.js', () => ({
+  connectedBrands: async () => [
+    {
+      brandId: state.brand.id,
+      organizationId: 'o1',
+      entityId: 'org_o1',
+      composioAccountId: 'ca_1',
+      connected: true,
+    },
+  ],
+  composioTarget: (c) => ({ entityId: c.entityId, accountId: c.composioAccountId }),
+}));
 vi.mock('../config/supabase.js', () => ({
   default: {
     from: (table) => {
@@ -40,9 +53,6 @@ vi.mock('../config/supabase.js', () => ({
             state.updates.push(update);
             Object.assign(state.brand, update);
             return resolve({ error: null });
-          }
-          if (table === 'integration_connections') {
-            return resolve({ data: [{ organization_id: 'o1' }], error: null });
           }
           if (table === 'brands') return resolve({ data: [{ ...state.brand }], error: null });
           return resolve({ error: null });
@@ -117,8 +127,9 @@ describe('the page sync', () => {
   it('starts over when a first sync stops in the recent days', async () => {
     state.failOn = day(13, Date.now());
     await runGscSync({ brandId: 'b1' });
-    // Nothing marked: the next sync reads the property from the start.
-    expect(state.updates).toEqual([]);
+    // Nothing marked: the next sync reads the property from the start. (The
+    // shopping read is a step of its own, and marks its own fields.)
+    expect(state.updates.filter((update) => !('gsc_shopping_synced_at' in update))).toEqual([]);
     expect(state.brand.gsc_pages_backfilled_property).toBeNull();
   });
 });

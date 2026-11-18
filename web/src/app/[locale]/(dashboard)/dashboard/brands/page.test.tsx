@@ -6,18 +6,28 @@ import messages from '../../../../../../messages/en.json';
 import { UpgradeDialogContext } from '@/components/providers/upgrade-gate';
 
 const profile = vi.hoisted(() => ({ organization_id: 'org-1', role: 'admin' }));
+const brands = vi.hoisted(() => ({
+  list: [] as { id: string; isDemo?: boolean; demoHiddenAt?: string | null }[],
+  /** The organization's brands the plan counts (org_brand_count); by default the listed ones. */
+  counted: null as number | null,
+}));
 vi.mock('@/lib/supabase/server', () => ({
   createClient: async () => ({
     from: () => ({ select: () => ({ single: async () => ({ data: profile }) }) }),
+    rpc: async () => ({
+      data: brands.counted ?? brands.list.filter((b) => !b.isDemo).length,
+      error: null,
+    }),
   }),
 }));
-const brands = vi.hoisted(() => ({ list: [] as { id: string }[] }));
 vi.mock('@/lib/actions/brand', () => ({ getBrands: async () => brands.list }));
 vi.mock('@/lib/guards/plan-guard', () => ({
   getOrgPlan: async () => ({ limits: { maxBrands: 2 } }),
 }));
 const cloud = vi.hoisted(() => ({ on: false }));
-vi.mock('@/config/plans', () => ({
+// Partial, so modules the page reaches (e.g. the trial's Start my plan now) still get the rest.
+vi.mock('@/config/plans', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   getPlan: () => ({ limits: { maxBrands: 2 } }),
   isCloud: () => cloud.on,
 }));
@@ -29,7 +39,13 @@ vi.mock('@/i18n/navigation', () => ({
   ),
 }));
 // The list and the menu beside the button have their own tests.
-vi.mock('./_brands-client', () => ({ BrandsClient: () => null }));
+const listed = vi.hoisted(() => ({ ids: [] as string[] }));
+vi.mock('./_brands-client', () => ({
+  BrandsClient: ({ brands }: { brands: { id: string }[] }) => {
+    listed.ids = brands.map((b) => b.id);
+    return null;
+  },
+}));
 vi.mock('@/components/layout/workspace-settings-menu', () => ({
   WorkspaceSettingsMenu: () => null,
 }));
@@ -65,6 +81,7 @@ beforeEach(() => {
   root = createRoot(container);
   profile.role = 'admin';
   brands.list = [];
+  brands.counted = null;
   cloud.on = false;
 });
 
@@ -143,5 +160,37 @@ describe('the brands page', () => {
     await act(async () => add.dispatchEvent(click));
     expect(click.defaultPrevented).toBe(true);
     expect(openUpgrade).toHaveBeenCalledExactlyOnceWith('Adding brands needs a plan');
+  });
+});
+
+describe('the brands page and brand access', () => {
+  it('counts every brand of the organization toward the plan, not only the ones shown (00390)', async () => {
+    // A Selected-brands manager sees one brand; the organization has two.
+    brands.list = [{ id: 'b1' }];
+    brands.counted = 2;
+    cloud.on = true;
+    profile.role = 'manager';
+    await render();
+    expect(links()).toEqual(['/dashboard/settings?tab=billing']);
+    expect(listed.ids).toEqual(['b1']);
+  });
+});
+
+describe('the brands page and the demo brand', () => {
+  it("doesn't count the demo brand toward the plan's brands", async () => {
+    brands.list = [{ id: 'b1' }, { id: 'demo', isDemo: true, demoHiddenAt: null }];
+    cloud.on = true;
+    await render();
+    expect(links()).toEqual(['/dashboard/brands/new']);
+    expect(listed.ids).toEqual(['b1', 'demo']);
+  });
+
+  it('leaves a hidden demo brand out of the list', async () => {
+    brands.list = [
+      { id: 'b1' },
+      { id: 'demo', isDemo: true, demoHiddenAt: '2026-10-28T00:00:00Z' },
+    ];
+    await render();
+    expect(listed.ids).toEqual(['b1']);
   });
 });

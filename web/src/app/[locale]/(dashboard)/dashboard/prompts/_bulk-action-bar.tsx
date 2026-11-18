@@ -1,15 +1,34 @@
 'use client';
 
-import { Lightbulb, Loader2, Pause, Play, Trash2, X } from 'lucide-react';
+import {
+  ChevronDown,
+  Lightbulb,
+  Loader2,
+  MapPin,
+  Pause,
+  Play,
+  Radar,
+  Tags,
+  Trash2,
+  X,
+} from 'lucide-react';
 import { useTranslations } from 'next-intl';
 import { Button } from '@/components/ui/button';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 
 /**
  * The prompts table's bulk action bar (PROMPT-006): shown while rows are
  * selected, with the row menu's own actions for all of them at once. Pause
- * and Resume each show only when some selected prompt can take them. While a
- * bulk delete runs, a few prompts per call, it shows how far it has got, even
- * with nothing selected.
+ * and Resume each show only when some selected prompt can take them;
+ * Locations adds locations to them or stops some (PROMPT-015). Track now
+ * shows when some selected prompts have no answers yet, and starts tracking
+ * those now. While a bulk delete runs, a few prompts per call, it shows how
+ * far it has got, even with nothing selected.
  */
 export function BulkActionBar({
   count,
@@ -18,9 +37,16 @@ export function BulkActionBar({
   suggesting,
   suggestBlockedReason,
   deleting,
+  trackNowCount = 0,
+  trackNowBusy = false,
+  onTrackNow,
   onPause,
   onResume,
   onSuggestContent,
+  onAddLocations,
+  onRemoveLocations,
+  onAddTags,
+  onRemoveTags,
   onDelete,
   onClear,
 }: {
@@ -34,13 +60,28 @@ export function BulkActionBar({
   suggestBlockedReason: string | null;
   /** How far the delete that is running has got; null when none is. */
   deleting: { done: number; total: number } | null;
+  /** How many selected prompts have no answers yet: Track now starts them. */
+  trackNowCount?: number;
+  /** A Track now run is starting. */
+  trackNowBusy?: boolean;
+  /** Undefined for those who can't track. */
+  onTrackNow?: () => void;
   onPause: () => void;
   onResume: () => void;
   onSuggestContent: () => void;
+  /** Open the locations dialog on the selection, to add or to stop some. */
+  onAddLocations: () => void;
+  onRemoveLocations: () => void;
+  /** Open the tags dialog on the selection, to add or to remove some. */
+  onAddTags: () => void;
+  onRemoveTags: () => void;
   onDelete: () => void;
   onClear: () => void;
 }) {
   const t = useTranslations('prompts.bulkDelete');
+  const tLocations = useTranslations('prompts.addLocations');
+  const tTags = useTranslations('prompts.bulkTags');
+  const tTrack = useTranslations('prompts.trackNow');
   const pausedCount = count - activeCount;
   const progress = deleting && (
     <span role="status" className="flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -61,6 +102,23 @@ export function BulkActionBar({
       <span className="text-xs font-medium">{count} selected</span>
       {progress}
       <div className="ml-auto flex flex-wrap items-center justify-end gap-1">
+        {onTrackNow && trackNowCount > 0 && (
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 gap-1.5 text-xs"
+            onClick={onTrackNow}
+            disabled={busy || trackNowBusy}
+            title={tTrack('bulkTitle', { count: trackNowCount })}
+          >
+            {trackNowBusy ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <Radar className="h-3 w-3" />
+            )}
+            {trackNowCount < count ? tTrack('bulkSome', { count: trackNowCount }) : tTrack('track')}
+          </Button>
+        )}
         {activeCount > 0 && (
           <Button
             variant="outline"
@@ -85,6 +143,36 @@ export function BulkActionBar({
             Resume{activeCount > 0 ? ` ${pausedCount}` : ''}
           </Button>
         )}
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            render={<Button variant="outline" size="sm" className="h-7 gap-1.5 text-xs" />}
+            disabled={busy}
+          >
+            <MapPin className="h-3 w-3" />
+            {tLocations('bulkButton')}
+            <ChevronDown className="h-3 w-3" />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-44">
+            <DropdownMenuItem onClick={onAddLocations}>{tLocations('bulkAdd')}</DropdownMenuItem>
+            <DropdownMenuItem onClick={onRemoveLocations}>
+              {tLocations('bulkRemove')}
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            render={<Button variant="outline" size="sm" className="h-7 gap-1.5 text-xs" />}
+            disabled={busy}
+          >
+            <Tags className="h-3 w-3" />
+            {tTags('bulkButton')}
+            <ChevronDown className="h-3 w-3" />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-44">
+            <DropdownMenuItem onClick={onAddTags}>{tTags('bulkAdd')}</DropdownMenuItem>
+            <DropdownMenuItem onClick={onRemoveTags}>{tTags('bulkRemove')}</DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
         {suggestBlockedReason && !suggesting && (
           <span className="px-1 text-[11px] text-muted-foreground">{suggestBlockedReason}</span>
         )}

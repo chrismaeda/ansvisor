@@ -7,6 +7,7 @@ import { apiFailure, type ApiFailure } from '@/lib/api-failure';
 import type { ContentUsage } from '@/lib/content-usage';
 import { assertWritable } from '@/lib/subscription-guard';
 import type { NoPlanMark } from '@/lib/billing/no-plan';
+import type { QuestionVolume } from '@/lib/content/question-volume';
 
 const AEO_SERVER_URL = API_BASE_URL;
 
@@ -84,6 +85,15 @@ export async function generateOpportunitiesOnDemand(
   return { ok: true, jobId: body.jobId, count: body.count };
 }
 
+/** A "+ New" request's needs (prompt groups): in its focus, already covered, without answers yet. */
+export interface NewRequestScope {
+  focus: 'auto' | 'topic' | 'prompt' | 'page';
+  requested: number;
+  needs: number;
+  covered: number;
+  noAnswers: number;
+}
+
 export interface GenerationJobStatus {
   status: 'waiting' | 'active' | 'completed' | 'failed' | 'delayed' | 'not_found';
   progress: { phase: string; message: string } | null;
@@ -99,6 +109,14 @@ export interface GenerationJobStatus {
     existingId?: string;
     /** A run for one page found no tracked prompts about it (AT-006 part B3). */
     noMatch?: boolean;
+    /** Needs the model folded into existing opportunities that answer the same thing. */
+    merged?: number;
+    /** Needs whose question an open opportunity already answers, added to it. */
+    sameQuestion?: number;
+    /** What the request could draw on, so the toast can say why fewer came back. */
+    scope?: NewRequestScope;
+    /** Needs written as another angle once the open ones ran out: the need, and what it had. */
+    angles?: { need: string; of: string }[];
   } | null;
   failedReason: string | null;
 }
@@ -246,6 +264,7 @@ export async function sendOpportunityToActionCenter(
 export interface OpportunityActionResult {
   id: string;
   actionNo: number;
+  brandNo?: number | null;
   title: string | null;
   status: string;
   outcome: string;
@@ -263,7 +282,9 @@ export async function getOpportunityActions(ids: string[]): Promise<OpportunityA
   const supabase = await createClient();
   const { data, error } = await supabase
     .from('actions')
-    .select('id, action_no, status, outcome, completed_at, validated_at, validation, payload')
+    .select(
+      'id, action_no, brand_no, status, outcome, completed_at, validated_at, validation, payload',
+    )
     .in('id', ids)
     .order('created_at');
   if (error) throw new Error(error.message);
@@ -275,6 +296,7 @@ export async function getOpportunityActions(ids: string[]): Promise<OpportunityA
     return {
       id: row.id,
       actionNo: Number(row.action_no),
+      brandNo: row.brand_no,
       title: payload.title ?? null,
       status: row.status,
       outcome: row.outcome,
@@ -308,6 +330,45 @@ export async function getOpportunityTopics(brandId: string): Promise<Opportunity
   return body.topics;
 }
 
+/** Needs (prompt groups) by what "+ New" can still do for them. */
+export interface NeedCounts {
+  /** With tracked answers and no opportunity yet: New can write for these. */
+  open: number;
+  /** Already have an opportunity. */
+  covered: number;
+  /** No tracked answers in the last 30 days yet: nothing to write from. */
+  noAnswers: number;
+  /** Covered needs New may write another angle on once the open ones run out. */
+  angles: number;
+}
+
+/** What "+ New" can still write for, read when its dialog opens. */
+export interface OpportunityAvailability extends NeedCounts {
+  needs: number;
+  /** Per topic id, and `none` for prompts without a topic. */
+  topics: Record<string, NeedCounts>;
+  /** Prompt id → the open opportunity its need already has. */
+  promptOpportunity: Record<string, string>;
+}
+
+export async function getOpportunityAvailability(
+  brandId: string,
+): Promise<OpportunityAvailability> {
+  const session = await getSession();
+
+  const res = await fetch(`${AEO_SERVER_URL}/api/content/brand/${brandId}/availability`, {
+    method: 'GET',
+    headers: { Authorization: `Bearer ${session.access_token}` },
+  });
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `Server error: ${res.status}`);
+  }
+
+  return res.json();
+}
+
 export async function getOpportunity(id: string): Promise<ContentOpportunity> {
   const session = await getSession();
 
@@ -338,6 +399,21 @@ export async function getOpportunityBasket(id: string): Promise<OpportunityBaske
   }
 
   return res.json();
+}
+
+/**
+ * An opportunity's volume: its question's, the prompt it is shown with
+ * (question-volume.ts). Null when the prompt isn't the brand's or has none.
+ */
+export async function getQuestionVolume(
+  brandId: string,
+  promptId: string,
+): Promise<QuestionVolume | null> {
+  const supabase = await createClient();
+  // Imported here: the admin client is created at module load and needs the
+  // service-role env, which only this read uses (as tracking.ts does).
+  const { readQuestionVolume } = await import('@/lib/content/question-volume-read');
+  return readQuestionVolume(supabase, brandId, promptId);
 }
 
 export interface BriefQuota extends NoPlanMark {
@@ -634,7 +710,7 @@ export async function saveWebhookConfig(
     isActive?: boolean;
   },
 ): Promise<WebhookConfig> {
-  await assertWritable();
+  await assertWritable({ brandId });
   const supabase = await createClient();
   const allowedEvents = [
     'opportunity.sent',

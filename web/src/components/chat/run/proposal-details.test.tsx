@@ -1,0 +1,143 @@
+import { act } from 'react';
+import { createRoot, type Root } from 'react-dom/client';
+import { NextIntlClientProvider } from 'next-intl';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import messages from '../../../../messages/en.json';
+import { ApprovalCard } from '@/components/agentic/approval-card';
+import { ProposalDetails } from './proposal-details';
+
+/** What Send to Action Center freezes, on its card (CHAT-09 items 18, 18b). */
+
+(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT =
+  true;
+
+let container: HTMLDivElement;
+let root: Root;
+beforeEach(() => {
+  container = document.createElement('div');
+  document.body.appendChild(container);
+  root = createRoot(container);
+});
+afterEach(() => {
+  act(() => root.unmount());
+  container.remove();
+});
+
+const LONG = `Plan | Price per bag | Ships in | Free shipping from. ${'Every plan ships fresh. '.repeat(10)}`;
+
+describe('ProposalDetails', () => {
+  it('shows each task with its new text shortened, the goal and what it is sent with', () => {
+    act(() =>
+      root.render(
+        <NextIntlClientProvider locale="en" messages={messages} timeZone="UTC">
+          <ProposalDetails
+            confirm={{
+              n: 1,
+              action: 'Send findings to Action Center',
+              target: '“Win back /pricing” · Recover · 1 task',
+              digest: 'd'.repeat(32),
+              canDontAskAgain: false,
+              why: 'Lost 6 citations.',
+              goal: 'Get /pricing cited again',
+              items: [
+                {
+                  title: 'Add a price table to /pricing',
+                  detail: 'On-page · /pricing · Done when: It is live',
+                  body: LONG,
+                },
+              ],
+              targets: [
+                { kind: 'pages', values: ['/pricing'] },
+                { kind: 'platforms', values: ['Google AI Overviews'] },
+              ],
+            }}
+          />
+        </NextIntlClientProvider>,
+      ),
+    );
+    const text = () => container.textContent ?? '';
+    expect(text()).toContain('Add a price table to /pricing');
+    expect(text()).toContain('On-page · /pricing · Done when: It is live');
+    expect(text()).toContain('GoalGet /pricing cited again');
+    expect(text()).toContain('Pages/pricing');
+    expect(text()).toContain('PlatformsGoogle AI Overviews');
+    expect(text()).not.toContain(LONG);
+    const showAll = container.querySelector<HTMLButtonElement>('[data-action="approval.showAll"]')!;
+    expect(showAll.textContent).toBe('Show all');
+    act(() => showAll.click());
+    expect(text()).toContain(LONG.trim());
+    expect(showAll.textContent).toBe('Show less');
+    expect(showAll.getAttribute('aria-expanded')).toBe('true');
+  });
+
+  it('labels what another agent may use “AI use”, as the agent’s page does (run_agent)', () => {
+    act(() =>
+      root.render(
+        <NextIntlClientProvider locale="en" messages={messages} timeZone="UTC">
+          <ProposalDetails
+            confirm={{
+              n: 2,
+              action: 'Run another agent',
+              target: 'FAQ writer',
+              digest: 'd'.repeat(32),
+              canDontAskAgain: false,
+              why: 'Draft the FAQ block for /pricing.',
+              targets: [{ kind: 'aiUse', values: ['Up to 6% of the monthly AI limit'] }],
+            }}
+          />
+        </NextIntlClientProvider>,
+      ),
+    );
+    expect(container.textContent).toBe('AI useUp to 6% of the monthly AI limit');
+  });
+
+  it('shows nothing for a card without them', () => {
+    act(() =>
+      root.render(
+        <NextIntlClientProvider locale="en" messages={messages} timeZone="UTC">
+          <ProposalDetails
+            confirm={{ n: 1, action: 'x', target: 'y', digest: 'd', canDontAskAgain: false }}
+          />
+        </NextIntlClientProvider>,
+      ),
+    );
+    expect(container.querySelector('[data-slot="proposal-details"]')).toBeNull();
+  });
+
+  it('shows a draft’s full text only after Show full text, and Approve still works', () => {
+    const onApprove = vi.fn();
+    act(() =>
+      root.render(
+        <NextIntlClientProvider locale="en" messages={messages} timeZone="UTC">
+          <ApprovalCard step={{ n: 1, total: 1 }} title="Publish" onApprove={onApprove}>
+            <ProposalDetails
+              confirm={{
+                n: 1,
+                action: 'Publish',
+                target: 'Pricing FAQ',
+                digest: 'd'.repeat(32),
+                canDontAskAgain: false,
+                fullText: 'Plans\nEvery plan ships fresh.',
+              }}
+            />
+          </ApprovalCard>
+        </NextIntlClientProvider>,
+      ),
+    );
+    const button = container.querySelector<HTMLButtonElement>(
+      '[data-action="approval.showFullText"]',
+    )!;
+    expect(button.textContent).toBe('Show full text');
+    expect(button.getAttribute('aria-expanded')).toBe('false');
+    expect(container.textContent).not.toContain('Every plan ships fresh.');
+    act(() => button.click());
+    expect(button.getAttribute('aria-expanded')).toBe('true');
+    expect(container.textContent).toContain('Every plan ships fresh.');
+    act(() => button.click());
+    expect(container.textContent).not.toContain('Every plan ships fresh.');
+    act(() =>
+      container.querySelector<HTMLButtonElement>('[data-action="approval.approve"]')!.click(),
+    );
+    expect(onApprove).toHaveBeenCalledWith({ dontAskAgain: false });
+  });
+});

@@ -1,9 +1,10 @@
 'use client';
 
-import { useEffect, useId, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { useTranslations } from 'next-intl';
 import { AlertTriangle, Check, ChevronDown } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import type { ContentAuthor } from '@/lib/content/authors';
 import {
   Dialog,
   DialogContent,
@@ -17,6 +18,8 @@ import {
   itemListJsonLd,
   MIN_LISTED,
   productJsonLd,
+  type AddedArticleSchema,
+  type ArticleSchemaPlan,
   type ListedProduct,
   type PageOfferRead,
   jsonLdScript,
@@ -44,10 +47,16 @@ export interface ReadyAnyway {
 }
 
 type RowState = 'ok' | 'missing' | 'check';
+/** The groups the rows show in, in this order: to fix, to check, in place. */
+const GROUPS: RowState[] = ['missing', 'check', 'ok'];
 type Row = {
   state: RowState;
   title: string;
+  /** A word beside the title: the schema Ansvisor adds is "Added". */
+  pill?: string;
   detail: string;
+  /** The Article schema's Leave it out, or Add it back once left out (00448). */
+  schema?: 'leaveOut' | 'addBack';
   /** Ready to paste's Fill now, while a placeholder is open. */
   fill?: boolean;
   /** The disclosure's Add line (CE-050): the line it puts under the H1. */
@@ -68,8 +77,11 @@ export interface ReadyToPaste {
  * ready and on Export (§7b, CE-057): a warning only when Trust is under 60
  * (nothing else blocks), what the CMS does for the page (its author, dates
  * and schema), Ready to paste (no placeholders, images with alt text, links
- * that work), and for an article the JSON-LD to paste when the CMS doesn't
- * write one, from the page's facts only. Mark ready anyway is logged with
+ * that work), and for an article the Article JSON-LD with its author that
+ * Ansvisor adds to the page it sends and exports (customer priorities item
+ * 7, 00448), from the page's facts only: the person can leave it out for a
+ * CMS that writes its own, and a page with an Article schema of its own
+ * gets none. Mark ready anyway is logged with
  * the Trust the page had; on Export it goes on to Export, and on Send to CMS
  * to the Send dialog (#1331). Rendered only while open.
  *
@@ -95,9 +107,11 @@ export function BeforePublish({
   onClose,
   quality,
   title,
-  isNew,
   pageType,
   image,
+  articleSchema,
+  ownArticleSchema = false,
+  onSchemaLeftOut,
   linksPending,
   onMarkReady,
   onFixFirst,
@@ -107,7 +121,26 @@ export function BeforePublish({
   product = null,
   category = null,
   shopping = null,
+  reviewer = null,
+  reviewerRequired = false,
+  reviewerLd = null,
+  openWork = null,
+  auditEstimate = null,
+  bannedPhrases = [],
 }: {
+  /**
+   * The brand's banned phrases on the page (Rules' brandBanned, while it is
+   * on): to fix before it's published. None when the brand has none.
+   */
+  bannedPhrases?: readonly string[];
+  /** Site Audit's estimate of the page, its AI search readiness (customer priorities item 9). */
+  auditEstimate?: ReactNode;
+  /**
+   * What is still open as it is marked ready (editor UX review 2026-11-03,
+   * decision a): the rules not met, the to-dos not done. Counted, never
+   * "all done"; Mark ready stays open.
+   */
+  openWork?: { rules: number; todos: number } | null;
   /**
    * The page's shopping links against the catalog now (shopping path, part
    * 6): the products that no longer sell, the category page, the products
@@ -115,6 +148,15 @@ export function BeforePublish({
    * null on a page without a shopping path.
    */
   shopping?: ShoppingLinks | 'reading' | 'failed' | null;
+  /** The reviewer selected in the Authors list, when read. */
+  reviewer?: ContentAuthor | null;
+  /** True for a regulated page that must name its qualified reviewer. */
+  reviewerRequired?: boolean;
+  /**
+   * The reviewer's WebPage JSON-LD as the page goes out (reviewerJsonLd):
+   * null until the page's text names them.
+   */
+  reviewerLd?: string | null;
   /**
    * Phase 3 (CE-053): a product page's Product schema, from its opening
    * paragraph, its images and the price it states (pageOffer); null on
@@ -138,11 +180,15 @@ export function BeforePublish({
   onClose: () => void;
   quality: QualityRead;
   title: string;
-  /** A new page; an optimized one is already live, with its published date. */
-  isNew: boolean;
   pageType: string | null;
   /** The page's own image (firstImage). */
   image: string | null;
+  /** The Article schema Ansvisor adds to an article page as it goes out (00448). */
+  articleSchema: AddedArticleSchema;
+  /** The page has an Article schema of its own: Ansvisor adds none. */
+  ownArticleSchema?: boolean;
+  /** Leave it out (true) or Add it back (false), kept on the draft. */
+  onSchemaLeftOut?: (leftOut: boolean) => void;
   /** The page's links whose read may still come: Trust may change. */
   linksPending: number;
   /** Marks it ready: with the warning's facts when past it. */
@@ -164,7 +210,7 @@ export function BeforePublish({
   const markRef = useRef<HTMLButtonElement>(null);
   // Fix first and Fill now move on to the page: focus isn't sent back to the button.
   const fixing = useRef(false);
-  const { author, brandName, siteTrust } = quality;
+  const { author, brandName } = quality;
   // E-E-A-T is read with the authors: until then, who the page is by isn't known.
   const authorsRead = quality.eeat !== null;
   const trust = quality.trust?.score ?? null;
@@ -181,6 +227,19 @@ export function BeforePublish({
         .sort((a, b) => b.gain - a.gain)
     : [];
   const article = !product && !category && isArticlePage(pageType);
+  // What Ansvisor does with the page's Article schema (articleSchemaPlan's, from the dialog's facts).
+  const schemaPlan: ArticleSchemaPlan = !article
+    ? 'none'
+    : ownArticleSchema
+      ? 'own'
+      : articleSchema.leftOut
+        ? 'leftOut'
+        : 'added';
+  // Who the added schema names: the page's author, else the brand.
+  const schemaBy =
+    articleSchema.input.author === undefined
+      ? null
+      : (articleSchema.input.author?.name ?? brandName);
   // Product needs its name and price: without either, no code to paste.
   const productName = pageName(title);
   const offer = product?.offer && !('several' in product.offer) ? product.offer : null;
@@ -202,29 +261,19 @@ export function BeforePublish({
     category?.status === 'read' &&
     category.items.length >= MIN_LISTED &&
     jsonLdScript(itemListJsonLd({ name: productName, items: category.items }));
-  const jsonLd = productLd
+  const primaryJsonLd = productLd
     ? productLd
     : itemListLd
       ? itemListLd
-      : article
-        ? jsonLdScript(
-            articleJsonLd({
-              title,
-              // An author only confirmed (00271) isn't named here: left out, as unknown.
-              author:
-                authorsRead && !(!author && quality.authorConfirmed?.real) ? author : undefined,
-              authorUrl:
-                (author &&
-                  siteTrust?.checks.authorPages.authors.find((a) => a.name === author.name)?.url) ||
-                null,
-              brandName,
-              brandUrl: siteTrust?.checks.organizationSchema.url ?? null,
-              image,
-              isNew,
-              today: localDate(new Date()),
-            }),
+      : article && schemaPlan !== 'own'
+        ? // The code Ansvisor adds, or, left out, the code to paste.
+          jsonLdScript(
+            articleJsonLd({ ...articleSchema.input, image, today: localDate(new Date()) }),
           )
         : null;
+  // A qualified reviewer is a WebPage.reviewedBy, never Article.author: the
+  // node that goes out with the page, shown as it goes.
+  const jsonLd = [primaryJsonLd, reviewerLd].filter(Boolean).join('\n') || null;
   // Added here: it counts once the page is read again.
   const [added, setAdded] = useState(false);
   // Where the page's type counts it (CE-052): a product page is the brand's own.
@@ -233,17 +282,56 @@ export function BeforePublish({
       ? null
       : (quality.aiChecks?.disclosure ?? null);
   const brand = quality.brandName || tQuality('yourBrand');
+  let reviewerRow: Row | null = null;
+  if (reviewerRequired || reviewer) {
+    if (reviewer && reviewerLd) {
+      reviewerRow = {
+        state: 'check',
+        title: t('reviewer.named', { name: reviewer.name }),
+        detail: t('reviewer.namedDetail', { name: reviewer.name }),
+      };
+    } else if (reviewer) {
+      reviewerRow = {
+        state: 'missing',
+        title: t('reviewer.notOnPage'),
+        detail: t('reviewer.notOnPageDetail', { name: reviewer.name }),
+      };
+    } else if (authorsRead) {
+      reviewerRow = {
+        state: 'missing',
+        title: t('reviewer.none'),
+        detail: t('reviewer.noneDetail'),
+      };
+    } else {
+      reviewerRow = {
+        state: 'check',
+        title: t('reviewer.title'),
+        detail: t('reviewer.unknown'),
+      };
+    }
+  }
   const rows: Row[] = [
     !authorsRead
       ? { state: 'check', title: t('author.ok'), detail: t('author.unknown') }
       : author
-        ? {
-            state: 'check',
-            title: contentByline ? t('author.inContentTitle') : t('author.ok'),
-            detail: contentByline
-              ? t('author.inContent', { line: contentByline })
-              : t('author.okDetail', { name: author.name }),
-          }
+        ? contentByline
+          ? {
+              state: 'check',
+              title: t('author.inContentTitle'),
+              detail: t('author.inContent', { line: contentByline }),
+            }
+          : schemaPlan === 'added'
+            ? // Named in the Article schema Ansvisor adds (00448).
+              {
+                state: 'ok',
+                title: t('author.inSchema', { name: author.name }),
+                detail: t('author.inSchemaDetail', { name: author.name }),
+              }
+            : {
+                state: 'check',
+                title: t('author.ok'),
+                detail: t('author.okDetail', { name: author.name }),
+              }
         : quality.authorConfirmed?.real
           ? // The person confirmed the author their site names (00271).
             { state: 'check', title: t('author.confirmed'), detail: t('author.confirmedDetail') }
@@ -257,8 +345,12 @@ export function BeforePublish({
             : {
                 state: 'missing',
                 title: t('author.none'),
-                detail: t('author.noneDetail', { byline: quality.team }),
+                detail:
+                  schemaPlan === 'added'
+                    ? t('author.noneSchemaDetail', { byline: quality.team, brand: brandName })
+                    : t('author.noneDetail', { byline: quality.team }),
               },
+    ...(reviewerRow ? [reviewerRow] : []),
     ...(product
       ? productLd
         ? [
@@ -323,13 +415,24 @@ export function BeforePublish({
         : article
           ? [
               { state: 'check' as const, title: t('dates.title'), detail: t('dates.detail') },
-              isNew
-                ? { state: 'check' as const, title: t('schema.title'), detail: t('schema.detail') }
-                : {
-                    state: 'check' as const,
-                    title: t('schema.titleLive'),
-                    detail: t('schema.detailLive'),
-                  },
+              schemaPlan === 'own'
+                ? { state: 'ok' as const, title: t('schema.own'), detail: t('schema.ownDetail') }
+                : schemaPlan === 'leftOut'
+                  ? {
+                      state: 'check' as const,
+                      title: t('schema.leftOut'),
+                      detail: t('schema.leftOutDetail'),
+                      schema: 'addBack' as const,
+                    }
+                  : {
+                      state: 'ok' as const,
+                      title: schemaBy ? t('schema.added') : t('schema.addedNoAuthor'),
+                      pill: t('schema.addedPill'),
+                      detail: schemaBy
+                        ? t('schema.addedDetail', { author: schemaBy })
+                        : t('schema.addedDetailNoAuthor'),
+                      schema: 'leaveOut' as const,
+                    },
             ]
           : [
               {
@@ -370,8 +473,11 @@ export function BeforePublish({
     ...(typeof shopping === 'object' && shopping?.prices?.length
       ? [cardPricesRow(t, shopping.prices)]
       : []),
+    ...(bannedPhrases.length ? [bannedRow(t, bannedPhrases)] : []),
     { ...readyRow(t, paste, linksPending), fill: paste.placeholders > 0 },
   ];
+  const counts: Record<RowState, number> = { missing: 0, check: 0, ok: 0 };
+  for (const row of rows) counts[row.state] += 1;
   // Nothing to ask about as Send opens it: straight on to the Send dialog.
   // Only once all is read: Trust, the authors, a category's products and the
   // shopping links not read yet may still have something to ask. A Trust
@@ -444,6 +550,11 @@ export function BeforePublish({
             </div>
           </div>
         )}
+        {mode === 'markReady' && openWork && openWork.rules + openWork.todos > 0 && (
+          <p role="status" className="text-xs text-muted-foreground">
+            {t('openWork', openWork)}
+          </p>
+        )}
         {linksPending > 0 && (
           <p role="status" className="text-xs text-muted-foreground">
             {t('linksPending', { count: linksPending })}
@@ -459,69 +570,102 @@ export function BeforePublish({
             {t('pageReading')}
           </p>
         )}
-        <ul className="divide-y rounded-xl border text-sm">
-          {rows.map((row) => (
-            <li key={row.title} className="flex items-start gap-2.5 px-3 py-2.5">
-              <span
-                aria-hidden
-                className={cn(
-                  'mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-[10px] font-semibold',
-                  row.state === 'ok'
-                    ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300'
-                    : row.state === 'missing'
-                      ? 'bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-300'
-                      : 'bg-muted text-muted-foreground',
-                )}
-              >
-                {row.state === 'ok' ? (
-                  <Check className="h-3 w-3" />
-                ) : row.state === 'missing' ? (
-                  '!'
-                ) : (
-                  '?'
-                )}
-              </span>
-              <div className="min-w-0 flex-1">
-                <p className="font-medium">
-                  {row.title}
-                  <span className="sr-only">
-                    {' · '}
-                    {t(`states.${row.state}`)}
-                  </span>
-                </p>
-                <p className="text-xs text-muted-foreground [overflow-wrap:anywhere]">
-                  {row.detail}
-                </p>
-              </div>
-              {row.fill && (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="shrink-0"
-                  onClick={() => {
-                    fixing.current = true;
-                    onFillNow();
-                  }}
-                >
-                  {t('paste.fill')}
-                </Button>
-              )}
-              {row.add && (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="shrink-0"
-                  onClick={() => {
-                    onAddDisclosure?.(row.add!);
-                    setAdded(true);
-                  }}
-                >
-                  {t('disclosure.add')}
-                </Button>
-              )}
-            </li>
-          ))}
-        </ul>
+        {/* One line first, then the rows in three groups (editor UX review
+            2026-11-03): what to fix, what to check yourself, what is in place. */}
+        {(counts.missing > 0 || counts.check > 0) && (
+          <p className="text-sm font-medium">
+            {t('summary', { fix: counts.missing, check: counts.check })}
+          </p>
+        )}
+        {GROUPS.filter((group) => counts[group] > 0).map((group) => (
+          <section key={group} aria-label={t(`groups.${group}`)} className="space-y-1.5">
+            <h3 className="text-xs font-medium text-muted-foreground">{t(`groups.${group}`)}</h3>
+            <ul className="divide-y rounded-xl border text-sm">
+              {rows
+                .filter((row) => row.state === group)
+                .map((row) => (
+                  <li key={row.title} className="flex items-start gap-2.5 px-3 py-2.5">
+                    <span
+                      aria-hidden
+                      className={cn(
+                        'mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-[10px] font-semibold',
+                        row.state === 'ok'
+                          ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300'
+                          : row.state === 'missing'
+                            ? 'bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-300'
+                            : 'bg-muted text-muted-foreground',
+                      )}
+                    >
+                      {row.state === 'ok' ? (
+                        <Check className="h-3 w-3" />
+                      ) : row.state === 'missing' ? (
+                        '!'
+                      ) : (
+                        '?'
+                      )}
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <p className="font-medium">
+                        {row.title}
+                        {row.pill && (
+                          <span className="ml-1.5 inline-flex rounded-full bg-emerald-50 px-1.5 py-px align-[1px] text-[11px] font-medium text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300">
+                            {row.pill}
+                          </span>
+                        )}
+                        <span className="sr-only">
+                          {' · '}
+                          {t(`states.${row.state}`)}
+                        </span>
+                      </p>
+                      <p className="text-xs text-muted-foreground [overflow-wrap:anywhere]">
+                        {row.detail}
+                      </p>
+                    </div>
+                    {row.fill && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="shrink-0"
+                        onClick={() => {
+                          fixing.current = true;
+                          onFillNow();
+                        }}
+                      >
+                        {t('paste.fill')}
+                      </Button>
+                    )}
+                    {row.schema && onSchemaLeftOut && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="shrink-0"
+                        data-action={
+                          row.schema === 'leaveOut' ? 'schema.leaveOut' : 'schema.addBack'
+                        }
+                        onClick={() => onSchemaLeftOut(row.schema === 'leaveOut')}
+                      >
+                        {t(row.schema === 'leaveOut' ? 'schema.leaveOut' : 'schema.addBack')}
+                      </Button>
+                    )}
+                    {row.add && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="shrink-0"
+                        onClick={() => {
+                          onAddDisclosure?.(row.add!);
+                          setAdded(true);
+                        }}
+                      >
+                        {t('disclosure.add')}
+                      </Button>
+                    )}
+                  </li>
+                ))}
+            </ul>
+          </section>
+        ))}
+        {auditEstimate}
         {jsonLd && (
           <div className="space-y-1.5">
             {mode === 'send' && (
@@ -539,8 +683,11 @@ export function BeforePublish({
                   aria-hidden
                   className={cn('h-3.5 w-3.5 transition-transform', !codeShown && '-rotate-90')}
                 />
-                {t('showCode')}
+                {t(schemaPlan === 'added' ? 'schema.showAdded' : 'showCode')}
               </button>
+            )}
+            {codeShown && schemaPlan === 'added' && mode !== 'send' && (
+              <p className="text-xs font-medium text-muted-foreground">{t('schema.codeAdded')}</p>
             )}
             {codeShown && (
               <pre
@@ -563,6 +710,9 @@ export function BeforePublish({
               <p className="text-xs text-muted-foreground">
                 {t(productLd ? 'productNote' : itemListLd ? 'itemListNote' : 'datesNote')}
               </p>
+            )}
+            {codeShown && reviewerLd && (
+              <p className="text-xs text-muted-foreground">{t('reviewer.schemaNote')}</p>
             )}
           </div>
         )}
@@ -651,6 +801,16 @@ function readyRow(t: T, paste: ReadyToPaste, linksPending: number): Row {
     };
   }
   return { state: 'ok', title: t('paste.title'), detail: t('paste.ok') };
+}
+
+/** The brand's banned phrases still on the page (Content rules): to say in other words first. */
+function bannedRow(t: T, phrases: readonly string[]): Row {
+  const { shown, more } = listed(phrases);
+  return {
+    state: 'missing',
+    title: t('banned.title', { count: phrases.length }),
+    detail: t('banned.detail', { list: shown.map((p) => `“${p}”`).join(', '), more }),
+  };
 }
 
 /**

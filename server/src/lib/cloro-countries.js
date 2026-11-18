@@ -22,10 +22,10 @@ import { locationsForScraper, parseLocation } from './locations.js';
 export const CLORO_COUNTRY_MODELS = {
   'chatgpt-web': 'chatgpt',
   'chatgpt-shopping': 'chatgpt',
-  'perplexity-web': 'perplexity',
-  'copilot-web': 'copilot',
   'gemini-web': 'gemini',
   'google-aimode': 'aimode',
+  // Copilot is asked through Bing AI Mode (cloro-scraper.js), whose list this is.
+  'copilot-web': 'bing_aimode',
   // AI Overview is asked through Google Search; its own list says where one shows.
   'google-aio': 'aioverview',
 };
@@ -188,8 +188,7 @@ export function supportsCountry(supported, scraperId, country) {
 
 /**
  * The locations a scraper is asked from: locationsForScraper's (cities only
- * for Google's engines, states collapsed where they can't be targeted),
- * less the countries the scraper doesn't answer from.
+ * for Google's engines), less the countries the scraper doesn't answer from.
  */
 export function supportedLocations(locations, scraperId, supported) {
   return locationsForScraper(locations, scraperId).filter((code) =>

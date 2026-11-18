@@ -21,9 +21,9 @@ vi.mock('@/lib/actions/content-drafts', () => ({
   getContentOverlap: (...args: unknown[]) => getContentOverlap(...args),
 }));
 // What the agent is given is agent-write.test.ts's; here, that Start hands it over.
-const listMembers = vi.fn();
+const listBrandMembers = vi.fn();
 vi.mock('@/lib/actions/team', () => ({
-  listMembers: (...args: unknown[]) => listMembers(...args),
+  listBrandMembers: (...args: unknown[]) => listBrandMembers(...args),
 }));
 const assignAction = vi.fn();
 vi.mock('@/lib/actions/action-center', () => ({
@@ -85,6 +85,17 @@ const toast = vi.hoisted(() =>
   Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn(), warning: vi.fn() }),
 );
 vi.mock('sonner', () => ({ toast }));
+const analytics = vi.hoisted(() => ({ track: vi.fn() }));
+vi.mock('@/lib/analytics', () => analytics);
+/** The content_generate events sent, in order. */
+const flows = () =>
+  analytics.track.mock.calls.filter(([event]) => String(event).startsWith('flow_'));
+const STARTED = ['flow_started', { flow: 'content_generate' }];
+const COMPLETED = ['flow_completed', { flow: 'content_generate' }];
+const failed = (code: string | null) => [
+  'flow_failed',
+  { flow: 'content_generate', error_code: code },
+];
 
 (
   globalThis as typeof globalThis & {
@@ -177,7 +188,7 @@ beforeEach(() => {
   getContentOverlap.mockReset().mockResolvedValue({ totalPrompts: 2, pages: [] });
   importContentPage.mockReset().mockResolvedValue({ error: 'failed' });
   sendContentDraftToActionCenter.mockReset();
-  listMembers.mockReset().mockResolvedValue(MEMBERS);
+  listBrandMembers.mockReset().mockResolvedValue(MEMBERS);
   assignAction.mockReset().mockResolvedValue(undefined);
   startAgentWriting.mockReset();
   agentWriteRequest.mockReset().mockResolvedValue({ sources: 'kept', rules: [] });
@@ -187,6 +198,7 @@ beforeEach(() => {
   push.mockReset();
   toast.error.mockReset();
   toast.success.mockReset();
+  analytics.track.mockClear();
 });
 
 afterEach(() => {
@@ -225,6 +237,24 @@ describe('New content', () => {
       bodyHtml: undefined,
     });
     expect(push).toHaveBeenCalledWith('/dashboard/content/editor/d9');
+    expect(flows()).toEqual([STARTED, COMPLETED]);
+    // Its title stays out of what is sent.
+    expect(JSON.stringify(analytics.track.mock.calls)).not.toContain('Northwind');
+  });
+
+  it('fails content_generate when the draft can’t be made', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    createContentDraft.mockRejectedValue(new Error('down'));
+    await render();
+    await click(button('Pick a content opportunity'));
+    const option = [...document.querySelectorAll<HTMLElement>('[role="option"]')].find(
+      (o) => o.textContent === 'Northwind vs HubSpot',
+    );
+    await click(option);
+    await click(button('Continue'));
+    await click(button('Open editor'));
+    expect(push).not.toHaveBeenCalled();
+    expect(flows()).toEqual([STARTED, failed(null)]);
   });
 
   it('keeps a long pick and a long title inside the dialog', async () => {
@@ -530,6 +560,28 @@ describe('New content', () => {
       expect(document.body.textContent).toContain('Optimize: Pricing');
     });
 
+    it('wraps a long page address with no break in it, from either preset', async () => {
+      // A Turkish slug in %-escapes: one word, wider than the dialog.
+      const slug =
+        '%C3%BCr%C3%BCnler%C4%B1m%C4%B1z%C4%B1n%C3%B6zellikleri%C3%A7%C4%B1kt%C4%B1lar%C4%B1';
+      const url = `https://northwind.example/${slug}`;
+      importContentPage.mockResolvedValue({ page: { url, title: 'Products', html: '<h1>P</h1>' } });
+      await render('b2b', { kind: 'page', url });
+      await act(async () => {});
+      const summary = [...document.querySelectorAll('p')].find((p) =>
+        p.textContent?.startsWith(`/${slug} · `),
+      );
+      expect(summary?.className).toContain('[overflow-wrap:anywhere]');
+
+      act(() => root.unmount());
+      root = createRoot(container);
+      getContentOverlap.mockResolvedValue({ totalPrompts: 2, pages: [] });
+      await render('b2b', { kind: 'opportunity', id: 'o2', page: { url, title: 'Products' } });
+      await act(async () => {});
+      const title = radio(`Optimize /${slug}`).querySelector('.font-medium');
+      expect(title?.className).toContain('[overflow-wrap:anywhere]');
+    });
+
     it('starts an opportunity for an existing page on that page, whatever else is cited', async () => {
       getContentOverlap.mockResolvedValue({ totalPrompts: 2, pages: [] });
       await render('b2b', {
@@ -696,7 +748,8 @@ describe('New content', () => {
         ...document.querySelectorAll<HTMLElement>('[aria-labelledby="start-who"] [role="radio"]'),
       ].find((r) => r.textContent?.startsWith('Team'))!;
       expect(team.getAttribute('aria-checked')).toBe('true');
-      expect(listMembers).toHaveBeenCalled();
+      // The people who can see the dialog's brand (BRAND-ACCESS).
+      expect(listBrandMembers).toHaveBeenCalledWith('b1');
     });
 
     it('leaves an opportunity no longer open to pick', async () => {
@@ -956,6 +1009,7 @@ describe('New content', () => {
       expect(toast.success).not.toHaveBeenCalled();
       // The dialog stays until the editor opens: no page under it meanwhile.
       expect(onOpenChange).not.toHaveBeenCalledWith(false);
+      expect(flows()).toEqual([STARTED, COMPLETED]);
     });
 
     it('aims the agent at a pasted page’s own length (F)', async () => {
@@ -1000,6 +1054,7 @@ describe('New content', () => {
       // Nothing to watch: the editor isn't opened, the toast offers the draft.
       expect(push).not.toHaveBeenCalled();
       expect(onOpenChange).toHaveBeenCalledWith(false);
+      expect(flows()).toEqual([STARTED, failed('ai_budget')]);
     });
 
     it('says the draft is the person’s to write when the agent is busy with another', async () => {
@@ -1033,6 +1088,7 @@ describe('New content', () => {
       );
       options.action.onClick();
       expect(push).toHaveBeenCalledWith('/dashboard/action-center/actions?action=a1');
+      expect(flows()).toEqual([STARTED, COMPLETED]);
     });
 
     it('assigns the task to the teammate picked under Team', async () => {
@@ -1086,6 +1142,8 @@ describe('New content', () => {
       expect(onSent).toHaveBeenCalled();
       options.action.onClick();
       expect(push).toHaveBeenCalledWith('/dashboard/content/editor/d9');
+      // Its words are the server's: a code of its own instead.
+      expect(flows()).toEqual([STARTED, failed('send_failed')]);
     });
   });
 });

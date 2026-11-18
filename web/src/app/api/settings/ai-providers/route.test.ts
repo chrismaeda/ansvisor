@@ -41,7 +41,7 @@ vi.mock('@/lib/supabase/admin', () => ({
       queries.push(query);
       const settle = () => Promise.resolve(results.shift() ?? { data: null, error: null });
       const chain: Record<string, unknown> = {};
-      for (const op of ['select', 'eq', 'upsert', 'update', 'delete', 'order', 'limit']) {
+      for (const op of ['select', 'eq', 'neq', 'upsert', 'update', 'delete', 'order', 'limit']) {
         chain[op] = (...args: unknown[]) => {
           query.calls.push([op, ...args]);
           return chain;
@@ -61,12 +61,50 @@ vi.mock('@/lib/supabase/admin', () => ({
   },
 }));
 
+/** What own keys do for the workspace (lib/chat/key.ts), as each test sets it. */
+const ownKeyAccess = vi.fn();
+vi.mock('@/lib/chat/key', () => ({
+  ownKeyAccess: (...args: unknown[]) => ownKeyAccess(...args),
+}));
+
 vi.mock('@/lib/agent/key-encryption', () => ({
   encryptApiKey: (key: string) => `enc(${key})`,
   last4: (key: string) => key.slice(-4),
 }));
 
+/** The key's test and what it keeps (lib/chat/key-test.ts), as each test sets them. */
+const keys = vi.hoisted(() => ({
+  test: vi.fn(async (): Promise<unknown> => ({ outcome: 'unknown' })),
+  keep: vi.fn(async () => 0),
+  read: vi.fn(async (): Promise<unknown> => ({ state: 'none', active: false })),
+  resume: vi.fn(async () => 0),
+  resolve: vi.fn(async () => {}),
+}));
+vi.mock('@/lib/chat/key-test', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/chat/key-test')>()),
+  testOwnKey: keys.test,
+  testSavedKey: keys.test,
+  keepKeyCheck: keys.keep,
+}));
+vi.mock('@/lib/agent/key', () => ({ readProviderKey: keys.read }));
+vi.mock('@/lib/chat/key-health', () => ({
+  resumeOwnKeyAgents: keys.resume,
+  resolveOwnKeyNotices: keys.resolve,
+}));
+
+/** The key guard as the server answers it (lib/chat/own-key-cap.ts). */
+const guards = vi.hoisted(() => ({
+  read: vi.fn(async (): Promise<unknown> => null),
+  forget: vi.fn(),
+}));
+vi.mock('@/lib/chat/own-key-cap', () => ({
+  readOwnKeyGuard: guards.read,
+  forgetOwnKeyCap: guards.forget,
+}));
+
 const { GET, PUT, PATCH, DELETE } = await import('./route');
+const { POST: TEST } = await import('./test/route');
+const { PUT: SET_GUARD } = await import('./guard/route');
 
 const KEY = 'sk-test-0123456789abcdef';
 const send = (method: string, body?: unknown) =>
@@ -82,10 +120,19 @@ beforeEach(() => {
   queries.length = 0;
   results = [];
   rpc.mockReset().mockResolvedValue({ data: true, error: null });
+  ownKeyAccess.mockReset().mockResolvedValue({ state: 'open' });
+  guards.read.mockReset().mockResolvedValue(null);
+  guards.forget.mockReset();
+  // Chat off, as today: a saved key is marked to keep working once it is on.
+  vi.stubEnv('CHAT_AGENTIC', 'false');
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
 });
 
 describe('GET', () => {
-  it('lists the saved providers with who saved them, and whether Chat has one', async () => {
+  it('lists the saved providers with who saved them, their health, and whether Chat has one', async () => {
     profile!.role = 'member';
     results = [
       {
@@ -97,6 +144,9 @@ describe('GET', () => {
             active: true,
             set_at: '2026-10-19T08:00:00Z',
             set_by: 'u2',
+            checked_at: '2026-11-01T09:00:00Z',
+            failing_since: '2026-11-01T08:00:00Z',
+            failure_class: 'no_credit',
           },
           {
             provider: 'azure',
@@ -113,6 +163,7 @@ describe('GET', () => {
     const res = await GET();
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({
+      access: { state: 'open' },
       configured: true,
       providers: [
         {
@@ -122,6 +173,11 @@ describe('GET', () => {
           active: true,
           setAt: '2026-10-19T08:00:00Z',
           setByEmail: 'u2@acme.test',
+          health: {
+            checkedAt: '2026-11-01T09:00:00Z',
+            failingSince: '2026-11-01T08:00:00Z',
+            failureClass: 'no_credit',
+          },
         },
         {
           provider: 'azure',
@@ -130,6 +186,8 @@ describe('GET', () => {
           active: false,
           setAt: '2026-10-18T08:00:00Z',
           setByEmail: null,
+          // A key never tested.
+          health: { checkedAt: null, failingSince: null, failureClass: null },
         },
       ],
     });
@@ -166,7 +224,8 @@ describe('PUT', () => {
   });
 
   it('saves the key encrypted, and makes the first one the one Chat uses', async () => {
-    results = [{ error: null }];
+    // The saved key's uses are read first (W4-06): none here.
+    results = [{ data: null, error: null }, { error: null }];
     const res = await PUT(
       send('PUT', {
         provider: 'azure',
@@ -175,7 +234,7 @@ describe('PUT', () => {
       }),
     );
     expect(res.status).toBe(200);
-    const [upsert] = queries[0].calls;
+    const upsert = queries[1].calls.find(([op]) => op === 'upsert')!;
     expect(upsert[0]).toBe('upsert');
     expect(upsert[1]).toMatchObject({
       organization_id: 'org1',
@@ -193,15 +252,39 @@ describe('PUT', () => {
       p_provider: 'azure',
       p_only_if_none: true,
     });
-    // Only an Anthropic key has an old copy to clear.
-    expect(queries.map((q) => q.table)).toEqual(['organization_ai_keys']);
+    // Only an Anthropic key has an old copy to clear; the workspace is marked
+    // to keep its key for Chat (below).
+    expect(queries.map((q) => q.table)).toEqual([
+      'organization_ai_keys',
+      'organization_ai_keys',
+      'organizations',
+    ]);
+  });
+
+  it('marks a workspace below Enterprise to keep its key for Chat while Chat is off', async () => {
+    expect((await PUT(send('PUT', { provider: 'openai', apiKey: KEY }))).status).toBe(200);
+    const mark = queries[queries.length - 1];
+    expect(mark.table).toBe('organizations');
+    expect(mark.calls).toEqual([
+      ['update', { legacy_key_grandfathered: true }],
+      ['eq', 'id', 'org1'],
+      // Only where its plan wouldn't include own keys (CHAT-16 item 28).
+      ['neq', 'plan', 'enterprise'],
+    ]);
+  });
+
+  it('marks nothing once Chat is on: own keys are then Enterprise’s', async () => {
+    vi.stubEnv('CHAT_AGENTIC', 'true');
+    vi.stubEnv('CHAT_AGENTIC_ORGS', '');
+    expect((await PUT(send('PUT', { provider: 'openai', apiKey: KEY }))).status).toBe(200);
+    expect(queries.map((q) => q.table)).toEqual(['organization_ai_keys', 'organization_ai_keys']);
   });
 
   it("clears the Anthropic key's old copy on organizations when it is replaced", async () => {
-    results = [{ error: null }, { error: null }];
+    results = [{ data: null, error: null }, { error: null }, { error: null }];
     expect((await PUT(send('PUT', { provider: 'anthropic', apiKey: KEY }))).status).toBe(200);
-    expect(queries[1].table).toBe('organizations');
-    expect(queries[1].calls).toEqual([
+    expect(queries[2].table).toBe('organizations');
+    expect(queries[2].calls).toEqual([
       [
         'update',
         {
@@ -213,6 +296,53 @@ describe('PUT', () => {
       ],
       ['eq', 'id', 'org1'],
     ]);
+  });
+});
+
+describe('what a key is for (W4-06)', () => {
+  const upsertOf = () =>
+    queries.flatMap((q) => q.calls).find(([op]) => op === 'upsert')?.[1] as {
+      settings: unknown;
+    };
+
+  it('saves the uses a save names, and keeps the saved ones when it names none', async () => {
+    results = [{ error: null }];
+    await PUT(send('PUT', { provider: 'openai', apiKey: KEY, settings: { useFor: ['images'] } }));
+    expect(upsertOf().settings).toEqual({ useFor: ['images'] });
+
+    queries.length = 0;
+    results = [
+      { data: { settings: { useFor: ['chat', 'images'] } }, error: null },
+      { error: null },
+    ];
+    await PUT(send('PUT', { provider: 'openai', apiKey: KEY, settings: { model: 'gpt-5.5' } }));
+    expect(upsertOf().settings).toEqual({ model: 'gpt-5.5', useFor: ['chat', 'images'] });
+  });
+
+  it('refuses images for an Anthropic key, or no use at all', async () => {
+    for (const useFor of [['images'], [], ['video']]) {
+      const res = await PUT(
+        send('PUT', { provider: 'anthropic', apiKey: KEY, settings: { useFor } }),
+      );
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({ field: 'useFor' });
+    }
+    expect((await PATCH(send('PATCH', { provider: 'anthropic', useFor: ['images'] }))).status).toBe(
+      400,
+    );
+  });
+
+  it('sets a saved key’s uses on PATCH, its other settings kept, and Chat’s key unchanged', async () => {
+    results = [{ data: { settings: { model: 'gpt-5.5' } }, error: null }, { error: null }];
+    const res = await PATCH(send('PATCH', { provider: 'openai', useFor: ['chat', 'images'] }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, useFor: ['chat', 'images'] });
+    const update = queries.flatMap((q) => q.calls).find(([op]) => op === 'update');
+    expect(update?.[1]).toEqual({ settings: { model: 'gpt-5.5', useFor: ['chat', 'images'] } });
+    expect(rpc).not.toHaveBeenCalled();
+
+    results = [{ data: null, error: null }];
+    expect((await PATCH(send('PATCH', { provider: 'google', useFor: ['chat'] }))).status).toBe(404);
   });
 });
 
@@ -249,6 +379,8 @@ describe('DELETE', () => {
       p_provider: 'openai',
     });
     expect(queries).toHaveLength(0);
+    // A removed key fails no more: the Admins' notices about it close.
+    expect(keys.resolve).toHaveBeenCalledWith('org1', 'openai');
   });
 
   it("clears the Anthropic key's old copy too", async () => {
@@ -307,5 +439,301 @@ describe('a read-only workspace (cloud, plan not active)', () => {
     org = { subscription_status: 'trialing', stripe_subscription_id: 'sub_1' };
     results = [{ error: null }];
     expect((await PUT(send('PUT', { provider: 'openai', apiKey: KEY }))).status).toBe(200);
+  });
+});
+
+describe('own keys with Chat on (CHAT-16 items 19 and 28)', () => {
+  it('tells the page what own keys do for the workspace', async () => {
+    ownKeyAccess.mockResolvedValue({ state: 'kept', until: '2026-12-01T00:00:00Z' });
+    results = [{ data: [], error: null }];
+    expect(await (await GET()).json()).toMatchObject({
+      access: { state: 'kept', until: '2026-12-01T00:00:00Z' },
+    });
+    expect(ownKeyAccess).toHaveBeenCalledWith('org1');
+  });
+
+  it('refuses saving or switching a key below Enterprise, and writes nothing', async () => {
+    ownKeyAccess.mockResolvedValue({ state: 'locked' });
+    for (const res of [
+      await PUT(send('PUT', { provider: 'openai', apiKey: KEY })),
+      await PATCH(send('PATCH', { provider: 'openai' })),
+    ]) {
+      expect(res.status).toBe(403);
+      expect(await res.json()).toMatchObject({ code: 'own_keys_enterprise' });
+    }
+    expect(queries).toHaveLength(0);
+    expect(rpc).not.toHaveBeenCalled();
+  });
+
+  it('saves on Enterprise', async () => {
+    ownKeyAccess.mockResolvedValue({ state: 'plan' });
+    results = [{ error: null }];
+    expect((await PUT(send('PUT', { provider: 'openai', apiKey: KEY }))).status).toBe(200);
+  });
+
+  it('lets a kept key be replaced during its 30 days, but adds no other provider', async () => {
+    ownKeyAccess.mockResolvedValue({ state: 'kept', until: '2026-12-01T00:00:00Z' });
+    // The saved provider is found: replaced.
+    results = [{ data: { provider: 'openai' }, error: null }, { error: null }];
+    expect((await PUT(send('PUT', { provider: 'openai', apiKey: KEY }))).status).toBe(200);
+    expect(queries[0].calls).toContainEqual(['eq', 'provider', 'openai']);
+
+    // None saved for Google: refused.
+    queries.length = 0;
+    results = [{ data: null, error: null }];
+    const res = await PUT(send('PUT', { provider: 'google', apiKey: KEY }));
+    expect(res.status).toBe(403);
+    expect(queries.map((q) => q.table)).toEqual(['organization_ai_keys']);
+  });
+
+  it('still removes a key below Enterprise', async () => {
+    ownKeyAccess.mockResolvedValue({ state: 'locked' });
+    const res = await DELETE(
+      new Request('http://localhost/api/settings/ai-providers?provider=openai', {
+        method: 'DELETE',
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect(ownKeyAccess).not.toHaveBeenCalled();
+  });
+});
+
+describe('testing a key (AGENT-OWN-KEY §5.2 item 7, §11 Q8)', () => {
+  const READY = {
+    state: 'ready',
+    config: { provider: 'openai', apiKey: KEY, settings: {} },
+    active: true,
+  };
+  const failing = (cls: string, status: number) => ({ outcome: 'failing', class: cls, status });
+
+  beforeEach(() => {
+    vi.stubEnv('CHAT_AGENTIC', 'true');
+    vi.stubEnv('CHAT_AGENTIC_ORGS', '');
+    ownKeyAccess.mockResolvedValue({ state: 'plan' });
+    keys.test.mockReset().mockResolvedValue({ outcome: 'working' });
+    keys.keep.mockReset().mockResolvedValue(0);
+    keys.read.mockReset().mockResolvedValue(READY);
+    keys.resume.mockReset().mockResolvedValue(0);
+    keys.resolve.mockClear();
+  });
+
+  it('saves nothing for a key its test turns down, and names why under the key', async () => {
+    keys.test.mockResolvedValue(failing('invalid', 401));
+    const res = await PUT(send('PUT', { provider: 'openai', apiKey: KEY }));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ code: 'key_invalid', field: 'apiKey' });
+    expect(keys.test).toHaveBeenCalledWith({ provider: 'openai', apiKey: KEY, settings: {} });
+    expect(queries).toHaveLength(0);
+    expect(rpc).not.toHaveBeenCalled();
+  });
+
+  it('saves a key out of credit with the warning, and an unanswered test unchecked', async () => {
+    keys.test.mockResolvedValue(failing('no_credit', 429));
+    results = [{ error: null }];
+    const res = await PUT(send('PUT', { provider: 'openai', apiKey: KEY }));
+    expect(await res.json()).toEqual({ ok: true, check: 'no_credit', resumed: 0 });
+    expect(keys.keep).toHaveBeenCalledWith('org1', 'openai', failing('no_credit', 429), {
+      active: true,
+    });
+    // The old key's notices close first; this key's failure tells the Admins anew.
+    expect(keys.resolve).toHaveBeenCalledWith('org1', 'openai');
+    expect(keys.resolve.mock.invocationCallOrder[0]).toBeLessThan(
+      keys.keep.mock.invocationCallOrder[0],
+    );
+
+    keys.test.mockResolvedValue({ outcome: 'unknown' });
+    results = [{ error: null }];
+    const unchecked = await PUT(send('PUT', { provider: 'openai', apiKey: KEY }));
+    expect(await unchecked.json()).toMatchObject({ ok: true, check: 'unchecked' });
+  });
+
+  it('says how many paused agents a working key Chat uses started again', async () => {
+    keys.keep.mockResolvedValue(3);
+    results = [{ error: null }];
+    const res = await PUT(send('PUT', { provider: 'openai', apiKey: KEY }));
+    expect(await res.json()).toEqual({ ok: true, check: 'working', resumed: 3 });
+  });
+
+  it('tests a key before Chat uses it, refusing one that fails and keeping why', async () => {
+    keys.read.mockResolvedValue({ ...READY, active: false });
+    keys.test.mockResolvedValue(failing('model', 404));
+    const res = await PATCH(send('PATCH', { provider: 'openai' }));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ code: 'key_model' });
+    expect(rpc).not.toHaveBeenCalled();
+    expect(keys.keep).toHaveBeenCalledWith('org1', 'openai', failing('model', 404), {
+      active: false,
+    });
+
+    keys.test.mockResolvedValue({ outcome: 'working' });
+    keys.keep.mockResolvedValue(2);
+    const switched = await PATCH(send('PATCH', { provider: 'openai' }));
+    expect(await switched.json()).toEqual({ ok: true, check: 'working', resumed: 2 });
+    expect(keys.keep).toHaveBeenLastCalledWith(
+      'org1',
+      'openai',
+      { outcome: 'working' },
+      {
+        active: true,
+      },
+    );
+  });
+
+  it('starts the agents its failure paused again when Chat’s key is removed', async () => {
+    const remove = () =>
+      DELETE(
+        new Request('http://localhost/api/settings/ai-providers?provider=openai', {
+          method: 'DELETE',
+        }),
+      );
+    expect((await remove()).status).toBe(200);
+    expect(keys.resume).toHaveBeenCalledWith('org1');
+
+    keys.resume.mockClear();
+    keys.read.mockResolvedValue({ ...READY, active: false });
+    await remove();
+    expect(keys.resume).not.toHaveBeenCalled();
+  });
+
+  it('tests a saved key for admins only, and says what it found', async () => {
+    const test = (provider: unknown) =>
+      TEST(
+        new Request('http://localhost/api/settings/ai-providers/test', {
+          method: 'POST',
+          body: JSON.stringify({ provider }),
+        }),
+      );
+    keys.keep.mockResolvedValue(4);
+    expect(await (await test('openai')).json()).toEqual({
+      ok: true,
+      outcome: 'working',
+      resumed: 4,
+    });
+    keys.test.mockResolvedValue(failing('no_credit', 429));
+    keys.keep.mockResolvedValue(0);
+    expect(await (await test('openai')).json()).toEqual({
+      ok: true,
+      outcome: 'failing',
+      class: 'no_credit',
+      resumed: 0,
+    });
+    keys.read.mockResolvedValue({ state: 'none', active: false });
+    expect((await test('openai')).status).toBe(404);
+    expect((await test('copilot')).status).toBe(400);
+
+    profile!.role = 'manager';
+    expect((await test('openai')).status).toBe(403);
+  });
+});
+
+describe('the key guard (AGENT-OWN-KEY §4.3, PR 9)', () => {
+  const GUARD = { capUsd: 250, usedUsd: 182.4, renewsAt: '2026-11-20T09:00:00.000Z' };
+  const setGuard = (body: unknown) =>
+    SET_GUARD(
+      new Request('http://localhost/api/settings/ai-providers/guard', {
+        method: 'PUT',
+        body: JSON.stringify(body),
+      }),
+    );
+
+  beforeEach(() => {
+    guards.read.mockResolvedValue(GUARD);
+  });
+
+  it('shows Admins the guard where Chat runs on own keys, with this month’s spend', async () => {
+    for (const access of [{ state: 'plan' }, { state: 'kept', until: '2026-12-01T00:00:00Z' }]) {
+      ownKeyAccess.mockResolvedValue(access);
+      results = [{ data: [], error: null }];
+      expect(await (await GET()).json()).toMatchObject({ guard: GUARD });
+    }
+    expect(guards.read).toHaveBeenCalledWith('org1');
+
+    // The server didn't answer: the card says so.
+    guards.read.mockResolvedValue(null);
+    results = [{ data: [], error: null }];
+    expect(await (await GET()).json()).toMatchObject({ guard: null });
+  });
+
+  it('sends it to nobody else, and nowhere own keys are off', async () => {
+    ownKeyAccess.mockResolvedValue({ state: 'plan' });
+    for (const role of ['manager', 'member', 'analyst']) {
+      profile!.role = role;
+      results = [{ data: [], error: null }];
+      expect(await (await GET()).json()).not.toHaveProperty('guard');
+    }
+    profile!.role = 'admin';
+    for (const state of ['open', 'locked']) {
+      ownKeyAccess.mockResolvedValue({ state });
+      results = [{ data: [], error: null }];
+      expect(await (await GET()).json()).not.toHaveProperty('guard');
+    }
+    expect(guards.read).not.toHaveBeenCalled();
+  });
+
+  it('lets Admins only change it', async () => {
+    profile!.role = 'manager';
+    expect((await setGuard({ capUsd: 300 })).status).toBe(403);
+    expect(queries).toHaveLength(0);
+  });
+
+  it('keeps it from $10 to $10,000', async () => {
+    ownKeyAccess.mockResolvedValue({ state: 'plan' });
+    for (const capUsd of [9.99, 10_000.01, 0, -5, '300', null, Number.NaN]) {
+      expect((await setGuard({ capUsd })).status).toBe(400);
+    }
+    expect(queries).toHaveLength(0);
+  });
+
+  it('saves it to the cent, and the agent checks read it fresh', async () => {
+    ownKeyAccess.mockResolvedValue({ state: 'plan' });
+    results = [{ error: null }];
+    guards.read.mockResolvedValue({ ...GUARD, capUsd: 400.25 });
+    const res = await setGuard({ capUsd: 400.254 });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, guard: { ...GUARD, capUsd: 400.25 } });
+    expect(queries[0].table).toBe('chat_settings');
+    expect(queries[0].calls[0]).toEqual([
+      'upsert',
+      { organization_id: 'org1', own_key_agent_month_usd: 400.25, updated_by: 'u1' },
+      { onConflict: 'organization_id' },
+    ]);
+    expect(guards.forget).toHaveBeenCalledWith('org1');
+  });
+
+  it('answers 404 where own keys are off, and writes nothing', async () => {
+    for (const state of ['open', 'locked']) {
+      ownKeyAccess.mockResolvedValue({ state });
+      expect((await setGuard({ capUsd: 300 })).status).toBe(404);
+    }
+    expect(queries).toHaveLength(0);
+  });
+
+  it('says unavailable before 00442, and 500 on any other failure', async () => {
+    ownKeyAccess.mockResolvedValue({ state: 'plan' });
+    results = [
+      {
+        error: {
+          code: 'PGRST204',
+          message: "Could not find the 'own_key_agent_month_usd' column of 'chat_settings'",
+        } as { message: string },
+      },
+    ];
+    const res = await setGuard({ capUsd: 300 });
+    expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({ code: 'unavailable' });
+
+    results = [{ error: { message: 'boom' } }];
+    expect((await setGuard({ capUsd: 300 })).status).toBe(500);
+    expect(guards.forget).not.toHaveBeenCalled();
+  });
+
+  it('answers 402 on a read-only workspace', async () => {
+    vi.stubEnv('NEXT_PUBLIC_IS_CLOUD', 'true');
+    org = { subscription_status: 'canceled', stripe_subscription_id: 'sub_1' };
+    ownKeyAccess.mockResolvedValue({ state: 'plan' });
+    const res = await setGuard({ capUsd: 300 });
+    expect(res.status).toBe(402);
+    expect(await res.json()).toMatchObject({ code: 'subscription_inactive' });
+    expect(queries).toHaveLength(0);
   });
 });

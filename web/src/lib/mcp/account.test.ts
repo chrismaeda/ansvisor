@@ -39,6 +39,8 @@ const auth: McpAuthContext = {
   email: 'ada@acme.example',
   organizationId: 'org-1',
   apiKeyId: 'key-1',
+  brandAccess: 'all',
+  role: 'admin',
 };
 
 describe('getMeFor', () => {
@@ -51,6 +53,7 @@ describe('getMeFor', () => {
     profile = {
       role: 'manager',
       work_areas: ['content', 'leaders', 'gone'],
+      work_areas_asked_at: '2026-11-12T09:00:00Z',
       can_manage_menus: true,
     };
     expect(await getMeFor(auth)).toEqual({
@@ -66,6 +69,16 @@ describe('getMeFor', () => {
       ],
       can_manage_menus: true,
     });
+  });
+
+  it('names no work areas saved before the reset (Everything)', async () => {
+    profile = {
+      role: 'manager',
+      work_areas: ['content'],
+      work_areas_asked_at: '2026-10-28T10:00:00Z',
+      can_manage_menus: false,
+    };
+    expect(await getMeFor(auth)).toMatchObject({ work_areas: [] });
   });
 
   it('lets an admin change menus always, an analyst never', async () => {
@@ -191,7 +204,12 @@ describe('getAiUsageFor', () => {
 
 describe('the get_me and get_ai_usage tools', () => {
   it('list as read-only tools with a title, and answer as JSON', async () => {
-    profile = { role: 'admin', work_areas: ['aeo'], can_manage_menus: false };
+    profile = {
+      role: 'admin',
+      work_areas: ['aeo'],
+      work_areas_asked_at: '2026-11-12T09:00:00Z',
+      can_manage_menus: false,
+    };
     org = { name: 'Acme' };
     failing = null;
     const server = createMcpServer(auth);

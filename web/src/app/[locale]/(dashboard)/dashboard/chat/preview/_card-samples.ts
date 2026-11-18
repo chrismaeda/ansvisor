@@ -1,0 +1,520 @@
+import type { ChatNotice } from '@/lib/actions/chat-notices';
+import type { ChatConfirmForm } from '@/lib/chat/events';
+import type { ChatDeliverable, ChatStep } from '@/lib/chat/events';
+import type { TrayResponse } from '@/lib/chat/runs-tray';
+import type { PlanStep } from '@/components/agentic/plan-card';
+import type { StepRow } from '@/components/agentic/step-list';
+
+/**
+ * The run cards' sample data for the design preview (Chat P0, D2), taken
+ * from the approved Chat v2 mockups (CHAT-mockup-v2.html `#s-plan`,
+ * `#s-need`, `#s-done`, `#s-denied`, `#s-failed`). In the product the server
+ * sends these words (the label registry, the precedence's denial), so they
+ * are data here, not the app's own copy.
+ */
+
+export const TASKS_PLAN = {
+  title: 'Action Center tasks · 4 due',
+  due: 'Due Fri, Oct 30',
+  uses: 'Action Center · 52 sources · 2 live pages',
+  connections: [
+    { name: 'Google Search Console', connected: true },
+    { name: 'Webflow', connected: true },
+  ],
+  time: '6 min',
+  aiUsage: '~2%',
+  outputs: 'FAQ draft, schema code, report',
+  steps: [
+    {
+      label: 'Read the 4 tasks and rank them by impact',
+      detail: 'Action Center · citations last 30 days',
+      cls: 'read',
+    },
+    {
+      label: 'Check /pricing and /features as AI engines see them',
+      detail: 'Live page read · schema check',
+      cls: 'read',
+    },
+    {
+      label: 'Write an FAQ block for /pricing from 18 fan-outs',
+      detail: 'Draft in this chat · your brand facts',
+      cls: 'read',
+    },
+    {
+      label: 'Change one cited passage on /pricing',
+      detail: 'Cited 12× · I show you the change first',
+      cls: 'write',
+    },
+    {
+      label: 'Push the FAQ, FAQPage schema and 2 link fixes to Webflow as a draft',
+      detail: 'Webflow draft · nothing goes live',
+      cls: 'write',
+    },
+    {
+      label: 'Publish the Webflow draft',
+      detail: 'Goes live on ansvisor.com/pricing',
+      cls: 'execute',
+    },
+  ] satisfies PlanStep[],
+};
+
+export const SHOPPING_PLAN = {
+  title: 'AI shopping readiness · 48 products',
+  uses: 'Product Visibility · 48 products',
+  connections: [{ name: 'Shopify', connected: false }],
+  time: '6 min',
+  aiUsage: '~2%',
+  outputs: 'Fix list, feed changes',
+  steps: [
+    { label: 'Read product pages and feed', detail: 'Shopify · 48 products', cls: 'read' },
+    {
+      label: 'Check against ChatGPT Shopping and Google Shopping',
+      detail: 'Product Visibility',
+      cls: 'read',
+    },
+    { label: 'Save the fixes as drafts', detail: 'Shopify drafts', cls: 'write' },
+    { label: 'Push the feed', detail: 'Leaves your workspace', cls: 'execute' },
+  ] satisfies PlanStep[],
+};
+
+export const QUALITY_PLAN = {
+  title: 'Quality pass · 3 drafts',
+  uses: 'Content · 3 drafts',
+  time: '4 min',
+  aiUsage: '~1%',
+  outputs: '3 improved drafts, your to-do list',
+  steps: [
+    { label: 'Score the 3 drafts under 60', detail: 'E-E-A-T · Trust · Readability', cls: 'read' },
+    { label: 'Save the fixes to the drafts', detail: 'Content Editor drafts', cls: 'write' },
+    { label: 'List what only you can add', detail: 'Quotes, first-hand data, author', cls: 'read' },
+  ] satisfies PlanStep[],
+};
+
+const step = (
+  n: number,
+  status: ChatStep['status'],
+  label: string,
+  detail?: string,
+  kind: ChatStep['kind'] = 'read',
+): ChatStep => ({ n, kind, status, label, ...(detail ? { detail } : {}) });
+
+/** A run's steps at one moment of the Action Center tasks run. */
+export const RUN_STEPS = {
+  running: [
+    step(1, 'done', 'Read Action Center', '4 tasks due this week'),
+    step(
+      2,
+      'done',
+      'Opened ansvisor.com/pricing',
+      'No FAQ block and no FAQPage schema found',
+      'open_page',
+    ),
+    step(3, 'running', 'Drafted FAQ block · /pricing', 'From 18 fan-outs', 'write'),
+  ],
+  waiting: [
+    step(1, 'done', 'Read Action Center', '4 tasks due this week'),
+    step(2, 'done', 'Opened ansvisor.com/pricing', undefined, 'open_page'),
+    step(3, 'done', 'Drafted FAQ block · /pricing', undefined, 'write'),
+    step(4, 'waiting', 'Change one cited passage on /pricing', 'Waiting for your OK', 'write'),
+  ],
+  done: [
+    step(1, 'done', 'Thinking · 3s', '3 tasks are due this week.', 'thinking'),
+    step(2, 'done', 'Read Action Center', '4 tasks due this week'),
+    step(3, 'done', 'Read Citations', 'Pricing prompts · Last 30 days · ChatGPT, Gemini'),
+    step(4, 'done', 'Opened ansvisor.com/pricing', undefined, 'open_page'),
+    step(5, 'done', 'Read Prompts', '12 prompts'),
+    step(6, 'done', 'Checked facts', 'Plan names and prices match your Billing page', 'check'),
+    step(7, 'done', 'Saved draft in Content', 'FAQ block · /pricing', 'write'),
+  ],
+  single: [
+    {
+      ...step(1, 'done', 'Read Citations', 'Gemini · Last 30 days'),
+      rowCount: 18,
+    },
+  ],
+  stopped: [
+    step(1, 'done', 'Read Action Center', '4 tasks due this week'),
+    step(2, 'skipped', 'Opened ansvisor.com/pricing', undefined, 'open_page'),
+  ],
+  error: [
+    step(1, 'done', 'Read Action Center', '4 tasks due this week'),
+    step(2, 'error', 'Read Citations', 'Timed out'),
+  ],
+} satisfies Record<string, ChatStep[]>;
+
+export const APPROVAL_HEAD = {
+  title: 'I need your OK on one change',
+  subtitle: 'Step 4 of 6 · Action Center tasks',
+  note: 'The run waits up to 7 days for you, then stops. Nothing changes until you answer.',
+};
+
+export const APPROVAL = {
+  title: 'Change a cited passage on /pricing',
+  badge: 'Cited 12× last month',
+  why: 'ChatGPT cites this passage, but it says “7 platforms” on Starter. Your pricing page says Starter covers ChatGPT and Gemini.',
+  change: {
+    before: 'Every plan tracks all 7 AI platforms, including Claude.',
+    after:
+      'Starter tracks ChatGPT and Gemini. Growth adds AI Overviews and AI Mode. Claude is on Enterprise.',
+  },
+  sources: [
+    'Brand fact · Plans (approved)',
+    'Cited page · /pricing',
+    'Fan-out · ansvisor plans platforms',
+  ],
+  dontAskAgainLabel: 'Don’t ask again for brand-fact fixes',
+  doneLabel: 'cited passage changed',
+};
+
+/**
+ * A finished run's next moves (CHAT-07 §C, mockup `#s-done`): the first
+ * continues it; the third is the server's own after a run that did real
+ * work (W4-32).
+ */
+export const NEXT_MOVES = [
+  { label: 'Do the same for /features', prompt: 'Do the same for /features', ghost: true },
+  {
+    label: 'Win back Google AI Overviews citations',
+    prompt: 'Win back the Google AI Overviews citations we lost this week',
+  },
+  { label: 'Save these steps as a skill', prompt: 'Save these steps as a skill' },
+];
+
+/** A FAQ Chat wrote, then changed (CHAT-25 §6, mockup #e-chat): versions 1 and 2. */
+const FAQ_PAGE: Omit<ChatDeliverable, 'version'> = {
+  title: 'FAQ: Pricing',
+  type: 'document',
+  formats: ['html', 'md', 'docx', 'pdf'],
+  status: 'draft',
+  // A draft id's shape, so the card offers Send to CMS (no such draft: nothing is sent).
+  href: '/dashboard/content/editor/00000000-0000-4000-8000-000000000412',
+  filed: 'in_files',
+};
+const FAQ_SECTIONS = [
+  {
+    heading: 'Which AI platforms does it track?',
+    text: 'Starter: ChatGPT and Gemini. Growth: five platforms. Enterprise adds Claude.',
+  },
+  { heading: 'Can I change plans?', text: 'Yes, any time from Billing.' },
+  { heading: 'Is there a free trial?', text: 'Yes, every plan starts with a free trial.' },
+  {
+    heading: 'How many prompts can I track?',
+    text: 'It depends on your plan; Billing shows yours.',
+  },
+  { heading: 'Can I add teammates?', text: 'Yes, from Settings › People.' },
+  { heading: 'Can I pay yearly?', text: 'Yes, yearly plans cost less than twelve months.' },
+  { heading: 'Can I get a refund?', text: 'Yes, within [REFUND PERIOD] of your first payment.' },
+];
+export const PAGE_VERSIONS: ChatDeliverable[] = [
+  {
+    ...FAQ_PAGE,
+    version: {
+      n: 1,
+      counts: { questions: 6, sections: 6, characters: 820 },
+      changes: { shortened: [], added: [], placeholders: [] },
+      sections: FAQ_SECTIONS.slice(0, 6),
+    },
+  },
+  {
+    ...FAQ_PAGE,
+    version: {
+      n: 2,
+      counts: { questions: 7, sections: 7, characters: 905 },
+      changes: {
+        shortened: [{ heading: 'Can I change plans?', before: 212, after: 140 }],
+        added: ['Can I get a refund?'],
+        placeholders: ['[REFUND PERIOD]'],
+      },
+      sections: FAQ_SECTIONS,
+      canUndo: true,
+      // As the editor's header shows them (W4-12b part 2).
+      rules: { met: 11, total: 12 },
+      quality: 90,
+    },
+  },
+];
+
+/**
+ * The next moves after a version with nothing left to fill and a rule still
+ * open: checking it first (W4-12b part 2), then Mark ready (W4-12b).
+ */
+export const PAGE_MOVES = [
+  { label: 'Check it against the rules', prompt: 'Check this page against the rules', ghost: true },
+  { label: 'Mark ready', prompt: 'Mark this page ready' },
+  { label: 'Make the answers shorter', prompt: 'Make the answers shorter' },
+];
+
+/** Two questions asked together before a FAQ draft (CHAT-07 §A). */
+export const QUESTIONS = {
+  page: {
+    n: 2,
+    question: 'Which page should the FAQ go on?',
+    options: [
+      { label: '/pricing', detail: 'Cited 18 times for pricing prompts', recommended: true },
+      { label: '/features', detail: 'Cited 6 times' },
+      { label: 'A new FAQ page' },
+    ],
+    allowOther: true,
+    multi: false,
+    batch: { at: 1, of: 2 },
+    then: 'Then I’ll write the FAQ draft',
+  },
+  topics: {
+    n: 3,
+    question: 'Which questions should it answer?',
+    options: [
+      { label: 'Plans and prices', recommended: true },
+      { label: 'Platforms tracked' },
+      { label: 'Trial and cancelling' },
+    ],
+    allowOther: false,
+    multi: true,
+    batch: { at: 2, of: 2 },
+  },
+};
+
+export const PUSH_APPROVAL = {
+  title: 'Push to Webflow as a draft',
+  items: [
+    { icon: '≡', title: 'FAQ block · 6 questions', detail: 'New section on /pricing' },
+    { icon: '{ }', title: 'FAQPage schema', detail: 'JSON-LD in the page head' },
+    { icon: '↗', title: '2 broken links fixed', detail: '/pricing → /plans, /features#api → /api' },
+  ],
+  note: 'Draft only · nothing goes live',
+};
+
+export const PUBLISH = {
+  title: 'Publish the Webflow draft for /pricing',
+  summary:
+    'FAQ block (6 questions), FAQPage schema, 1 changed passage and 2 link fixes · Webflow draft “Pricing”',
+  note: 'Goes live on ansvisor.com/pricing · same in every mode',
+  actionLabel: 'Publish',
+  busyLabel: 'Publishing…',
+  previewLabel: 'Preview in Webflow',
+  disabledReason: 'After the draft is approved',
+  doneLabel: 'Published to ansvisor.com/pricing · 14:32 · by you',
+};
+
+/** A page sent to the brand's webhook (AUTONOMOUS-GO-LIVE PR 11): what its card names. */
+export const WEBHOOK_PAGE = '“Pricing FAQ” → Webhook';
+
+/** The Inbox notice after an agent sent it on its own: read, so the preview marks nothing. */
+export const WEBHOOK_NOTICE: ChatNotice = {
+  id: '00000000-0000-4000-8000-000000000011',
+  kind: 'agent_went_live',
+  agent: 'Publisher',
+  title: 'Pricing FAQ',
+  target: 'webhook',
+  draftId: '00000000-0000-4000-8000-000000000012',
+  chatId: '00000000-0000-4000-8000-000000000013',
+  url: null,
+  createdAt: '2026-11-03T08:00:00.000Z',
+  read: true,
+};
+
+export const RESULT = {
+  done: {
+    title: 'Done. 4 tasks are ready for you to close.',
+    summary: '6 of 6 steps · Auto (Haiku 5.5 + Sonnet 5.5) · 2% of monthly AI limit',
+  },
+  needsClick: {
+    title: 'Ready to go live. Publishing needs your click.',
+    summary: '5 of 6 steps · Auto (Haiku 5.5 + Sonnet 5.5) · 2% of monthly AI limit',
+  },
+  generatedAt: '2026-10-26T11:32:00Z',
+  dataAsOf: '2026-10-26T05:00:00Z',
+  timeZone: 'Europe/Istanbul',
+  kpis: [
+    { label: 'Tasks ready', value: '4', note: 'of 4' },
+    { label: 'Changes', value: '2', note: 'you approved 2' },
+    { label: 'First impact check', value: 'Nov 2', note: 'day 7 · 14 · 30 · 90' },
+  ],
+  files: [
+    {
+      icon: '≡',
+      title: 'FAQ block for /pricing',
+      meta: '6 questions · HTML + Markdown · in Files',
+      href: '/dashboard/content/library',
+    },
+    { icon: '{ }', title: 'FAQPage schema', meta: 'JSON-LD · in the Webflow draft' },
+    // Not a path in the app: no Open.
+    {
+      icon: '▤',
+      title: 'What I did and why',
+      meta: 'Report · 1 page',
+      href: 'https://example.com/report',
+    },
+  ],
+  note: 'You close tasks in Action Center. I never mark them done.',
+  primary: {
+    label: 'Close tasks in Action Center',
+    href: '/dashboard/action-center',
+    action: 'done.closeTasksInActionCenter',
+  },
+} as const;
+
+export const DENIALS = {
+  role: {
+    title: 'I can’t add these prompts for you',
+    subtitle: 'Answered in 1 s · you are signed in as Analyst',
+    asked: 'Add 5 prompts to Tracked Prompts for Ansvisor.',
+    askedItems: [
+      'best aeo tools',
+      'aeo vs seo',
+      'ai visibility tracker',
+      'track brand in perplexity',
+      'llms.txt generator',
+    ],
+    why: 'Your role is Analyst. Adding prompts needs Manager or Admin.',
+    whySource: 'Role rule · Settings › Team › Roles & access',
+    whoCan: 'Admins and Managers can do this.',
+    nextActions: ['ask_admin', 'see_access'],
+  },
+  plan: {
+    title: 'Full auto needs Growth',
+    subtitle: 'Answered in 1 s · you are signed in as Admin · preview as Starter',
+    asked: 'Run /winback in Full auto, so drafts are saved without asking you first.',
+    why: 'Full auto needs Growth. Your plan: Starter.',
+    whySource: 'Plan rule · Billing › Plans',
+    whoCan: 'Admins can change the plan.',
+    nextActions: ['upgrade', 'compare_plans'],
+    extra: {
+      label: 'Growth adds',
+      items: [
+        { title: 'Full auto', detail: 'agents apply changes for you, logged and undoable' },
+        { title: '3 more AI platforms', detail: 'AI Overviews, AI Mode, Copilot' },
+        {
+          title: 'Open pull request and MCP write',
+          detail: 'ship fixes as PRs, act from Claude, ChatGPT, Cursor',
+        },
+      ],
+      note: '$249 a month · $200 more than Starter',
+    },
+  },
+  policy: {
+    title: 'Your Admin set this tool to Never',
+    subtitle: 'Answered in 1 s · you are signed in as Manager',
+    asked: 'Send 4 outreach emails from /wrongclaim to third-party sites.',
+    why: 'Your Admin set this tool to Never: Send outreach email. Chat can’t run it for anyone in this workspace.',
+    whySource: 'Tool policy · Settings › Chat',
+    whoCan: 'Admins can change the tool policy.',
+    nextActions: ['ask_admin', 'open_policy', 'see_access'],
+  },
+} as const;
+
+export const DENIAL_FOOTNOTE = 'Nothing was changed · nothing outside your access was shown';
+
+export const FAILED = {
+  title: 'Merchant feed fix · EU',
+  reason: 'Google Merchant Center isn’t connected · nothing was changed',
+  connect: 'Connect Google Merchant Center',
+  steps: [
+    { n: 1, label: 'Read 48 products', detail: 'Product Visibility · EU', state: 'done' },
+    {
+      n: 2,
+      label: 'Update 12 titles in Google Merchant Center',
+      detail: 'Google Merchant Center isn’t connected',
+      state: 'failed',
+      pill: 'asks',
+    },
+    {
+      n: 3,
+      label: 'Push the feed',
+      detail: 'Leaves your workspace',
+      state: 'pending',
+      pill: 'click',
+    },
+  ] satisfies StepRow[],
+  runReason: 'The answer stopped before it was done · Retry sends your message again',
+};
+
+export const TRAY: TrayResponse = {
+  running: 1,
+  needsYou: 1,
+  runs: [
+    {
+      source: 'chat',
+      state: 'needsYou',
+      title: 'Action Center tasks',
+      step: 4,
+      steps: 6,
+      stepLabel: 'Change one cited passage on /pricing',
+      startedAt: '2026-10-26T13:02:00Z',
+      finishedAt: null,
+      href: '/dashboard/action-center',
+    },
+    {
+      source: 'chat',
+      state: 'running',
+      title: 'Win back citations · /features',
+      step: 2,
+      steps: 5,
+      stepLabel: 'Comparing cited pages',
+      startedAt: '2026-10-26T12:40:00Z',
+      finishedAt: null,
+      href: '/dashboard/citations',
+    },
+    {
+      source: 'content',
+      state: 'done',
+      title: 'Weekly citations report',
+      step: 3,
+      steps: 3,
+      stepLabel: 'Checking sources',
+      startedAt: '2026-10-26T04:58:00Z',
+      finishedAt: '2026-10-26T05:02:00Z',
+      href: '/dashboard/content/library',
+    },
+    {
+      source: 'chat',
+      state: 'failed',
+      title: 'Merchant feed fix · EU',
+      step: 2,
+      steps: 3,
+      stepLabel: 'Update 12 titles in Google Merchant Center',
+      startedAt: '2026-10-26T04:30:00Z',
+      finishedAt: '2026-10-26T04:31:00Z',
+      href: '/dashboard/shopping',
+    },
+  ],
+};
+
+/** A skill's draft card (W3-08): save_skill's form, as the registry gives it. */
+export const SKILL_DRAFT: ChatConfirmForm = {
+  kind: 'skill',
+  submit: 'Save skill',
+  fields: [
+    {
+      name: 'name',
+      kind: 'text',
+      label: 'Name',
+      value: 'pricing-brief',
+      maxLength: 64,
+      required: true,
+      hint: 'Its /command: lowercase letters, digits and single hyphens.',
+    },
+    { name: 'title', kind: 'text', label: 'Title', value: 'Pricing brief', maxLength: 120 },
+    {
+      name: 'description',
+      kind: 'textarea',
+      label: 'What it does and when to use it',
+      value:
+        'Writes a pricing brief that opens with the answer. Use it for plan and pricing pages.',
+      maxLength: 1024,
+      required: true,
+    },
+    {
+      name: 'instructions',
+      kind: 'textarea',
+      label: 'Steps',
+      value:
+        '1. Open with the answer in two sentences.\n2. Then three short sections: plans, limits, what changed.\n3. Keep figures as [placeholders] for the person to fill.',
+      maxLength: 51200,
+      required: true,
+    },
+  ],
+  notes: [
+    'Private to you until an Admin shares it.',
+    'It shapes how Chat works: it adds no tool and skips no card.',
+  ],
+};

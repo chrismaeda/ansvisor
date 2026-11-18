@@ -17,6 +17,7 @@ import {
   type ActionCategory,
   type ActionDismissReason,
   type ActionImpact,
+  missingDismissReason,
   taskProgress,
   type ActionStatus,
   type TaskStatus,
@@ -60,7 +61,20 @@ import {
   type TaskDetailsEdit,
 } from '@/lib/action-center/task-details';
 import type { PriorityLevel, PriorityReason } from '@/lib/action-center/priority';
+import type { CompetitorFindings } from '@/lib/action-center/competitor-findings';
+import type { WinningFindings } from '@/lib/action-center/winning-findings';
 import { assertWritable } from '@/lib/subscription-guard';
+import { canAccessBrand } from '@/lib/brand-access';
+import { logEvent, touchAction, writeTaskStatus } from '@/lib/action-center/task-status';
+import { readTaskAttachments, type TaskAttachment } from '@/lib/action-center/chat-attachments';
+import { startNowWork } from '@/lib/content/action-drafts';
+import {
+  NO_DOT_SOURCES,
+  actionDotFactsOf,
+  readActionDotSources,
+} from '@/lib/action-center/action-dot-reads';
+import type { ActionDotFacts } from '@/lib/page-dots';
+import type { DraftMethod } from '@/lib/content/drafts';
 
 export interface ActionAssignee {
   id: string;
@@ -73,6 +87,8 @@ export interface ActionAssignee {
 export interface ActionItem {
   id: string;
   actionNo: number;
+  /** Its number in its brand ("AC-03", 00534); null until its brand is numbered (actionCode). */
+  brandNo?: number | null;
   category: ActionCategory;
   /**
    * The server definition's id. Not narrowed to the kinds this build has copy
@@ -91,28 +107,48 @@ export interface ActionItem {
   taskTotal: number;
   taskCompleted: number;
   signalCount: number;
+  /**
+   * When the nightly pass found it New with no one's event for a month
+   * (00432); null when it isn't stale. Shown only while the action is New.
+   */
+  staleAt?: string | null;
   /** 0–100 (AC-006); null until the server has scored the action. */
   priorityScore: number | null;
   priorityLevel: PriorityLevel | null;
   priorityReason: PriorityReason | null;
+  /**
+   * The draft its "Start now" writes (AC-ACTION-PLAN spec §10): a new page or
+   * an existing page's, from a writing task still to do; null when its work
+   * isn't writing. Read with the list only.
+   */
+  startNow?: DraftMethod | null;
+  /** What lights its dot (lib/page-dots.ts); read with the list only. */
+  dotFacts?: ActionDotFacts;
 }
 
 export async function getActions(brandId: string): Promise<ActionItem[]> {
   const supabase = await createClient();
   const { data, error } = await supabase
     .from('actions')
-    .select(ACTION_COLUMNS)
+    .select(`${ACTION_COLUMNS}, tasks_writing_since`)
     .eq('brand_id', brandId)
+    // In the list's default order (lib/action-center/sort.ts): past the cap, the
+    // list keeps the most recently updated, and the same ones on every read.
+    .order('updated_at', { ascending: false })
+    .order('action_no', { ascending: false })
     .limit(1000);
   if (error) throw new Error(error.message);
-  const rows = (data ?? []) as ActionRow[];
+  const rows = (data ?? []) as (ActionRow & { tasks_writing_since?: string | null })[];
   if (rows.length === 0) return [];
 
   const actionIds = rows.map((row) => row.id);
   const assigneeIds = [...new Set(rows.map((row) => row.assignee_id).filter(Boolean))] as string[];
 
-  const [tasksRes, signalsRes, profiles, entityCounts] = await Promise.all([
-    supabase.from('action_tasks').select('action_id, status').in('action_id', actionIds),
+  const [tasksRes, signalsRes, profiles, entityCounts, dotSources] = await Promise.all([
+    supabase
+      .from('action_tasks')
+      .select('id, action_id, status, task_key')
+      .in('action_id', actionIds),
     // The signals that support each action now (AC-007): its open ones.
     supabase
       .from('signals')
@@ -124,16 +160,33 @@ export async function getActions(brandId: string): Promise<ActionItem[]> {
     readAssignees(supabase, brandId, assigneeIds),
     // Each action's list (AC-009): its count less what was removed since.
     readEntityCounts(supabase, actionIds),
+    // What lights each row's dot (lib/page-dots.ts); a failed read lights nothing.
+    readActionDotSources(supabase, brandId).catch((err) => {
+      console.error('[actions] could not read the dots:', err);
+      return NO_DOT_SOURCES;
+    }),
   ]);
   if (tasksRes.error) throw new Error(tasksRes.error.message);
   if (signalsRes.error) throw new Error(signalsRes.error.message);
 
   const taskStatuses = new Map<string, string[]>();
+  const taskRows = new Map<string, { id: string; taskKey: string | null; status: string }[]>();
   for (const task of tasksRes.data ?? []) {
     const statuses = taskStatuses.get(task.action_id) ?? [];
     statuses.push(task.status);
     taskStatuses.set(task.action_id, statuses);
+    const rows = taskRows.get(task.action_id) ?? [];
+    rows.push({ id: task.id, taskKey: task.task_key, status: task.status });
+    taskRows.set(task.action_id, rows);
   }
+  const dotFacts = actionDotFactsOf(
+    dotSources,
+    rows.map((row) => ({
+      id: row.id,
+      tasksWritingSince: row.tasks_writing_since ?? null,
+      taskStatuses: taskStatuses.get(row.id) ?? [],
+    })),
+  );
   const signalCounts = new Map<string, number>();
   for (const signal of signalsRes.data ?? []) {
     if (!signal.action_id) continue;
@@ -141,13 +194,18 @@ export async function getActions(brandId: string): Promise<ActionItem[]> {
   }
   return rows.map((row) => {
     const progress = taskProgress(taskStatuses.get(row.id) ?? []);
-    return actionItemFromRow(row, {
+    const item = actionItemFromRow(row, {
       assignee: row.assignee_id ? (profiles.get(row.assignee_id) ?? null) : null,
       taskTotal: progress.total,
       taskCompleted: progress.completed,
       signalCount: signalCounts.get(row.id) ?? 0,
       entityCounts: entityCounts.get(row.id),
     });
+    return {
+      ...item,
+      startNow: startNowWork(taskRows.get(row.id) ?? [], item.payload)?.method ?? null,
+      dotFacts: dotFacts.get(row.id),
+    };
   });
 }
 
@@ -175,6 +233,12 @@ export interface ActionTask {
    * platform and evidence (PROMPT-004). Null when it carries nothing.
    */
   details: ActionTaskDetails | null;
+  /** What Analyze competitor content found, once it ran (learning C1). */
+  competitorFindings?: CompetitorFindings | null;
+  /** What Find what sets your winning pages apart found, once it ran (learning C4). */
+  winningFindings?: WinningFindings | null;
+  /** Files and drafts Chat attached to it (CHAT-09 items 13, 16): "Attached from Chat". */
+  attachments?: TaskAttachment[];
 }
 
 export interface ActionEvent {
@@ -200,6 +264,8 @@ export interface ActionDetail {
   kpis: ActionKpiRef[];
   /** Improve actions only: positions now next to the baseline (PROMPT-008). */
   positionOutcome: ImproveOutcome | null;
+  /** Sent from Chat: its chat, when the reader may open it (their own, or shared); else null. */
+  chatHref?: string | null;
 }
 
 /**
@@ -280,49 +346,54 @@ export async function getActionDetail(brandId: string, actionId: string): Promis
     (outcomeRes.data?.payload ?? {}) as Record<string, unknown>,
     entityCounts.get(actionId),
   );
+  const tasks = (tasksRes.data ?? []).map(taskFromRow);
+  const [attachments, chatHref] = await Promise.all([
+    readTaskAttachments(
+      supabase,
+      brandId,
+      tasks.map((task) => task.id),
+    ),
+    readableChat(supabase, payload),
+  ]);
   return {
-    tasks: (tasksRes.data ?? []).map(taskFromRow).map((task) => ({
+    tasks: tasks.map((task) => ({
       ...task,
       titleParams: currentTaskParams(task.titleParams, payload) ?? task.titleParams,
+      attachments: attachments.get(task.id) ?? [],
     })),
     signals,
     entities,
     events: (eventsRes.data ?? []).map(eventFromRow),
     kpis: (kpisRes.data ?? []).map(kpiFromRow),
     positionOutcome: parseImproveOutcome(outcomeRes.data?.position_outcome ?? null),
+    chatHref,
   };
 }
 
-async function logEvent(
+/**
+ * The chat a finding was sent from, read as the member (its author, or the
+ * team when it is shared): a chat they can't read gets no link. Null for an
+ * action not sent from Chat, or when it can't be read.
+ */
+async function readableChat(
   supabase: Awaited<ReturnType<typeof createClient>>,
-  actionId: string,
-  event: string,
-  data: Record<string, string | number | null>,
-) {
-  const { data: auth } = await supabase.auth.getUser();
-  // Best-effort: a missing trail entry must not fail the change it records.
-  await supabase
-    .from('action_events')
-    .insert({ action_id: actionId, event, data, actor_id: auth.user?.id ?? null });
-}
-
-/** Bump the action's updated stamp so the table's Updated column tracks real
- *  work, not just nightly refreshes. */
-async function touchAction(
-  supabase: Awaited<ReturnType<typeof createClient>>,
-  brandId: string,
-  actionId: string,
-) {
-  await supabase
-    .from('actions')
-    .update({ updated_at: new Date().toISOString() })
-    .eq('brand_id', brandId)
-    .eq('id', actionId);
+  payload: Record<string, unknown>,
+): Promise<string | null> {
+  const id = payload.source === 'chat' ? payload.conversationId : null;
+  if (typeof id !== 'string' || !id) return null;
+  const { data, error } = await supabase
+    .from('chat_conversations')
+    .select('id')
+    .eq('id', id)
+    .maybeSingle();
+  if (error || !data) return null;
+  return `/dashboard/chat/${data.id as string}`;
 }
 
 /**
  * Sets an action's status. A dismissal keeps why, when the person said
- * (learning A5); any other status clears it, as a dismissal it no longer is.
+ * (learning A5); any other status clears it, as a dismissal it no longer is
+ * (00366). A database without dismiss_reason still changes the status.
  */
 export async function updateActionStatus(
   brandId: string,
@@ -330,25 +401,43 @@ export async function updateActionStatus(
   status: ActionStatus,
   reason: ActionDismissReason | null = null,
 ): Promise<void> {
-  await assertWritable();
+  await assertWritable({ brandId });
   const supabase = await createClient();
   const dismissReason =
     status === 'dismissed' && reason && ACTION_DISMISS_REASONS.includes(reason) ? reason : null;
-  const { error } = await supabase
-    .from('actions')
-    .update({
-      status,
-      completed_at: status === 'completed' ? new Date().toISOString() : null,
-      dismiss_reason: dismissReason,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('brand_id', brandId)
-    .eq('id', actionId);
+  const change = {
+    status,
+    completed_at: status === 'completed' ? new Date().toISOString() : null,
+    updated_at: new Date().toISOString(),
+  };
+  const write = (values: typeof change & { dismiss_reason?: string | null }) =>
+    supabase.from('actions').update(values).eq('brand_id', brandId).eq('id', actionId);
+  let { error } = await write({ ...change, dismiss_reason: dismissReason });
+  // A database without 00366 has no dismiss_reason (PGRST204 from PostgREST's
+  // schema cache, 42703 from Postgres): the status changes anyway, a
+  // dismissal's reason kept in the event below only. Any other error stands.
+  if (missingDismissReason(error)) ({ error } = await write(change));
   if (error) throw new Error(error.message);
   await logEvent(supabase, actionId, 'status_changed', {
     to: status,
     ...(dismissReason ? { reason: dismissReason } : {}),
   });
+}
+
+/**
+ * Still relevant on a stale action (00432): no longer stale, and its month
+ * starts again from this History line, as from anyone's change.
+ */
+export async function keepActionRelevant(brandId: string, actionId: string): Promise<void> {
+  await assertWritable({ brandId });
+  const supabase = await createClient();
+  const { error } = await supabase
+    .from('actions')
+    .update({ stale_at: null, updated_at: new Date().toISOString() })
+    .eq('brand_id', brandId)
+    .eq('id', actionId);
+  if (error) throw new Error(error.message);
+  await logEvent(supabase, actionId, 'still_relevant', {});
 }
 
 /**
@@ -374,12 +463,20 @@ export async function deleteAction(actionId: string): Promise<void> {
   }
 }
 
+/**
+ * Assign an action, or clear its assignee. The assignee must be someone who
+ * can see the brand (BRAND-ACCESS §3.1): a teammate it wasn't shared with,
+ * or anyone outside the workspace, is refused before anything is written.
+ */
 export async function assignAction(
   brandId: string,
   actionId: string,
   assigneeId: string | null,
 ): Promise<void> {
-  await assertWritable();
+  await assertWritable({ brandId });
+  if (assigneeId && !(await canAccessBrand(assigneeId, brandId))) {
+    throw new Error("The assignee can't see this brand");
+  }
   const supabase = await createClient();
   const { error } = await supabase
     .from('actions')
@@ -395,7 +492,7 @@ export async function setActionDueDate(
   actionId: string,
   dueDate: string | null,
 ): Promise<void> {
-  await assertWritable();
+  await assertWritable({ brandId });
   const supabase = await createClient();
   const { error } = await supabase
     .from('actions')
@@ -406,6 +503,28 @@ export async function setActionDueDate(
   await logEvent(supabase, actionId, 'due_date_set', { dueDate });
 }
 
+/**
+ * The group a product pages action works on (G21, AC plan P-6): the first
+ * 3, 5 or 10 of its products, its pages and count read again
+ * (set_product_group_size, 00493). Throws when it can't be changed: a
+ * closed or deleted action, or another kind.
+ */
+export async function setProductGroupSize(
+  brandId: string,
+  actionId: string,
+  size: number,
+): Promise<void> {
+  await assertWritable({ brandId });
+  if (![3, 5, 10].includes(size)) throw new Error('A group is 3, 5 or 10 products');
+  const supabase = await createClient();
+  const { data, error } = await supabase.rpc('set_product_group_size', {
+    p_action_id: actionId,
+    p_size: size,
+  });
+  if (error) throw new Error(error.message);
+  if (!data) throw new Error('The group can’t be changed');
+}
+
 export async function updateTaskStatus(
   brandId: string,
   actionId: string,
@@ -413,7 +532,7 @@ export async function updateTaskStatus(
   status: TaskStatus,
   skipReason?: string,
 ): Promise<void> {
-  await assertWritable();
+  await assertWritable({ brandId });
   const supabase = await createClient();
 
   // A skip records why. "We decided not to" is only useful to the next reader
@@ -422,18 +541,7 @@ export async function updateTaskStatus(
   const reason = status === 'skipped' ? (skipReason ?? '').trim().slice(0, 200) : null;
   if (status === 'skipped' && !reason) throw new Error('A skipped task needs a reason');
 
-  const { error } = await supabase
-    .from('action_tasks')
-    .update({ status, skip_reason: reason, updated_at: new Date().toISOString() })
-    .eq('action_id', actionId)
-    .eq('id', taskId);
-  if (error) throw new Error(error.message);
-  await logEvent(supabase, actionId, 'task_status', {
-    taskId,
-    to: status,
-    ...(reason ? { reason } : {}),
-  });
-  await touchAction(supabase, brandId, actionId);
+  await writeTaskStatus(supabase, { brandId, actionId, taskId }, status, { skipReason: reason });
 }
 
 /** Longest a task's text may be. Long enough for a real instruction, short
@@ -455,7 +563,7 @@ function cleanTaskTitle(raw: string): string {
  * as many as someone types.
  */
 export async function addTask(brandId: string, actionId: string, title: string): Promise<void> {
-  await assertWritable();
+  await assertWritable({ brandId });
   const supabase = await createClient();
   const text = cleanTaskTitle(title);
 
@@ -496,7 +604,7 @@ export async function updateTaskDetails(
   taskId: string,
   edit: TaskDetailsEdit & { title: string | null },
 ): Promise<void> {
-  await assertWritable();
+  await assertWritable({ brandId });
   if (!isTaskDetailsEdit(edit) || (edit.title !== null && typeof edit.title !== 'string')) {
     throw new Error('Invalid task details');
   }
@@ -546,7 +654,7 @@ export async function updateTaskDetails(
  * action makes that a non-issue.
  */
 export async function deleteTask(brandId: string, actionId: string, taskId: string): Promise<void> {
-  await assertWritable();
+  await assertWritable({ brandId });
   const supabase = await createClient();
 
   const { error } = await supabase

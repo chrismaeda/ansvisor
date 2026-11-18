@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 import { useNow, useTranslations } from 'next-intl';
 import { toast } from 'sonner';
-import { ArrowLeft, Check, Circle } from 'lucide-react';
+import { ArrowLeft, Check, Circle, X } from 'lucide-react';
 import { Link } from '@/i18n/navigation';
 import { Button } from '@/components/ui/button';
 import { buttonVariants } from '@/components/ui/button-variants';
@@ -37,11 +37,13 @@ const SLOW_AFTER_S = 120;
 /**
  * The run this page waits on, as the server starts it (content-writer.js
  * startWritingRun): a Start on a new page writes it, one on a live page runs
- * as a Fix (its suggestions), and a rewrite rewrites the whole page.
+ * as a Fix (its suggestions), and a rewrite rewrites the whole page. Write
+ * this (customer priorities item 9) builds the brief first, in a run of its
+ * own (briefThenWrite).
  */
 const WRITING_RUNS = {
-  create: ['write'],
-  optimize: ['fix'],
+  create: ['brief', 'write'],
+  optimize: ['brief', 'fix'],
   rewrite: ['rewrite'],
 } as const satisfies Record<DraftMethod | 'rewrite', readonly AgentRunKind[]>;
 
@@ -55,6 +57,8 @@ const DOING = {
   create: ['answerFirst', 'outline', 'rules', 'sources', 'placeholders'],
   optimize: ['missing', 'quoted', 'rules', 'sources', 'placeholders'],
   rewrite: ['rules', 'length', 'kept', 'voice', 'sources', 'placeholders'],
+  // Write this's brief, before the page.
+  brief: ['outline', 'sources'],
 } as const;
 /** Seconds each line stays. */
 const DOING_S = 4;
@@ -162,6 +166,8 @@ export function AgentWriting({
   since,
   rewrite = false,
   onRunEnded,
+  embedded = false,
+  onClose,
 }: {
   draftId: string;
   brandId: string;
@@ -173,6 +179,9 @@ export function AgentWriting({
   rewrite?: boolean;
   /** The run ended (stopped, done or failed): the page reads the draft again. */
   onRunEnded?: (stopped?: boolean) => void;
+  /** Inside another page (Chat's Open here, CHAT-25 §4): Close in the Library link's place. */
+  embedded?: boolean;
+  onClose?: () => void;
 }) {
   const t = useTranslations('contentEditor.editor');
   const seconds = elapsedSeconds(since, useNow({ updateInterval: 1000 }));
@@ -211,27 +220,45 @@ export function AgentWriting({
   return (
     <>
       <header className="flex items-center gap-2.5 border-b px-4 py-2.5">
-        <Link
-          href={CONTENT_LIBRARY_PATH}
-          aria-label={t('back')}
-          title={t('back')}
-          className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}
-        >
-          <ArrowLeft className="h-4 w-4" />
-        </Link>
+        {embedded ? (
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            aria-label={t('closeHere')}
+            title={t('closeHere')}
+            onClick={onClose}
+          >
+            <X className="h-4 w-4" />
+          </Button>
+        ) : (
+          <Link
+            href={CONTENT_LIBRARY_PATH}
+            aria-label={t('back')}
+            title={t('back')}
+            className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}
+          >
+            <ArrowLeft className="h-4 w-4" />
+          </Link>
+        )}
         <h1 className="min-w-0 truncate text-sm font-medium">{title.trim() || t('untitled')}</h1>
       </header>
       <div className="flex flex-1 flex-col items-center justify-center px-6">
         <div role="status" className="w-full max-w-sm space-y-4">
           <div className="flex items-center gap-3">
             <AgentTile tone="working" count={0} />
-            <p className="text-sm font-medium">{t('agentWriting.title')}</p>
+            <p className="text-sm font-medium">
+              {t(run?.kind === 'brief' ? 'agentWriting.titleBrief' : 'agentWriting.title')}
+            </p>
           </div>
           {run ? (
             <div className="space-y-2 rounded-xl border bg-card px-4 py-3.5">
               <RunSteps run={run} moving />
               <div className="flex items-center gap-3 border-t pt-2.5">
-                <DoingLine mode={mode} run={run} seconds={seconds} />
+                <DoingLine
+                  mode={run.kind === 'brief' ? 'brief' : mode}
+                  run={run}
+                  seconds={seconds}
+                />
                 {seconds !== null && (
                   <p aria-hidden className="shrink-0 text-xs text-muted-foreground tabular-nums">
                     {clock(seconds)}

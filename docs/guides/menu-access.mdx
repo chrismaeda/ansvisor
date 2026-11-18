@@ -7,6 +7,10 @@ description: "Choose which left-menu sections each role and each person sees, le
 
 It only hides. A section off someone's menu still opens from a link, and what their role can do there doesn't change. To change what someone can do, change their role in **Settings → Team**.
 
+## Fold a group
+
+Each titled group on the left menu, **Analytics** and **Execution**, folds under its title: click the title, and the chevron on its right turns. The menu opens with every group open; a folded group stays folded in that browser and opens by itself on one of its pages. **Chat** and **Agent Center** above the groups, and **Reports** and **Competitors** below them, have no title and don't fold. With the menu narrowed to icons, every item shows.
+
 ## Who changes menus
 
 **Admins** change menus, and can let **managers** do it too: in **Settings → Menu access → Who can change menus**, switch a manager on. A manager who changes menus sees **Menu access** in Settings, and nothing else of the admins' settings. They change what each role sees and every non-admin's menu, never an admin's. Only admins choose who changes menus.
@@ -41,29 +45,23 @@ Until an admin hides something, every role sees every section.
 
 ## Pick what you work on
 
-Each person can say what they work on or lead. Their menu then keeps only those areas' sections:
+Everyone starts on **Everything**: every section their role shows. Each person can then say what they work on or lead, in **Settings → Account → Your work areas**. Their menu then keeps only those areas' sections:
 
 | Work area | Sections |
 |---|---|
-| Founders & leaders | Action Center, Chat, Brand Visibility, Mentions, AI Referral Traffic, Reports |
-| AEO/GEO & Audit | Action Center, Content, Audit, Citations, AI Referral Traffic, Reports |
-| Content | Action Center, Chat, Content, Prompts, Citations, Reports |
-| Brand & PR | Action Center, Chat, Brand Visibility, Mentions, Citations, Reports |
-| Growth | Action Center, Chat, Brand Visibility, Prompts, Citations, AI Referral Traffic, Reports |
-| Product Development | Action Center, Chat, Brand Visibility, Prompts, Mentions, Product Visibility, Reports |
-| Business Development | Action Center, Chat, Brand Visibility, Prompts, Mentions, Citations, Reports |
-| Developers | Action Center, Audit, Prompts, Citations, AI Referral Traffic, Reports |
-| Analytics | Action Center, Brand Visibility, Prompts, Mentions, Citations, Product Visibility, AI Referral Traffic, Reports |
+| Founders & leaders | Action Center, Chat, Agent Center, Visibility, Mentions, AI Referral Traffic, Reports, Competitors |
+| AEO/GEO & Audit | Action Center, Agent Center, Content, Audit, Citations, AI Referral Traffic, Reports |
+| Content | Action Center, Chat, Agent Center, Content, Prompts, Citations, Reports |
+| Brand & PR | Action Center, Chat, Agent Center, Visibility, Mentions, Citations, Reports, Competitors |
+| Growth | Action Center, Chat, Agent Center, Visibility, Prompts, Citations, AI Referral Traffic, Reports, Competitors |
+| Product Development | Action Center, Chat, Agent Center, Visibility, Prompts, Mentions, Product Visibility, Reports |
+| Business Development | Action Center, Chat, Agent Center, Visibility, Prompts, Mentions, Citations, Reports, Competitors |
+| Developers | Action Center, Agent Center, Audit, Prompts, Citations, AI Referral Traffic, Reports |
+| Analytics | Action Center, Agent Center, Visibility, Prompts, Mentions, Citations, Product Visibility, AI Referral Traffic, Reports, Competitors |
 
-Pick one or more; none means every section. **Settings** is always on the menu, with your API keys and MCP.
+Mentions and Citations are tabs of Visibility, and stay sections of their own: a menu without them shows Visibility with the tabs it keeps. Pick one or more; none means every section. **Settings** is always on the menu, with your API keys and MCP.
 
-**What do you work on?** is asked once:
-
-- when you sign up, after your competitors and before you choose a plan;
-- when you join from an invitation, on your first sign-in, with the workspace's name and your first name, like **Welcome to Acme Workspace, Ada**;
-- on a self-hosted install, the first time the admin opens the dashboard.
-
-**Skip: show me everything** keeps every section. Change your answer any time in **Settings → Account → Your work areas**, which also shows your menu and why a section is off it: **Hidden by your admin** or **Not in your work areas**.
+Nobody is asked at sign-up or on joining: new people, invited teammates and the demo start on **Everything**. Work areas picked before November 11, 2026 (the old **What do you work on?** step) went back to **Everything** then, without changing what's stored; pick them again to narrow your menu. **Settings → Account → Your work areas** also shows your menu and why a section is off it: **Hidden by your admin** or **Not in your work areas**.
 
 ## How a menu is worked out
 
@@ -78,5 +76,5 @@ Action Center always stays. Nobody takes a section off an admin's menu; only an 
 When something is off your menu, the bottom of the sidebar says how much, as **3 sections off your menu**, with **Change** leading to your work areas.
 
 <Note>
-**Self-hosting:** menu access needs migration `00374_menu_access.sql`. Apply it before you upgrade the web app (see [Upgrading](/self-host/upgrading)). It counts everyone already in your workspace as asked, so only new and invited people see **What do you work on?**.
+**Self-hosting:** menu access needs migration `00374_menu_access.sql`. Apply it before you upgrade the web app (see [Upgrading](/self-host/upgrading)).
 </Note>

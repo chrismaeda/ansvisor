@@ -152,6 +152,8 @@ export interface SignalOutcome {
 export interface ActionHistoryItem {
   id: string;
   actionNo: number;
+  /** Its number in its brand (00534); null until its brand is numbered (actionCode). */
+  brandNo?: number | null;
   kind: string;
   /** Grow / Recover / Protect / Fix / Compete — the module's one classification. */
   type: ActionCategory;
@@ -185,7 +187,7 @@ export interface ActionHistoryItem {
    * The prompts or pages it named, when it was measured on them (learning
    * A1), with the brand-wide figures kept as a second line.
    */
-  measuredOn?: { entity: 'prompts' | 'pages'; count: number } | null;
+  measuredOn?: { entity: 'prompts' | 'pages' | 'topics'; count: number } | null;
   /**
    * Nights tracking missed in its before and after windows (learning A6);
    * `tooMany` when past the limit, the result then not measurable.
@@ -258,6 +260,42 @@ export function compareHistory(sort: HistorySort) {
         return bDate.localeCompare(aDate);
     }
   };
+}
+
+/** History's filters, as its bar sets them: 'all' or left out lets every row through. */
+export interface HistoryFilters {
+  status?: ActionStatus | 'all';
+  /** The bar's Type: an action's category. */
+  type?: ActionCategory | 'all';
+  priority?: PriorityLevel | 'all';
+  source?: SignalSource | 'all';
+  search?: string;
+}
+
+/**
+ * The rows History lists for its filters, in its order for `sort`: the
+ * page's own narrowing, shared with Chat's read of it (get_action_history).
+ * `searchText` is what a row renders (its title, description and code),
+ * since titles are composed from i18n templates and never stored as text.
+ */
+export function filterHistory(
+  items: readonly ActionHistoryItem[],
+  filters: HistoryFilters,
+  sort: HistorySort,
+  searchText: (item: ActionHistoryItem) => string,
+): ActionHistoryItem[] {
+  const needle = (filters.search ?? '').trim().toLowerCase();
+  const on = <T extends string>(value: T | 'all' | undefined): value is T =>
+    value !== undefined && value !== 'all';
+  return items
+    .filter((item) => {
+      if (on(filters.status) && item.status !== filters.status) return false;
+      if (on(filters.type) && item.type !== filters.type) return false;
+      if (on(filters.priority) && item.priorityLevel !== filters.priority) return false;
+      if (on(filters.source) && !item.sources.includes(filters.source)) return false;
+      return !needle || searchText(item).toLowerCase().includes(needle);
+    })
+    .sort(compareHistory(sort));
 }
 
 const pct = (part: number, total: number) => (total === 0 ? 0 : Math.round((part / total) * 100));

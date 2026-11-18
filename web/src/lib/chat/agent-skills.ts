@@ -1,0 +1,204 @@
+/**
+ * The skills an agent is made of (CHAT-21 §D step 1) until Chat's skills
+ * registry (CHAT-13) lists them: Ansvisor's own skills (Chat agentic plan
+ * §4), the governance mockup's ten first, with the connections each one
+ * uses, Required or Optional (§D step 4). Their titles are
+ * chatAgents.skills.{id}. Pure.
+ *
+ * A connection is a kind, never one product: `cms` is any CMS the brand
+ * sends pages to (Webflow, WordPress, Framer, Wix or a workflow webhook),
+ * `catalog` any source of its product catalog (Merchant Center, a feed, a
+ * store). Only what a skill can't work without is Required: /publish sends
+ * the page, /shopping reads the catalog. /winback and /tasks write their
+ * drafts without a CMS, and /report and /winback read without Search
+ * Console: those are Optional, and a run without them does the rest
+ * (§H item 42).
+ *
+ * Then CHAT-24 §5's seven for the focus areas (W2-23b), in the library's
+ * order (SKILL_ORDER). Their SKILL.md files read only Ansvisor's own data
+ * (answers, fan-outs, citations, mentions, the site audit and the pages
+ * they fetch) and save page work as drafts, so they use no connection:
+ * /listings reads the sites AI cites, not a catalog, and /audit-fix writes
+ * a robots or CMS change for the person to make.
+ *
+ * Then the AGENTS plan's (§7 step 3): /setup, the Onboarding & Help agent's,
+ * reads the Getting started steps and the ready-to-use agents, and uses no
+ * connection either: it says how to connect one. /fanout, the Fan-out Gap
+ * Filler's, reads the brand's own fan-outs and answers and saves its answers
+ * as drafts, so it uses none either.
+ * /prompts, the Prompt Portfolio Manager's, reads the brand's prompts,
+ * suggestions and fan-outs, and its Search Console queries when Search
+ * Console is connected: Optional, as for /report. Its changes are prompts
+ * added and paused, each on a card.
+ *
+ * Then /plan: a 30-day plan from the brand's visibility, prompts,
+ * competitors, opportunities and open actions, all Ansvisor's own data, so
+ * it uses no connection. Its actions go to the Action Center with
+ * create_action, once the person says yes.
+ *
+ * Then the packs' (AGENTS plan §8.1, §8.3): /content-plan, the Content Plan
+ * Builder's, plans the week's pages from opportunities, fan-out gaps and
+ * open actions, all Ansvisor's own data, so it uses no connection.
+ * /seasonal, the Seasonal Prompt Planner's, reads Search Console's queries
+ * for a season's searches when it is connected: Optional, as for /prompts.
+ * /traffic, AI Traffic → Signups', reads Ansvisor's own AI visits, and the
+ * key events Google Analytics counts when it is connected: Optional too, and
+ * without it sign-ups are "Not measured".
+ *
+ * Then /ai-revenue: which pages and assistants bring customers and revenue,
+ * from Ansvisor's conversions from AI visits, and from Google Analytics when
+ * it is connected: Optional, as for /traffic. What isn't set up is "Not
+ * measured", with the step that sets it up.
+ *
+ * Last, /operator: the AEO Operator's own skill, an agent made of it alone
+ * (agent-rules.ts isOperatorSkills), which reads only Ansvisor's own numbers
+ * and uses no connection.
+ *
+ * A workspace's own skills (CHAT-13, W3-06) are instructions only: an
+ * agent may name one by its /command, and it needs no connection (skillOf
+ * gives none). Whether it may run now is the workspace's to say
+ * (offAgentSkill, from skills/store.ts agentSkillStates).
+ */
+
+/** A connection a skill uses, and whether it can't work without it. */
+export interface SkillConnection {
+  key: string;
+  required: boolean;
+}
+
+export interface AgentSkill {
+  /** Its `/command` without the slash, as chat_agent_versions.skill_ids keeps it. */
+  id: string;
+  /** The connections it uses: an agent that runs it gets them, Required or Optional as here. */
+  uses: readonly SkillConnection[];
+}
+
+/** Any CMS the brand sends pages to. */
+export const CMS_CONNECTION = 'cms';
+/** Any source of the brand's product catalog. */
+export const CATALOG_CONNECTION = 'catalog';
+
+/** The kinds a brand's connections are read as, and the products saved agents may name for them. */
+const KIND_OF: Record<string, string> = {
+  [CMS_CONNECTION]: CMS_CONNECTION,
+  webflow: CMS_CONNECTION,
+  wordpress: CMS_CONNECTION,
+  framer: CMS_CONNECTION,
+  wix: CMS_CONNECTION,
+  webhook: CMS_CONNECTION,
+  [CATALOG_CONNECTION]: CATALOG_CONNECTION,
+  shopify: CATALOG_CONNECTION,
+  merchant_center: CATALOG_CONNECTION,
+  google_search_console: 'google_search_console',
+  gsc: 'google_search_console',
+  google_analytics: 'google_analytics',
+  ga4: 'google_analytics',
+};
+
+/** A connection key as the kind it is read as (agent-connections.ts), or null for one not read. */
+export const connectionKindOf = (key: string): string | null => KIND_OF[key] ?? null;
+
+const optional = (key: string): SkillConnection => ({ key, required: false });
+const required = (key: string): SkillConnection => ({ key, required: true });
+
+export const ANSVISOR_SKILLS: readonly AgentSkill[] = [
+  { id: 'winback', uses: [optional('google_search_console'), optional(CMS_CONNECTION)] },
+  { id: 'tasks', uses: [optional(CMS_CONNECTION)] },
+  { id: 'quality', uses: [] },
+  { id: 'faq', uses: [] },
+  { id: 'report', uses: [optional('google_search_console')] },
+  { id: 'beat', uses: [] },
+  { id: 'refresh', uses: [] },
+  { id: 'publish', uses: [required(CMS_CONNECTION)] },
+  { id: 'shopping', uses: [required(CATALOG_CONNECTION)] },
+  { id: 'wrongclaim', uses: [] },
+  { id: 'answerfirst', uses: [] },
+  { id: 'facts', uses: [] },
+  // ChatGPT Business Hub plan, PR 7: reads tracked answers, approved facts and
+  // the brand's own pages, and saves drafts: no connection.
+  { id: 'chatgpt-profile', uses: [] },
+  { id: 'compare', uses: [] },
+  { id: 'translate', uses: [] },
+  { id: 'questions', uses: [] },
+  { id: 'features', uses: [] },
+  { id: 'gaps', uses: [] },
+  { id: 'markets', uses: [] },
+  { id: 'listings', uses: [] },
+  { id: 'rivals', uses: [] },
+  { id: 'audit-fix', uses: [] },
+  { id: 'setup', uses: [] },
+  { id: 'fanout', uses: [] },
+  { id: 'prompts', uses: [optional('google_search_console')] },
+  { id: 'plan', uses: [] },
+  { id: 'content-plan', uses: [] },
+  { id: 'seasonal', uses: [optional('google_search_console')] },
+  { id: 'traffic', uses: [optional('google_analytics')] },
+  { id: 'ai-revenue', uses: [optional('google_analytics')] },
+  // Ads Phase 0 PR 15, only with Ads on: Ansvisor's own Ads reads, and drafts saved in it.
+  { id: 'earn-or-pay', uses: [] },
+  { id: 'ad-drafts', uses: [] },
+  // AEO Operator plan §4.2: the Operator's own, its only skill, with CHAT_OPERATOR on. It reads
+  // the workspace's own numbers and starts other agents' runs: no connection of its own.
+  { id: 'operator', uses: [] },
+];
+
+/** Connections any agent may add as Optional (mockup: Google Analytics). */
+export const OPTIONAL_CONNECTIONS: readonly string[] = ['google_analytics'];
+
+/** Follow-on skills an agent may add after its primary one (§D step 1). */
+export const MAX_FOLLOW_ON_SKILLS = 2;
+
+export function skillOf(id: string): AgentSkill | null {
+  return ANSVISOR_SKILLS.find((skill) => skill.id === id) ?? null;
+}
+
+/**
+ * The connections a list of skills uses, in order, once each: Required when
+ * one of the skills can't work without it, with the skill that needs it
+ * (else the first that uses it).
+ */
+export function skillConnections(
+  skillIds: readonly string[],
+): { key: string; skill: string; required: boolean }[] {
+  const out: { key: string; skill: string; required: boolean }[] = [];
+  for (const id of skillIds) {
+    for (const use of skillOf(id)?.uses ?? []) {
+      const seen = out.find((c) => c.key === use.key);
+      if (!seen) out.push({ key: use.key, skill: id, required: use.required });
+      else if (use.required && !seen.required) Object.assign(seen, { skill: id, required: true });
+    }
+  }
+  return out;
+}
+
+/** The skill of a list that needs a connection (its "Required by /…"), or null. */
+export function requiredBy(skillIds: readonly string[], key: string): string | null {
+  return (
+    skillIds.find((id) => skillOf(id)?.uses.some((use) => use.key === key && use.required)) ?? null
+  );
+}
+
+/** What an agent's checks know of its skills now (skills/store.ts agentSkillStates). */
+export interface AgentSkillStates {
+  /** The Ansvisor skills the workspace turned off. */
+  disabled: ReadonlySet<string>;
+  /** The workspace's own skills it names, each true when the person it acts as may run it. */
+  workspace: ReadonlyMap<string, boolean>;
+}
+
+/**
+ * The first of an agent's skills it can't run now, or null (CHAT-21 §G item
+ * 34: the agent pauses with skill_off): an Ansvisor skill the workspace
+ * turned off, or a workspace skill that is off, not approved, gone, not the
+ * person's to use, or no longer matching its checksum.
+ */
+export function offAgentSkill(
+  skillIds: readonly string[],
+  states: AgentSkillStates,
+): string | null {
+  return (
+    skillIds.find((id) =>
+      skillOf(id) ? states.disabled.has(id) : states.workspace.get(id) !== true,
+    ) ?? null
+  );
+}

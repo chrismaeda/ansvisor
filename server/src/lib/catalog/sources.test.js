@@ -6,6 +6,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // The module reaches the supabase admin client at import time, whose config
 // hard-exits when SUPABASE_* env is absent (as in CI).
 vi.mock('../../config/supabase.js', () => ({ default: {} }));
+// The brand's Merchant Center sign-in (BRAND-ACCESS PR 16, 00470); none: the workspace's entity.
+const brandConnection = vi.hoisted(() => vi.fn(async () => null));
+vi.mock('../brand-integrations.js', () => ({ brandConnection }));
 // The plan's product cap (ECOM-019): none unless a test sets one.
 const getCatalogProductCap = vi.hoisted(() => vi.fn(async () => -1));
 vi.mock('../plan-guard.js', async (importOriginal) => ({
@@ -47,7 +50,9 @@ beforeEach(() => {
     format: 'auto',
     url: 'https://shop.example/feed.xml',
   };
-  fake.rows('catalog_sources').push({ ...source, last_synced_at: null });
+  fake
+    .rows('catalog_sources')
+    .push({ ...source, last_synced_at: null, brands: { is_demo: false } });
 });
 afterEach(() => {
   delete process.env.IS_CLOUD;
@@ -252,6 +257,77 @@ describe('syncSource for a store (00282)', () => {
     expect(outcome).toEqual({ status: 'failed', error: 'The store took too long to answer.' });
   });
 
+  it("gives a store's order read its own deadline, not what the catalog read left", async () => {
+    await saveCredentials(STORE_ID, { apiKey: KEY }, { db: fake.db });
+    const slowCall = async (_address, opts) => {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      if (opts.signal.aborted) throw new ConnectorHttpError('timeout', 'GET x was stopped');
+      return { status: 200, headers: {}, data: null };
+    };
+    const acme = {
+      ...connector(async (_source, ctx) => {
+        await ctx.request('https://shop.example/api/products');
+        return { items: [item], errors: [], format: 'acme_store' };
+      }),
+      syncOrders: vi.fn(async (_source, ctx) => {
+        await ctx.request('https://shop.example/api/orders');
+        return { orders: [], skipped: 0, truncated: false };
+      }),
+    };
+    // Each read alone fits the deadline; the two together don't.
+    const outcome = await syncSource(store, {
+      db: fake.db,
+      now: NOW,
+      request: vi.fn(slowCall),
+      readMs: 60,
+      connectors: { acme_store: acme },
+    });
+    expect(outcome.status).toBe('ok');
+    expect(acme.syncOrders).toHaveBeenCalledTimes(1);
+    expect(outcome.counts.orders).not.toHaveProperty('failed');
+    expect(outcome.counts.orders).toMatchObject({ items: 0, truncated: false });
+    expect(row().last_orders_synced_at).toBe(NOW.toISOString());
+  });
+
+  it("records an order read that ran out of time, and keeps the catalog's outcome", async () => {
+    await saveCredentials(STORE_ID, { apiKey: KEY }, { db: fake.db });
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const request = vi.fn(async (address, opts) => {
+      if (!address.endsWith('/orders')) return { status: 200, headers: {}, data: null };
+      return new Promise((_resolve, reject) => {
+        opts.signal.addEventListener('abort', () =>
+          reject(new ConnectorHttpError('timeout', 'GET x was stopped')),
+        );
+      });
+    });
+    const acme = {
+      ...connector(async () => ({ items: [item], errors: [], format: 'acme_store' })),
+      syncOrders: vi.fn(async (_source, ctx) => {
+        await ctx.request('https://shop.example/api/orders');
+        return { orders: [], skipped: 0, truncated: false };
+      }),
+    };
+    const outcome = await syncSource(store, {
+      db: fake.db,
+      now: NOW,
+      request,
+      readMs: 20,
+      connectors: { acme_store: acme },
+    });
+    const orders = {
+      failed: true,
+      timedOut: true,
+      error: 'The store took too long to answer.',
+    };
+    expect(outcome).toMatchObject({ status: 'ok', counts: { items: 1, orders } });
+    expect(row()).toMatchObject({ last_status: 'ok', last_counts: { orders } });
+    expect(row().last_orders_synced_at ?? null).toBeNull();
+    expect(warn).toHaveBeenCalledWith(
+      { err: { name: 'ConnectorHttpError', code: 'timeout' }, sourceId: STORE_ID },
+      expect.stringContaining('order sync failed'),
+    );
+  });
+
   it("doesn't read a source twice at once", async () => {
     await saveCredentials(STORE_ID, { apiKey: KEY }, { db: fake.db });
     let release;
@@ -405,9 +481,13 @@ describe('syncSource with the workspace sign-in (#1270)', () => {
       readMs: 20,
       connectors: { merchant_center: gmc },
     });
-    expect(signInRequest).toHaveBeenCalledWith('google-merchant-center', 'org_org-1', {
-      hosts: ['merchantapi.googleapis.com'],
-    });
+    expect(signInRequest).toHaveBeenCalledWith(
+      'google-merchant-center',
+      { entityId: 'org_org-1', accountId: null },
+      {
+        hosts: ['merchantapi.googleapis.com'],
+      },
+    );
     expect(signals).toHaveLength(2);
     expect(signals[0]).toBeInstanceOf(AbortSignal);
     expect(signals[1]).toBe(signals[0]);
@@ -472,7 +552,7 @@ describe('sweepCatalogSources', () => {
   it("syncs the due feeds, and records that an inactive workspace's were not read", async () => {
     process.env.IS_CLOUD = 'true';
     const [first] = fake.rows('catalog_sources');
-    first.brands = { organizations: { subscription_status: 'active' } };
+    first.brands = { is_demo: false, organizations: { subscription_status: 'active' } };
     fake.rows('catalog_sources').push({
       id: '1b8d6a1e-2a3c-4d5e-8f90-123456789abc',
       brand_id: 'brand-2',
@@ -480,7 +560,7 @@ describe('sweepCatalogSources', () => {
       format: 'auto',
       url: 'https://other.example/feed.xml',
       last_synced_at: null,
-      brands: { organizations: { subscription_status: 'canceled' } },
+      brands: { is_demo: false, organizations: { subscription_status: 'canceled' } },
     });
     const fetch = vi.fn().mockResolvedValue({ html: fixture('google-feed.xml') });
     const result = await sweepCatalogSources({ db: fake.db, now: NOW, fetch });
@@ -510,7 +590,7 @@ describe('sweepCatalogSources', () => {
 
     process.env.IS_CLOUD = 'true';
     const [first] = fake.rows('catalog_sources');
-    first.brands = { organizations: { subscription_status: 'past_due' } };
+    first.brands = { is_demo: false, organizations: { subscription_status: 'past_due' } };
     first.last_synced_at = null;
     fake.writes.length = 0;
     const fetch = vi.fn();
@@ -531,6 +611,7 @@ describe('sweepCatalogSources', () => {
         format: 'auto',
         url: null,
         last_synced_at: null,
+        brands: { is_demo: false },
       },
       {
         id: '4b8d6a1e-2a3c-4d5e-8f90-123456789abc',
@@ -539,6 +620,7 @@ describe('sweepCatalogSources', () => {
         format: 'auto',
         url: null,
         last_synced_at: null,
+        brands: { is_demo: false },
       },
     );
     const fetch = vi.fn().mockResolvedValue({ html: fixture('google-feed.xml') });
@@ -556,6 +638,18 @@ describe('sweepCatalogSources', () => {
       ['feed_url', 'ok'],
     ]);
   });
+
+  it("never reads a demo brand's sources (00380), nor lets them hold the line", async () => {
+    fake.rows('catalog_sources')[0].brands = { is_demo: true };
+    const fetch = vi.fn();
+    expect(await sweepCatalogSources({ db: fake.db, now: NOW, fetch })).toEqual({
+      due: 0,
+      synced: 0,
+      inactive: 0,
+    });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(kept().last_synced_at).toBeNull();
+  });
 });
 
 describe("the plan's product cap (ECOM-019)", () => {
@@ -565,14 +659,17 @@ describe("the plan's product cap (ECOM-019)", () => {
     fake
       .rows('brands')
       .push(
-        { id: 'brand-1', organization_id: 'org-1' },
-        { id: 'brand-2', organization_id: 'org-1' },
-        { id: 'brand-x', organization_id: 'org-2' },
+        { id: 'brand-1', organization_id: 'org-1', is_demo: false },
+        { id: 'brand-2', organization_id: 'org-1', is_demo: false },
+        { id: 'brand-demo', organization_id: 'org-1', is_demo: true },
+        { id: 'brand-x', organization_id: 'org-2', is_demo: false },
       );
     fake.rows('catalog_products').push(
       // The workspace's other brand: one live, one removed.
       { id: 'p1', brand_id: 'brand-2', source: OTHER, external_id: 'X1', removed_at: null },
       { id: 'p2', brand_id: 'brand-2', source: OTHER, external_id: 'X2', removed_at: NOW },
+      // The workspace's demo brand's sample catalog (00380): never counts.
+      { id: 'pd', brand_id: 'brand-demo', source: OTHER, external_id: 'D1', removed_at: null },
       // Another workspace's, and this source's own: neither counts.
       { id: 'p3', brand_id: 'brand-x', source: OTHER, external_id: 'X3', removed_at: null },
       {

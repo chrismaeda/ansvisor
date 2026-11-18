@@ -278,7 +278,7 @@ describe('actionCsv', () => {
 
 describe('actionListCsv', () => {
   const listRow = {
-    number: 52,
+    number: 'AC-52',
     priorityScore: 84,
     priorityLevel: 'High',
     title: 'Recover lost citations on 3 prompts',
@@ -303,7 +303,7 @@ describe('actionListCsv', () => {
     expect(header).toContain('priority_score,priority_level,');
     expect(header).toContain(',signal_count,affected_count,affected_items,created');
     expect(row).toBe(
-      '52,84,High,Recover lost citations on 3 prompts,Recover,New,,,1 / 6,3,7,"Best coffee subscription?; Coffee, delivered",2026-10-15T00:00:00Z',
+      'AC-52,84,High,Recover lost citations on 3 prompts,Recover,New,,,1 / 6,3,7,"Best coffee subscription?; Coffee, delivered",2026-10-15T00:00:00Z',
     );
   });
 
@@ -312,7 +312,7 @@ describe('actionListCsv', () => {
       '\n',
     );
     expect(row).toBe(
-      '52,,,Recover lost citations on 3 prompts,Recover,New,,,1 / 6,3,0,,2026-10-15T00:00:00Z',
+      'AC-52,,,Recover lost citations on 3 prompts,Recover,New,,,1 / 6,3,0,,2026-10-15T00:00:00Z',
     );
   });
 });
@@ -452,6 +452,8 @@ describe('a task with AC-004 fields', () => {
             sources: [],
             where: 'acme.example/blog/best-tools · 3 prompts on ChatGPT',
             url: '/blog/best-tools',
+            linkTo: null,
+            links: [],
             why: 'Cited #2 until Oct 8.\nThe pages cited now have a dated table.',
             change: { before: null, after: 'A 2026 feature table.' },
             how: ['Add a feature table.', 'Put "2026" in the title.'],

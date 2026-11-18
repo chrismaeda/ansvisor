@@ -1,0 +1,215 @@
+import { CMS_NAMES } from '@/lib/content/cms-names';
+import type { CmsTarget } from '@/lib/content/cms-send-client';
+import { supabaseAdmin } from '@/lib/supabase/admin';
+import { summaryValue } from './activity';
+import { draftTitleOfOrganization, listWords } from './registry/targets';
+import type { UndoRule, WriteRecord } from './undo';
+import { DAY_MS, asObject, check, textOf } from './undo-parts';
+
+/**
+ * What Chat's output rows record, and Undo where §9 gives one: a report it
+ * made goes from Reports (30 days); a page it sent to a CMS and audits it
+ * started have no Undo (window 0): the CMS keeps its draft item, and an
+ * audit's results stay with its quota used. Their rows record what they did
+ * all the same, and the card says it can't be undone. Images Chat made
+ * (W4-08) have none either: their set is deleted in Files. Server only.
+ */
+
+/** No Undo (§9): the row records the change, Undo finds nothing to put back. */
+const NO_UNDO = {
+  windowMs: 0,
+  async before() {
+    return null;
+  },
+  async inverse() {
+    return 'gone' as const;
+  },
+};
+
+// ─── build_report: take it out of Reports (§9: 30 days) ─────────────────────
+
+const buildReport: UndoRule = {
+  targetType: 'report',
+  windowMs: 30 * DAY_MS,
+  async before() {
+    return null;
+  },
+  async record(_input, output): Promise<WriteRecord> {
+    const id = textOf(asObject(output).id);
+    let title: string | null = null;
+    if (id) {
+      const { data, error } = await supabaseAdmin
+        .from('reports')
+        .select('title')
+        .eq('id', id)
+        .maybeSingle();
+      check(error, 'the report');
+      title = (data?.title as string | undefined) ?? null;
+    }
+    return {
+      target: { type: 'report', id },
+      summaryParams: { title: summaryValue(title) },
+      undo: id ? { after: { id } } : null,
+    };
+  },
+  async inverse({ id, brandId }) {
+    let remove = supabaseAdmin.from('reports').delete().eq('id', id);
+    if (brandId) remove = remove.eq('brand_id', brandId);
+    const { data, error } = await remove.select('id');
+    if (error) throw new Error(`Could not remove the report: ${error.message}`);
+    return (data ?? []).length > 0 ? 'ok' : 'gone';
+  },
+  href: () => '/dashboard/reports',
+};
+
+// ─── push_cms_draft: recorded, no Undo (the CMS keeps its draft item) ───────
+
+/** A CMS as the app names it ("Webflow"), never its key. */
+const cmsName = (key: string | null) =>
+  key && Object.hasOwn(CMS_NAMES, key) ? CMS_NAMES[key as CmsTarget] : null;
+
+const pushCmsDraft: UndoRule = {
+  ...NO_UNDO,
+  targetType: 'content_draft',
+  async record(input, output, _before, organizationId): Promise<WriteRecord> {
+    const { draft_id: id, destination } = asObject(input);
+    const title =
+      typeof id === 'string'
+        ? await draftTitleOfOrganization(id, organizationId).catch(() => null)
+        : null;
+    return {
+      target: { type: 'content_draft', id: textOf(id) },
+      summaryParams: {
+        title: summaryValue(title),
+        cms: summaryValue(cmsName(textOf(asObject(output).target) ?? textOf(destination))),
+      },
+      undo: null,
+    };
+  },
+  href: (id) => `/dashboard/content/editor/${id}`,
+};
+
+// ─── suggest_draft_changes: recorded, no Undo (the person accepts or rejects them) ─
+
+const suggestDraftChanges: UndoRule = {
+  ...NO_UNDO,
+  targetType: 'content_draft',
+  async record(input, _output, _before, organizationId): Promise<WriteRecord> {
+    const { draft_id: id } = asObject(input);
+    const title =
+      typeof id === 'string'
+        ? await draftTitleOfOrganization(id, organizationId).catch(() => null)
+        : null;
+    return {
+      target: { type: 'content_draft', id: textOf(id) },
+      summaryParams: { title: summaryValue(title) },
+      undo: null,
+    };
+  },
+  href: (id) => `/dashboard/content/editor/${id}`,
+};
+
+// ─── run_site_audit: recorded, no Undo (results stay, quota used) ───────────
+
+const runSiteAudit: UndoRule = {
+  ...NO_UNDO,
+  targetType: 'site_audit',
+  async record(input, output): Promise<WriteRecord> {
+    const audits = asObject(output).audits;
+    const first = Array.isArray(audits) ? textOf(asObject(audits[0]).id) : null;
+    const urls = asObject(input).urls;
+    return {
+      target: { type: 'site_audit', id: first },
+      summaryParams: {
+        pages: summaryValue(listWords(Array.isArray(urls) ? (urls as string[]) : [])),
+      },
+      undo: null,
+    };
+  },
+  href: () => '/dashboard/audit',
+};
+
+// ─── run_agent: recorded, no Undo (the agent it ran keeps its own run) ──────
+
+const runAgent: UndoRule = {
+  ...NO_UNDO,
+  targetType: 'agent',
+  async record(input, output): Promise<WriteRecord> {
+    const agent = textOf(asObject(output).agent);
+    return {
+      target: { type: 'agent', id: textOf(asObject(input).agent) },
+      summaryParams: { agent: summaryValue(agent) },
+      undo: null,
+    };
+  },
+  href: (id) => `/dashboard/agents/${id}`,
+};
+
+// ─── run_agent_plan: recorded, no Undo (each agent it started keeps its own run) ─
+
+const runAgentPlan: UndoRule = {
+  ...NO_UNDO,
+  targetType: 'agent_plan',
+  async record(input, output): Promise<WriteRecord> {
+    const made = asObject(output);
+    const count = (value: unknown) => String(typeof value === 'number' ? value : 0);
+    return {
+      target: { type: 'agent_plan', id: textOf(asObject(input).plan_id) },
+      summaryParams: { started: count(made.started), skipped: count(made.skipped) },
+      undo: null,
+    };
+  },
+  href: () => '/dashboard/agents',
+};
+
+// ─── generate_image: recorded, no Undo (§9 row 70: the set is deleted in Files) ─
+
+const generateImage: UndoRule = {
+  ...NO_UNDO,
+  targetType: 'chat_file',
+  async record(input, output): Promise<WriteRecord> {
+    const made = asObject(output);
+    return {
+      target: { type: 'chat_file', id: textOf(made.file_id) },
+      summaryParams: {
+        title: summaryValue(textOf(made.title)),
+        model: summaryValue(textOf(made.model) ?? textOf(asObject(input).model)),
+      },
+      undo: null,
+    };
+  },
+  href: () => '/dashboard/chat/files',
+};
+
+// ─── save_ad_drafts: recorded, no Undo (a newer draft takes its place on the Pay card) ─
+
+const saveAdDrafts: UndoRule = {
+  ...NO_UNDO,
+  targetType: 'prompt',
+  async record(input): Promise<WriteRecord> {
+    const target = { type: 'prompt', id: textOf(asObject(input).prompt_id) };
+    return { target, summaryParams: {}, undo: null };
+  },
+  href: () => '/dashboard/ads',
+};
+
+/** The output rows' records and Undo, by tool name (undo.ts UNDO_RULES). */
+export const OUTPUT_UNDO_RULES: Readonly<Record<string, UndoRule>> = {
+  build_report: buildReport,
+  push_cms_draft: pushCmsDraft,
+  // A page put live (AUTONOMOUS-GO-LIVE PR 9): recorded the same way; Take down is its own click.
+  publish_cms: pushCmsDraft,
+  // A page taken down (PR 10): recorded the same way, its CMS from the output; publish it again to undo.
+  unpublish_cms: pushCmsDraft,
+  // A page sent to the brand's webhook (PR 11): recorded the same way; its workflow's now, no Undo.
+  trigger_content_webhook: pushCmsDraft,
+  // Suggestions in the editor beside the chat (W4-14): the page changes only on the person's Accept.
+  suggest_draft_changes: suggestDraftChanges,
+  run_site_audit: runSiteAudit,
+  run_agent: runAgent,
+  // The AEO Operator's plan, started (AEO Operator PR 4).
+  run_agent_plan: runAgentPlan,
+  generate_image: generateImage,
+  // Ad drafts saved through the claims gate (Ads Phase 0 PR 15).
+  save_ad_drafts: saveAdDrafts,
+};

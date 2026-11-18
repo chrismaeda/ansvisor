@@ -50,6 +50,8 @@ const auth: McpAuthContext = {
   email: null,
   organizationId: 'org-1',
   apiKeyId: 'key-1',
+  brandAccess: 'all',
+  role: 'admin',
 };
 
 const row = (over: Record<string, unknown>) => ({
@@ -145,7 +147,13 @@ describe('listSignalsFor', () => {
     expect(linkReads.map((ids) => ids.length)).toEqual([100, 50]);
     expect(signals[0].used_by_actions).toHaveLength(2);
     expect(signals[149].used_by_actions).toEqual([
-      { id: 'a9', action_no: 77, kind: 'recover_lost_citations', status: 'new' },
+      {
+        id: 'a9',
+        action_no: 77,
+        code: 'AC-77',
+        kind: 'recover_lost_citations',
+        status: 'new',
+      },
     ]);
     expect(signals[1].used_by_actions).toEqual([]);
   });

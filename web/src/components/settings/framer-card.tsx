@@ -40,6 +40,7 @@ import {
   type FramerError,
   type FramerFieldMap,
 } from '@/lib/framer-client';
+import { frictionFlow } from '@/lib/friction-events';
 import { useBrandStore } from '@/stores/use-brand-store';
 import { Picker } from './webflow-card';
 
@@ -78,6 +79,8 @@ export function FramerCard() {
   const [replacingFor, setReplacingFor] = useState<string | null>(null);
   const replacing = replacingFor !== null && replacingFor === activeBrandId;
   const [disconnecting, setDisconnecting] = useState(false);
+  // Connected just now without a collection, for the brand: its picker takes the focus.
+  const [settingUpFor, setSettingUpFor] = useState<string | null>(null);
   // Bumped to read the connection again: a key refused or replaced meanwhile.
   const [reads, setReads] = useState(0);
 
@@ -133,7 +136,7 @@ export function FramerCard() {
   };
 
   return (
-    <div className="space-y-4 rounded-lg border p-4">
+    <div className="space-y-4 rounded-lg border bg-card p-4">
       <div className="flex items-start gap-3">
         <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border bg-muted/50">
           <LayoutTemplate className="h-5 w-5 text-muted-foreground" />
@@ -141,12 +144,21 @@ export function FramerCard() {
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <p className="text-sm font-medium">{t('title')}</p>
-            {connection?.status === 'connected' && (
+            {connection?.status === 'connected' && connection.collectionId && (
               <Badge
                 variant="outline"
                 className="border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
               >
                 {t('connected')}
+              </Badge>
+            )}
+            {/* Connected, but nothing goes to Framer until a collection is saved. */}
+            {connection?.status === 'connected' && !connection.collectionId && (
+              <Badge
+                variant="outline"
+                className="border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400"
+              >
+                {t('setupNotFinished')}
               </Badge>
             )}
             {connection?.status === 'auth_failed' && (
@@ -246,6 +258,7 @@ export function FramerCard() {
             onCancel={replacing ? () => setReplacingFor(null) : undefined}
             onConnected={(next) => {
               setReplacingFor(null);
+              setSettingUpFor(next.collectionId ? null : activeBrandId);
               setConnection(next);
             }}
           />
@@ -256,13 +269,20 @@ export function FramerCard() {
           key={`${activeBrandId}:${connection.projectId}`}
           brandId={activeBrandId}
           connection={connection}
-          onSaved={setConnection}
+          focusCollection={settingUpFor === activeBrandId}
+          onSaved={(next) => {
+            setSettingUpFor(null);
+            setConnection(next);
+          }}
           onStale={() => setReads((n) => n + 1)}
         />
       )}
     </div>
   );
 }
+
+/** cms_connect: the Connect below, until the CMS is connected. */
+const CONNECT = frictionFlow('cms_connect', { target: 'framer' });
 
 /** The project and an API key made in it: the key goes to the API once, never shown again. */
 function KeyForm({
@@ -292,9 +312,11 @@ function KeyForm({
 
   const connect = async () => {
     setConnecting(true);
+    CONNECT.started();
     const result = await connectFramer(brandId, { project: project.trim(), apiKey: key });
     setConnecting(false);
     if (!result.ok) {
+      CONNECT.failed(result.code);
       if (result.code === 'subscription') openUpgrade();
       else
         toast.error(
@@ -302,8 +324,10 @@ function KeyForm({
         );
       return;
     }
+    CONNECT.completed();
     setApiKey('');
-    toast.success(t('connectedToast'));
+    // A new key for the same project keeps its collection; else the setup's last step is left.
+    toast.success(t(result.connection.collectionId ? 'connectedToast' : 'connectedSetupToast'));
     onConnected(result.connection);
   };
   const connectProject = guard(() => void connect(), { action: tActions('connectCms') });
@@ -379,11 +403,14 @@ function KeyForm({
 function FramerMapping({
   brandId,
   connection,
+  focusCollection,
   onSaved,
   onStale,
 }: {
   brandId: string;
   connection: FramerConnection;
+  /** Just connected: the collection picker, the setup's last step, takes the focus. */
+  focusCollection: boolean;
   onSaved: (connection: FramerConnection) => void;
   /** The connection changed (a key refused, replaced or removed): read it again. */
   onStale: () => void;
@@ -491,11 +518,16 @@ function FramerMapping({
 
   return (
     <div className="space-y-4">
-      <p className="text-sm text-muted-foreground">
-        {connection.collectionName
-          ? t('pagesGoTo', { collection: connection.collectionName })
-          : t('noCollection')}
-      </p>
+      {connection.collectionId ? (
+        <p className="text-sm text-muted-foreground">
+          {t('pagesGoTo', { collection: connection.collectionName ?? connection.collectionId })}
+        </p>
+      ) : (
+        <div className="flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-300">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>{t('setupStep')}</span>
+        </div>
+      )}
       {listed === null ? (
         <p className="flex items-center gap-2 text-xs text-muted-foreground">
           <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -511,6 +543,7 @@ function FramerMapping({
           items={collectionItems}
           value={collection ? collection.id : null}
           placeholder={t('collectionPlaceholder')}
+          autoFocus={focusCollection}
           onChange={(value) => {
             const next = collections.find((c) => c.id === value);
             if (!next || next.id === collectionId) return;
@@ -532,7 +565,7 @@ function FramerMapping({
       )}
 
       {collection && (
-        <div className="space-y-3 rounded-md border p-3">
+        <div className="space-y-3 rounded-md border bg-card p-3">
           <div>
             <p className="text-sm font-medium">{t('fieldsTitle')}</p>
             <p className="text-xs text-muted-foreground">{t('fieldsHint')}</p>

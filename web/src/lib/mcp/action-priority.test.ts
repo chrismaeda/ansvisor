@@ -48,10 +48,16 @@ let actionRows: Record<string, unknown>[] = ACTIONS;
 let taskRows: Record<string, unknown>[] = [];
 /** What get_action's own row adds to the first action. */
 let detail: Record<string, unknown> = {};
+/** A database without 00366: reading dismiss_reason fails with 42703. */
+let without00366 = false;
 
 function builder(table: string) {
+  let columns = '';
   const chain = {
-    select: () => chain,
+    select: (cols: string) => {
+      columns = cols;
+      return chain;
+    },
     eq: () => chain,
     is: () => chain,
     in: () => chain,
@@ -60,13 +66,19 @@ function builder(table: string) {
       return chain;
     },
     limit: () => chain,
-    maybeSingle: async () => ({
-      data:
-        table === 'actions'
-          ? { ...ACTIONS[0], brand_id: 'brand-1', payload: {}, ...detail }
-          : { id: 'brand-1' },
-      error: null,
-    }),
+    maybeSingle: async () =>
+      table === 'actions' && without00366 && columns.includes('dismiss_reason')
+        ? {
+            data: null,
+            error: { code: '42703', message: 'column actions.dismiss_reason does not exist' },
+          }
+        : {
+            data:
+              table === 'actions'
+                ? { ...ACTIONS[0], brand_id: 'brand-1', payload: {}, ...detail }
+                : { id: 'brand-1' },
+            error: null,
+          },
     then: (resolve: (v: { data: unknown; error: null }) => void) =>
       resolve({
         data: table === 'actions' ? actionRows : table === 'action_tasks' ? taskRows : [],
@@ -91,6 +103,8 @@ const auth: McpAuthContext = {
   email: null,
   organizationId: 'org-1',
   apiKeyId: 'key-1',
+  brandAccess: 'all',
+  role: 'admin',
 };
 
 describe('listActionsFor', () => {
@@ -103,7 +117,15 @@ describe('listActionsFor', () => {
   it('gives each action its priority, or null before it is scored', async () => {
     const rows = await listActionsFor(auth, { brandId: 'brand-1' });
     expect(rows?.map((r) => r.priority)).toEqual([
-      { score: 94, level: 'critical', reason: { change: 'lost', demand: 'high' } },
+      {
+        score: 94,
+        level: 'critical',
+        reason: { change: 'lost', demand: 'high' },
+        // A reason from before the factors were kept has no confidence.
+        confidence: null,
+        confidence_note: null,
+        confidence_score: null,
+      },
       null,
     ]);
     // Highest priority first, unscored ones last, as the app lists them.
@@ -130,6 +152,29 @@ describe('listActionsFor', () => {
       subject: { entity: 'prompts', count: 12 },
       days: 2,
     });
+  });
+
+  it('says how sure the score is as a level and why, keeping the raw factor, and which are stale', async () => {
+    actionRows = [
+      {
+        ...ACTIONS[0],
+        priority_reason: { kinds: 1, sources: 1, factors: { confidence: 0.3 } },
+        stale_at: '2026-10-31T03:00:00Z',
+      },
+      { ...ACTIONS[1], status: 'on_hold', stale_at: '2026-10-31T03:00:00Z' },
+    ];
+    const rows = await listActionsFor(auth, { brandId: 'brand-1' });
+    expect(rows?.[0].priority).toMatchObject({
+      confidence: 'low',
+      confidence_note: 'one kind of finding from one source',
+      confidence_score: 0.3,
+      reason: { factors: { confidence: 0.3 } },
+    });
+    expect(rows?.map((r) => [r.stale, r.stale_at])).toEqual([
+      [true, '2026-10-31T03:00:00Z'],
+      // Only a New action is stale.
+      [false, null],
+    ]);
   });
 
   it('lists the most recently updated first when asked', async () => {
@@ -247,7 +292,25 @@ describe('getActionFor', () => {
         net_of_control: null,
         dismiss_reason: 'wrong_data',
       });
+      // A reason left from an earlier dismissal is not read once it moved on.
+      detail = { status: 'in_progress', validation: null, dismiss_reason: 'wrong_data' };
+      expect(await getActionFor(auth, 'a1')).toMatchObject({ dismiss_reason: null });
     } finally {
+      detail = {};
+    }
+  });
+
+  it('reads the action on a database without 00366, with no reason given', async () => {
+    without00366 = true;
+    detail = { status: 'dismissed', validation: null };
+    try {
+      expect(await getActionFor(auth, 'a1')).toMatchObject({
+        id: 'a1',
+        status: 'dismissed',
+        dismiss_reason: null,
+      });
+    } finally {
+      without00366 = false;
       detail = {};
     }
   });
@@ -258,6 +321,9 @@ describe('getActionFor', () => {
       score: 94,
       level: 'critical',
       reason: { change: 'lost', demand: 'high' },
+      confidence: null,
+      confidence_note: null,
+      confidence_score: null,
     });
   });
 });

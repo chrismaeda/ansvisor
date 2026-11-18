@@ -261,7 +261,7 @@ export async function sendTrafficDigestForBrand(
   // Nothing to send to, or Resend isn't set up: the week is done all the same.
   let outcome = 'skipped';
   try {
-    recipients = await resolveRecipients(brand.organization_id, settings);
+    recipients = await resolveRecipients(brand.organization_id, settings, brandId);
     if (recipients.length) {
       const settingsUrl = `${appUrl()}/dashboard/settings?tab=notifications`;
       const { subject, html } = renderTrafficDigestEmail({
@@ -336,6 +336,8 @@ export async function sendTrafficDigests({ now = new Date() } = {}) {
       .from('brands')
       .select('id')
       .eq('is_active', true)
+      // A demo brand (00380) is sample data: nobody is mailed about it.
+      .eq('is_demo', false)
       .order('id', { ascending: true })
       .range(from, to),
   );

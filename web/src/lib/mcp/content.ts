@@ -1,6 +1,25 @@
 import { supabaseAdmin } from '@/lib/supabase/admin';
+import {
+  SHOPPING_COLUMNS,
+  lastSendsOf,
+  mcpShoppingLinks,
+  mcpShoppingPath,
+  type McpLastSend,
+  type McpShoppingLinks,
+  type McpShoppingPath,
+} from './content-delivery';
 import type { McpAuthContext } from '@/lib/mcp-auth';
-import { brandInOrg } from '@/lib/mcp/data';
+import { brandAllowed, mayUseBrand } from '@/lib/mcp/data';
+import { PAGE_ROWS, pageRows } from '@/lib/mcp/list-page';
+import {
+  LOOKUP_MAX,
+  LOOKUP_WORDS,
+  askedIds,
+  containsPattern,
+  idAndSearchLookup,
+  keysOf,
+  searchWords,
+} from '@/lib/mcp/lookup';
 import {
   draftPassages,
   keepAgentSuggestions,
@@ -13,6 +32,7 @@ import { CITED_DAYS, passageKey, quotedPassages } from '@/lib/content/cited-pass
 import { agentStateOf, contentEditorPath, isPageType, type PageType } from '@/lib/content/drafts';
 import { IMPACT_PERIODS } from '@/lib/content/impact';
 import { detectPageType, siteTypeOf } from '@/lib/content/page-types';
+import { refuseBannedPhrases } from '@/lib/chat/banned-guard';
 import { sanitizeDraftHtml } from '@/lib/content/sanitize-draft-html';
 import { SOURCES_DAYS } from '@/lib/content/sources';
 import {
@@ -62,7 +82,7 @@ interface DraftRow {
   actions: { action_no: number } | { action_no: number }[] | null;
 }
 
-/** A draft in the caller's organization, or null. */
+/** A draft of a brand the caller may use, or null. */
 async function draftFor(auth: McpAuthContext, draftId: string): Promise<DraftRow | null> {
   if (!auth.organizationId) return null;
   const { data, error } = await supabaseAdmin
@@ -72,7 +92,8 @@ async function draftFor(auth: McpAuthContext, draftId: string): Promise<DraftRow
     .eq('brands.organization_id', auth.organizationId)
     .maybeSingle();
   if (error) throw new Error(error.message);
-  return (data as unknown as DraftRow | null) ?? null;
+  const draft = (data as unknown as DraftRow | null) ?? null;
+  return draft && (await mayUseBrand(auth, draft.brand_id)) ? draft : null;
 }
 
 const actionNo = (row: DraftRow) => {
@@ -140,6 +161,26 @@ export interface McpDraftSummary {
   open_suggestions: number;
   updated_at: string;
   editor_path: string;
+  /** Its last Send to CMS, as the Library shows it; null when never sent. */
+  last_send: McpLastSend | null;
+  /** Whether its shopping links still sell. */
+  shopping_links: McpShoppingLinks;
+  /** Set aside in the Library (00233): only on a lookup's rows, which read archived drafts too. */
+  archived?: true;
+}
+
+/** How many agent suggestions wait for review on each draft, by draft id. */
+async function openSuggestionCounts(draftIds: string[]): Promise<Map<string, number>> {
+  const open = new Map<string, number>();
+  if (!draftIds.length) return open;
+  const { data, error } = await supabaseAdmin
+    .from('content_draft_suggestions')
+    .select('draft_id')
+    .in('draft_id', draftIds)
+    .eq('status', 'open');
+  if (error) throw new Error(error.message);
+  for (const s of data ?? []) open.set(s.draft_id, (open.get(s.draft_id) ?? 0) + 1);
+  return open;
 }
 
 /** A brand's drafts, the latest changed first; null for a brand outside the organization. */
@@ -148,38 +189,137 @@ export async function listContentDraftsFor(
   brandId: string,
   status?: string,
 ): Promise<McpDraftSummary[] | null> {
-  if (!(await brandInOrg(auth, brandId))) return null;
-  let query = supabaseAdmin
-    .from('content_drafts')
-    .select('id, title, status, method, page_type, author, source_url, updated_at')
-    .eq('brand_id', brandId)
-    // Archived drafts (00233) are set aside in the Library, and here.
-    .is('archived_at', null)
-    .order('updated_at', { ascending: false })
-    .limit(LIST_LIMIT);
-  if (status) query = query.eq('status', status);
-  const { data, error } = await query;
-  if (error) throw new Error(error.message);
-  const rows = data ?? [];
+  return (await contentDraftsPageFor(auth, brandId, status))?.rows ?? null;
+}
 
-  const open = new Map<string, number>();
-  if (rows.length) {
-    const { data: suggestions, error: suggestionsError } = await supabaseAdmin
-      .from('content_draft_suggestions')
-      .select('draft_id')
-      .in(
-        'draft_id',
-        rows.map((r) => r.id),
-      )
-      .eq('status', 'open');
-    if (suggestionsError) throw new Error(suggestionsError.message);
-    for (const s of suggestions ?? []) open.set(s.draft_id, (open.get(s.draft_id) ?? 0) + 1);
+/** The brand's drafts from `offset`, latest changed first, with how many match in all. */
+export async function contentDraftsPageFor(
+  auth: McpAuthContext,
+  brandId: string,
+  status?: string,
+  page: { limit?: number; offset?: number } = {},
+  /**
+   * Chat's lookup: these drafts only, by id (checked ids), or those with
+   * every word in their title; any status, archived too, each archived one
+   * marked, its organization joined on the rows.
+   */
+  find?: { ids?: readonly string[]; search?: string },
+): Promise<{ rows: McpDraftSummary[]; total: number } | null> {
+  if (!(await brandAllowed(auth, brandId))) return null;
+  const limit = Math.min(Math.max(Math.trunc(page.limit ?? LIST_LIMIT), 1), LIST_LIMIT);
+  const offset = Math.max(Math.trunc(page.offset ?? 0), 0);
+  const words = searchWords(find?.search);
+  if (find && (find.ids?.length === 0 || (find.search !== undefined && !words.length))) {
+    return { rows: [], total: 0 };
   }
-  return rows.map((row) => ({
-    ...row,
-    open_suggestions: open.get(row.id) ?? 0,
-    editor_path: contentEditorPath(row.id),
-  }));
+  const organizationId = auth.organizationId as string;
+  const matching = (head = false) => {
+    if (find) {
+      let query = supabaseAdmin
+        .from('content_drafts')
+        .select(
+          `id, title, status, method, page_type, author, source_url, updated_at, archived_at, ${SHOPPING_COLUMNS}, brands!inner(organization_id)`,
+          { count: 'exact', head },
+        )
+        .eq('brand_id', brandId)
+        .eq('brands.organization_id', organizationId);
+      if (find.ids) query = query.in('id', [...find.ids]);
+      // Each word as an escaped pattern: the text is data, never part of the filter's syntax.
+      for (const word of words) query = query.ilike('title', containsPattern(word));
+      return query;
+    }
+    const query = supabaseAdmin
+      .from('content_drafts')
+      .select(
+        `id, title, status, method, page_type, author, source_url, updated_at, ${SHOPPING_COLUMNS}`,
+        { count: 'exact', head },
+      )
+      .eq('brand_id', brandId)
+      // Archived drafts (00233) are set aside in the Library, and here.
+      .is('archived_at', null);
+    return status ? query.eq('status', status) : query;
+  };
+  const { rows, total } = await pageRows(
+    await matching()
+      .order('updated_at', { ascending: false })
+      .order('id')
+      .range(offset, offset + limit - 1),
+    () => matching(true),
+  );
+
+  const ids = rows.map((r) => r.id);
+  const [open, sends] = await Promise.all([openSuggestionCounts(ids), lastSendsOf(ids)]);
+  const drafts = rows.map((read) => {
+    const { shopping_built, content_shopping_checks, ...rest } = read;
+    // A lookup's own columns: the join stays out of the row, archived becomes a mark.
+    const row = { ...rest } as typeof rest & { brands?: unknown; archived_at?: string | null };
+    const archivedAt = row.archived_at;
+    delete row.brands;
+    delete row.archived_at;
+    return {
+      ...row,
+      open_suggestions: open.get(row.id) ?? 0,
+      editor_path: contentEditorPath(row.id),
+      last_send: sends.get(row.id) ?? null,
+      shopping_links: mcpShoppingLinks(shopping_built, content_shopping_checks),
+      ...(archivedAt ? { archived: true as const } : {}),
+    };
+  });
+  return { rows: drafts, total };
+}
+
+/**
+ * The brand's drafts by the ids or title words a person named, for Chat
+ * (the owner's plan of 2026-11-16, item 2): any status, archived included
+ * and marked, the latest changed first. Only this brand of the caller's
+ * organization: an id of another brand or workspace is not found. Null for
+ * a brand outside the caller's organization or access.
+ */
+export async function lookUpDraftsFor(
+  auth: McpAuthContext,
+  params: { brandId: string; ids?: readonly string[]; search?: string; offset?: number },
+): Promise<
+  | ({ note: string; drafts: McpDraftSummary[]; not_found: string[] } & {
+      total?: number;
+      offset?: number;
+      next_offset?: number | null;
+    })
+  | null
+> {
+  if (!(await brandAllowed(auth, params.brandId))) return null;
+  const asked = askedIds(params.ids);
+  const ids = keysOf<string>(asked, 'id');
+  const terms = searchWords(params.search);
+  const offset = Math.max(Math.trunc(params.offset ?? 0), 0);
+  const none = { rows: [], total: 0 };
+  const [byIds, bySearch] = await Promise.all([
+    ids.length > 0
+      ? contentDraftsPageFor(auth, params.brandId, undefined, { limit: LOOKUP_MAX }, { ids })
+      : none,
+    terms.length > 0
+      ? contentDraftsPageFor(
+          auth,
+          params.brandId,
+          undefined,
+          { limit: PAGE_ROWS, offset },
+          { search: params.search },
+        )
+      : none,
+  ]);
+  if (!byIds || !bySearch) return null;
+  const lookup = idAndSearchLookup(
+    LOOKUP_WORDS.drafts,
+    asked.length > 0 ? { asked, rows: byIds.rows } : null,
+    params.search !== undefined
+      ? { text: params.search, terms, rows: bySearch.rows, total: bySearch.total, offset }
+      : null,
+  );
+  return {
+    note: lookup.note,
+    ...lookup.page,
+    drafts: lookup.rows,
+    not_found: lookup.not_found,
+  };
 }
 
 export interface McpDraft {
@@ -207,6 +347,12 @@ export interface McpDraft {
    * links and inline citations. A link to anything else is unwrapped.
    */
   link_targets: { own_pages: LinkTargets['own']; sources: LinkTargets['sources'] };
+  /** Its last Send to CMS; null when never sent. */
+  last_send: McpLastSend | null;
+  /** What the page should link on an online shop (its Brief tab); null for none. */
+  shopping_path: McpShoppingPath | null;
+  /** Whether its shopping links still sell. */
+  shopping_links: McpShoppingLinks;
 }
 
 /** One draft, its passages numbered and the locked ones marked; null outside the organization. */
@@ -217,14 +363,21 @@ export async function getContentDraftFor(
   const draft = await draftFor(auth, draftId);
   if (!draft) return null;
   const passages = draftPassages(draft.body_html);
-  const [locked, openSuggestions, targets] = await Promise.all([
+  const [locked, openSuggestions, targets, sends, shopping] = await Promise.all([
     lockedKeys(
       draft,
       passages.map((p) => p.text),
     ),
     openSuggestionsOf(draft.id),
     linkTargetsOf(draft),
+    lastSendsOf([draft.id]),
+    supabaseAdmin
+      .from('content_drafts')
+      .select(`shopping_path, ${SHOPPING_COLUMNS}`)
+      .eq('id', draft.id)
+      .maybeSingle(),
   ]);
+  if (shopping.error) throw new Error(shopping.error.message);
 
   return {
     id: draft.id,
@@ -248,6 +401,12 @@ export async function getContentDraftFor(
     })),
     open_suggestions: openSuggestions,
     link_targets: { own_pages: targets.own, sources: targets.sources },
+    last_send: sends.get(draft.id) ?? null,
+    shopping_path: mcpShoppingPath(shopping.data?.shopping_path ?? null),
+    shopping_links: mcpShoppingLinks(
+      shopping.data?.shopping_built ?? null,
+      shopping.data?.content_shopping_checks ?? null,
+    ),
   };
 }
 
@@ -309,7 +468,9 @@ export interface CreateDraftInput {
  * checked against the draft allow-list, as a save is; the page type is the
  * one given, or the one the page shows; prompts are kept to the brand's.
  * Null for a brand outside the organization; 'off_domain' for a source_url
- * that isn't on one of the brand's domains.
+ * that isn't on one of the brand's domains; { banned } (the message naming
+ * the phrases) when the title or page has one of the brand's banned phrases
+ * (Content rules), so the assistant rewrites and sends it again.
  */
 export async function createContentDraftFor(
   auth: McpAuthContext,
@@ -317,12 +478,18 @@ export async function createContentDraftFor(
 ): Promise<
   | { id: string; status: string; page_type: string | null; editor_path: string }
   | 'off_domain'
+  | { banned: string }
   | null
 > {
-  if (!(await brandInOrg(auth, input.brandId))) return null;
+  if (!(await brandAllowed(auth, input.brandId))) return null;
   if (input.sourceUrl && !(await onBrandDomain(input.brandId, input.sourceUrl))) {
     return 'off_domain';
   }
+  const refused = await refuseBannedPhrases({ brandId: input.brandId }, [
+    input.title,
+    input.bodyHtml,
+  ]);
+  if (refused) return { banned: refused.message };
   const { data: brand, error: brandError } = await supabaseAdmin
     .from('brands')
     .select('site_type, industry, shopping_mode_enabled')
@@ -370,6 +537,8 @@ export async function createContentDraftFor(
       source_url: input.sourceUrl ?? null,
       prompt_ids: promptIds,
       status: 'in_review',
+      // Made by an MCP client (00463, W4-10).
+      origin: 'mcp',
     })
     .select('id, status, page_type')
     .single();

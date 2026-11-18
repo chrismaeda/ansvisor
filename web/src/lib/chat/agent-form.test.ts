@@ -1,0 +1,787 @@
+import { describe, expect, it } from 'vitest';
+import {
+  createBody,
+  defaultAgentName,
+  draftFromView,
+  firstStepWithProblems,
+  formFromAgent,
+  formFromPreset,
+  FAST_MODEL,
+  isOperatorForm,
+  modelKeyProvider,
+  newForm,
+  newTriggerDraft,
+  patchBody,
+  refusalPlace,
+  parseList,
+  scopeOf,
+  stepProblems,
+  syncConnections,
+  triggerError,
+  triggerInputOf,
+  WRITING_MODEL,
+  type AgentFormSetup,
+  type AgentFormState,
+  type FormContext,
+  type TriggerDraft,
+} from './agent-form';
+import { createAgentInput, updateAgentInput } from './agent-rules';
+import { AGENT_PRESETS, readyPreset } from './agents/catalog';
+import { AGENT_ID, OPERATOR_BRAND, detail, operatorDetail } from './testing/agent-fixtures';
+
+/**
+ * The create-agent flow as data (CHAT-21 §D, CHAT-27 item 19): a new form
+ * and Edit's, each step's checks, the bodies the API takes (parsed by the
+ * server's own schemas here), only what changed in a PATCH, and the step a
+ * refusal belongs to.
+ */
+
+const NOW = new Date('2026-10-30T12:00:00Z');
+const BRAND = 'bbbbbbbb-0000-4000-8000-000000000001';
+const BRAND_2 = 'bbbbbbbb-0000-4000-8000-000000000002';
+
+const SETUP: AgentFormSetup = {
+  role: 'manager',
+  brands: [
+    { id: BRAND, name: 'Ansvisor' },
+    { id: BRAND_2, name: 'Brand B' },
+  ],
+  topics: [],
+  engines: ['chatgpt-web', 'perplexity-web'],
+  fullAuto: 'open',
+  planName: 'Growth',
+  fullAutoPlan: 'Growth',
+  workspaceAgentsAdminsOnly: false,
+  runShareDefault: 0.1,
+  takenNames: [],
+  ownKeyProvider: null,
+  ownKeyProviders: [],
+  modelChoiceOpen: true,
+  timeZone: null,
+};
+
+const ctxOf = (over: Partial<AgentFormSetup> = {}, agent: FormContext['agent'] = null) => ({
+  setup: { ...SETUP, ...over },
+  agent,
+  now: NOW,
+});
+
+const fresh = (over: Partial<AgentFormState> = {}): AgentFormState => ({
+  ...newForm(SETUP, { timeZone: 'UTC', brandId: null, skill: 'winback', triggerKey: 'k0' }),
+  name: 'Win back',
+  ...over,
+});
+
+const schedule = (over: Partial<Extract<TriggerDraft, { kind: 'schedule' }>>) =>
+  ({ ...newTriggerDraft('schedule', 'k0', 'UTC'), ...over }) as TriggerDraft;
+
+describe('a new agent', () => {
+  it('starts on Monday 07:00 on the viewer’s clock, the brand on screen, and its skill’s connections', () => {
+    const form = newForm(SETUP, {
+      timeZone: 'Europe/Istanbul',
+      brandId: BRAND_2,
+      skill: 'winback',
+      triggerKey: 'k0',
+    });
+    expect(form.brandIds).toEqual([BRAND_2]);
+    expect(form.mode).toBe('auto');
+    expect(form.maxRun).toBe('10');
+    // /winback writes its drafts without a CMS or Search Console: both Optional.
+    expect(form.connections).toEqual([
+      { key: 'google_search_console', required: false },
+      { key: 'cms', required: false },
+    ]);
+    expect(triggerInputOf(form.triggers[0])).toEqual({
+      kind: 'schedule',
+      enabled: true,
+      config: {
+        type: 'recurring',
+        rrule: 'FREQ=WEEKLY;BYDAY=MO;BYHOUR=7;BYMINUTE=0',
+        timezone: 'Europe/Istanbul',
+      },
+    });
+    // No brand on screen: the first.
+    expect(
+      newForm(SETUP, { timeZone: 'UTC', brandId: null, skill: null, triggerKey: 'k' }).brandIds,
+    ).toEqual([BRAND]);
+  });
+
+  it('is named after its skill, then with its brand, then numbered (§O)', () => {
+    expect(defaultAgentName('Win back lost citations', 'Ansvisor', [])).toBe(
+      'Win back lost citations',
+    );
+    expect(
+      defaultAgentName('Win back lost citations', 'Ansvisor', ['win back LOST citations']),
+    ).toBe('Win back lost citations · Ansvisor');
+    expect(
+      defaultAgentName('Win back lost citations', 'Ansvisor', [
+        'Win back lost citations',
+        'Win back lost citations · Ansvisor',
+      ]),
+    ).toBe('Win back lost citations 2');
+    expect(defaultAgentName('x'.repeat(70), null, [])).toHaveLength(60);
+  });
+
+  it('starts from a ready-to-use agent: its skills, triggers, mode and connections, on the brand on screen', () => {
+    const preset = readyPreset('visibility-watch')!;
+    const form = formFromPreset(SETUP, preset, { timeZone: 'Europe/Istanbul', brandId: BRAND_2 });
+    expect(form.skills).toEqual(['report']);
+    expect(form.brandIds).toEqual([BRAND_2]);
+    expect(form.mode).toBe('auto');
+    expect(form.connections).toEqual([
+      { key: 'google_search_console', required: false },
+      { key: 'google_analytics', required: false },
+    ]);
+    expect(form.triggers.map((t) => t.key)).toEqual(['k0', 'k1']);
+    expect(form.triggers.map(triggerInputOf)).toEqual([
+      {
+        kind: 'schedule',
+        enabled: true,
+        config: {
+          type: 'recurring',
+          rrule: 'FREQ=DAILY;BYHOUR=8;BYMINUTE=0',
+          timezone: 'Europe/Istanbul',
+        },
+      },
+      {
+        kind: 'kpi',
+        enabled: true,
+        config: {
+          kpi: 'ai_visibility',
+          direction: 'any',
+          threshold: 10,
+          unit: 'percent',
+          period: 'day',
+        },
+      },
+    ]);
+    // Nothing named or saved yet: the page names it, the person saves it.
+    expect(form).toMatchObject({ name: '', nameEdited: false, visibility: 'private' });
+    expect(firstStepWithProblems({ ...form, name: 'Visibility Watch' }, ctxOf())).toBeNull();
+    // Manual only: no trigger at all.
+    expect(
+      formFromPreset(SETUP, readyPreset('ready-to-publish')!, { timeZone: 'UTC', brandId: null })
+        .triggers,
+    ).toEqual([]);
+  });
+
+  it('starts Onboarding & Help on All brands, its When a brand is added needing them (00482)', () => {
+    const form = formFromPreset(SETUP, readyPreset('onboarding-help')!, {
+      timeZone: 'UTC',
+      brandId: BRAND_2,
+    });
+    expect(form).toMatchObject({ skills: ['setup'], mode: 'ask_first', allBrands: true });
+    expect(form.brandIds).toEqual([]);
+    expect(form.triggers.map(triggerInputOf)).toEqual([
+      { kind: 'brand_added', enabled: true, config: {} },
+    ]);
+    expect(firstStepWithProblems({ ...form, name: 'Onboarding & Help' }, ctxOf())).toBeNull();
+    expect(
+      createAgentInput.parse(createBody({ ...form, name: 'Onboarding' }, 'manager')),
+    ).toMatchObject({
+      scope: { all_brands: true },
+      triggers: [{ kind: 'brand_added', config: {}, enabled: true }],
+    });
+  });
+
+  it('starts a Full auto preset on Auto, ask before changes where the plan or Settings › Chat keep Full auto closed', () => {
+    const preset = readyPreset('weekly-report')!;
+    const at = { timeZone: 'UTC', brandId: null };
+    expect(formFromPreset(SETUP, preset, at).mode).toBe('full_auto');
+    expect(formFromPreset({ ...SETUP, fullAuto: 'plan' }, preset, at).mode).toBe('auto');
+    expect(formFromPreset({ ...SETUP, fullAuto: 'policy' }, preset, at).mode).toBe('auto');
+  });
+
+  it('keeps Optional connections when its skills change, and only the new skills’ own ones', () => {
+    expect(
+      syncConnections(
+        [
+          { key: 'webflow', required: true },
+          { key: 'google_analytics', required: false },
+        ],
+        ['report'],
+      ),
+    ).toEqual([
+      { key: 'google_search_console', required: false },
+      { key: 'google_analytics', required: false },
+    ]);
+  });
+
+  it('asks for any CMS only where a skill sends the page, and for any catalog source for /shopping', () => {
+    // /winback drafts without a CMS; /publish then sends it: any CMS becomes Required.
+    expect(syncConnections([], ['winback', 'publish'])).toEqual([
+      { key: 'google_search_console', required: false },
+      { key: 'cms', required: true },
+    ]);
+    expect(syncConnections([], ['tasks'])).toEqual([{ key: 'cms', required: false }]);
+    expect(syncConnections([], ['shopping'])).toEqual([{ key: 'catalog', required: true }]);
+    expect(syncConnections([], ['faq', 'quality'])).toEqual([]);
+  });
+
+  it("asks for nothing for the focus areas' skills, and keeps what the person added", () => {
+    expect(syncConnections([], ['questions', 'listings', 'audit-fix'])).toEqual([]);
+    expect(
+      syncConnections(
+        [
+          { key: 'google_search_console', required: false },
+          { key: 'google_analytics', required: false },
+        ],
+        ['rivals', 'report'],
+      ),
+    ).toEqual([
+      { key: 'google_search_console', required: false },
+      { key: 'google_analytics', required: false },
+    ]);
+  });
+});
+
+describe('triggers', () => {
+  it('make the RRULE subset the API keeps, and read it back', () => {
+    const rule = (repeat: string, time = '09:30') =>
+      (triggerInputOf(schedule({ repeat: repeat as never, time }))!.config as { rrule: string })
+        .rrule;
+    expect(rule('daily')).toBe('FREQ=DAILY;BYHOUR=9;BYMINUTE=30');
+    expect(rule('weekdays')).toBe('FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=30');
+    expect(rule('FR')).toBe('FREQ=WEEKLY;BYDAY=FR;BYHOUR=9;BYMINUTE=30');
+    expect(rule('month_first')).toBe('FREQ=MONTHLY;BYMONTHDAY=1;BYHOUR=9;BYMINUTE=30');
+    expect(rule('month_last')).toBe('FREQ=MONTHLY;BYMONTHDAY=-1;BYHOUR=9;BYMINUTE=30');
+
+    const view = (rrule: string) => ({
+      kind: 'schedule' as const,
+      enabled: true,
+      config: { type: 'recurring', rrule, timezone: 'Europe/Istanbul' },
+    });
+    const weekly = draftFromView(view('FREQ=WEEKLY;BYDAY=MO;BYHOUR=9;BYMINUTE=0'), 'a', 'UTC');
+    expect(weekly).toMatchObject({ repeat: 'MO', time: '09:00', timezone: 'Europe/Istanbul' });
+    // Kept as read: the same settings go back.
+    expect(triggerInputOf(weekly)!.config).toEqual(
+      view('FREQ=WEEKLY;BYDAY=MO;BYHOUR=9;BYMINUTE=0').config,
+    );
+  });
+
+  it('send a kept trigger back exactly, and a rule the token can’t name keeps its days', () => {
+    const config = {
+      type: 'recurring',
+      rrule: 'FREQ=DAILY;BYDAY=MO,WE;BYHOUR=8;BYMINUTE=0',
+      timezone: 'UTC',
+    };
+    const kept = draftFromView({ kind: 'schedule', enabled: true, config }, 'a', 'UTC');
+    expect(kept).toMatchObject({ repeat: 'custom' });
+    expect(triggerInputOf(kept)).toEqual({ kind: 'schedule', enabled: true, config });
+    // Its time changed: the same days at the new time.
+    const moved = { ...kept, raw: null, time: '10:15' } as TriggerDraft;
+    expect(triggerInputOf(moved)!.config).toEqual({
+      ...config,
+      rrule: 'FREQ=DAILY;BYDAY=MO,WE;BYHOUR=10;BYMINUTE=15',
+    });
+  });
+
+  it('place a one-off on its zone’s clock and refuse one in the past, but not a kept one', () => {
+    const once = schedule({
+      repeat: 'once',
+      date: '2026-11-05',
+      time: '13:00',
+      timezone: 'Europe/Istanbul',
+    });
+    expect(triggerInputOf(once)!.config).toEqual({ type: 'once', at: '2026-11-05T10:00:00.000Z' });
+    expect(triggerError(once, NOW)).toBeNull();
+    expect(triggerError({ ...once, date: '2026-10-01' } as TriggerDraft, NOW)).toBe(
+      'schedule_past',
+    );
+    expect(triggerError({ ...once, date: '2028-01-01' } as TriggerDraft, NOW)).toBe(
+      'schedule_too_far',
+    );
+    expect(triggerError({ ...once, date: '' } as TriggerDraft, NOW)).toBe('date_required');
+    expect(triggerError({ ...once, time: '' } as TriggerDraft, NOW)).toBe('time_required');
+    const fired = draftFromView(
+      { kind: 'schedule', enabled: true, config: { type: 'once', at: '2026-10-01T10:00:00.000Z' } },
+      'a',
+      'Europe/Istanbul',
+    );
+    expect(fired).toMatchObject({ repeat: 'once', date: '2026-10-01', time: '13:00' });
+    expect(triggerError(fired, NOW)).toBeNull();
+  });
+
+  it('check a KPI’s threshold and a signal’s category, and keep a watch rule as it is', () => {
+    const kpi = newTriggerDraft('kpi', 'a', 'UTC');
+    expect(triggerInputOf(kpi)!.config).toEqual({
+      kpi: 'citations',
+      direction: 'down',
+      threshold: 10,
+      unit: 'percent',
+      period: 'week',
+    });
+    expect(triggerError({ ...kpi, threshold: '0' } as TriggerDraft, NOW)).toBe('threshold');
+    expect(triggerError({ ...kpi, threshold: '' } as TriggerDraft, NOW)).toBe('threshold');
+    expect(triggerError({ ...kpi, threshold: '2000' } as TriggerDraft, NOW)).toBe(
+      'threshold_percent',
+    );
+    expect(triggerError({ ...kpi, threshold: '2000', unit: 'absolute' } as TriggerDraft, NOW)).toBe(
+      null,
+    );
+    expect(triggerError({ ...kpi, kpi: '' } as TriggerDraft, NOW)).toBe('kpi_required');
+    const signal = newTriggerDraft('signal', 'b', 'UTC');
+    expect(triggerInputOf(signal)!.config).toEqual({ category: 'recover' });
+    expect(triggerError({ ...signal, category: '' } as TriggerDraft, NOW)).toBe(
+      'category_required',
+    );
+    const rule = draftFromView(
+      { kind: 'watch_rule', enabled: false, config: { watch_rule_id: AGENT_ID } },
+      'c',
+      'UTC',
+    );
+    expect(triggerInputOf(rule)).toEqual({
+      kind: 'watch_rule',
+      enabled: false,
+      config: { watch_rule_id: AGENT_ID },
+    });
+    expect(triggerError(rule, NOW)).toBeNull();
+  });
+});
+
+describe('each step’s checks', () => {
+  it('step 1: a skill, and instructions up to 2,000 characters', () => {
+    expect(stepProblems(0, fresh({ skills: [] }), ctxOf()).fields).toEqual({
+      skills: 'skill_required',
+    });
+    expect(stepProblems(0, fresh({ instructions: 'x'.repeat(2001) }), ctxOf()).fields).toEqual({
+      instructions: 'instructions_long',
+    });
+    expect(stepProblems(0, fresh(), ctxOf()).fields).toEqual({});
+  });
+
+  it('step 2: each trigger, at most 5 and none twice, a brand, and the scope’s lists', () => {
+    const past = schedule({ key: 'p', repeat: 'once', date: '2026-10-01', time: '09:00' });
+    expect(stepProblems(1, fresh({ triggers: [past] }), ctxOf()).triggers).toEqual({
+      p: 'schedule_past',
+    });
+    const twice = [schedule({ key: 'a' }), schedule({ key: 'b' })];
+    expect(stepProblems(1, fresh({ triggers: twice }), ctxOf()).fields.triggers).toBe(
+      'triggers_same',
+    );
+    const six = ['a', 'b', 'c', 'd', 'e', 'f'].map((key, i) => schedule({ key, time: `0${i}:00` }));
+    expect(stepProblems(1, fresh({ triggers: six }), ctxOf()).fields.triggers).toBe(
+      'triggers_many',
+    );
+    expect(stepProblems(1, fresh({ brandIds: [] }), ctxOf()).fields.brands).toBe('brand_required');
+    expect(stepProblems(1, fresh({ brandIds: [] }), ctxOf({ brands: [] })).fields.brands).toBe(
+      'no_brands',
+    );
+    expect(stepProblems(1, fresh({ allBrands: true, brandIds: [] }), ctxOf()).fields).toEqual({});
+    // When a brand is added needs All brands: picked brands are marked, with why.
+    const added = [newTriggerDraft('brand_added', 'n', 'UTC')];
+    expect(stepProblems(1, fresh({ triggers: added }), ctxOf())).toEqual({
+      fields: { brands: 'brand_added_all_brands' },
+      triggers: {},
+    });
+    expect(
+      stepProblems(1, fresh({ triggers: added, allBrands: true, brandIds: [] }), ctxOf()),
+    ).toEqual({ fields: {}, triggers: {} });
+    expect(stepProblems(1, fresh({ urlsText: 'ansvisor.com/pricing' }), ctxOf()).fields.urls).toBe(
+      'urls_invalid',
+    );
+    expect(
+      stepProblems(
+        1,
+        fresh({ urlsText: 'https://ansvisor.com/pricing\nhttps://ansvisor.com/' }),
+        ctxOf(),
+      ).fields,
+    ).toEqual({});
+    expect(stepProblems(1, fresh({ tagsText: 'x'.repeat(51) }), ctxOf()).fields.tags).toBe(
+      'tags_invalid',
+    );
+    // One address or tag a line: a comma stays in it.
+    const commas = fresh({
+      urlsText: 'https://ansvisor.com/compare?a=1,2\nhttps://ansvisor.com/',
+      tagsText: 'pricing, plans\nbrand',
+    });
+    expect(stepProblems(1, commas, ctxOf()).fields).toEqual({});
+    expect(scopeOf(commas)).toMatchObject({
+      urls: ['https://ansvisor.com/compare?a=1,2', 'https://ansvisor.com/'],
+      tags: ['pricing, plans', 'brand'],
+    });
+    expect(parseList(' a \r\n\n a\nb ')).toEqual(['a', 'b']);
+    // Manual only: no trigger kept is fine.
+    expect(stepProblems(1, fresh({ triggers: [] }), ctxOf()).fields).toEqual({});
+  });
+
+  it('step 3: Full auto only where the plan and Settings › Chat allow it', () => {
+    const full = fresh({ mode: 'full_auto' });
+    expect(stepProblems(2, full, ctxOf()).fields).toEqual({});
+    expect(stepProblems(2, full, ctxOf({ fullAuto: 'plan' })).fields.mode).toBe('full_auto_plan');
+    expect(stepProblems(2, full, ctxOf({ fullAuto: 'policy' })).fields.mode).toBe('full_auto_off');
+  });
+
+  it('step 4: a name, Max per run 1–50, an Admin’s monthly cap 1–100, sharing as Settings › Chat allows', () => {
+    expect(stepProblems(3, fresh({ name: '   ' }), ctxOf()).fields.name).toBe('name_required');
+    expect(stepProblems(3, fresh({ name: 'x'.repeat(61) }), ctxOf()).fields.name).toBe('name_long');
+    for (const maxRun of ['0', '51', '7.5', '']) {
+      expect(stepProblems(3, fresh({ maxRun }), ctxOf()).fields.maxRun).toBe('run_share');
+    }
+    const capped = fresh({ monthCapOn: true, maxMonth: '101' });
+    expect(stepProblems(3, capped, ctxOf({ role: 'admin' })).fields.maxMonth).toBe('month_share');
+    // A Manager sends no monthly cap: nothing to check.
+    expect(stepProblems(3, capped, ctxOf()).fields.maxMonth).toBeUndefined();
+    const shared = fresh({ visibility: 'workspace' });
+    expect(
+      stepProblems(3, shared, ctxOf({ workspaceAgentsAdminsOnly: true })).fields.visibility,
+    ).toBe('workspace_admins_only');
+    expect(
+      stepProblems(3, shared, ctxOf({ workspaceAgentsAdminsOnly: true, role: 'admin' })).fields,
+    ).toEqual({});
+  });
+
+  it('finds the first step that isn’t ready', () => {
+    expect(firstStepWithProblems(fresh({ skills: [] }), ctxOf())).toBe(0);
+    expect(firstStepWithProblems(fresh({ brandIds: [], name: '' }), ctxOf())).toBe(1);
+    expect(firstStepWithProblems(fresh({ brandIds: [] }), ctxOf(), 1)).toBeNull();
+    expect(firstStepWithProblems(fresh(), ctxOf())).toBeNull();
+  });
+});
+
+describe('what is sent', () => {
+  it('sends a name the person didn’t type as the skill’s title, for the server to name by §O', () => {
+    const auto = createAgentInput.parse(
+      createBody(fresh({ nameEdited: false }), 'manager', 'Win back lost citations'),
+    );
+    expect(auto).toMatchObject({ name: 'Win back lost citations', autoName: true });
+    const typed = createAgentInput.parse(
+      createBody(fresh({ nameEdited: true }), 'manager', 'Win back lost citations'),
+    );
+    expect(typed).toMatchObject({ name: 'Win back', autoName: false });
+  });
+
+  it('creates a draft the server’s own schema takes, the monthly cap only from an Admin', () => {
+    const body = createBody(
+      fresh({
+        urlsText: 'https://ansvisor.com/pricing',
+        engines: ['perplexity-web'],
+        instructions: '  Be brief  ',
+      }),
+      'manager',
+    );
+    expect(body).not.toHaveProperty('maxMonthShare');
+    const parsed = createAgentInput.parse(body);
+    expect(parsed).toMatchObject({
+      name: 'Win back',
+      visibility: 'private',
+      maxRunShare: 0.1,
+      skills: ['winback'],
+      instructions: 'Be brief',
+      mode: 'auto',
+      model: 'auto',
+      scope: {
+        brand_ids: [BRAND],
+        engines: ['perplexity-web'],
+        urls: ['https://ansvisor.com/pricing'],
+      },
+    });
+    expect(parsed.triggers).toHaveLength(1);
+    expect(
+      createAgentInput.parse(createBody(fresh({ monthCapOn: true, maxMonth: '25' }), 'admin'))
+        .maxMonthShare,
+    ).toBe(0.25);
+    expect(createBody(fresh(), 'admin').maxMonthShare).toBeNull();
+  });
+
+  it('opens Edit on the agent’s version, and sends nothing when nothing changed', () => {
+    const agent = detail();
+    const form = formFromAgent(agent, SETUP, { timeZone: 'UTC', triggerKey: (i) => `k${i}` })!;
+    expect(form).toMatchObject({
+      skills: ['winback', 'refresh'],
+      name: 'Citation win-back',
+      nameEdited: true,
+      visibility: 'workspace',
+      maxRun: '10',
+      monthCapOn: false,
+      brandIds: [BRAND],
+      engines: ['perplexity-web'],
+    });
+    expect(form.triggers.map((d) => d.kind)).toEqual(['schedule', 'signal']);
+    expect(patchBody(form, agent, 'manager')).toBeNull();
+  });
+
+  it('patches only what changed, with the version it opened', () => {
+    const agent = detail();
+    const form = formFromAgent(agent, SETUP, { timeZone: 'UTC', triggerKey: (i) => `k${i}` })!;
+    const renamed = patchBody({ ...form, name: '  Win  back ' }, agent, 'manager');
+    // With the version and the moment it opened: a save in between refuses this one.
+    expect(renamed).toEqual({
+      expectedVersion: 2,
+      expectedUpdatedAt: '2026-10-29T10:00:00.000Z',
+      name: 'Win back',
+    });
+    expect(updateAgentInput.safeParse(renamed).success).toBe(true);
+
+    const changed = patchBody(
+      {
+        ...form,
+        mode: 'ask_first',
+        skills: ['winback'],
+        triggers: form.triggers.map((d, i) => (i === 1 ? { ...d, enabled: false } : d)),
+        maxRun: '15',
+      },
+      agent,
+      'manager',
+    )!;
+    expect(changed).toMatchObject({
+      expectedVersion: 2,
+      mode: 'ask_first',
+      skills: ['winback'],
+      maxRunShare: 0.15,
+    });
+    expect((changed.triggers as { enabled: boolean }[]).map((t) => t.enabled)).toEqual([
+      true,
+      false,
+    ]);
+    expect(updateAgentInput.safeParse(changed).success).toBe(true);
+    // An Admin's monthly cap, set and taken off.
+    expect(patchBody({ ...form, monthCapOn: true, maxMonth: '30' }, agent, 'admin')).toEqual({
+      expectedVersion: 2,
+      expectedUpdatedAt: '2026-10-29T10:00:00.000Z',
+      maxMonthShare: 0.3,
+    });
+  });
+
+  it('sends Can call only when it names agents, and patches it when it changes', () => {
+    const callee = 'cccccccc-0000-4000-8000-000000000001';
+    expect(createBody(fresh(), 'manager')).not.toHaveProperty('canCall');
+    expect(
+      createAgentInput.parse(createBody(fresh({ canCall: [callee] }), 'manager')).canCall,
+    ).toEqual([callee]);
+
+    const agent = detail();
+    const form = formFromAgent(agent, SETUP, { timeZone: 'UTC', triggerKey: (i) => `k${i}` })!;
+    expect(form.canCall).toEqual([]);
+    const added = patchBody({ ...form, canCall: [callee] }, agent, 'manager');
+    expect(added).toEqual({
+      expectedVersion: 2,
+      expectedUpdatedAt: '2026-10-29T10:00:00.000Z',
+      canCall: [callee],
+    });
+    expect(updateAgentInput.safeParse(added).success).toBe(true);
+    const calling = { ...agent, settings: { ...agent.settings!, canCall: [callee] } };
+    const reopened = formFromAgent(calling, SETUP, {
+      timeZone: 'UTC',
+      triggerKey: (i) => `k${i}`,
+    })!;
+    expect(reopened.canCall).toEqual([callee]);
+    expect(patchBody(reopened, calling, 'manager')).toBeNull();
+    expect(patchBody({ ...reopened, canCall: [] }, calling, 'manager')).toMatchObject({
+      canCall: [],
+    });
+  });
+});
+
+describe('the server’s refusals', () => {
+  it('land on the step they belong to', () => {
+    expect(refusalPlace('name_taken', null)).toEqual({ step: 3, field: 'name' });
+    expect(refusalPlace('name_taken_hidden', null)).toEqual({ step: 3, field: 'name' });
+    expect(refusalPlace('schedule_past', null)).toEqual({ step: 1, field: 'triggers' });
+    expect(refusalPlace('topic_not_found', null)).toEqual({ step: 1, field: 'brands' });
+    expect(refusalPlace('brand_added_scope', null)).toEqual({ step: 1, field: 'brands' });
+    expect(refusalPlace('demo_brand', null)).toEqual({ step: 1, field: 'brands' });
+    expect(refusalPlace('plan_locked', 'fullAuto')).toEqual({ step: 2, field: 'mode' });
+    expect(refusalPlace('plan_locked', 'engines')).toEqual({ step: 1, field: 'engines' });
+    expect(refusalPlace('policy_never', 'workspace')).toEqual({ step: 3, field: 'visibility' });
+    // The go-live box on Mode & approvals (AUTONOMOUS-GO-LIVE §7.2).
+    expect(refusalPlace('go_live_off', null)).toEqual({ step: 2, field: 'form' });
+    expect(refusalPlace('go_live_mode', null)).toEqual({ step: 2, field: 'form' });
+    expect(refusalPlace('forbidden_role', 'goLive')).toEqual({ step: 2, field: 'form' });
+    expect(refusalPlace('forbidden_role', 'monthCap')).toEqual({ step: 3, field: 'maxMonth' });
+    expect(refusalPlace('agent_limit', null)).toEqual({ step: 3, field: 'form' });
+    // Can call sits on the last step, under Max per run.
+    expect(refusalPlace('agent_not_found', null)).toEqual({ step: 3, field: 'form' });
+    expect(refusalPlace('plan_locked', 'canCall')).toEqual({ step: 3, field: 'form' });
+    expect(refusalPlace('version_conflict', null)).toEqual({ step: 3, field: 'form' });
+    expect(refusalPlace(null, null)).toEqual({ step: 3, field: 'form' });
+  });
+});
+
+describe('the key the chosen model runs on', () => {
+  const keyOf = (model: string, over: Partial<AgentFormSetup> = {}) =>
+    modelKeyProvider(model, { ...SETUP, ...over });
+
+  it('runs Auto on the key Auto runs on, else on the monthly AI limit', () => {
+    expect(keyOf('auto', { ownKeyProvider: 'openai', ownKeyProviders: ['openai'] })).toBe('openai');
+    expect(keyOf('auto')).toBeNull();
+  });
+
+  it('runs a picked model on the own key for its provider', () => {
+    const anthropic = { ownKeyProvider: 'openai', ownKeyProviders: ['openai', 'anthropic'] };
+    expect(keyOf(FAST_MODEL, anthropic)).toBe('anthropic');
+    expect(keyOf(WRITING_MODEL, anthropic)).toBe('anthropic');
+    // Before the OpenRouter key, when both are saved.
+    expect(keyOf(FAST_MODEL, { ownKeyProviders: ['openrouter', 'anthropic'] })).toBe('anthropic');
+  });
+
+  it('runs a picked model on the own OpenRouter key when its provider has none', () => {
+    expect(
+      keyOf(FAST_MODEL, { ownKeyProvider: 'openai', ownKeyProviders: ['openai', 'openrouter'] }),
+    ).toBe('openrouter');
+  });
+
+  it('runs a picked model on the AI limit when no own key runs it, even where Auto runs on one', () => {
+    const openai = { ownKeyProvider: 'openai', ownKeyProviders: ['openai'] };
+    expect(keyOf(FAST_MODEL, openai)).toBeNull();
+    expect(keyOf(WRITING_MODEL, openai)).toBeNull();
+    expect(keyOf('anthropic/claude-opus-5.5', openai)).toBeNull();
+  });
+
+  it('runs Auto’s key where the engine runs Auto: the free trial, and a model no longer offered', () => {
+    const openai = { ownKeyProvider: 'openai', ownKeyProviders: ['openai'] };
+    expect(keyOf(FAST_MODEL, { ...openai, modelChoiceOpen: false })).toBe('openai');
+    expect(keyOf('openai/gpt-4o', openai)).toBe('openai');
+  });
+});
+
+describe('an AEO Operator’s form (AEO Operator plan §4.3)', () => {
+  const PRESET = AGENT_PRESETS.find((p) => p.id === 'aeo-operator')!;
+  const operatorForm = (over: Partial<AgentFormState> = {}): AgentFormState => ({
+    ...formFromPreset(SETUP, PRESET, { timeZone: 'Europe/Istanbul', brandId: BRAND_2 }),
+    name: 'AEO Operator',
+    ...over,
+  });
+
+  it('opens from its preset or /operator: one brand, weekdays 07:00, 5%, all my agents, 5 a day', () => {
+    const form = operatorForm();
+    expect(isOperatorForm(form)).toBe(true);
+    expect(form).toMatchObject({
+      skills: ['operator'],
+      allBrands: false,
+      brandIds: [BRAND_2],
+      mode: 'auto',
+      connections: [],
+      canCall: [],
+      visibility: 'private',
+      // Its daily budget: 5%, never the workspace's per-run default (10%).
+      maxRun: '5',
+      operator: { allowed: null, includeWorkspace: false, maxRuns: '5' },
+    });
+    // Weekdays at 07:00 on the creator's chosen clock, as every preset's schedule.
+    expect(triggerInputOf(form.triggers[0])).toEqual({
+      kind: 'schedule',
+      config: {
+        type: 'recurring',
+        rrule: 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=7;BYMINUTE=0',
+        timezone: 'Europe/Istanbul',
+      },
+      enabled: true,
+    });
+    // ?skill=operator opens the same form.
+    const bySkill = newForm(SETUP, {
+      timeZone: 'Europe/Istanbul',
+      brandId: BRAND_2,
+      skill: 'operator',
+      triggerKey: 'k0',
+    });
+    expect({ ...bySkill, triggers: [] }).toEqual({ ...form, name: '', triggers: [] });
+    expect(triggerInputOf(bySkill.triggers[0])).toEqual(triggerInputOf(form.triggers[0]));
+    // Any other agent's form isn't one.
+    expect(isOperatorForm(fresh())).toBe(false);
+    expect(fresh().operator).toBeNull();
+  });
+
+  it('checks one brand, a daily budget of 1–10%, 1–8 a day and its picked agents', () => {
+    const at = (step: 0 | 1 | 2 | 3, over: Partial<AgentFormState>) =>
+      stepProblems(step, operatorForm(over), ctxOf()).fields;
+    expect(at(1, {})).toEqual({});
+    expect(at(1, { brandIds: [] }).brands).toBe('operator_brand');
+    expect(at(1, { brandIds: [BRAND, BRAND_2] }).brands).toBe('operator_brand');
+    expect(at(1, { allBrands: true, brandIds: [] }).brands).toBe('operator_brand');
+    expect(stepProblems(1, operatorForm(), ctxOf({ brands: [] })).fields.brands).toBe('no_brands');
+    expect(at(3, {})).toEqual({});
+    for (const budget of ['0', '11', '50', '', '2.5']) {
+      expect(at(3, { maxRun: budget }).maxRun, budget).toBe('operator_budget');
+    }
+    for (const budget of ['1', '10']) expect(at(3, { maxRun: budget }).maxRun).toBeUndefined();
+    const settings = (over: Partial<NonNullable<AgentFormState['operator']>>) => ({
+      operator: { allowed: null, includeWorkspace: false, maxRuns: '5', ...over },
+    });
+    for (const runs of ['0', '9', '', 'x']) {
+      expect(at(3, settings({ maxRuns: runs })).maxRuns, runs).toBe('operator_max_runs');
+    }
+    expect(at(3, settings({ maxRuns: '8' })).maxRuns).toBeUndefined();
+    expect(at(3, settings({ allowed: [] })).operatorAgents).toBe('operator_agents');
+    expect(at(3, settings({ allowed: [AGENT_ID] })).operatorAgents).toBeUndefined();
+    // No Max per run, Can call, engines, tags or URLs to check: they aren't its.
+    expect(firstStepWithProblems(operatorForm(), ctxOf())).toBeNull();
+  });
+
+  it('sends its operator settings and its daily budget as maxRunShare, as the server’s schema takes them', () => {
+    const form = operatorForm({
+      maxRun: '7',
+      operator: { allowed: [AGENT_ID], includeWorkspace: true, maxRuns: '3' },
+    });
+    const body = createBody(form, 'manager');
+    expect(body).toMatchObject({
+      name: 'AEO Operator',
+      visibility: 'private',
+      maxRunShare: 0.07,
+      skills: ['operator'],
+      instructions: null,
+      mode: 'auto',
+      connections: [],
+      scope: { brand_ids: [BRAND_2] },
+      operator: { allowed: [AGENT_ID], includeWorkspace: true, maxRuns: 3 },
+    });
+    expect(body).not.toHaveProperty('canCall');
+    expect(createAgentInput.parse(body)).toMatchObject({
+      maxRunShare: 0.07,
+      operator: { allowed: [AGENT_ID], includeWorkspace: true, maxRuns: 3, askFirst: true },
+    });
+    // The defaults: all its owner's active agents, theirs only, 5 a day, 5%.
+    expect(createBody(operatorForm(), 'manager')).toMatchObject({
+      maxRunShare: 0.05,
+      operator: { allowed: null, includeWorkspace: false, maxRuns: 5 },
+    });
+  });
+
+  it('opens Edit on an Operator’s settings, and patches them all when one changes', () => {
+    const agent = operatorDetail({
+      maxRunShare: 0.07,
+      settings: {
+        ...operatorDetail().settings!,
+        operator: { allowed: [AGENT_ID], includeWorkspace: true, maxRuns: 3 },
+      },
+    });
+    const form = formFromAgent(agent, SETUP, { timeZone: 'UTC', triggerKey: (i) => `k${i}` })!;
+    expect(form).toMatchObject({
+      brandIds: [OPERATOR_BRAND],
+      maxRun: '7',
+      operator: { allowed: [AGENT_ID], includeWorkspace: true, maxRuns: '3' },
+    });
+    expect(patchBody(form, agent, 'manager')).toBeNull();
+    const patch = patchBody(
+      { ...form, maxRun: '4', operator: { ...form.operator!, maxRuns: '6' } },
+      agent,
+      'manager',
+    );
+    expect(patch).toEqual({
+      expectedVersion: agent.version,
+      expectedUpdatedAt: agent.updatedAt,
+      maxRunShare: 0.04,
+      operator: { allowed: [AGENT_ID], includeWorkspace: true, maxRuns: 6 },
+    });
+    expect(updateAgentInput.parse(patch)).toMatchObject({ operator: { maxRuns: 6 } });
+    // Back to all its owner's agents.
+    expect(
+      patchBody({ ...form, operator: { ...form.operator!, allowed: null } }, agent, 'manager'),
+    ).toMatchObject({ operator: { allowed: null, includeWorkspace: true, maxRuns: 3 } });
+    // An Operator kept without settings (none read): its defaults, sent once on a save.
+    const bare = operatorDetail({
+      settings: { ...operatorDetail().settings!, operator: undefined },
+    });
+    const kept = formFromAgent(bare, SETUP, { timeZone: 'UTC', triggerKey: (i) => `k${i}` })!;
+    expect(kept.operator).toEqual({ allowed: null, includeWorkspace: false, maxRuns: '5' });
+  });
+
+  it('puts the server’s Operator refusals on their steps', () => {
+    expect(refusalPlace('operator_scope', null)).toEqual({ step: 1, field: 'brands' });
+    expect(refusalPlace('operator_taken', null)).toEqual({ step: 1, field: 'brands' });
+    expect(refusalPlace('operator_budget', null)).toEqual({ step: 3, field: 'maxRun' });
+    expect(refusalPlace('operator_visibility', null)).toEqual({ step: 3, field: 'visibility' });
+    expect(refusalPlace('operator_off', null)).toEqual({ step: 3, field: 'form' });
+    expect(refusalPlace('plan_locked', 'operator')).toEqual({ step: 3, field: 'form' });
+  });
+});

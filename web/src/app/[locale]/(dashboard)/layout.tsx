@@ -1,4 +1,5 @@
 import { redirect } from 'next/navigation';
+import { cookies } from 'next/headers';
 import { createClient } from '@/lib/supabase/server';
 import { Sidebar } from '@/components/layout/sidebar';
 import { SidebarErrorBoundary } from '@/components/layout/sidebar-error-boundary';
@@ -6,18 +7,74 @@ import { MobileNav } from '@/components/layout/mobile-nav';
 import { AuthProvider } from '@/components/providers/auth-provider';
 import { PlanProvider } from '@/components/providers/plan-provider';
 import { AiUsageProvider } from '@/components/providers/ai-usage-provider';
+import { GetMoreProvider } from '@/components/ai-usage/get-more';
 import { RoleProvider, type TeamRole } from '@/components/providers/role-provider';
 import { MenuAccessProvider } from '@/components/providers/menu-access-provider';
+import { ChatAgenticProvider } from '@/components/providers/chat-agentic-provider';
+import { chatAgenticEnabled } from '@/lib/chat/flag';
+import { AdsProvider } from '@/components/providers/ads-provider';
+import { adsEnabled } from '@/lib/ads/flag';
+import { isTourTopic } from '@/lib/chat/tour';
+import { readTourPrefs } from '@/lib/chat/tour-prefs';
+import { firstNameOf } from '@/lib/chat/home';
+import { importLegacyChats } from '@/lib/chat/legacy-import';
+import { pageOpenOf } from '@/lib/chat/page-open';
+import { panelSizeOf } from '@/lib/chat/panel';
+import { planFactsFromOrgRow } from '@/lib/chat/plan-facts';
+import { DEFAULT_CHAT_SETTINGS, parseTeamRole } from '@/lib/chat/precedence';
+import { composerSetupOf } from '@/lib/chat/composer-setup';
+import { chatRunsOnOwnKey } from '@/lib/chat/key';
+import { failingKeyFor } from '@/lib/chat/key-health';
+import { skillMenuFor } from '@/lib/chat/skills/store';
+import { ChatPanelPage, ChatPanelProvider } from '@/components/chat/panel/chat-panel-provider';
+import { ChatSidePanelSlot } from '@/components/chat/panel/chat-side-panel-slot';
 import { BrandLoader } from '@/components/providers/brand-loader';
 import { BrandGuard } from '@/components/providers/brand-guard';
 import { GettingStartedPageOpened } from '@/components/getting-started/page-opened';
+import { NavSeen } from '@/components/layout/nav-seen';
 import { getBrands } from '@/lib/actions/brand';
-import { menuOfProfile, readRoleHidden } from '@/lib/menu-access';
-import { getPlan, isCloud, type PlanId } from '@/config/plans';
+import { menuOfProfile, menuSectionsFor, readRoleHidden } from '@/lib/menu-access';
+import { getPlan, isCloud, toPlanId } from '@/config/plans';
 import { evaluateSubscriptionAccess } from '@/lib/billing/subscription-access';
+import {
+  isSetupDeferred,
+  isSetupDeferredValue,
+  planLapsed,
+  readSetupProgress,
+  SETUP_DEFERRED_COOKIE,
+  setupAfterPurchaseMayOpen,
+} from '@/lib/onboarding/setup-after-purchase';
 import { UpgradeDialogProvider } from '@/components/providers/upgrade-dialog-provider';
+import { DemoBrandProvider } from '@/components/providers/demo-brand-provider';
 import { ReadOnlyBanner } from '@/components/billing/read-only-banner';
+import { DemoBanner } from '@/components/billing/demo-banner';
+import { PlanEndsBanner } from '@/components/billing/plan-ends-banner';
 import { TrackingJobHandoff } from '@/components/layout/tracking-job-handoff';
+import { FirstRunReady } from '@/components/layout/first-run-ready';
+import { KeepCurrentTheme } from '@/components/theme/keep-current-theme';
+import { sendSignupEventOnce } from '@/lib/signup-event';
+
+/**
+ * Whether the organization's plan lapsed after a subscription (planLapsed),
+ * for someone whose onboarding isn't finished: one small read before the
+ * redirect to onboarding. Unread, it hasn't (onboarding, as before).
+ */
+async function lapsedPlan(
+  supabase: Awaited<ReturnType<typeof createClient>>,
+  organizationId: string,
+): Promise<boolean> {
+  const { data, error } = await supabase
+    .from('organizations')
+    .select('subscription_status, stripe_subscription_id')
+    .eq('id', organizationId)
+    .single();
+  if (error || !data) return false;
+  return planLapsed({
+    cloud: true,
+    subscriptionStatus: data.subscription_status as string | null,
+    everSubscribed: Boolean(data.stripe_subscription_id),
+  });
+}
 
 export default async function DashboardLayout({ children }: { children: React.ReactNode }) {
   const supabase = await createClient();
@@ -32,36 +89,136 @@ export default async function DashboardLayout({ children }: { children: React.Re
   const { data: profile } = await supabase
     .from('profiles')
     .select(
-      'organization_id, onboarding_completed, role, work_areas, work_areas_asked_at, menu_shown, menu_hidden, can_manage_menus',
+      'organization_id, onboarding_completed, role, full_name, work_areas, work_areas_asked_at, menu_shown, menu_hidden, can_manage_menus',
     )
     .eq('id', user.id)
     .single();
 
-  if (!profile?.organization_id || !profile?.onboarding_completed) {
+  // The sign-up events (Resend's welcome e-mail, PostHog's signed_up), once
+  // per account, from its first signed-in page: every kind of sign-up comes
+  // here. In the background, and before onboarding's redirect, where a new
+  // account goes.
+  if (profile) sendSignupEventOnce(user);
+
+  // Setup after purchase put off by its admin ("Manage your plan" on the
+  // setup screens, for half an hour): checked against the plan and the role
+  // once the organization is read (isSetupDeferred). Without the cookie,
+  // everything goes as before.
+  const deferred = isSetupDeferredValue((await cookies()).get(SETUP_DEFERRED_COOKIE)?.value);
+
+  if (!profile?.organization_id) {
+    redirect('/dashboard/onboarding');
+  }
+  // Onboarding not finished goes back to it, unless setup is put off, or,
+  // on the cloud, the plan lapsed after a subscription (a trial canceled or a
+  // payment failed before setup's Finish): then the dashboard opens
+  // read-only, Billing included, never the wizard, whose writes that plan
+  // refuses (planLapsed; the onboarding layout sends it here too).
+  if (
+    !profile.onboarding_completed &&
+    !deferred &&
+    !(isCloud() && (await lapsedPlan(supabase, profile.organization_id)))
+  ) {
     redirect('/dashboard/onboarding');
   }
 
   const role = (profile.role ?? 'analyst') as TeamRole;
+  const chatOn = chatAgenticEnabled(profile.organization_id);
+  // Ads (ADS_ENABLED): in development, off in production; the same for every workspace.
+  const adsOn = adsEnabled();
 
-  const [{ data: org, error: orgError }, brands, roleHidden] = await Promise.all([
+  const [
+    { data: org, error: orgError },
+    brands,
+    roleHidden,
+    chatPrefsRead,
+    chatSettingsRead,
+    chatOnOwnKey,
+    tourRead,
+  ] = await Promise.all([
     supabase
       .from('organizations')
-      .select('plan, subscription_status, plan_overrides, stripe_subscription_id')
+      .select(
+        'name, plan, subscription_status, plan_overrides, stripe_subscription_id, subscription_ends_at, cancel_at_period_end',
+      )
       .eq('id', profile.organization_id)
       .single(),
     getBrands(profile.organization_id),
     // The sections the viewer's role leaves out (menu access); no read for admins.
     readRoleHidden(supabase, profile.organization_id, role),
+    // Chat's side panel on every page (CHAT-01 items 13–24): the person's choices for it.
+    chatOn
+      ? supabase
+          .from('chat_user_prefs')
+          .select(
+            'panel_on_pages, panel_size, default_mode, usage_notice_period, legacy_imported_at, page_open',
+          )
+          .eq('user_id', user.id)
+          .maybeSingle()
+      : Promise.resolve({ data: null, error: null }),
+    // The panel's composer is set up as Chat's pages set theirs up
+    // (chatComposerSetup): the Admin's "Full auto for members" (CHAT-23), so
+    // Full auto shows open only where the server runs it, and whether Chat
+    // runs on the workspace's own key, so the AI limit doesn't pause it there.
+    chatOn
+      ? supabase
+          .from('chat_settings')
+          .select('full_auto_for_members')
+          .eq('organization_id', profile.organization_id)
+          .maybeSingle()
+      : Promise.resolve({ data: null, error: null }),
+    chatOn ? chatRunsOnOwnKey(profile.organization_id).catch(() => false) : false,
+    // Where the person's product tour stands (00486), read on its own: a
+    // database without those columns yet keeps the panel's choices above.
+    chatOn ? readTourPrefs(supabase, user.id) : Promise.resolve(null),
   ]);
-  const menu = menuOfProfile({ ...profile, role }, roleHidden);
+  // Onboarding not finished opens the dashboard only while its admin has put
+  // setup off with a plan active, or read-only once the plan lapsed after a
+  // subscription; an organization that couldn't be read, never.
+  if (!profile.onboarding_completed) {
+    const orgFacts = {
+      cloud: isCloud(),
+      subscriptionStatus: (org?.subscription_status as string | null) ?? null,
+    };
+    if (
+      orgError ||
+      !(
+        isSetupDeferred({ ...orgFacts, role, deferred }) ||
+        planLapsed({ ...orgFacts, everSubscribed: Boolean(org?.stripe_subscription_id) })
+      )
+    ) {
+      redirect('/dashboard/onboarding');
+    }
+  }
+  const chatPrefs = chatPrefsRead.data;
+  // The side panel is Chat too: the person's Agent Chat conversations come
+  // over on their first visit with it, as they do on Chat's pages (W1-02).
+  if (chatOn && !chatPrefsRead.error && !chatPrefs?.legacy_imported_at) {
+    await importLegacyChats({
+      userId: user.id,
+      email: user.email ?? null,
+      organizationId: profile.organization_id,
+    });
+  }
+  // Of the sections the workspace has: Agents only with the new Chat on,
+  // Ads only with Ads on.
+  const menu = menuOfProfile({ ...profile, role }, roleHidden, menuSectionsFor(chatOn, adsOn));
+
+  // The organization's demo brand (sample data, 00380), shown or hidden: the
+  // dialog's offer reads whether the organization ever subscribed. Hidden
+  // (after a plan was bought), it is out of every brand list until it is
+  // shown again from the brand switcher.
+  const demoBrand = brands.find((b) => b.isDemo) ?? null;
+  const listedBrands = brands.filter((b) => !(b.isDemo && b.demoHiddenAt));
 
   // Cloud mode: when the subscription isn't active/trialing, the dashboard is
   // read-only — every page opens (Billing included, to choose a plan), and an
   // action opens the upgrade dialog instead of running. Only an admin of a
   // new account that never had a subscription goes back to onboarding's plan
-  // step, where its trial starts. An org row that couldn't be read decides
-  // nothing: no redirect and no lock (the API still refuses a lapsed plan's
-  // changes with 402).
+  // step, where its trial starts — unless the organization has a demo brand
+  // to explore (onboarding's "Explore the demo"). An org row that couldn't be
+  // read decides nothing: no redirect and no lock (the API still refuses a
+  // lapsed plan's changes with 402).
   const subscriptionStatus = (org?.subscription_status as string | null) ?? null;
   let subscriptionActive = true;
   let adminName: string | null = null;
@@ -72,6 +229,7 @@ export default async function DashboardLayout({ children }: { children: React.Re
       role,
       subscriptionStatus,
       Boolean(org?.stripe_subscription_id),
+      { hasDemoBrand: demoBrand !== null },
     );
     if (access.state === 'choose_plan') {
       redirect('/dashboard/onboarding');
@@ -80,15 +238,23 @@ export default async function DashboardLayout({ children }: { children: React.Re
       subscriptionActive = false;
       adminName = access.adminName;
     }
+    // Setup after purchase (lib/onboarding/setup-after-purchase.ts): a plan
+    // active or trialing, for an admin or a manager, and the organization's
+    // data says setup is due (no brand of its own at all: the demo brand left
+    // out, a paused one counted) or was left part-way (its one brand with no
+    // competitor and never tracked): onboarding opens there, and its Finish
+    // starts the first run. The brands this person sees decide first; the
+    // reads after them only where they could change the answer, and an
+    // unread one decides nothing. Never with a plan that isn't active (the
+    // dashboard opens read-only, above), nor while its admin has put it off.
+    if (setupAfterPurchaseMayOpen({ cloud: true, subscriptionStatus, role, deferred })) {
+      if (await readSetupProgress(supabase, profile.organization_id, brands)) {
+        redirect('/dashboard/onboarding');
+      }
+    }
   }
 
-  // "What do you work on?", asked once (menu access): an invited person on
-  // their first visit, a self-hosted admin after onboarding.
-  if (!menu.workAreasAsked) {
-    redirect('/dashboard/welcome');
-  }
-
-  const planId = (org?.plan ?? 'starter') as PlanId;
+  const planId = toPlanId(org?.plan);
 
   // Effective API-model allowlist for the client (null = all allowed).
   // Enterprise orgs can be switched on per customer via
@@ -103,45 +269,140 @@ export default async function DashboardLayout({ children }: { children: React.Re
     allowedModelIds = effective ? [...effective] : null;
   }
 
+  // The facts chatComposerSetup reads: the live role, the plan and the
+  // members switch; any of them unread, the careful setup.
+  const teamRole = parseTeamRole(profile.role);
+  const composerModes = composerSetupOf(
+    chatPrefs?.default_mode,
+    org && !chatSettingsRead.error && teamRole
+      ? {
+          role: teamRole,
+          plan: planFactsFromOrgRow(org),
+          settings: {
+            ...DEFAULT_CHAT_SETTINGS,
+            fullAutoForMembers:
+              chatSettingsRead.data?.full_auto_for_members ??
+              DEFAULT_CHAT_SETTINGS.fullAutoForMembers,
+          },
+        }
+      : null,
+  );
+  const metadataName = (user.user_metadata as { full_name?: unknown } | null)?.full_name;
+  const chatPanel = {
+    enabled: chatOn && chatPrefs?.panel_on_pages !== false,
+    size: panelSizeOf(chatPrefs?.panel_size),
+    firstName: firstNameOf(
+      profile.full_name ?? (typeof metadataName === 'string' ? metadataName : null),
+    ),
+    ...composerModes,
+    usageNoticeSeen: chatPrefs?.usage_notice_period ?? null,
+    onOwnKey: chatOnOwnKey,
+    // Read only where Chat runs on the own key (AGENT-OWN-KEY §5.2 item 5).
+    keyFailure: chatOnOwnKey ? await failingKeyFor(profile.organization_id) : null,
+    skills: await skillMenuFor(profile.organization_id, user.id),
+    // Where a page Chat writes opens (W4-11), as Chat's pages read it.
+    pageOpen: pageOpenOf(chatPrefs?.page_open),
+  };
+  const tour = tourRead;
+  const tourTopic = tour?.tour_topic;
+
   return (
     <>
-      <AuthProvider user={user} />
-      <BrandLoader brands={brands} />
+      <AuthProvider
+        user={user}
+        person={{
+          organizationId: profile.organization_id,
+          plan: planId,
+          subscriptionStatus,
+          cancelAtPeriodEnd: Boolean(org?.cancel_at_period_end),
+          role,
+        }}
+      />
+      <BrandLoader brands={listedBrands} />
+      {/* Cloud: a browser with no theme yet keeps light, the one shown (config/theme.ts). */}
+      <KeepCurrentTheme />
       <PlanProvider
         planId={planId}
         allowedModelIds={allowedModelIds}
         subscriptionActive={subscriptionActive}
         subscriptionStatus={subscriptionStatus}
+        planEndsAt={org?.cancel_at_period_end ? (org.subscription_ends_at as string | null) : null}
+        trialEndsAt={
+          subscriptionStatus === 'trialing'
+            ? ((org?.subscription_ends_at as string | null) ?? null)
+            : null
+        }
+        workspaceName={(org?.name as string | null) ?? null}
       >
         <RoleProvider role={role}>
-          <UpgradeDialogProvider adminName={adminName} organizationId={profile.organization_id}>
-            {/* Inside the provider: it records nothing while the workspace is read-only. */}
-            <GettingStartedPageOpened />
-            <MenuAccessProvider hidden={menu.hidden} canManageMenus={menu.canManageMenus}>
-              <AiUsageProvider>
-                <div className="flex h-screen overflow-hidden">
-                  {/* Desktop sidebar */}
-                  <div className="relative hidden md:flex md:flex-shrink-0">
-                    <SidebarErrorBoundary>
-                      <Sidebar />
-                    </SidebarErrorBoundary>
-                  </div>
+          <ChatAgenticProvider enabled={chatOn}>
+            <AdsProvider enabled={adsOn}>
+              <DemoBrandProvider
+                demoBrand={
+                  demoBrand ? { id: demoBrand.id, hidden: Boolean(demoBrand.demoHiddenAt) } : null
+                }
+                everSubscribed={Boolean(org?.stripe_subscription_id)}
+              >
+                <UpgradeDialogProvider
+                  adminName={adminName}
+                  organizationId={profile.organization_id}
+                >
+                  {/* Inside the provider: it records nothing while the workspace is read-only. */}
+                  <GettingStartedPageOpened />
+                  {/* A menu dot's page opened: its dot clears. */}
+                  <NavSeen />
+                  <MenuAccessProvider hidden={menu.hidden} canManageMenus={menu.canManageMenus}>
+                    <AiUsageProvider>
+                      {/* The Get more window, for every limit on the page (CHAT-18 §B item 6). */}
+                      <GetMoreProvider>
+                        <ChatPanelProvider
+                          setup={chatPanel}
+                          tour={{
+                            chatId: tour?.tour_chat_id ?? null,
+                            topic: isTourTopic(tourTopic) ? tourTopic : null,
+                            finished: Boolean(tour?.tour_finished_at),
+                          }}
+                        >
+                          <div className="flex h-screen overflow-hidden">
+                            {/* Desktop sidebar */}
+                            <div className="relative hidden md:flex md:flex-shrink-0">
+                              <SidebarErrorBoundary>
+                                <Sidebar />
+                              </SidebarErrorBoundary>
+                            </div>
 
-                  {/* Main area */}
-                  <div className="flex flex-1 flex-col overflow-hidden">
-                    <div className="flex h-16 items-center border-b bg-card px-4 gap-3 md:hidden">
-                      <MobileNav />
-                    </div>
-                    <ReadOnlyBanner />
-                    <main className="flex-1 overflow-y-auto bg-background p-6">
-                      <BrandGuard>{children}</BrandGuard>
-                    </main>
-                    <TrackingJobHandoff />
-                  </div>
-                </div>
-              </AiUsageProvider>
-            </MenuAccessProvider>
-          </UpgradeDialogProvider>
+                            {/* Main area, beside Chat's side panel when it is open */}
+                            <ChatPanelPage className="flex flex-1 flex-col overflow-hidden">
+                              <div className="flex h-16 items-center border-b bg-card px-4 gap-3 md:hidden">
+                                <MobileNav />
+                              </div>
+                              <ReadOnlyBanner />
+                              <PlanEndsBanner />
+                              <DemoBanner />
+                              {/* The only scroll of a page. Relative: what a page places
+                                  absolutely with nothing positioned around it (a
+                                  screen-reader label, sr-only) is placed and clipped here.
+                                  Placed on the page instead, it made the window taller than
+                                  the shell, and the window scrolled past it (2026-11-14). */}
+                              <main
+                                data-slot="dashboard-main"
+                                className="relative flex-1 overflow-y-auto bg-background p-6"
+                              >
+                                <BrandGuard>{children}</BrandGuard>
+                              </main>
+                              <TrackingJobHandoff />
+                              <FirstRunReady />
+                            </ChatPanelPage>
+                          </div>
+                          {chatPanel.enabled && <ChatSidePanelSlot />}
+                        </ChatPanelProvider>
+                      </GetMoreProvider>
+                    </AiUsageProvider>
+                  </MenuAccessProvider>
+                </UpgradeDialogProvider>
+              </DemoBrandProvider>
+            </AdsProvider>
+          </ChatAgenticProvider>
         </RoleProvider>
       </PlanProvider>
     </>

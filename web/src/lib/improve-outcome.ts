@@ -98,26 +98,44 @@ export function improvePlatformLabels(
 export interface ImprovingAction {
   actionId: string;
   actionNo: number;
+  brandNo?: number | null;
   avgBefore: number | null;
   avgAfter: number | null;
 }
 
-const TRACKED = ['new', 'in_progress', 'on_hold', 'completed'];
+/**
+ * The statuses an Improve action is still tracked in: open, or completed
+ * (until its final read, which pickImprovingAction checks). Dismissed and
+ * No improvement never are.
+ */
+export const IMPROVE_TRACKED_STATUSES: readonly string[] = [
+  'new',
+  'in_progress',
+  'on_hold',
+  'completed',
+];
 
 /**
  * The newest of a prompt's Improve actions that is still tracked: open, or
  * completed with its final read not yet taken. Dismissed ones never count.
  */
 export function pickImprovingAction(
-  rows: { id: string; action_no: number; status: string; position_outcome: unknown }[],
+  rows: {
+    id: string;
+    action_no: number;
+    brand_no?: number | null;
+    status: string;
+    position_outcome: unknown;
+  }[],
 ): ImprovingAction | null {
   for (const row of rows) {
-    if (!TRACKED.includes(row.status)) continue;
+    if (!IMPROVE_TRACKED_STATUSES.includes(row.status)) continue;
     const outcome = parseImproveOutcome(row.position_outcome);
     if (outcome?.final) continue;
     return {
       actionId: row.id,
       actionNo: Number(row.action_no),
+      brandNo: row.brand_no ?? null,
       avgBefore: outcome?.summary.avgBefore ?? null,
       avgAfter: outcome?.summary.avgAfter ?? null,
     };

@@ -2,10 +2,16 @@
 
 import { useState } from 'react';
 import { useTranslations } from 'next-intl';
+import { AskAboutThis } from '@/components/chat/panel/ask-about-this';
 import {
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
   BarChart3,
   Check,
   CirclePlay,
+  Clock,
+  FilePen,
   MessageSquare,
   MoreHorizontal,
   MousePointerClick,
@@ -15,11 +21,16 @@ import {
   ShieldCheck,
   Layers,
   Quote,
+  RotateCcw,
   Sparkles,
   Target,
   X,
 } from 'lucide-react';
 import { RemovedNote } from '@/components/action-center/removed-note';
+import { RunAgentButton } from '@/components/action-center/run-agent-button';
+import { useDotViewer } from '@/components/layout/menu-dot';
+import { PageDot } from '@/components/layout/page-dot';
+import { actionDots, localDay, pickDot } from '@/lib/page-dots';
 import { Badge } from '@/components/ui/badge';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Button } from '@/components/ui/button';
@@ -48,11 +59,12 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import type { ActionItem } from '@/lib/actions/action-center';
-import type {
-  ActionCategory,
-  ActionDismissReason,
-  ActionKind,
-  ActionStatus,
+import {
+  OPEN_ACTION_STATUSES,
+  type ActionCategory,
+  type ActionDismissReason,
+  type ActionKind,
+  type ActionStatus,
 } from '@/lib/action-center/registry';
 import { DismissReasonDialog } from './dismiss-reason-dialog';
 import {
@@ -61,7 +73,14 @@ import {
   assigneeLabel,
   labelInitials,
 } from '@/lib/action-center/display';
-import type { PriorityLevel } from '@/lib/action-center/priority';
+import { STALE_AFTER_DAYS, isStale, type PriorityLevel } from '@/lib/action-center/priority';
+import { actionCode } from '@/lib/action-center/action-ref';
+import {
+  columnSortDirection,
+  nextColumnSort,
+  type ActionSort,
+  type ActionSortColumn,
+} from '@/lib/action-center/sort';
 import { formatRelative } from '@/lib/format-relative';
 import { cn } from '@/lib/utils';
 import { useUpgradeGate } from '@/components/providers/upgrade-gate';
@@ -124,6 +143,24 @@ export function ActionStatusBadge({ status }: { status: ActionStatus }) {
     <Badge variant="outline" className={ACTION_STATUS_BADGE[status]}>
       <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-current opacity-70" />
       {t(`status.${status}`)}
+    </Badge>
+  );
+}
+
+/**
+ * Stale (00432): New for a month with no one on it. Amber, as On Hold: it
+ * waits on someone.
+ */
+export function StalePill() {
+  const t = useTranslations('actionCenter.actionsPage');
+  return (
+    <Badge
+      variant="outline"
+      className="border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400"
+      title={t('stale.hint', { days: STALE_AFTER_DAYS })}
+    >
+      <Clock aria-hidden="true" className="h-3 w-3" />
+      {t('stale.pill')}
     </Badge>
   );
 }
@@ -206,9 +243,11 @@ const MENU_STATUSES = [
 ] as const;
 
 /**
- * An action's row menu: set it In Progress, Completed or Dismissed, or
- * delete it, without opening the drawer. The status it already has is off;
- * Delete asks first, and is off for members who can't delete.
+ * An action's row menu: Start in Content Editor for an open action whose
+ * work is writing (AC-ACTION-PLAN spec §10 item 6), set it In Progress,
+ * Completed or Dismissed, keep a stale one, or delete it, without opening
+ * the drawer. The status it already has is off; Delete asks first, and is
+ * off for members who can't delete.
  */
 function ActionMenu({
   action,
@@ -216,7 +255,9 @@ function ActionMenu({
   canDelete,
   disabled,
   onStatusChange,
+  onKeep,
   onDelete,
+  onStartNow,
 }: {
   action: ActionItem;
   title: string;
@@ -227,7 +268,9 @@ function ActionMenu({
     status: ActionStatus,
     reason?: ActionDismissReason | null,
   ) => void;
+  onKeep?: (action: ActionItem) => void;
   onDelete: (action: ActionItem) => void;
+  onStartNow?: (action: ActionItem) => void;
 }) {
   const t = useTranslations('actionCenter.actionsPage');
   const [confirming, setConfirming] = useState(false);
@@ -252,7 +295,22 @@ function ActionMenu({
         >
           <MoreHorizontal className="h-4 w-4" />
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-40">
+        <DropdownMenuContent align="end" className="w-52">
+          {onStartNow && action.startNow && OPEN_ACTION_STATUSES.includes(action.status) && (
+            <>
+              <DropdownMenuItem
+                onClick={guard(() => onStartNow(action), {
+                  action: tActions(
+                    action.startNow === 'optimize' ? 'optimizeContent' : 'createContent',
+                  ),
+                })}
+              >
+                <FilePen className="h-4 w-4" />
+                {t('rowMenu.startNow')}
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+            </>
+          )}
           {MENU_STATUSES.map(({ status, icon: Icon }) => (
             <DropdownMenuItem
               key={status}
@@ -267,6 +325,14 @@ function ActionMenu({
               {t(`rowMenu.${status}`)}
             </DropdownMenuItem>
           ))}
+          {onKeep && isStale(action) && (
+            <DropdownMenuItem
+              onClick={guard(() => onKeep(action), { action: tActions('changeActionStatus') })}
+            >
+              <RotateCcw className="h-4 w-4" />
+              {t('rowMenu.stillRelevant')}
+            </DropdownMenuItem>
+          )}
           <DropdownMenuSeparator />
           <DropdownMenuItem
             variant="destructive"
@@ -297,13 +363,59 @@ function ActionMenu({
   );
 }
 
+/**
+ * A header that sorts the list on a click (the Updated and Priority Score
+ * columns): most recent or highest first, then the other way round. Its
+ * arrow and `aria-sort` say how the list is sorted now.
+ */
+function SortHead({
+  column,
+  label,
+  sort,
+  onSortChange,
+}: {
+  column: ActionSortColumn;
+  label: string;
+  sort?: ActionSort;
+  onSortChange?: (sort: ActionSort) => void;
+}) {
+  const t = useTranslations('actionCenter.actionsPage');
+  if (!sort || !onSortChange) return <TableHead className="text-xs">{label}</TableHead>;
+  const direction = columnSortDirection(sort, column);
+  const next = nextColumnSort(sort, column);
+  const Arrow = direction === 'ascending' ? ArrowUp : direction ? ArrowDown : ArrowUpDown;
+  return (
+    <TableHead className="text-xs" aria-sort={direction ?? undefined}>
+      <button
+        type="button"
+        onClick={() => onSortChange(next)}
+        title={t('table.sortTo', { sort: t(`sort.${next}`) })}
+        className="group inline-flex items-center gap-1 rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        {label}
+        <Arrow
+          aria-hidden="true"
+          className={cn(
+            'h-3 w-3',
+            !direction && 'text-muted-foreground opacity-50 group-hover:opacity-100',
+          )}
+        />
+      </button>
+    </TableHead>
+  );
+}
+
 export function ActionTable({
   actions,
   onSelect,
   onStatusChange,
+  onKeep,
   onDelete,
+  onStartNow,
   canDelete = false,
   busyIds,
+  sort,
+  onSortChange,
 }: {
   actions: ActionItem[];
   onSelect: (action: ActionItem) => void;
@@ -313,16 +425,25 @@ export function ActionTable({
     status: ActionStatus,
     reason?: ActionDismissReason | null,
   ) => void;
+  /** Still relevant on a stale action's row menu. */
+  onKeep?: (action: ActionItem) => void;
   onDelete?: (action: ActionItem) => void;
+  /** Start in Content Editor, on the menu of a row whose work is writing. */
+  onStartNow?: (action: ActionItem) => void;
   canDelete?: boolean;
   /** Actions with a change in flight: their menu waits. */
   busyIds?: Set<string>;
+  /** The list's sort: with onSortChange, the Updated and Priority Score headers set it. */
+  sort?: ActionSort;
+  onSortChange?: (sort: ActionSort) => void;
 }) {
   const t = useTranslations('actionCenter.actionsPage');
   const withMenu = Boolean(onStatusChange && onDelete);
   const tTexts = useTranslations('actionCenter.actionTexts');
   const tCategories = useTranslations('actionCenter.actionCategories');
   const tCommon = useTranslations('common');
+  const viewer = useDotViewer();
+  const today = localDay(new Date());
 
   return (
     <div className="overflow-x-auto rounded-lg border bg-card">
@@ -330,11 +451,21 @@ export function ActionTable({
         <TableHeader>
           <TableRow>
             <TableHead className="text-xs">{t('table.action')}</TableHead>
-            <TableHead className="text-xs">{t('table.priority')}</TableHead>
+            <SortHead
+              column="priority"
+              label={t('table.priority')}
+              sort={sort}
+              onSortChange={onSortChange}
+            />
             <TableHead className="text-xs">{t('table.status')}</TableHead>
             <TableHead className="text-xs">{t('table.assignee')}</TableHead>
             <TableHead className="text-xs">{t('table.dueDate')}</TableHead>
-            <TableHead className="text-xs">{t('table.updated')}</TableHead>
+            <SortHead
+              column="updated"
+              label={t('table.updated')}
+              sort={sort}
+              onSortChange={onSortChange}
+            />
             {withMenu && (
               <TableHead className={MENU_CELL}>
                 <span className="sr-only">{t('table.actions')}</span>
@@ -358,9 +489,28 @@ export function ActionTable({
                       />
                     </div>
                     <div className="min-w-0">
-                      <p className="truncate text-sm font-medium">{texts.title}</p>
+                      <div className="flex min-w-0 items-center gap-1">
+                        <p className="truncate text-sm font-medium">{texts.title}</p>
+                        <PageDot
+                          dot={pickDot(actionDots(action, action.dotFacts, today), viewer)}
+                        />
+                        <AskAboutThis
+                          reference={{ type: 'task', id: action.id, label: texts.title }}
+                          className="shrink-0"
+                        />
+                        <RunAgentButton
+                          action={action}
+                          title={texts.title}
+                          variant="row"
+                          className="shrink-0"
+                        />
+                      </div>
                       <p className="truncate text-xs text-muted-foreground">{texts.description}</p>
-                      <div className="mt-1 flex flex-wrap gap-1">
+                      <div className="mt-1 flex flex-wrap items-center gap-1">
+                        {/* Its number, as Chat names it ("AC-251"): kept whole when the row is narrow. */}
+                        <span className="whitespace-nowrap text-[10px] tabular-nums text-muted-foreground">
+                          {actionCode(action)}
+                        </span>
                         <Badge variant="outline" className="text-[10px]">
                           {tCategories(action.category)}
                         </Badge>
@@ -378,7 +528,10 @@ export function ActionTable({
                   <PriorityBadge score={action.priorityScore} level={action.priorityLevel} />
                 </TableCell>
                 <TableCell>
-                  <ActionStatusBadge status={action.status} />
+                  <div className="flex flex-wrap items-center gap-1">
+                    <ActionStatusBadge status={action.status} />
+                    {isStale(action) && <StalePill />}
+                  </div>
                   {action.taskTotal > 0 && (
                     <div className="mt-1.5 w-24">
                       <p className="text-[10px] text-muted-foreground">
@@ -423,7 +576,9 @@ export function ActionTable({
                       canDelete={canDelete}
                       disabled={busyIds?.has(action.id) ?? false}
                       onStatusChange={onStatusChange}
+                      onKeep={onKeep}
                       onDelete={onDelete}
+                      onStartNow={onStartNow}
                     />
                   </TableCell>
                 )}

@@ -1,7 +1,9 @@
 import { randomBytes } from 'crypto';
 import * as cheerio from 'cheerio';
 import { z } from 'zod';
-import { HEADING_LIMITS, PLACEHOLDER_RULE, passageKey } from './content-agent.js';
+import { HEADING_LIMITS, passageKey } from './content-agent.js';
+import { HEALTH_RULE } from './content-health.js';
+import { RESEARCH_RULE } from './content-research.js';
 import { linkKey } from './content-links.js';
 import { sourcesField } from './content-sources.js';
 import { textLength } from './page-content.js';
@@ -59,9 +61,10 @@ export const rewriteSchema = z.object({
 export const REWRITE_SYSTEM_PROMPT = `You are the Content Agent for Answer Engine Optimization (AEO). You rewrite one existing web page, whole, so it meets the rules listed and AI assistants (ChatGPT, Perplexity, Gemini, Copilot, Google's AI Overviews) understand it, trust it and cite it. A person compares your page with theirs and accepts or rejects it.
 
 How to rewrite:
-- Meet every rule listed, and the writer's own rules. Aim at the Length given: the page's whole text, kept blocks included, within 20% of it. When the page is too long, cut repetition, filler and the least useful parts first, and keep its answers, facts and data.
-- Keep the page's facts and voice. Use only facts from the page, the brand, the brief and your data. Never invent numbers, prices, dates, names, customers, sources or quotes; when the page needs a fact you don't have, write a placeholder in square brackets, e.g. [figure, source, year]. A number that isn't in them becomes a placeholder.
-${PLACEHOLDER_RULE}
+- Meet the brand's rules first, then every rule listed and the writer's own rules; when they disagree, the brand's rule wins. Aim at the Length given: the page's whole text, kept blocks included, within 20% of it. When the page is too long, cut repetition, filler and the least useful parts first, and keep its answers, facts and data. When the Length can't hold every section, merge or drop the least useful ones rather than go past it: the Length is the person's choice.
+- Keep the page's facts and voice. Use only facts from the page, the brand, the brief and your data, and the ones you ask to have looked up. Never invent numbers, prices, dates, names, customers, sources or quotes. Keep each placeholder the page has in square brackets as it is: the person fills it.
+${RESEARCH_RULE}
+${HEALTH_RULE}
 - Put the numbers (S1, S2…) of the data the page uses in "sources".
 - Never give a claim to a source that neither the page nor Your input gives ("According to X…", "X says…"): you don't see what a cited page or a link says. Keep every name the page has (a product, a brand, a person) where it lists or claims it.
 - One H1, the page's title, first. Sections are H2s; questions and sub-sections are H3s.

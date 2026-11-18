@@ -26,8 +26,19 @@ const sweepActionTasks = vi.fn();
 vi.mock('../action-center/task-writer/index.js', () => ({
   sweepActionTasks: (...a) => sweepActionTasks(...a),
 }));
+const sweepStaleActions = vi.fn();
+vi.mock('../action-center/stale.js', () => ({
+  sweepStaleActions: (...a) => sweepStaleActions(...a),
+}));
+const syncBusinessHubSetupAction = vi.fn();
+const syncBusinessHubNumbersAction = vi.fn();
+vi.mock('../action-center/from-business-hub.js', () => ({
+  syncBusinessHubSetupAction: (...a) => syncBusinessHubSetupAction(...a),
+  syncBusinessHubNumbersAction: (...a) => syncBusinessHubNumbersAction(...a),
+}));
 
 import { runFirstSignalPass, runSignalCatchUp, runSignalPass } from './pass.js';
+import { ENGINE_THRESHOLDS } from '../../config/action-engine.js';
 
 const BRAND = 'brand-1';
 const NOW = new Date('2026-09-25T06:00:00Z');
@@ -66,6 +77,8 @@ function mockDb({ runs = [], passes = [] } = {}) {
 }
 
 beforeEach(() => {
+  sweepStaleActions.mockReset();
+  sweepStaleActions.mockResolvedValue({ marked: 1, cleared: 0 });
   from.mockReset();
   recordSignalsForBrand.mockReset();
   generateActionsForBrand.mockReset();
@@ -77,6 +90,9 @@ beforeEach(() => {
   activeBrandFilter.mockReset().mockResolvedValue(() => true);
   isBrandActive.mockReset().mockResolvedValue(true);
   sweepActionTasks.mockReset().mockResolvedValue({ written: 0, skipped: 0, failed: 0 });
+  syncBusinessHubSetupAction.mockReset().mockResolvedValue('exists');
+  syncBusinessHubNumbersAction.mockReset().mockResolvedValue('fresh');
+  vi.unstubAllEnvs();
 });
 
 describe('runSignalPass', () => {
@@ -153,6 +169,75 @@ describe('runSignalPass', () => {
     await runSignalPass(BRAND, { now: NOW });
 
     expect(writes[0].row).toMatchObject({ outcome: 'skipped', detail: { actions: null } });
+  });
+
+  // 00432: an action left New with no one on it for a month is marked stale.
+  it('marks stale actions on a recorded night and a skipped one, and logs it', async () => {
+    let writes = mockDb({ runs: [{ completed_at: RUN_AT }] });
+    recordSignalsForBrand.mockResolvedValue({ inserted: 0 });
+    generateActionsForBrand.mockResolvedValue({ created: 0 });
+    await runSignalPass(BRAND, { now: NOW });
+    expect(sweepStaleActions).toHaveBeenCalledWith(BRAND, { now: NOW });
+    expect(writes[0].row.detail.stale).toEqual({ marked: 1, cleared: 0 });
+
+    writes = mockDb({ runs: [{ completed_at: RUN_AT }] });
+    recordSignalsForBrand.mockResolvedValue({ skipped: 'no_fresh_results' });
+    await runSignalPass(BRAND, { now: NOW });
+    expect(sweepStaleActions).toHaveBeenCalledTimes(2);
+  });
+
+  it('logs the pass even when marking stale actions fails', async () => {
+    const writes = mockDb({ runs: [{ completed_at: RUN_AT }] });
+    recordSignalsForBrand.mockResolvedValue({ inserted: 0 });
+    generateActionsForBrand.mockResolvedValue({ created: 0 });
+    sweepStaleActions.mockRejectedValue(new Error('timeout'));
+    await runSignalPass(BRAND, { now: NOW });
+    expect(writes[0].row).toMatchObject({ outcome: 'recorded', detail: { stale: null } });
+  });
+
+  // ChatGPT Business Hub (BUSINESS_HUB_ENABLED): the setup action, once per brand.
+  it('leaves Business Hub alone while its flag is off', async () => {
+    const writes = mockDb({ runs: [{ completed_at: RUN_AT }] });
+    await runSignalPass(BRAND, { now: NOW });
+    expect(syncBusinessHubSetupAction).not.toHaveBeenCalled();
+    expect(syncBusinessHubNumbersAction).not.toHaveBeenCalled();
+    expect(writes[0].row.detail).not.toHaveProperty('businessHub');
+  });
+
+  it("raises the Business Hub setup action while tonight's new actions leave room, and logs it", async () => {
+    vi.stubEnv('BUSINESS_HUB_ENABLED', 'true');
+    const { maxNewActionsPerDay } = ENGINE_THRESHOLDS.noise;
+    let writes = mockDb({ runs: [{ completed_at: RUN_AT }] });
+    syncBusinessHubSetupAction.mockResolvedValue('opened');
+    generateActionsForBrand.mockResolvedValue({ created: maxNewActionsPerDay - 1 });
+    await runSignalPass(BRAND, { now: NOW });
+    expect(syncBusinessHubSetupAction).toHaveBeenCalledWith(BRAND, { now: NOW, open: true });
+    expect(syncBusinessHubNumbersAction).toHaveBeenCalledWith(BRAND, { now: NOW, open: true });
+    expect(writes[0].row.detail.businessHub).toEqual({ setup: 'opened', numbers: 'fresh' });
+
+    writes = mockDb({ runs: [{ completed_at: RUN_AT }] });
+    syncBusinessHubSetupAction.mockResolvedValue('held');
+    generateActionsForBrand.mockResolvedValue({ created: maxNewActionsPerDay });
+    await runSignalPass(BRAND, { now: NOW });
+    expect(syncBusinessHubSetupAction).toHaveBeenLastCalledWith(BRAND, { now: NOW, open: false });
+    expect(syncBusinessHubNumbersAction).toHaveBeenLastCalledWith(BRAND, { now: NOW, open: false });
+    expect(writes[0].row.detail.businessHub).toEqual({ setup: 'held', numbers: 'fresh' });
+  });
+
+  it('logs the pass even when the Business Hub syncs throw, each on its own', async () => {
+    vi.stubEnv('BUSINESS_HUB_ENABLED', 'true');
+    let writes = mockDb({ runs: [{ completed_at: RUN_AT }] });
+    syncBusinessHubSetupAction.mockRejectedValue(new Error('prompt_results read: timeout'));
+    await runSignalPass(BRAND, { now: NOW });
+    expect(writes[0].row).toMatchObject({ outcome: 'recorded' });
+    // The reminder still ran.
+    expect(writes[0].row.detail.businessHub).toEqual({ numbers: 'fresh' });
+
+    writes = mockDb({ runs: [{ completed_at: RUN_AT }] });
+    syncBusinessHubNumbersAction.mockRejectedValue(new Error('actions read: timeout'));
+    await runSignalPass(BRAND, { now: NOW });
+    expect(writes[0].row).toMatchObject({ outcome: 'recorded' });
+    expect(writes[0].row.detail).not.toHaveProperty('businessHub');
   });
 
   it('leaves the scores to the generator on a recorded night', async () => {

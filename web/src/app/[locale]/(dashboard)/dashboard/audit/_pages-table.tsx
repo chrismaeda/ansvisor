@@ -27,6 +27,9 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { pct, scoreColor } from '@/components/audit/audit-report';
+import { ScoreRangeMark } from '@/components/audit/score-range';
+import { scoreRange } from '@/lib/audit/score-range';
+import { signedValue, TONE_TEXT } from '../(brand-visibility)/insights/kpi-format';
 import type { AuditedPage, AuditedPageStatus, AuditRun, AuditTemplate } from '@/lib/actions/audits';
 import { formatDate, formatDateTime, formatNumber } from '@/lib/format';
 import { cn } from '@/lib/utils';
@@ -111,7 +114,42 @@ function StatusPill({ status }: { status: AuditedPageStatus }) {
   );
 }
 
-function HistoryRun({ run, onDelete }: { run: AuditRun; onDelete: (id: string) => void }) {
+/**
+ * The change since the page's first audit, beside its current score: green
+ * up, red down, "0" unchanged. Once the page has two completed audits.
+ */
+function SinceFirst({ page }: { page: AuditedPage }) {
+  const t = useTranslations('audit');
+  const current = pct(page.score);
+  const first = pct(page.firstScore);
+  if (current === null || first === null || !page.firstAuditedAt || page.trend.length < 2) {
+    return null;
+  }
+  const change = current - first;
+  const date = formatDate(page.firstAuditedAt);
+  return (
+    <span
+      title={t('pages.sinceFirstTip', { date })}
+      className={cn(
+        'ml-1.5 text-xs font-medium',
+        TONE_TEXT[change > 0 ? 'good' : change < 0 ? 'bad' : 'neutral'],
+      )}
+    >
+      {signedValue(change)}
+      <span className="sr-only"> {t('pages.sinceFirst', { date })}</span>
+    </span>
+  );
+}
+
+/** The current score's range ("± 2") from the page's own latest audits, once it has enough. */
+function PageScoreRange({ page }: { page: AuditedPage }) {
+  const range = page.score === null ? null : scoreRange(page.trend);
+  if (!range) return null;
+  return <ScoreRangeMark range={range} className="ml-1 text-xs" />;
+}
+
+/** An earlier audit of the page; Delete only with `onDelete` (admins and managers, 2026-11-03). */
+function HistoryRun({ run, onDelete }: { run: AuditRun; onDelete?: (id: string) => void }) {
   const t = useTranslations('audit');
   // A read-only workspace (plan not active): the upgrade dialog instead of the confirm.
   const { isLocked, openUpgrade } = useUpgradeGate();
@@ -130,38 +168,42 @@ function HistoryRun({ run, onDelete }: { run: AuditRun; onDelete: (id: string) =
       <Link href={`/dashboard/audit/${run.id}`} className="text-primary hover:underline">
         {t('pages.viewReport')}
       </Link>
-      <Dialog
-        onOpenChange={(open, details) => {
-          if (!open || !isLocked) return;
-          details.cancel();
-          openUpgrade(tActions('deleteAudits'));
-        }}
-      >
-        <DialogTrigger
-          render={
-            <Button
-              variant="ghost"
-              size="icon"
-              className="ml-auto h-7 w-7 shrink-0 text-muted-foreground hover:text-destructive"
-              aria-label={t('deleteAudit')}
-            />
-          }
+      {onDelete && (
+        <Dialog
+          onOpenChange={(open, details) => {
+            if (!open || !isLocked) return;
+            details.cancel();
+            openUpgrade(tActions('deleteAudits'));
+          }}
         >
-          <Trash2 className="h-3.5 w-3.5" />
-        </DialogTrigger>
-        <DialogContent className="sm:max-w-sm">
-          <DialogHeader>
-            <DialogTitle>{t('deleteAudit')}</DialogTitle>
-            <DialogDescription>{t('deleteConfirm')}</DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <DialogClose render={<Button variant="outline" />}>{t('cancel')}</DialogClose>
-            <DialogClose render={<Button variant="destructive" onClick={() => onDelete(run.id)} />}>
-              {t('deleteAudit')}
-            </DialogClose>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+          <DialogTrigger
+            render={
+              <Button
+                variant="ghost"
+                size="icon"
+                className="ml-auto h-7 w-7 shrink-0 text-muted-foreground hover:text-destructive"
+                aria-label={t('deleteAudit')}
+              />
+            }
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </DialogTrigger>
+          <DialogContent className="sm:max-w-sm">
+            <DialogHeader>
+              <DialogTitle>{t('deleteAudit')}</DialogTitle>
+              <DialogDescription>{t('deleteConfirm')}</DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <DialogClose render={<Button variant="outline" />}>{t('cancel')}</DialogClose>
+              <DialogClose
+                render={<Button variant="destructive" onClick={() => onDelete(run.id)} />}
+              >
+                {t('deleteAudit')}
+              </DialogClose>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
     </li>
   );
 }
@@ -190,7 +232,8 @@ export function AuditPagesTable({
   primaryHost: string | null;
   loadingMore: boolean;
   onLoadMore: () => void;
-  onDeleteRun: (id: string) => void;
+  /** Deleting an earlier audit: admins and managers only, else none. */
+  onDeleteRun?: (id: string) => void;
   /** Keys of the selected pages. */
   selected: Set<string>;
   onSelect: (keys: string[], on: boolean) => void;
@@ -250,7 +293,8 @@ export function AuditPagesTable({
               <TableHead className="w-9" />
               {/* The page column takes the room left, and long URLs truncate in it. */}
               <TableHead className="w-full">{t('pages.page')}</TableHead>
-              <TableHead>{t('pages.score')}</TableHead>
+              <TableHead>{t('pages.firstScore')}</TableHead>
+              <TableHead>{t('pages.currentScore')}</TableHead>
               <TableHead className="text-right">{t('pages.issues')}</TableHead>
               <TableHead>{t('pages.status')}</TableHead>
               <TableHead>{t('pages.lastAudit')}</TableHead>
@@ -266,7 +310,7 @@ export function AuditPagesTable({
               >
                 {group.template !== undefined && (
                   <TableRow className="bg-muted/40 hover:bg-muted/40">
-                    <TableCell colSpan={7} className="py-2 text-xs whitespace-normal">
+                    <TableCell colSpan={8} className="py-2 text-xs whitespace-normal">
                       <TemplateHeader template={group.template} />
                     </TableCell>
                   </TableRow>
@@ -326,9 +370,21 @@ export function AuditPagesTable({
                           </Link>
                         </TableCell>
                         <TableCell
+                          className="tabular-nums text-muted-foreground"
+                          title={
+                            page.firstAuditedAt
+                              ? t('pages.firstAuditedOn', { date: formatDate(page.firstAuditedAt) })
+                              : undefined
+                          }
+                        >
+                          {pct(page.firstScore) ?? '—'}
+                        </TableCell>
+                        <TableCell
                           className={cn('font-semibold tabular-nums', scoreColor(page.score))}
                         >
                           {pct(page.score) ?? '—'}
+                          <PageScoreRange page={page} />
+                          <SinceFirst page={page} />
                         </TableCell>
                         <TableCell className="text-right tabular-nums">
                           {page.issues === null ? '—' : formatNumber(page.issues)}
@@ -352,7 +408,7 @@ export function AuditPagesTable({
                       {expanded && (
                         <TableRow id={historyId} className="hover:bg-transparent">
                           <TableCell colSpan={2} />
-                          <TableCell colSpan={5} className="pt-0 whitespace-normal">
+                          <TableCell colSpan={6} className="pt-0 whitespace-normal">
                             <ul className="divide-y rounded-md border">
                               {page.runs.map((run) => (
                                 <HistoryRun key={run.id} run={run} onDelete={onDeleteRun} />

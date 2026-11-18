@@ -1,4 +1,4 @@
-import { act } from 'react';
+import { act, type ReactNode } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { NextIntlClientProvider } from 'next-intl';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -11,9 +11,26 @@ import {
   percentLabel,
   type AiUsage,
 } from '@/lib/billing/ai-usage';
+import { RoleProvider, type TeamRole } from '@/components/providers/role-provider';
 import { AiUsageCard } from './ai-usage-card';
 
 vi.mock('@/lib/actions/ai-usage', () => ({ getAiUsage: vi.fn() }));
+vi.mock('@/i18n/navigation', () => ({
+  useRouter: () => ({ refresh: () => {} }),
+  Link: ({
+    href,
+    className,
+    children,
+  }: {
+    href: string;
+    className?: string;
+    children: ReactNode;
+  }) => (
+    <a href={href} className={className}>
+      {children}
+    </a>
+  ),
+}));
 
 (
   globalThis as typeof globalThis & {
@@ -39,11 +56,13 @@ const usage = (over: Partial<AiUsage> = {}): AiUsage => ({
 let container: HTMLDivElement;
 let root: Root;
 
-async function render() {
+async function render(role: TeamRole = 'admin') {
   await act(async () => {
     root.render(
       <NextIntlClientProvider locale="en" messages={messages}>
-        <AiUsageCard />
+        <RoleProvider role={role}>
+          <AiUsageCard />
+        </RoleProvider>
       </NextIntlClientProvider>,
     );
   });
@@ -102,6 +121,41 @@ describe('AiUsageCard', () => {
     expect(container.textContent).not.toContain('No AI usage yet');
   });
 
+  it('gives Chat its row in percent, and says it uses the allowance, once Chat is on', async () => {
+    vi.mocked(getAiUsage).mockResolvedValue(
+      usage({
+        chatMetered: true,
+        percentUsed: 20.5,
+        features: [
+          { feature: 'content', percent: 12.5 },
+          { feature: 'chat', percent: 8 },
+        ],
+      }),
+    );
+    await render();
+    const text = container.textContent ?? '';
+    expect([...container.querySelectorAll('li')].map((li) => li.textContent)).toEqual([
+      'Content Editor (briefs, Content Agent, quality checks)12.5%',
+      'Chat8%',
+    ]);
+    expect(text).toContain("Chat, Improve suggestions, the Content Editor's AI");
+    expect(text).toContain("Chat uses this allowance too. Chat on your own AI key isn't counted.");
+    expect(text).not.toContain('Agent Chat runs on your own AI key');
+    // Shares only: no dollar figure reaches the page.
+    expect(text).not.toContain('$');
+  });
+
+  it('keeps today’s line on Agent Chat while Chat is off', async () => {
+    vi.mocked(getAiUsage).mockResolvedValue(usage({ chatMetered: false }));
+    await render();
+    const text = container.textContent ?? '';
+    expect(text).toContain("Agent Chat runs on your own AI key, so it doesn't use this allowance.");
+    expect(text).toContain(
+      "Improve suggestions, the Content Editor's AI and the Action Center's task writing share",
+    );
+    expect(text).not.toContain('Chat uses this allowance too');
+  });
+
   it('says nothing has used it yet, in place of the list', async () => {
     vi.mocked(getAiUsage).mockResolvedValue(usage({ percentUsed: 0, features: [] }));
     await render();
@@ -138,13 +192,43 @@ describe('AiUsageCard', () => {
     );
   });
 
-  it('says the free trial’s is used up and starting the plan gives more, not a bigger plan', async () => {
+  it('shows the free trial’s credit with no share, and its end', async () => {
+    vi.mocked(getAiUsage).mockResolvedValue(usage({ trial: true, percentUsed: 42.5 }));
+    await render();
+    const text = container.textContent!;
+    expect(text).toContain('Trial AI credit');
+    expect(text).toContain('The trial ends on November 20, 2026');
+    expect(text).toContain('Your free trial comes with a starter AI credit.');
+    // No share: neither the whole, its bar, nor each feature's.
+    expect(text).not.toContain('%');
+    expect(container.querySelector('[role="progressbar"]')).toBeNull();
+    // Nothing to start yet below 80%.
+    expect(container.querySelector('button')).toBeNull();
+  });
+
+  it('offers an admin to start the plan once the trial credit is almost or all used', async () => {
+    vi.mocked(getAiUsage).mockResolvedValue(usage({ trial: true, percentUsed: 85 }));
+    await render();
+    expect(container.textContent).toContain('Trial AI credit almost used');
+    expect(container.querySelector('button')!.textContent).toBe('Start my plan now');
+
     vi.mocked(getAiUsage).mockResolvedValue(usage({ trial: true, percentUsed: 100 }));
+    act(() => root.unmount());
+    root = createRoot(container);
     await render();
     expect(container.textContent).toContain(
-      "The free trial's AI usage is used up. Starting the plan below gives its full monthly allowance.",
+      'Your trial AI credit is used up. Start your plan now for its full monthly AI usage.',
     );
     expect(container.textContent).not.toContain('A bigger plan');
+    expect(container.querySelector('button')!.textContent).toBe('Start my plan now');
+
+    act(() => root.unmount());
+    root = createRoot(container);
+    await render('manager');
+    expect(container.textContent).toContain(
+      'To start the plan now, ask an admin of your workspace.',
+    );
+    expect(container.querySelector('button')).toBeNull();
   });
 
   it('offers no bigger plan on Enterprise', async () => {
@@ -193,6 +277,78 @@ describe('AiUsageCard', () => {
     await render();
     expect(container.textContent).toContain("Couldn't read this period's AI usage.");
     error.mockRestore();
+  });
+
+  describe('By agent (CHAT-27 item 27)', () => {
+    const byAgentList = () =>
+      container.querySelector('section[aria-labelledby="ai-usage-by-agent"]');
+
+    it('lists each agent’s share highest first, linked to its page, then what used the rest', async () => {
+      vi.mocked(getAiUsage).mockResolvedValue(
+        usage({
+          chatMetered: true,
+          byAgent: {
+            agents: [
+              { agentId: 'a-2', percent: 1.5, name: 'Rival brief' },
+              { agentId: null, percent: 3 },
+              { agentId: 'a-1', percent: 12, name: 'Weekly report' },
+            ],
+            chat: 4.2,
+          },
+        }),
+      );
+      await render('analyst');
+      const list = byAgentList()!;
+      expect(list.querySelector('h3')!.textContent).toBe('By agent');
+      expect([...list.querySelectorAll('li')].map((li) => li.textContent)).toEqual([
+        'Weekly report12%',
+        'Deleted agent3%',
+        'Rival brief1.5%',
+        'Chat (no agent)4.2%',
+        'Content Editor (briefs, Content Agent, quality checks)30%',
+        'Action Center task writing0.4%',
+        'Improve suggestions12.5%',
+      ]);
+      expect(
+        [...list.querySelectorAll('a')].map((a) => [a.textContent, a.getAttribute('href')]),
+      ).toEqual([
+        ['Weekly report', '/dashboard/agents/a-1'],
+        ['Rival brief', '/dashboard/agents/a-2'],
+      ]);
+      // Shares of the limit only: never an amount.
+      expect(container.textContent).not.toMatch(/\$|USD/);
+    });
+
+    it('says when no agent used any', async () => {
+      vi.mocked(getAiUsage).mockResolvedValue(
+        usage({ chatMetered: true, byAgent: { agents: [], chat: 1 } }),
+      );
+      await render();
+      expect(byAgentList()!.textContent).toBe('By agentNo agent has used AI this period.');
+      expect(byAgentList()!.querySelector('li')).toBeNull();
+    });
+
+    it('isn’t there with Chat off, in the trial, or with nothing used at all', async () => {
+      vi.mocked(getAiUsage).mockResolvedValue(usage());
+      await render();
+      expect(byAgentList()).toBeNull();
+
+      const agents = { agents: [{ agentId: 'a-1', percent: 12, name: 'Weekly report' }], chat: 0 };
+      vi.mocked(getAiUsage).mockResolvedValue(usage({ trial: true, byAgent: agents }));
+      act(() => root.unmount());
+      root = createRoot(container);
+      await render();
+      expect(byAgentList()).toBeNull();
+
+      vi.mocked(getAiUsage).mockResolvedValue(
+        usage({ percentUsed: 0, features: [], byAgent: { agents: [], chat: 0 } }),
+      );
+      act(() => root.unmount());
+      root = createRoot(container);
+      await render();
+      expect(byAgentList()).toBeNull();
+      expect(container.textContent).toContain('No AI usage yet this period.');
+    });
   });
 });
 

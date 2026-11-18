@@ -49,6 +49,8 @@ const auth: McpAuthContext = {
   email: null,
   organizationId: 'org-1',
   apiKeyId: 'key-1',
+  brandAccess: 'all',
+  role: 'admin',
 };
 
 const brand = {
@@ -335,6 +337,7 @@ describe('getMentionCompetitorsFor', () => {
         sameResponseAsYou: 41,
         previousMentions: 200,
         mentionsChangePct: 30,
+        type: null,
       },
       {
         competitorId: 'c2',
@@ -344,8 +347,39 @@ describe('getMentionCompetitorsFor', () => {
         sameResponseAsYou: 36,
         previousMentions: 0,
         mentionsChangePct: null,
+        type: null,
       },
     ]);
+  });
+
+  it("gives each competitor its type (00542) and lists only one type's when asked", async () => {
+    rpc.mockResolvedValue({ data: overview, error: null });
+    tables.competitors = {
+      data: [
+        { id: 'c1', type: 'marketplace' },
+        { id: 'c2', type: 'Reseller' },
+      ],
+      error: null,
+    };
+    const all = await getMentionCompetitorsFor(auth, { brandId: 'b1' });
+    expect(all?.competitors.map((c) => [c.competitorId, c.type])).toEqual([
+      ['c1', 'Marketplace / aggregator'],
+      ['c2', 'Reseller'],
+    ]);
+    // The brand's own rows only, inner-joined on the key's organization.
+    expect(filters).toContainEqual(['competitors', 'brand_id', 'b1']);
+    expect(filters).toContainEqual(['competitors', 'brands.organization_id', 'org-1']);
+
+    const resellers = await getMentionCompetitorsFor(auth, { brandId: 'b1' }, { type: 'reseller' });
+    expect(resellers?.competitors.map((c) => c.competitorId)).toEqual(['c2']);
+    const marketplaces = await getMentionCompetitorsFor(
+      auth,
+      { brandId: 'b1' },
+      { type: 'Marketplace / aggregator' },
+    );
+    expect(marketplaces?.competitors.map((c) => c.competitorId)).toEqual(['c1']);
+    const untyped = await getMentionCompetitorsFor(auth, { brandId: 'b1' }, { type: 'none' });
+    expect(untyped?.competitors).toEqual([]);
   });
 });
 
@@ -428,6 +462,17 @@ describe('listMentionsFor', () => {
       error: { code: '57014', message: 'statement timeout' },
     });
     await expect(listMentionsFor(auth, { brandId: 'b1' })).rejects.toThrow('statement timeout');
+  });
+
+  it('reads 100 a page for the MCP tool, and any answer by offset for Chat', async () => {
+    rpc.mockResolvedValue({ data: { total: 0, prompts: 0, rows: [] }, error: null });
+    await listMentionsFor(auth, { brandId: 'b1', page: 3 });
+    expect(rpc.mock.calls[0][1]).toMatchObject({ p_limit: 100, p_offset: 200 });
+    // Chat's page: answers 21–100 of every 100 are reachable, not only the first 20.
+    await listMentionsFor(auth, { brandId: 'b1', offset: 70, limit: 50 });
+    expect(rpc.mock.calls[1][1]).toMatchObject({ p_limit: 50, p_offset: 70 });
+    await listMentionsFor(auth, { brandId: 'b1', offset: -5, limit: 500 });
+    expect(rpc.mock.calls[2][1]).toMatchObject({ p_limit: 100, p_offset: 0 });
   });
 });
 
@@ -606,5 +651,41 @@ describe('overrideMentionSentimentFor', () => {
     });
     rpc.mockResolvedValueOnce({ data: null, error: { code: '57014', message: 'timeout' } });
     await expect(overrideMentionSentimentFor(auth, 'r1', 'neutral')).rejects.toThrow('timeout');
+  });
+});
+
+describe('a Selected-brands key (BRAND-ACCESS)', () => {
+  // Shared with the key's owner: another brand, not b1.
+  const selected: McpAuthContext = { ...auth, role: 'manager', brandAccess: ['b2'] };
+  const params = { brandId: 'b1' };
+
+  it('reads no Mentions function for a brand not shared with its owner', async () => {
+    rpc.mockResolvedValue({ data: overview, error: null });
+    await expect(getMentionsSummaryFor(selected, params)).resolves.toBeNull();
+    await expect(getMentionCompetitorsFor(selected, params)).resolves.toBeNull();
+    await expect(listMentionsFor(selected, params)).resolves.toBeNull();
+    await expect(getMentionsPerceptionFor(selected, params)).resolves.toBeNull();
+    // The functions (00434) run with the service role here, which they don't check.
+    expect(rpc).not.toHaveBeenCalled();
+
+    await expect(
+      getMentionsSummaryFor({ ...selected, brandAccess: ['b1'] }, params),
+    ).resolves.not.toBeNull();
+    expect(rpc).toHaveBeenCalledWith('mentions_overview', expect.anything());
+  });
+
+  it("reads an answer of such a brand as missing, and doesn't correct it", async () => {
+    tables = {
+      prompt_results: {
+        data: { id: 'r1', brand_id: 'b1', brands: { organization_id: 'org-1' } },
+        error: null,
+      },
+    };
+    await expect(getMentionFor(selected, 'r1')).resolves.toBeNull();
+    await expect(overrideMentionSentimentFor(selected, 'r1', 'neutral')).resolves.toEqual({
+      error: 'missing',
+      message: 'Answer not found',
+    });
+    expect(rpc).not.toHaveBeenCalled();
   });
 });

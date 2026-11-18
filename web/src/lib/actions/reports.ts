@@ -19,7 +19,13 @@ import {
 } from '@/lib/actions/tracking';
 import { getCitationsOverview, type CitationsSourceBreakdown } from '@/lib/actions/citations';
 import { getShoppingKpis } from '@/lib/actions/shopping';
+import { getTrafficAiPipeline, type TrafficAiPipeline } from '@/lib/actions/traffic';
+import { getOrgPlan } from '@/lib/guards/plan-guard';
+import { hasFeature } from '@/config/plans';
 import { type SourceCategory } from '@/lib/citations/classify';
+import { auditSnapshotFrom, type AuditSnapshotRow } from '@/lib/reports/audit-score';
+import { readEarlierPageAudits } from '@/lib/audit/page-trend';
+import type { ScoreRange } from '@/lib/audit/score-range';
 import { stripEntityMarkup } from '@/lib/entity-markup';
 import { countTrafficLogs, scanTrafficLogs } from '@/lib/traffic-scan';
 import { LOW_SAMPLE_VISITS } from '@/lib/traffic-change';
@@ -146,6 +152,45 @@ export interface ReportAiTraffic {
   topPages: { url: string; visits: number }[];
 }
 
+/**
+ * HubSpot's AI-sourced contacts, deals and revenue in the period (#2140),
+ * as AI Traffic's pipeline section reads them (brand_ai_pipeline, 00520):
+ * the totals, the top engines and pages, and HubSpot's own AI Referrals.
+ */
+export interface ReportAiPipeline {
+  currency: string | null;
+  totals: TrafficAiPipeline['totals'];
+  byEngine: TrafficAiPipeline['byEngine'];
+  byPage: TrafficAiPipeline['byPage'];
+  hubspotNative: TrafficAiPipeline['hubspotNative'];
+  /** When HubSpot was last read, as of the report. */
+  syncedAt: string | null;
+}
+
+/** Engines and pages a report keeps. */
+const PIPELINE_ROWS = 5;
+
+/**
+ * The pipeline for the report's period, or null when the brand has nothing
+ * to read: HubSpot not connected, marking contacts off, or not read yet.
+ */
+async function getPipelineSnapshot(
+  brandId: string,
+  dateFrom: string,
+  dateTo: string,
+): Promise<ReportAiPipeline | null> {
+  const pipeline = await getTrafficAiPipeline(brandId, { dateFrom, dateTo });
+  if (!pipeline?.connected || !pipeline.contactsConsent || !pipeline.syncedAt) return null;
+  return {
+    currency: pipeline.currency,
+    totals: pipeline.totals,
+    byEngine: pipeline.byEngine.slice(0, PIPELINE_ROWS),
+    byPage: pipeline.byPage.slice(0, PIPELINE_ROWS),
+    hubspotNative: pipeline.hubspotNative,
+    syncedAt: pipeline.syncedAt,
+  };
+}
+
 export interface ReportShoppingVisibility {
   /** Own share of all shopping cards in the window, as a percentage. */
   shoppingSovPct: number;
@@ -159,10 +204,23 @@ export interface ReportShoppingVisibility {
 
 export interface ReportAuditScore {
   url: string;
+  /** 0–100 points when `scale` is 100; on older reports, the 0–1 score rounded to one decimal. */
   totalScore: number | null;
-  /** The prior completed audit's score, for the delta; null when first audit. */
+  /**
+   * The same page's audit before, for the change; null when it is the page's
+   * first. On older reports (no `scale`), the brand's audit before, which
+   * could be another page's.
+   */
   previousScore: number | null;
   auditedAt: string;
+  /** 100 on reports saved since the scores are 0–100 points. Absent on older reports. */
+  scale?: 100;
+  /**
+   * The score's range ("64 ± 2"), from the page's last complete audits up to
+   * this one, as Site Audit works it out: null with fewer than 3. Absent on
+   * reports saved before it.
+   */
+  range?: ScoreRange | null;
 }
 
 /** Prompt-level Visibility Rate KPI (#492) — mirrors the Insights dashboard's headline metric. */
@@ -222,6 +280,8 @@ export interface ReportPayload {
   topicPerformance?: ReportTopicPerf[];
   /** Real AI-referred visits in the period. */
   aiTraffic?: ReportAiTraffic;
+  /** HubSpot's AI-sourced pipeline (#2140): only for a brand with HubSpot read. */
+  aiPipeline?: ReportAiPipeline;
   /** Shopping card presence (only gathered when the brand's shopping mode is on). */
   shoppingVisibility?: ReportShoppingVisibility;
   /** Latest completed Site Audit as of the period end. */
@@ -565,30 +625,30 @@ async function getShoppingSnapshot(
 }
 
 /**
- * Latest completed Site Audit as of the period end, with the prior audit's
- * score for the delta. Audits aren't period-bound like the other metrics, so
- * "as of dateTo" keeps historical reports honest.
+ * Latest completed Site Audit as of the period end, with the score of the
+ * same page's audit before it for the change, both on the 0–100 scale the
+ * audit report shows, and the score's range from that page's audits up to
+ * it. Audits aren't period-bound like the other metrics, so "as of dateTo"
+ * keeps historical reports honest. A partial audit (its AI-judged signals
+ * didn't run) is never compared, so it's left out.
  */
 async function getAuditSnapshot(brandId: string, dateTo: string): Promise<ReportAuditScore | null> {
   const supabase = await createClient();
   const { data, error } = await supabase
     .from('site_audits')
-    .select('url, total_score, created_at')
+    .select('url, final_url, total_score, created_at')
     .eq('brand_id', brandId)
     .eq('status', 'completed')
+    .eq('partial', false)
     .lte('created_at', dateTo)
     .order('created_at', { ascending: false })
-    .limit(2);
+    .limit(1);
   if (error) throw new Error(error.message);
-  if (!data || data.length === 0) return null;
-
-  const [latest, prior] = data;
-  return {
-    url: latest.url as string,
-    totalScore: latest.total_score === null ? null : round1(Number(latest.total_score)),
-    previousScore: prior && prior.total_score !== null ? round1(Number(prior.total_score)) : null,
-    auditedAt: latest.created_at as string,
-  };
+  const latest = (data?.[0] ?? null) as AuditSnapshotRow | null;
+  if (!latest) return null;
+  // The page's own audits before it, however many of the brand's came between.
+  const earlier = await readEarlierPageAudits(supabase, brandId, latest);
+  return auditSnapshotFrom([latest, ...earlier]);
 }
 
 /**
@@ -781,7 +841,7 @@ export async function createReport(
     sections?: ReportSection[];
   },
 ): Promise<{ id: string }> {
-  await assertWritable();
+  await assertWritable({ brandId });
   const supabase = await createClient();
   const {
     data: { session },
@@ -797,7 +857,7 @@ export async function createReport(
   // it (mirrors the sidebar's requiresBrandPref rule).
   const { data: brand } = await supabase
     .from('brands')
-    .select('name, shopping_mode_enabled')
+    .select('name, shopping_mode_enabled, organization_id')
     .eq('id', brandId)
     .single();
   const brandName = (brand?.name as string) ?? 'Brand';
@@ -807,6 +867,16 @@ export async function createReport(
   );
   const sectionSet = new Set<ReportSection>(picked);
   if (!brand?.shopping_mode_enabled) sectionSet.delete('shoppingVisibility');
+  // HubSpot's pipeline (#2140) is the plan's crm_integrations, as on AI Traffic.
+  if (
+    sectionSet.has('aiPipeline') &&
+    !(
+      brand?.organization_id &&
+      hasFeature(await getOrgPlan(brand.organization_id as string), 'crm_integrations')
+    )
+  ) {
+    sectionSet.delete('aiPipeline');
+  }
   const has = (s: ReportSection) => sectionSet.has(s);
 
   // 1. Gather the metric snapshot through the existing analytics actions —
@@ -849,6 +919,7 @@ export async function createReport(
     queryFanout,
     topicPerformance,
     aiTraffic,
+    aiPipeline,
     shoppingVisibility,
     auditScore,
   ] = await Promise.all([
@@ -861,6 +932,7 @@ export async function createReport(
     pick('queryFanout', () => getFanoutSnapshot(brandId, dateFrom, dateTo)),
     pick('topicPerformance', () => getTopicPerformance(brandId, dateFrom, dateTo)),
     pick('aiTraffic', () => getTrafficSnapshot(brandId, dateFrom, dateTo)),
+    pick('aiPipeline', () => getPipelineSnapshot(brandId, dateFrom, dateTo)),
     pick('shoppingVisibility', () => getShoppingSnapshot(brandId, dateFrom, dateTo)),
     pick('auditScore', () => getAuditSnapshot(brandId, dateTo)),
   ]);
@@ -904,6 +976,7 @@ export async function createReport(
       : {}),
     ...(topicPerformance && topicPerformance.length > 0 ? { topicPerformance } : {}),
     ...(aiTraffic ? { aiTraffic } : {}),
+    ...(aiPipeline ? { aiPipeline } : {}),
     ...(shoppingVisibility ? { shoppingVisibility } : {}),
     ...(auditScore ? { auditScore } : {}),
     ...(sov

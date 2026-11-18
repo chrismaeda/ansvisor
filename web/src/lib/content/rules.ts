@@ -1,13 +1,15 @@
 import { z } from 'zod';
 import { LANGUAGES } from '@/config/prompt-options';
 import { classifyDomain, normalizeDomain } from '@/lib/citations/classify';
-import { PAGE_TYPES, type DraftMethod, type PageType } from '@/lib/content/drafts';
+import { PAGE_TYPES, isPageType, type DraftMethod, type PageType } from '@/lib/content/drafts';
 import { lengthTarget } from '@/lib/content/editor';
 import { feedCheck, type CatalogMatch } from '@/lib/content/feed-match';
 import { decodeHtmlBlock } from '@/lib/content/html-allowlist';
+import { parseHtml } from '@/lib/content/dom';
 import { pageOffer } from '@/lib/content/page-schema';
 import { countWords, languageCode } from '@/lib/content/readability';
-import { wordsOf } from '@/lib/content/sources';
+import { carriesFanout } from '@/lib/content/fanout-match';
+import { bannedPhrasesIn } from '@/lib/chat/banned-phrases';
 import {
   shoppingLinks,
   type PageCard,
@@ -283,6 +285,33 @@ const SHOPPING_RULES: RuleDef[] = [
   { key: 'shopLinksLive', group: 'links', kind: 'switch', value: '', check: 'page' },
 ];
 
+/**
+ * Short pages ask for fewer fan-out sections and questions, so no default
+ * set asks for more than its Length holds (lengthConflict): two sections,
+ * three questions and a summary take 950 characters at the least, within
+ * the 960 an 800-character Length allows.
+ */
+const SHORT_TYPES: ReadonlySet<PageType | null> = new Set<PageType>([
+  'product_page',
+  'category_page',
+  'collection_page',
+  'sizing_guide',
+]);
+const SHORT_VALUES: Readonly<Record<string, string>> = { fanoutH2: '2', faq: '3', fanoutFaq: '2' };
+
+/**
+ * The brand's banned phrases (Brand settings › Content rules, 00538): in
+ * the Style group, after Banned words, only while the brand has some. On
+ * by default; checked against them (RuleContext's bannedPhrases).
+ */
+const BRAND_BANNED: RuleDef = {
+  key: 'brandBanned',
+  group: 'style',
+  kind: 'switch',
+  value: '',
+  check: 'page',
+};
+
 /** The Shopping rules' keys: checked against the shopping path (shoppingStatus). */
 export const SHOPPING_RULE_KEYS: ReadonlySet<string> = new Set(SHOPPING_RULES.map((r) => r.key));
 
@@ -298,6 +327,8 @@ export function ruleSet(
     language?: string | null;
     length?: number | null;
     shopping?: boolean;
+    /** The brand's banned phrases: the rule shows only when it has some. */
+    bannedPhrases?: readonly string[];
   } = {},
 ): RuleDef[] {
   const own = (pageType && TYPE_RULES[pageType]) || [];
@@ -314,8 +345,13 @@ export function ruleSet(
       if (rule.key === 'keywords' && defaults.keywords?.length) {
         return { ...rule, value: defaults.keywords.join(', ') };
       }
+      if (SHORT_TYPES.has(pageType) && Object.hasOwn(SHORT_VALUES, rule.key)) {
+        return { ...rule, value: SHORT_VALUES[rule.key] };
+      }
       return rule;
-    }),
+    }).flatMap((rule) =>
+      rule.key === 'bannedWords' && defaults.bannedPhrases?.length ? [rule, BRAND_BANNED] : [rule],
+    ),
   ];
 }
 
@@ -339,8 +375,14 @@ export type TextRule = z.infer<typeof textRuleSchema>;
 
 /** The draft's choices on its rules (content_drafts.rules, 00213). */
 export const draftRulesSchema = z.object({
-  /** The page type whose set applies; null follows the draft's type. */
+  /** The page type whose set applies; null follows the draft's type (ruleSetType). */
   set: z.enum(PAGE_TYPES).nullable(),
+  /**
+   * The page's type when that set was picked: the set holds while the page
+   * keeps it. None on a set picked before it was kept (legacyPin): that set
+   * holds whatever the type. Only the person's own pick writes it.
+   */
+  setFor: z.enum(PAGE_TYPES).optional(),
   /**
    * The set the draft started from: Ansvisor's default, or the workspace's
    * My rules (00214). Null until the person changes something: the
@@ -365,6 +407,61 @@ export const NO_DRAFT_RULES: DraftRules = {
   overrides: {},
   textRules: [],
 };
+
+/**
+ * A set picked before a pick kept the page's type with it (setFor): it holds
+ * whatever the page type, with or without one, its type rules checked, as it
+ * always did, until the person picks a set again.
+ */
+export const legacyPin = (rules: Pick<DraftRules, 'set' | 'setFor'>): boolean =>
+  !!rules.set && !rules.setFor;
+
+/**
+ * The page type whose set applies: a set picked before setFor (legacyPin)
+ * whatever the page type; one the person picked while the page had another
+ * type, as long as the page keeps that type; else the page type's own (a
+ * type set or changed since, or a set picked with none), so the rules
+ * follow the page type.
+ */
+export function ruleSetType(
+  rules: Pick<DraftRules, 'set' | 'setFor'>,
+  pageType: string | null,
+): PageType | null {
+  const own = isPageType(pageType) ? pageType : null;
+  if (legacyPin(rules)) return rules.set;
+  return rules.set && own && rules.setFor === own ? rules.set : own;
+}
+
+/**
+ * The draft's choices once the person picks its page type (the header's
+ * menu, Next's Set page type): a deliberate choice about the rules, so the
+ * set follows that type (the owner, 2026-11-14). A set picked before setFor
+ * (legacyPin) goes, and so does one picked for another type (it already fell
+ * back). Only the pin goes: the custom values, text rules, source and the
+ * page's own length stay, so a rule the type's set also has keeps its value.
+ * A set picked for this very type stays, and so does everything when no set
+ * is pinned: null then, nothing to save. Every other change keeps the pin
+ * (ruleSetType).
+ */
+export function rulesForPageType(rules: DraftRules, pageType: PageType): DraftRules | null {
+  if (!rules.set || rules.setFor === pageType) return null;
+  const next: DraftRules = { ...rules, set: null };
+  delete next.setFor;
+  return next;
+}
+
+/**
+ * The page type the rules are checked as (RuleContext's pageType): the
+ * page's own, so another type's rules are set apart; a set picked before
+ * setFor (legacyPin) its own, so its type rules are checked as they were.
+ */
+export function rulesPageType(
+  rules: Pick<DraftRules, 'set' | 'setFor'>,
+  pageType: string | null,
+): PageType | null {
+  if (legacyPin(rules)) return rules.set;
+  return isPageType(pageType) ? pageType : null;
+}
 
 /** A workspace's My rules for one page type (content_rule_sets, 00214). */
 export const savedRuleSetSchema = z.object({
@@ -626,9 +723,20 @@ export const RULE_LENGTH_MAX = 50_000;
  */
 export function ruleLength(rules: ActiveRule[], pageType: PageType | null): number {
   const rule = rules.find((r) => r.key === 'length');
-  const value = rule?.on ? Number(rule.current) : NaN;
+  const value = rule?.on ? (lengthSpan(rule.current)?.target ?? NaN) : NaN;
   if (!Number.isFinite(value) || value <= 0) return lengthTarget(pageType);
   return Math.min(RULE_LENGTH_MAX, Math.max(RULE_LENGTH_MIN, value));
+}
+
+/**
+ * The range the person set on the Length rule while it is on, as the agent
+ * is told to keep within it; undefined for one number (the agent aims at
+ * it, its band as before), with the rule off or unset.
+ */
+export function ruleLengthBand(rules: ActiveRule[]): { min: number; max: number } | undefined {
+  const rule = rules.find((r) => r.key === 'length');
+  const span = rule?.on && /[-–—]/.test(rule.current) ? lengthSpan(rule.current) : null;
+  return span ? { min: span.min, max: span.max } : undefined;
 }
 
 /**
@@ -675,7 +783,8 @@ const BLOCK_TAGS = 'h1, h2, h3, p, li, table, ol, ul, blockquote';
 
 /** Reads the page's blocks in order, each list item and table once. */
 export function readPage(html: string, characters: number): PageRead {
-  const doc = new DOMParser().parseFromString(html, 'text/html');
+  // The content DOM's parser (dom.ts): the browser's, or jsdom's on the server (go-live gate).
+  const doc = parseHtml(html);
   const blocks: PageBlock[] = [];
   for (const el of doc.body.querySelectorAll(BLOCK_TAGS)) {
     const tag = el.tagName.toLowerCase();
@@ -703,7 +812,7 @@ export function readPage(html: string, characters: number): PageRead {
   for (const el of doc.body.querySelectorAll('[data-html-block]')) {
     const inner = decodeHtmlBlock(el.getAttribute('data-html-block') ?? '');
     if (!inner) continue;
-    const block = new DOMParser().parseFromString(inner, 'text/html');
+    const block = parseHtml(inner);
     htmlBlockH1s += [...block.body.querySelectorAll('h1')].filter((h) =>
       h.textContent?.trim(),
     ).length;
@@ -742,6 +851,8 @@ export type RuleStatus =
       count: number;
       /** The linked products that no longer sell, by name and why (shopLinksLive). */
       items?: { title: string; state: ShoppingLinkState }[];
+      /** The brand's banned phrases on the page, as the brand wrote them (brandBanned). */
+      phrases?: string[];
     }
   | {
       state: 'bad';
@@ -773,6 +884,9 @@ export type RuleStatus =
         | 'notHowTo'
         | 'englishOnly'
         | 'noSizes'
+        /** Another page type's own rule (otherType), or a product's specs the page doesn't give. */
+        | 'otherType'
+        | 'needsSpecs'
         /** No shopping path yet, it's being read, or it couldn't be (shopping path, part 6). */
         | 'noShoppingPath'
         | 'shoppingReading'
@@ -798,6 +912,14 @@ export interface RuleContext {
    * couldn't be; none without a path.
    */
   shopping?: ShoppingCheck | 'reading' | 'failed' | null;
+  /**
+   * The draft's own page type, as rulesPageType reads it: another type's own
+   * rules (a set picked for another type) aren't checked on it. None where
+   * it isn't told.
+   */
+  pageType?: PageType | null;
+  /** The brand's banned phrases (Content rules), for brandBanned. None where it isn't told. */
+  bannedPhrases?: readonly string[];
 }
 
 /** Phrases that read as machine-written (spec §10, "Remove AI traces"). */
@@ -844,13 +966,8 @@ function linkHost(href: string): string | null {
   return normalizeDomain(href) || null;
 }
 
-/** Whether a fan-out's words are carried by a text, as the Sources tab reads it. */
-function carries(fanout: string, text: string): boolean {
-  const words = [...new Set(wordsOf(fanout))];
-  if (!words.length) return false;
-  const have = new Set(wordsOf(text));
-  return words.filter((w) => have.has(w)).length / words.length >= 0.75;
-}
+/** Whether a heading or an FAQ question carries a fan-out (fanoutH2, fanoutFaq). */
+const carries = carriesFanout;
 
 /**
  * An FAQ's heading, in the languages it's read in ("FAQ", "Häufig gestellte
@@ -865,6 +982,8 @@ const FAQ_HEADING =
  */
 const SIZES =
   /(?<!\p{L})(?:size\s+(?:chart|guide|table)|sizes|sizing|xxs|xs|xl|xxl|xxxl|(?:eu|us|uk)\s?\d{1,2}(?:[.,]5)?)(?!\p{L})/iu;
+/** A product's spec as a page lists it: "Weight: 1.2 kg", "Material: leather". */
+const SPEC_LINE = /^\p{L}[\p{L}\p{N} ()/-]{0,30}:\s*\S/u;
 /** The languages an FAQ's heading is read in: another page's missing FAQ isn't said. */
 const FAQ_LANGUAGES = new Set(['en', 'de', 'fr', 'es', 'tr', 'it', 'pt', 'nl']);
 const isFaqHeading = (text: string) =>
@@ -922,6 +1041,36 @@ export function lengthBand(target: number): { min: number; max: number } {
     min: Math.round(target * (1 - LENGTH_TOLERANCE)),
     max: Math.round(target * (1 + LENGTH_TOLERANCE)),
   };
+}
+
+/** One bound of a Length range, as typed: "4500", "4,500" or "4.500". */
+const lengthBound = (text: string): number | null => {
+  const digits = text.replace(/[\s.,]/g, '');
+  return /^\d{1,6}$/.test(digits) && Number(digits) > 0 ? Number(digits) : null;
+};
+
+/**
+ * A Length as set: one number, met within LENGTH_TOLERANCE of it either
+ * way, or a range the person sets ("4500-5500", editor test 2026-11-03:
+ * a Length no rewrite hits exactly), met within it and aimed at its
+ * middle. Null for neither (no value, 0, or something else).
+ */
+export function lengthSpan(value: string): { target: number; min: number; max: number } | null {
+  const range = value.split(/[-–—]/);
+  if (range.length === 2) {
+    const a = lengthBound(range[0]);
+    const b = lengthBound(range[1]);
+    if (a === null || b === null) return null;
+    const [min, max] = a <= b ? [a, b] : [b, a];
+    return { target: Math.round((min + max) / 2), min, max };
+  }
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? { target: n, ...lengthBand(n) } : null;
+}
+
+/** A Length range as the rule keeps it: "4500-5500", the smaller first. */
+export function lengthRangeValue(min: number, max: number): string {
+  return `${Math.min(min, max)}-${Math.max(min, max)}`;
 }
 
 const atLeast = (have: number, want: number): RuleStatus =>
@@ -1013,6 +1162,20 @@ export function overLengthFor<T extends { rule: ActiveRule; status: RuleStatus }
 }
 
 /**
+ * The page's characters now and the most its Length allows, while the
+ * Length rule is on and set (editor UX review 2026-11-03, decision b): a
+ * Fix or a hand-off never adds past it (content-agent.js capToLength).
+ */
+export function lengthCapFor<T extends { rule: ActiveRule }>(
+  rules: T[],
+  characters: number,
+): { count: number; max: number } | undefined {
+  const length = rules.find(({ rule }) => rule.key === 'length' && rule.on);
+  const span = length ? lengthSpan(length.rule.current) : null;
+  return span ? { count: Math.max(0, Math.round(characters)), max: span.max } : undefined;
+}
+
+/**
  * What to say when only held rules are left for the agent: the quoted
  * passages' (a sentence in one), else the Length's, out of a rewrite's reach.
  */
@@ -1068,6 +1231,8 @@ export const NO_REACH: RewriteReach = { kept: 0, floor: 0, last: null };
 export interface LengthOutOfReach {
   count: number;
   target: number;
+  /** The most the Length allows (lengthSpan). */
+  max: number;
   /** The characters a rewrite keeps as they are. */
   kept: number;
   /** Why: the least a rewrite comes to is past the Length, or the last rewrite came to `least`. */
@@ -1117,31 +1282,37 @@ export function keptOutOfReach<T extends { rule: ActiveRule; status: RuleStatus 
 }
 
 /**
+ * How much longer than the last rewrite came to the page must be for that
+ * rewrite to say another won't get further: a page that took it (about as
+ * long, or shorter) is rewritten from there, and the cut pass goes on.
+ */
+const REWRITTEN_SLACK = 0.05;
+
+/**
  * Whether the page is over its Length by more than a rewrite could take
  * out: the least a rewrite comes to (`reach.floor`) is past the top of the
- * Length's band, or the last rewrite (lastRewriteSays) came to more than it.
- * A last rewrite that got within the band says it's in reach, whatever the
- * estimate. Null otherwise, and for a page under its Length.
+ * Length's band, or the last rewrite (lastRewriteSays) came to more than it
+ * from a page still longer than it came to (editor test 2026-11-03: a
+ * rewrite taken a little long held the Length out of reach for good, and
+ * the agent never shortened the page again). A last rewrite that got
+ * within the band says it's in reach, whatever the estimate. Null
+ * otherwise, and for a page under its Length.
  */
 export function lengthOutOfReach<T extends { rule: ActiveRule; status: RuleStatus }>(
   rules: T[],
   reach: RewriteReach,
 ): LengthOutOfReach | null {
   const length = rules.find(({ rule }) => rule.key === 'length' && rule.on);
-  const target = Number(length?.rule.current);
+  const span = length ? lengthSpan(length.rule.current) : null;
   const status = length?.status;
-  if (
-    status?.state !== 'bad' ||
-    status.code !== 'long' ||
-    !Number.isFinite(target) ||
-    target <= 0
-  ) {
-    return null;
-  }
-  const { max } = lengthBand(target);
+  if (status?.state !== 'bad' || status.code !== 'long' || !span) return null;
+  const { target, max } = span;
   const says = lastRewriteSays(reach.last, target, reach.kept);
   if (says?.inReach && says.chars <= max) return null;
-  const reached = says && says.chars > max ? says.chars : null;
+  const reached =
+    says && says.chars > max && status.count > says.chars * (1 + REWRITTEN_SLACK)
+      ? says.chars
+      : null;
   if (reached === null && reach.floor <= max) return null;
   // The more of the two, so the Length suggested is one a rewrite can reach.
   const least = Math.max(reach.floor, reached ?? 0);
@@ -1152,6 +1323,7 @@ export function lengthOutOfReach<T extends { rule: ActiveRule; status: RuleStatu
   return {
     count: status.count,
     target,
+    max,
     kept: reach.kept,
     why,
     least,
@@ -1180,7 +1352,7 @@ export function rewriteAdvice<T extends { rule: ActiveRule; status: RuleStatus }
   held: ReadonlySet<string> = NO_HELD,
 ): RewriteAdvice | null {
   const length = rules.find(({ rule }) => rule.key === 'length' && rule.on);
-  const target = Number(length?.rule.current);
+  const target = length ? (lengthSpan(length.rule.current)?.target ?? NaN) : NaN;
   const status = length?.status;
   // An empty page has nothing to rewrite, and one too long can't be sent whole.
   if (status && 'count' in status && (status.count === 0 || status.count > REWRITE_MAX_CHARS)) {
@@ -1268,6 +1440,13 @@ export const ruleNumber = (rule: Pick<ActiveRule, 'current'>) =>
 
 /** Checks one rule against the page as written. */
 export function checkRule(rule: ActiveRule, page: PageRead, ctx: RuleContext): RuleStatus {
+  if (
+    rule.group === 'type' &&
+    ctx.pageType !== undefined &&
+    !(ctx.pageType && TYPE_RULES[ctx.pageType]?.some((own) => own.key === rule.key))
+  ) {
+    return { state: 'info', code: 'otherType' };
+  }
   if (rule.check === 'feed') return feedStatus(page, ctx.catalog);
   if (rule.key === 'whoFor' && !rule.current.trim()) return { state: 'bad', code: 'notSet' };
   if (rule.check === 'ai') return { state: 'info', code: 'aiCheck' };
@@ -1301,7 +1480,8 @@ export function checkRule(rule: ActiveRule, page: PageRead, ctx: RuleContext): R
       return over ? { state: 'bad', code: 'over', count: over } : { state: 'ok' };
     }
     case 'length': {
-      const { min, max } = lengthBand(n);
+      // A range as set, else the band around one number (a Length of 0 reads every page long).
+      const { min, max } = lengthSpan(rule.current) ?? lengthBand(n);
       if (page.characters < min) {
         return { state: 'bad', code: 'short', count: page.characters, min, max };
       }
@@ -1408,13 +1588,26 @@ export function checkRule(rule: ActiveRule, page: PageRead, ctx: RuleContext): R
       const found = list(rule.current).reduce((sum, word) => sum + count(page.text, word), 0);
       return found ? { state: 'bad', code: 'found', count: found } : { state: 'ok' };
     }
+    case 'brandBanned': {
+      // As Chat's draft check reads them: whole words, in any case.
+      const phrases = bannedPhrasesIn([page.text], ctx.bannedPhrases ?? []);
+      return phrases.length
+        ? { state: 'bad', code: 'found', count: phrases.length, phrases }
+        : { state: 'ok' };
+    }
     case 'comparisonTable':
     case 'sideBySide':
     case 'specsTable':
     case 'sizeChart':
-      return blocks.some((b) => b.tag === 'table')
-        ? { state: 'ok' }
-        : { state: 'bad', code: 'missing' };
+      if (blocks.some((b) => b.tag === 'table')) return { state: 'ok' };
+      // No specs on the page to set out: the agent won't invent them.
+      if (
+        rule.key === 'specsTable' &&
+        blocks.filter((b) => isText(b) && SPEC_LINE.test(b.text)).length < 2
+      ) {
+        return { state: 'info', code: 'needsSpecs' };
+      }
+      return { state: 'bad', code: 'missing' };
     case 'proofPerSection': {
       const sections = splitSections(blocks);
       if (!sections.length) return { state: 'bad', code: 'noH2' };
@@ -1533,8 +1726,8 @@ export function lengthConflict(
     return n;
   };
   const length = statuses.find((s) => s.rule.key === 'length')?.rule;
-  const target = length?.on ? Number(length.current) : NaN;
-  if (!Number.isFinite(target) || target <= 0) return null;
+  const span = length?.on ? lengthSpan(length.current) : null;
+  if (!span) return null;
   const need =
     Math.min(asked('fanoutH2'), fanouts) * LEAST_SECTION +
     Math.max(
@@ -1546,9 +1739,24 @@ export function lengthConflict(
     (asked('summary') ? LEAST_SUMMARY : 0);
   // The page holds them all already: it shows they fit.
   if (counted.every((status) => status.state === 'ok')) return null;
-  const { max } = lengthBand(target);
+  const { max } = span;
   return need > max ? { need, max } : null;
 }
+
+/**
+ * A rule this page can't meet: it doesn't apply here, or can't be checked
+ * (another type's rule, no feed, no sizes, no specs, no fan-outs…). The
+ * Rules tab sets it apart, "Not checked on this page"; it is never counted
+ * (rulesMet) nor sent to the Content Agent. Not an AI check, which applies,
+ * nor a feed or catalog still being read.
+ */
+const CHECKED_INFO: ReadonlySet<string> = new Set(['aiCheck', 'feedReading', 'shoppingReading']);
+export const notCheckedHere = (status: RuleStatus): boolean =>
+  status.state === 'info' && !CHECKED_INFO.has(status.code);
+
+/** The brand's banned phrases a rule's status found on the page (brandBanned); none otherwise. */
+export const phrasesFound = (status: RuleStatus | undefined): string[] =>
+  (status?.state === 'bad' && 'phrases' in status && status.phrases) || [];
 
 /** How many of the rules in effect are met: off rules and ones the page can't say don't count. */
 export function rulesMet(statuses: { rule: ActiveRule; status: RuleStatus }[]): {
@@ -1557,4 +1765,11 @@ export function rulesMet(statuses: { rule: ActiveRule; status: RuleStatus }[]): 
 } {
   const counted = statuses.filter((s) => s.rule.on && s.status.state !== 'info');
   return { met: counted.filter((s) => s.status.state === 'ok').length, total: counted.length };
+}
+
+/** The language a draft's own Language rule names, when it is on and set. */
+export function draftLanguage(rules: unknown): string | null {
+  const language = draftRulesSchema.safeParse(rules).data?.overrides.language;
+  const value = language?.on === false ? '' : (language?.value?.trim() ?? '');
+  return value || null;
 }

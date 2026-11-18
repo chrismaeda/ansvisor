@@ -2,6 +2,9 @@ import { randomUUID } from 'crypto';
 import { NoObjectGeneratedError, generateObject } from 'ai';
 import { z } from 'zod';
 import supabaseAdmin from '../config/supabase.js';
+import { brandRulesSection } from './brand-rules.js';
+import { readBrandRules } from './brand-rules-read.js';
+import { bannedPhrasesIn, readBannedPhrases } from './content-rules.js';
 import { resolveModel } from './ai-provider.js';
 import {
   ATTRIBUTION_RULE,
@@ -13,7 +16,6 @@ import {
   HEADING_RULE,
   LINK_RULE,
   MAX_AGENT_SUGGESTIONS,
-  PLACEHOLDER_RULE,
   draftPassages,
   hasOpenSuggestions,
   keepSuggestions,
@@ -24,13 +26,36 @@ import {
   WRITING_STALE_MS,
 } from './content-agent.js';
 import {
+  CONTENT_WRITE_MAX_TOKENS,
   WRITING_GUARDRAIL,
   briefForWriter,
   briefRulesOn,
-  contentBriefModelId,
+  contentReadModelId,
+  contentWriteModelId,
+  rebuildDraftBrief,
   rebuildSources,
 } from './content-brief.js';
+import {
+  HEALTH_RULE,
+  healthGuard,
+  healthHtml,
+  healthPage,
+  withoutHealthFinds,
+} from './content-health.js';
 import { inputSources, readDraftInputs } from './content-inputs.js';
+import {
+  RESEARCH_RULE,
+  applyEdits,
+  editHtml,
+  linkFacts,
+  lookUpFacts,
+  lookUpSuggestionFacts,
+  pageOwn,
+  settler,
+  sweepHtml,
+  sweeper,
+  withFactLinks,
+} from './content-research.js';
 import { draftLanguage } from './content-language.js';
 import { linkAllowList, linkTargetsPrompt, readLinkTargets } from './content-links.js';
 import { insertProductGrid } from './shopping-blocks.js';
@@ -71,6 +96,7 @@ import {
   textLength,
 } from './content-rewrite.js';
 import {
+  RunStoppedError,
   advanceRun,
   finishRun,
   fixUnderWay,
@@ -82,6 +108,7 @@ import {
 import { getLanguageName } from './languages.js';
 import { logger } from './logger.js';
 import { reserveAiBudget } from './plan-guard.js';
+import { objectOptions } from './structured-output.js';
 
 /**
  * "Agent" in the Content Editor's Start (CE-015, spec §5): the Content Agent
@@ -103,12 +130,6 @@ import { reserveAiBudget } from './plan-guard.js';
 const CALL_TIMEOUT_MS = 180_000;
 /** How far a Length's band reaches either side of it (the editor's LENGTH_TOLERANCE). */
 const LENGTH_TOLERANCE = 0.2;
-/**
- * How far past the top of its Length's band a rewrite may come before one
- * more pass cuts it: 15% of the Length (editor test 2026-10-25, where
- * rewrites for 4,000 came to 5,468, 6,843 and 7,335 characters).
- */
-const CUT_PASS_OVER = 0.15;
 
 // A 'writing' older than WRITING_STALE_MS (content-agent.js, which Fix open
 // rules checks too) was left by a server that stopped: it can start again.
@@ -144,6 +165,12 @@ export const writeDraftInput = z.object({
    * hold those only AI can read (tone, language).
    */
   counted: z.number().int().min(0).max(60).optional(),
+  /**
+   * Write this (customer priorities item 9): the brief is built from these
+   * sources first, in the same run, and the page written from it. A draft
+   * with a brief of its own keeps it.
+   */
+  buildBrief: z.boolean().optional(),
 });
 
 export const pageSchema = z.object({
@@ -173,10 +200,11 @@ How to write:
 - Answer first: the opening paragraphs answer the page's main question directly.
 - Follow the outline when there is one; each H2 answers one of the questions or AI searches given.
 - Short paragraphs and plain sentences. Lists where a reader compares or follows steps.
-- Follow every rule listed, and the writer's own rules.
+- Follow the brand's rules first, then every rule listed and the writer's own rules; when they disagree, the brand's rule wins.
 - For each fan-out a rule names, use its words, not questions of your own: a section heading for fanoutH2, an FAQ question ending in "?" for fanoutFaq.
-- Use only facts from the brand, the brief and your data. Never invent numbers, prices, dates, names, customers, sources or quotes. When the page needs a fact you don't have, write a placeholder in square brackets, e.g. [price], [figure, source, year]. A number that isn't in them becomes a placeholder.
-${PLACEHOLDER_RULE}
+- Use only facts from the brand, the brief and your data, and the ones you ask to have looked up. Never invent numbers, prices, dates, names, customers, sources or quotes.
+${RESEARCH_RULE}
+${HEALTH_RULE}
 - Plain text in every field: no HTML, no Markdown.
 - Write in the language asked for.`;
 
@@ -184,7 +212,7 @@ ${PLACEHOLDER_RULE}
  * With the brief rules (2026) on: the brief's section plans followed, headings
  * kept short (the editor's limits), and the guardrail.
  */
-const WRITE_RULES_2026 = `- Follow the brief's section plans when it has them: each section's answer first, its format, the facts it names (a placeholder until a source is found), the names as written.
+const WRITE_RULES_2026 = `- Follow the brief's section plans when it has them: each section's answer first, its format, the facts it names (from your data, else looked up with {{find: …}}), the names as written.
 - Headings are one short line: the title up to ${HEADING_LIMITS.h1} characters, each section heading about 8 to 15 words (a fan-out's own words, when shorter) and under ${HEADING_LIMITS.other} characters. Never put a sentence or an answer in a heading.
 ${WRITING_GUARDRAIL}`;
 
@@ -210,8 +238,9 @@ ${LINK_RULE}
 ${FANOUT_RULE}
 - Never change a passage marked LOCKED: AI assistants quote its wording today. You may insert after it.
 - Put the keys of the rules a change meets in "rules" (none when it meets none).
-- Use only facts from the page, the brand and your data. Never invent numbers, prices, dates, names, sources or quotes; write a placeholder in square brackets instead, e.g. [figure, source, year].
-${PLACEHOLDER_RULE}
+- Use only facts from the page, the brand and your data, and the ones you ask to have looked up. Never invent numbers, prices, dates, names, sources or quotes.
+${RESEARCH_RULE}
+${HEALTH_RULE}
 ${SOURCES_RULE}
 ${ATTRIBUTION_RULE}
 - Keep the page's voice. The most useful changes first, at most ${MAX_AGENT_SUGGESTIONS}.
@@ -296,6 +325,64 @@ export function sourcedPage(page, known, people = knownPeople()) {
   };
 }
 
+/**
+ * A written page with `editsFor(text, heading)`'s edits ({ start, end,
+ * text }) made in each of its texts, in order: the title, the intro, each
+ * section's heading, paragraphs and list, the FAQ's heading, questions and
+ * answers (content-research.js lookUpFacts, settler).
+ */
+export function editPage(page, editsFor) {
+  const fix = (text, heading = false) => applyEdits(text, editsFor(String(text ?? ''), heading));
+  const heading = (text) => fix(text, true);
+  return {
+    ...page,
+    title: heading(page.title),
+    intro: page.intro.map((text) => fix(text)),
+    sections: page.sections.map((section) => ({
+      ...section,
+      heading: heading(section.heading),
+      paragraphs: section.paragraphs.map((text) => fix(text)),
+      bullets: section.bullets.map((text) => fix(text)),
+    })),
+    faqHeading: heading(page.faqHeading),
+    faq: page.faq.map((item) => ({ question: heading(item.question), answer: fix(item.answer) })),
+  };
+}
+
+/**
+ * The cited pages' checks the writer can give a page in its body HTML. Not
+ * its schema (FAQ schema, JSON-LD), date markup or freshness, which the
+ * site's template or CMS sets, nor its byline, which would name a person the
+ * writer doesn't know. The Brief tab still shows them all.
+ */
+export const WRITER_CHECKS = Object.freeze([
+  'length',
+  'structural-depth',
+  'h2-coverage',
+  'lists',
+  'tables',
+  'statistic-density',
+  'quotations',
+  'citation-density',
+  'outbound-authority-links',
+  'readability',
+]);
+
+/**
+ * What the pages AI cites for the draft's prompts have (learning C2), as the
+ * brief's rebuild read them through Site Audit's checks: seen, not guessed.
+ * Only what the writer can give the page (WRITER_CHECKS).
+ */
+export function citedHave(features) {
+  const checks = (features?.checks ?? []).filter(
+    (c) => c?.label && c.pages > 0 && WRITER_CHECKS.includes(c.key),
+  );
+  if (!checks.length) return '';
+  return `\nWhat the pages AI cites for these prompts have (Site Audit's checks, ${features.pages} pages read): ${checks
+    .map((c) => `${c.label} on ${c.pages}`)
+    .join('; ')}. Give the page these where they serve its readers.`;
+}
+
 /** The brief as the model reads it: the draft's own, else its opportunity's. */
 export function briefText(draftBrief, opportunityBrief, { links = true } = {}) {
   if (draftBrief?.outline?.length || draftBrief?.goal) {
@@ -309,7 +396,7 @@ export function briefText(draftBrief, opportunityBrief, { links = true } = {}) {
 Audience: ${draftBrief.audience || '—'}
 Outline:
 ${list(sections)}
-Keywords: ${(draftBrief.keywords ?? []).join(', ') || '—'}${plan ? `\n${plan}` : ''}`;
+Keywords: ${(draftBrief.keywords ?? []).join(', ') || '—'}${citedHave(draftBrief.citedFeatures)}${plan ? `\n${plan}` : ''}`;
   }
   if (opportunityBrief?.outline?.length) {
     const sections = opportunityBrief.outline.map(
@@ -329,9 +416,9 @@ Call to action: ${opportunityBrief.callToAction || '—'}`;
  * suggestions should do about it: a page told only the Length doesn't know
  * it's already twice as long (editor test 2026-10-26).
  */
-export function lengthNow(now, target) {
-  const top = Math.round(target * (1 + LENGTH_TOLERANCE));
-  const bottom = Math.round(target * (1 - LENGTH_TOLERANCE));
+export function lengthNow(now, target, band = null) {
+  const top = band?.max ?? Math.round(target * (1 + LENGTH_TOLERANCE));
+  const bottom = band?.min ?? Math.round(target * (1 - LENGTH_TOLERANCE));
   if (now > top) {
     return `The page is about ${now} characters now, over its Length: suggest cuts (repetition, filler, the least useful detail) before anything new, and keep each addition short.`;
   }
@@ -339,6 +426,16 @@ export function lengthNow(now, target) {
     return `The page is about ${now} characters now, under its Length: add what the questions and rules ask for.`;
   }
   return `The page is about ${now} characters now: keep it about this long.`;
+}
+
+/**
+ * The Length as the model is told it: about so many characters, or within
+ * the range the person set (editor test 2026-11-03).
+ */
+export function lengthLine({ length, lengthBand }) {
+  return lengthBand
+    ? `between ${lengthBand.min} and ${lengthBand.max} characters, about ${length}.`
+    : `about ${length} characters.`;
 }
 
 /**
@@ -370,6 +467,13 @@ export function buildWritePrompt({
   const of = (kind) => numbered.filter((s) => s.kind === kind);
   const rules = input.rules.map((r) => `${r.key}: ${r.name}${r.detail ? ` — ${r.detail}` : ''}`);
   const own = input.textRules.map((text) => `- ${text}`);
+  // The brand's rules (Settings › Content, 00450): before the writer's own, which they outrank.
+  const brandRules = brandRulesSection(brand.rules, "The brand's rules, which come first:");
+  // Settings › Content's banned phrases (brands.content_rules): never in the page, nor its title.
+  const banned = brand?.bannedPhrases ?? [];
+  const bannedLine = banned.length
+    ? `Never use these phrases, in the page or its title: ${banned.map((p) => `"${p}"`).join(', ')}. Say it in other words.`
+    : '';
   // Brief › Your input, the person's own (CE-048): with what to do with it.
   const given = of('input').map(
     (s) => `${s.id} "${s.label}" (${s.detail})${s.note ? ` — ${s.note}` : ''}`,
@@ -391,7 +495,7 @@ Industry: ${brand?.industry || 'Not specified'}
 ${siteTypeLine(brand)}Description: ${brand?.description || 'N/A'}
 
 Page type: ${pageTypeFormat(draft.page_type)}
-Length: about ${sources.length} characters.${now === null ? '' : ` ${lengthNow(now, sources.length)}`}
+Length: ${lengthLine(sources)}${now === null ? '' : ` ${lengthNow(now, sources.length, sources.lengthBand)}`}
 
 Brief:
 ${brief}
@@ -412,7 +516,7 @@ ${list(of('cited_page').map((s) => `${s.id} ${s.label}`))}
 ${given.length ? `\nYour input, the person's own for this page:\n${given.join('\n')}\n${INPUT_RULE}\n` : ''}
 Rules (key: rule — what it asks):
 ${list(rules)}
-${own.length ? `\nThe writer's own rules:\n${own.join('\n')}\n` : ''}${linkTargets ? `\n${linkTargets}\n` : ''}
+${brandRules ? `\n${brandRules}\n` : ''}${bannedLine ? `\n${bannedLine}\n` : ''}${own.length ? `\nThe writer's own rules:\n${own.join('\n')}\n` : ''}${linkTargets ? `\n${linkTargets}\n` : ''}
 ${page}
 
 Write in ${current ? "the page's own language" : getLanguageName(brand?.language)}.`;
@@ -538,7 +642,10 @@ export async function startDraftWriting({ draftId, brandId, input, rewrite = fal
     .eq('id', brandId)
     .single();
   if (brandError) throw brandError;
-  const modelId = contentBriefModelId();
+  // The brand's rules (00450), read here: the prompts put them first.
+  brand.rules = await readBrandRules(brandId);
+  brand.bannedPhrases = await readBannedPhrases(brandId);
+  const modelId = contentWriteModelId();
   // Held on the budget now, for the run below: starts at once can't pass it.
   const budget = await reserveAiBudget(brand.organization_id, {
     feature: 'content',
@@ -579,19 +686,66 @@ export async function startDraftWriting({ draftId, brandId, input, rewrite = fal
       });
     }
 
-    // Written before the answer, so the editor reads its steps, and Stop finds
-    // it, at once; with its claim, the one a Stop on it lets go of.
     const held = { ...draft, agent_state: 'writing', agent_state_at: claimedAt };
-    const run = await startWritingRun(held, input, rewrite);
-    runDraftWriting({ draft: held, brand, model, input, budget, rewrite, run }).catch((err) =>
-      logger.error({ err, draftId }, '[content-writer] run failed'),
-    );
+    if (input.buildBrief && !rewrite && !draft.brief) {
+      // Write this: the brief's run first, holding the claim, then the page's.
+      briefThenWrite({ draft: held, brand, model, modelId, input, budget }).catch((err) =>
+        logger.error({ err, draftId }, '[content-writer] run failed'),
+      );
+    } else {
+      // Written before the answer, so the editor reads its steps, and Stop finds
+      // it, at once; with its claim, the one a Stop on it lets go of.
+      const run = await startWritingRun(held, input, rewrite);
+      runDraftWriting({ draft: held, brand, model, modelId, input, budget, rewrite, run }).catch(
+        (err) => logger.error({ err, draftId }, '[content-writer] run failed'),
+      );
+    }
   } catch (err) {
     // Not started: the hold goes.
     await budget.release();
     throw err;
   }
   return { started: true };
+}
+
+/**
+ * Write this (customer priorities item 9): the draft's brief built from the
+ * sources the page is written from, as the editor's Build brief builds it
+ * (its own run, shown step by step, holding the draft's claim so a Stop lets
+ * go of it), then the page written from it. A brief that can't be built (no
+ * sources, the AI budget, the model) leaves the page written from what there
+ * is, as Start writes it; a Stop ends both, and the hold on the budget goes.
+ */
+async function briefThenWrite({ draft, brand, model, modelId, input, budget }) {
+  let brief = null;
+  try {
+    brief = await rebuildDraftBrief({
+      draftId: draft.id,
+      brandId: draft.brand_id,
+      sources: input.sources,
+      // As the editor's rulesForBrief: a rebuild writes the keywords anew from the sources.
+      rules: input.rules.filter((rule) => rule.key !== 'keywords'),
+      claimedAt: draft.agent_state_at,
+    });
+  } catch (err) {
+    if (err instanceof RunStoppedError) {
+      await budget.release();
+      // The Stop let go of the claim; this only ends one it couldn't.
+      await finish(draft, { agent_state: null }).catch((finishErr) =>
+        logger.error({ err: finishErr, draftId: draft.id }, '[content-writer] state not saved'),
+      );
+      return { stopped: true };
+    }
+    logger.warn({ err, draftId: draft.id }, '[content-writer] brief not built, writing without it');
+  }
+  return runDraftWriting({
+    draft: brief ? { ...draft, brief } : draft,
+    brand,
+    model,
+    modelId,
+    input,
+    budget,
+  });
 }
 
 /**
@@ -630,15 +784,18 @@ async function letGo(draft) {
  */
 async function rewritePage({
   attributable,
+  language,
   draft,
   shoppingPath,
   brand,
   model,
+  modelId,
   input,
   budget,
   numbered,
   known,
   people,
+  health,
   brief,
   run,
 }) {
@@ -646,6 +803,8 @@ async function rewritePage({
   const ruleKeys = new Set(input.rules.map((r) => r.key));
   // The Length rule's target; with Length off, the page keeps its length.
   const length = ruleKeys.has('length') ? input.sources.length : textLength(draft.body_html);
+  // A range the person set: the cut pass keeps the page within it.
+  const band = ruleKeys.has('length') ? (input.sources.lengthBand ?? null) : null;
   // Where it may link: the brand's pages and the draft's sources (A).
   // …and its shopping path's shop pages (shopping path, part 4).
   const targets = withShopping(
@@ -661,7 +820,7 @@ async function rewritePage({
   const { object, usage } = await runCall(run, budget, CALL_TIMEOUT_MS, (abortSignal) =>
     generateObject({
       model,
-      schema: rewriteSchema,
+      ...objectOptions(modelId, rewriteSchema, { maxOutputTokens: CONTENT_WRITE_MAX_TOKENS }),
       system: rewriteSystemPrompt(),
       prompt: buildWritePrompt({
         brand,
@@ -677,31 +836,72 @@ async function rewritePage({
   );
   await budget.charge(usage);
   if (!isPageHtml(object.html)) throw new Error('The agent answered with no page in HTML');
-  // Well past its Length: one more pass that only cuts.
-  const answer = ruleKeys.has('length')
-    ? await cutToLength({ answer: object, page, length, brand, draft, model, run })
-    : object;
+  // Well past its Length: one more pass that only cuts, within the rules.
+  const cut = { page, length, band, brand, draft, model, modelId, run, rules: input.rules };
+  const within = ruleKeys.has('length') ? await cutToLength({ answer: object, ...cut }) : object;
+  // A banned phrase that slipped through: those sentences once more, before
+  // the guards below read it (as a new page's, withoutBanned).
+  const answer = await rewriteWithoutBanned({
+    answer: within,
+    page,
+    brand,
+    draft,
+    model,
+    modelId,
+    run,
+  });
   await advanceRun(run, 3);
 
   // No invented person or quote (CE-044): read in its words as written,
   // blockquotes too, before what it kept goes back, so the page's own
-  // passages are never touched.
+  // passages are never touched. No health claim the brand didn't make, nor
+  // a {{find: …}} for one, before anything is looked up (content-health.js).
+  const stats = { health: 0 };
   const cleaned = cleanPageHtml(
     // A claim given to a source it wasn't given: a placeholder, not the page dropped.
-    placeholderAttributionsInHtml(guardPeopleInHtml(answer.html, people).html, attributable),
+    placeholderAttributionsInHtml(
+      guardPeopleInHtml(healthHtml(answer.html, health, stats), people).html,
+      attributable,
+    ),
     rewriteLinks(draft.body_html, linkAllowList(targets)),
     { h1Kept: page.h1Token !== null, originalH1: page.h1 },
   );
-  const { html: restored, missing } = restoreKept(cleaned, page.kept, {
+  // The facts it asked for, and the figures it wrote with no source, looked
+  // up on the web and written in with their links, or left for the person
+  // (content-research.js). Its kept lines are never read, nor its shopping
+  // path's products' specs.
+  const looked = await lookUpFacts({
+    map: (editsFor) => editHtml(cleaned, editsFor),
+    known,
+    own: pageOwn(draft.body_html),
+    products: shoppingGiven(shoppingPath).names,
+    orgId: brand.organization_id,
+    draftId: draft.id,
+    modelId: contentReadModelId(),
+    run,
+    context: { brand: brand.name, title: draft.title, language: getLanguageName(language) },
+  });
+  // No number without a source (CE-033): one nobody found is the person's
+  // to fill, as a fact only the brand has; a marker left broken goes with
+  // its sentence, in code or an attribute on its own (sweeper, sweepHtml).
+  const settled = editHtml(
+    editHtml(placeholderNumbersInHtml(looked.page, known), settler(looked.own, looked.stats)),
+    sweeper(looked.own, looked.stats),
+  );
+  // …and none the facts pass wrote in.
+  const checked = healthHtml(settled, health, stats);
+  logger.info(
+    { draftId: draft.id, ...looked.stats, health: stats.health },
+    '[content-writer] facts settled',
+  );
+  const linked = linkFacts(sweepHtml(checked, looked.own), looked.links);
+  const { html, missing } = restoreKept(linked, page.kept, {
     word: page.word,
     h1Token: page.h1Token,
   });
   if (missing.length) {
     throw new Error(`The rewrite left out ${missing.length} kept block(s)`);
   }
-  // No number without a source: one the page, the brand, the brief or the
-  // data doesn't have becomes a placeholder (CE-033).
-  const html = placeholderNumbersInHtml(restored, known);
   if (!textLength(html)) throw new Error('The agent left no page to review');
   if (html.length > MAX_PAGE_HTML) throw new Error('The rewritten page is too long to keep');
   // A batch that landed during the run stays the one to decide.
@@ -755,20 +955,37 @@ async function rewritePage({
 }
 
 /**
- * One more pass when a rewrite came well past its Length (CUT_PASS_OVER past
- * its band's top): the model cuts its own page to the Length, keeping every
- * heading with its answer, each kept line, the links and the facts. On its
- * own hold on the budget, so a budget the first pass used up skips it. The
- * cut is taken only when it is shorter and keeps every kept line; else, or
+ * One more pass when a rewrite came past the top of its Length's band
+ * (editor test 2026-10-25, where rewrites for 4,000 came to 5,468, 6,843
+ * and 7,335 characters): the model cuts its own page to the Length, keeping
+ * every heading with its answer, each kept line, the links and the facts.
+ * Any way past it, not only well past (editor test 2026-11-03: a rewrite
+ * left a little long was taken as the most a rewrite reaches, so the
+ * Length set was never met). On its own hold on the budget, so a budget
+ * the first pass used up skips it. It is told the rules, and keeps every
+ * section they ask for (editor test 2026-11-12: a cut dropped the FAQ and
+ * fan-out sections). The cut is taken only when it is shorter, keeps every
+ * kept line and, with a rule asking for sections, every heading; else, or
  * when it fails, the first rewrite stands (logged). A stop goes through.
  */
-async function cutToLength({ answer, page, length, brand, draft, model, run }) {
+async function cutToLength({
+  answer,
+  page,
+  length,
+  band,
+  brand,
+  draft,
+  model,
+  modelId,
+  run,
+  rules,
+}) {
   const total = ownText({ ...page, html: answer.html }) + page.keptChars;
-  const max = Math.round(length * (1 + LENGTH_TOLERANCE));
-  if (total <= max + length * CUT_PASS_OVER) return answer;
+  const max = band?.max ?? Math.round(length * (1 + LENGTH_TOLERANCE));
+  if (total <= max) return answer;
   const budget = await reserveAiBudget(brand.organization_id, {
     feature: 'content',
-    modelId: contentBriefModelId(),
+    modelId,
     draftId: draft.id,
   }).catch((err) => {
     logger.info(
@@ -782,9 +999,9 @@ async function cutToLength({ answer, page, length, brand, draft, model, run }) {
     const { object, usage } = await runCall(run, budget, CALL_TIMEOUT_MS, (abortSignal) =>
       generateObject({
         model,
-        schema: rewriteSchema,
+        ...objectOptions(modelId, rewriteSchema, { maxOutputTokens: CONTENT_WRITE_MAX_TOKENS }),
         system: rewriteSystemPrompt(),
-        prompt: cutPrompt({ html: answer.html, page, total, length, max }),
+        prompt: cutPrompt({ html: answer.html, page, total, length, max, rules }),
         abortSignal,
       }),
     );
@@ -798,7 +1015,11 @@ async function cutToLength({ answer, page, length, brand, draft, model, run }) {
       cut < Infinity &&
       restoreKept(object.html, page.kept, { word: page.word, h1Token: page.h1Token }).missing
         .length === 0;
-    if (cut >= total || !keepsAll) {
+    // No section a rule asks for dropped: as many headings as the first pass wrote.
+    const keepsSections =
+      !rules.some((r) => SECTION_RULES.has(r.key)) ||
+      headings(object.html) >= headings(answer.html);
+    if (cut >= total || !keepsAll || !keepsSections) {
       logger.info(
         { draftId: draft.id, total, cut },
         '[content-writer] the cut pass kept nothing shorter',
@@ -822,12 +1043,154 @@ async function cutToLength({ answer, page, length, brand, draft, model, run }) {
   }
 }
 
-/** What the cut pass is told: its own page, how long it is and the Length to cut it to. */
-function cutPrompt({ html, page, total, length, max }) {
+const bannedIn = (brand, page, title) =>
+  bannedPhrasesIn([title, renderPage(page)], brand.bannedPhrases ?? []);
+
+/**
+ * The new page without the brand's banned phrases (Settings › Content): the
+ * prompt asks, this checks. Found one, the model rewrites only the
+ * sentences that have it, once, on its own hold on the budget; the page is
+ * checked again. A failed rewrite, or a phrase left, keeps the page as
+ * written and logs the count (never the phrases). A stop goes through.
+ */
+async function withoutBanned({
+  written,
+  title,
+  brand,
+  draft,
+  language,
+  model,
+  modelId,
+  run,
+  known,
+  people,
+}) {
+  const same = { written, title };
+  const found = bannedIn(brand, written, title);
+  if (!found.length) return same;
+  let result = same;
+  const object = await bannedCall({
+    brand,
+    draft,
+    model,
+    modelId,
+    run,
+    schema: pageSchema,
+    system: writeSystemPrompt(),
+    prompt: `The page below uses phrases the brand never uses: ${found.map((p) => `"${p}"`).join(', ')}. Rewrite only the sentences (and the title or headings) that contain them, in other words. Keep everything else exactly as it is: the facts, links, placeholders in square brackets, {{find: …}} and {{ask: …}} markers. Return the whole page.\n\n${JSON.stringify(written)}\n\nWrite in the page's own language.`,
+  });
+  if (object) {
+    const next = sourcedPage(object, known, people);
+    result = {
+      written: next,
+      title: headingCase(clean(next.title).slice(0, 300), language) || title,
+    };
+  }
+  const left = bannedIn(brand, result.written, result.title);
+  if (left.length) {
+    logger.warn(
+      { brandId: draft.brand_id, count: left.length },
+      '[content-writer] banned phrases left in the page, saved anyway',
+    );
+  }
+  return result;
+}
+
+/**
+ * The banned-phrase pass's one call, on its own hold on the budget: its
+ * answer, or null without budget or when it fails. A stop goes through.
+ */
+async function bannedCall({ brand, draft, model, modelId, run, schema, system, prompt }) {
+  const budget = await reserveAiBudget(brand.organization_id, {
+    feature: 'content',
+    modelId,
+    draftId: draft.id,
+  }).catch(() => null);
+  if (!budget) return null;
+  try {
+    const { object, usage } = await runCall(run, budget, CALL_TIMEOUT_MS, (abortSignal) =>
+      generateObject({
+        model,
+        ...objectOptions(modelId, schema, { maxOutputTokens: CONTENT_WRITE_MAX_TOKENS }),
+        system,
+        prompt,
+        abortSignal,
+      }),
+    );
+    await budget.charge(usage);
+    return object;
+  } catch (err) {
+    if (isStop(err, run)) throw err;
+    if (NoObjectGeneratedError.isInstance(err) && err.usage) await budget.charge(err.usage);
+    else await budget.release();
+    return null;
+  } finally {
+    await budget.release();
+  }
+}
+
+/**
+ * A rewrite without the brand's banned phrases, as a new page is
+ * (withoutBanned): its own words are checked, never the kept lines, which
+ * are the person's. Found one, the model rewrites only those sentences,
+ * once; taken when it keeps every kept line and heading, else the rewrite
+ * stands. A phrase left is offered anyway, logged with the count.
+ */
+async function rewriteWithoutBanned({ answer, page, brand, draft, model, modelId, run }) {
+  const banned = brand.bannedPhrases ?? [];
+  const found = bannedPhrasesIn([answer.html], banned);
+  if (!found.length) return answer;
+  const object = await bannedCall({
+    brand,
+    draft,
+    model,
+    modelId,
+    run,
+    schema: rewriteSchema,
+    system: rewriteSystemPrompt(),
+    prompt: `The page below uses phrases the brand never uses: ${found.map((p) => `"${p}"`).join(', ')}. Rewrite only the sentences (and headings) that contain them, in other words. Keep everything else exactly as it is: every heading and section, every [[${page.word} n]] line exactly as it is and on its own, the links on their words, the facts, placeholders in square brackets, {{find: …}} and {{ask: …}} markers. Return the whole page.\n\n${answer.html}\n\nWrite in the page's own language.`,
+  });
+  const keeps =
+    object &&
+    isPageHtml(object.html) &&
+    restoreKept(object.html, page.kept, { word: page.word, h1Token: page.h1Token }).missing
+      .length === 0 &&
+    headings(object.html) >= headings(answer.html);
+  const next = keeps ? { ...answer, html: object.html } : answer;
+  const left = bannedPhrasesIn([next.html], banned);
+  if (left.length) {
+    logger.warn(
+      { brandId: draft.brand_id, count: left.length },
+      '[content-writer] banned phrases left in the rewrite, offered anyway',
+    );
+  }
+  return next;
+}
+
+/** The rules whose sections a cut keeps: fan-out H2s, FAQ, summary, direct answers. */
+const SECTION_RULES = new Set([
+  'fanoutH2',
+  'fanoutFaq',
+  'faq',
+  'buyingFaq',
+  'summary',
+  'h2Answer',
+  'first40Words',
+]);
+const headings = (html) => (String(html).match(/<h[23][\s>]/gi) ?? []).length;
+
+/**
+ * What the cut pass is told: its own page, how long it is, the Length to
+ * cut it to, and the rules it is written to (Length aside, said above).
+ */
+function cutPrompt({ html, page, total, length, max, rules = [] }) {
+  const meets = rules
+    .filter((r) => r.key !== 'length')
+    .map((r) => `- ${r.key}: ${r.name}${r.detail ? ` — ${r.detail}` : ''}`);
   return `Your rewrite below is about ${total} characters of text, ${page.keptChars} of them in kept blocks, which count toward Length. Its Length is ${length} characters, up to ${max}. Cut it to about ${length}.
 
-Cut repetition, filler, long examples and the least useful detail first. Keep the H1 and every heading, a short answer under each heading, every [[${page.word} n]] line exactly as it is and on its own, the links on their words, the facts and any placeholders in square brackets. Add nothing new. Return the whole page.
-
+Cut repetition, filler, long examples and the least useful detail first. Keep the H1, a short answer under each heading, every [[${page.word} n]] line exactly as it is and on its own, the links on their words, the facts, each {{find: …}} and {{ask: …}} exactly as it is, and any placeholders in square brackets. Keep every section the rules require; shorten inside sections instead. Add nothing new. Return the whole page.
+${meets.length ? `\nThe rules the page is written to (key: rule — what it asks):\n${meets.join('\n')}\n` : ''}
 ${html}
 
 Write in the page's own language.`;
@@ -837,12 +1200,15 @@ Write in the page's own language.`;
  * The run itself: the page written, or the suggestions left, and the draft
  * In review; 'failed' when the model fails or leaves nothing to review. The
  * model's answer is charged to the hold Start took on the budget
- * (reserveAiBudget); a run that ends before one lets the hold go.
+ * (reserveAiBudget); a run that ends before one lets the hold go. `modelId`
+ * is the `model`'s, for its call settings (structured-output.js) and the
+ * cut pass's hold.
  */
 export async function runDraftWriting({
   draft,
   brand,
   model,
+  modelId = contentWriteModelId(),
   input,
   budget,
   rewrite = false,
@@ -852,7 +1218,16 @@ export async function runDraftWriting({
   // before it answers, so Stop finds it at once; Stop aborts the call.
   const run = started ?? (await startWritingRun(draft, input, rewrite));
   try {
-    const result = await writeWithRun({ draft, brand, model, input, budget, rewrite, run });
+    const result = await writeWithRun({
+      draft,
+      brand,
+      model,
+      modelId,
+      input,
+      budget,
+      rewrite,
+      run,
+    });
     await finishRun(
       run,
       'done',
@@ -904,7 +1279,7 @@ function startWritingRun(draft, input, rewrite) {
 }
 
 /** The run itself, step by step: nothing is kept once it is stopped. */
-async function writeWithRun({ draft, brand, model, input, budget, rewrite, run }) {
+async function writeWithRun({ draft, brand, model, modelId, input, budget, rewrite, run }) {
   await advanceRun(run, 1);
   const [prompts, inputRow, opportunityRes, shoppingPath] = await Promise.all([
     readPrompts(draft.brand_id, input.sources.promptIds),
@@ -953,6 +1328,7 @@ async function writeWithRun({ draft, brand, model, input, budget, rewrite, run }
       shopping.prices,
       ...input.rules.flatMap((r) => [r.name, r.detail]),
       ...input.textRules,
+      ...(brand.rules ?? []),
       todayText(),
     ),
     shopping.names,
@@ -973,9 +1349,25 @@ async function writeWithRun({ draft, brand, model, input, budget, rewrite, run }
     ...shopping.names,
     ...input.rules.flatMap((r) => [r.name, r.detail]),
     ...input.textRules,
+    ...(brand.rules ?? []),
     ...numbered.map(sourceWords),
     ...authors,
   );
+  // A health brand's guard: the claims it made in its own words (the page,
+  // its description, Your input, its products' names and the rules people
+  // wrote), never the brief's, a buyer's or a cited page's (content-health.js).
+  const health = healthGuard(brand, {
+    html: draft.body_html,
+    texts: [
+      draft.title,
+      brand.name,
+      brand.description,
+      ...shopping.names,
+      ...input.textRules,
+      ...(brand.rules ?? []),
+    ],
+    numbered,
+  });
   // The sources a claim may be given to: the ones the page gives claims to,
   // its Your input and authors (editor test 2026-10-25).
   const language = await draftLanguage(draft, brand);
@@ -986,15 +1378,18 @@ async function writeWithRun({ draft, brand, model, input, budget, rewrite, run }
   if (rewrite) {
     return await rewritePage({
       attributable,
+      language,
       draft,
       shoppingPath,
       brand,
       model,
+      modelId,
       input,
       budget,
       numbered,
       known: knownInPage,
       people,
+      health,
       brief,
       run,
     });
@@ -1005,7 +1400,7 @@ async function writeWithRun({ draft, brand, model, input, budget, rewrite, run }
     const { object, usage } = await runCall(run, budget, CALL_TIMEOUT_MS, (abortSignal) =>
       generateObject({
         model,
-        schema: pageSchema,
+        ...objectOptions(modelId, pageSchema, { maxOutputTokens: CONTENT_WRITE_MAX_TOKENS }),
         system: writeSystemPrompt(),
         prompt: buildWritePrompt({
           brand,
@@ -1020,10 +1415,56 @@ async function writeWithRun({ draft, brand, model, input, budget, rewrite, run }
     );
     await budget.charge(usage);
     await advanceRun(run, 3);
-    // No number without a source: a placeholder where one had none.
-    const written = sourcedPage(object, knownInPage, people);
+    // No health claim the brand didn't make, nor a {{find: …}} for one,
+    // before anything is looked up (content-health.js).
+    const stats = { health: 0 };
+    const asked = healthPage(object, health, editPage, stats);
+    // The facts it asked for, and the figures it wrote with no source,
+    // looked up on the web and written in with their links, or left for the
+    // person (content-research.js); never its shopping path's products' specs.
+    const looked = await lookUpFacts({
+      map: (editsFor) => editPage(asked, editsFor),
+      known: knownInPage,
+      own: pageOwn(draft.body_html),
+      products: shopping.names,
+      orgId: brand.organization_id,
+      draftId: draft.id,
+      modelId: contentReadModelId(),
+      run,
+      context: { brand: brand.name, title: draft.title, language: getLanguageName(language) },
+    });
+    // No number without a source (CE-033): one nobody found is the person's
+    // to fill, as a fact only the brand has; a marker left broken goes; and
+    // no health claim the facts pass wrote in.
+    const written = healthPage(
+      editPage(
+        editPage(sourcedPage(looked.page, knownInPage, people), settler(looked.own, looked.stats)),
+        sweeper(looked.own, looked.stats),
+      ),
+      health,
+      editPage,
+      stats,
+    );
+    logger.info(
+      { draftId: draft.id, ...looked.stats, health: stats.health },
+      '[content-writer] facts settled',
+    );
     // The title column as the H1 reads it: a capital first (headingCase).
     const title = headingCase(clean(written.title).slice(0, 300), language) || draft.title;
+    // A banned phrase that slipped through: one rewrite of those sentences,
+    // checked again; a phrase left is saved anyway, with a warning.
+    const page = await withoutBanned({
+      written,
+      title,
+      brand,
+      draft,
+      language,
+      model,
+      modelId,
+      run,
+      known: knownInPage,
+      people,
+    });
     // Stopped meanwhile: the page stays as it was, and History with it.
     await stopIfStopped(run);
     // Try again over a page the person has written in: History keeps it
@@ -1038,11 +1479,17 @@ async function writeWithRun({ draft, brand, model, input, budget, rewrite, run }
     const saved = await finish(
       draft,
       {
-        title,
+        title: page.title,
         // The shopping path's names it wrote, linked (shopping-links.js), and
         // its products as a grid where the page names them most (shopping-blocks.js).
         body_html: insertProductGrid(
-          linkShoppingPath(renderPage({ ...written, title }, { language }), shoppingPath).html,
+          linkShoppingPath(
+            linkFacts(
+              renderPage({ ...page.written, title: page.title }, { language }),
+              looked.links,
+            ),
+            shoppingPath,
+          ).html,
           shoppingPath && { ...shoppingPath, pageType: draft.page_type },
         ),
         status: 'in_review',
@@ -1074,7 +1521,7 @@ async function writeWithRun({ draft, brand, model, input, budget, rewrite, run }
   const { object, usage } = await runCall(run, budget, CALL_TIMEOUT_MS, (abortSignal) =>
     generateObject({
       model,
-      schema: suggestionsSchema,
+      ...objectOptions(modelId, suggestionsSchema, { maxOutputTokens: CONTENT_WRITE_MAX_TOKENS }),
       system: suggestSystemPrompt(),
       prompt: buildWritePrompt({
         brand,
@@ -1092,13 +1539,38 @@ async function writeWithRun({ draft, brand, model, input, budget, rewrite, run }
   );
   await budget.charge(usage);
   await advanceRun(run, 3);
+  // The facts it asked for, and the figures it wrote with no source, looked
+  // up (content-research.js); its data's own figures are its sources'. One
+  // that asks for a health claim to be looked up goes first: none is
+  // searched (content-health.js); keepSuggestions reads the claims.
+  const looked = await lookUpSuggestionFacts({
+    suggestions: withoutHealthFinds(object.suggestions, health),
+    known: knownInPage,
+    own: pageOwn(draft.body_html),
+    products: shopping.names,
+    orgId: brand.organization_id,
+    draftId: draft.id,
+    modelId: contentReadModelId(),
+    run,
+    context: { brand: brand.name, title: draft.title, language: getLanguageName(language) },
+  });
+  for (const value of looked.learned) known.add(value);
   const rows = keepSuggestions(
-    object.suggestions,
+    looked.suggestions,
     passages,
     lockedKeys,
     ruleKeys,
-    linkAllowList(targets),
-    { numbered, known, people, attributable, banned: bannedWordsOf(input.rules) },
+    withFactLinks(linkAllowList(targets), looked.links),
+    {
+      numbered,
+      known,
+      people,
+      attributable,
+      banned: bannedWordsOf(input.rules),
+      health,
+      bannedPhrases: brand.bannedPhrases ?? [],
+      draftId: draft.id,
+    },
   );
   // Stopped meanwhile: nothing it wrote is kept.
   await stopIfStopped(run);

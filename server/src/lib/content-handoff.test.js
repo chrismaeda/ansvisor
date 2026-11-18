@@ -31,10 +31,14 @@ describe('handOffInput', () => {
         .success,
     ).toBe(true);
     expect(HANDOFF_CHECKS['readability:typeRules']).toMatch(/never one made up/);
-    // An answer too: fit, sizes, shipping, returns and prices only from the page and the data.
+    // An answer too: fit, sizes, shipping, returns and prices only from the page and the data,
+    // else asked of the person, the brand's own ("Your input needed").
     expect(HANDOFF_CHECKS['readability:typeRules']).toMatch(
-      /an answer the page and your data don't give \(fit, sizes, shipping, returns, prices\) is a placeholder too/,
+      /an answer the page and your data don't give \(fit, sizes, shipping, returns, prices\) is \{\{ask: …\}\} too/,
     );
+    // A figure with no source is looked up, never left as a placeholder.
+    expect(HANDOFF_CHECKS['trust:claimsSourced']).toContain('{{find: …}}');
+    expect(Object.values(HANDOFF_CHECKS).join(' ')).not.toContain('placeholder');
     expect(
       handOffInput.safeParse({ items: [{ key: 'readability:longSentences' }], origin: 'cron' })
         .success,
@@ -99,5 +103,17 @@ describe('handOffDraft', () => {
     expect(zero.overLength).toBeUndefined();
     await handOffDraft({ draftId: 'd1', brandId: 'b1', input: zero });
     expect(fixDraftRules.mock.calls.at(-1)[0].input).not.toHaveProperty('overLength');
+  });
+
+  it('passes on the room its Length leaves, so its checks never take the page past it (editor UX review 2026-11-03)', async () => {
+    const input = handOffInput.parse({
+      items: [{ key: 'readability:longSentences', detail: '' }],
+      lengthCap: { count: 700, max: 960 },
+    });
+    await handOffDraft({ draftId: 'd1', brandId: 'b1', input });
+    expect(fixDraftRules.mock.calls.at(-1)[0].input.lengthCap).toEqual({ count: 700, max: 960 });
+    const none = handOffInput.parse({ items: [{ key: 'readability:longSentences', detail: '' }] });
+    await handOffDraft({ draftId: 'd1', brandId: 'b1', input: none });
+    expect(fixDraftRules.mock.calls.at(-1)[0].input).not.toHaveProperty('lengthCap');
   });
 });

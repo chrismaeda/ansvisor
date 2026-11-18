@@ -1,0 +1,105 @@
+---
+title: Skills in Chat
+route: /dashboard/chat
+keywords: [manager adds library skill, skills, skill, setup guide, /setup, create a skill, skill draft, save these steps as a skill, slash menu, ansvisor skills, used skill, save a skill, my skills, skills page, turn off a skill, schedule a skill, import a skill, upload a skill, skill from github, skill from skills.sh, skills.sh, review a skill, skill update, update available, library, skill library, library skills, add a skill from the library, third-party skills, mit skills, pending approval, faq from fan-outs, weekly report, win back citations, ready to publish, buyer questions, rival brief, listing gaps, fan-out gaps, fanout, sub-questions ai searches, prompt portfolio, prompts to add, prompts to pause, 30-day plan, /plan, monthly plan, task list, plan actions, weekly content plan, /content-plan, content brief, seasonal prompts, /seasonal, holiday prompts, ai traffic and sign-ups, /traffic, ai visitors, sign-ups from ai, customers and revenue from ai, /ai-revenue, which pages bring customers, revenue from ai]
+synonyms: [slash commands, playbooks, how-tos, templates, marketplace, skills directory]
+plan: all
+updated: 2026-11-16
+last_checked: 2026-11-16
+owner: Cihan
+app_version: 0.3.0
+approved: true
+sources: [web/messages/en.json, skills/README.md, skills/content-plan/SKILL.md, skills/seasonal/SKILL.md, skills/traffic/SKILL.md, skills/ai-revenue/SKILL.md]
+---
+Skills teach Chat how to do a task the way Ansvisor recommends: what to read, the steps to take and what the result looks like. Chat has twenty-nine Ansvisor skills, such as **Win back lost citations**, **FAQ from fan-outs**, **Fan-out gaps**, **Prompt portfolio**, **Ready to publish**, **Weekly report**, **Buyer questions**, **Rival brief**, **30-day plan**, **Weekly content plan** and **Setup guide**.
+
+## Use a skill
+
+Type **/** at the start of an empty box, or click **/**. Under the shortcuts, **Skills** lists each skill by its command and name. Type to filter, such as **/fa** for **/faq**, then press Enter or click. The command goes first in the box: finish your message after it and send.
+
+You can also type a skill's command yourself, at the start of your message. One answer uses up to three skills, a shortcut's own steps counted. **/report** is the **Weekly report** skill; for any other report, use the **/new-report** shortcut (**Reports**).
+
+## The Skills page
+
+Open **Skills** in the Chat menu to see every skill. **Ansvisor skills** lists Ansvisor's, and **All**, **Content**, **Visibility**, **Product Visibility**, **Technical** and **Reports** narrow them. **Library** lists skills by other people to add (below). **My skills** lists your workspace's own, with where each came from and whether it waits for review.
+
+A card shows the connections the skill uses on the brand you have open: green when connected, grey when not. **Run** starts a chat with the skill. **Schedule** opens Chat with "Every Monday at 9:00, /skill" in the box, to change before you send. **Create agent** starts an agent on it.
+
+Admins turn a skill on or off for the whole workspace, and you turn your own saved skills on or off. Click a skill's name to see its details, share it with your workspace or delete it.
+
+## When Chat picks a skill
+
+Chat also picks a skill by itself when one fits your question. Either way, the steps above the answer show **Used skill:** with the skill's name, and where it comes from under it: **Ansvisor library**, or **You** for a skill you saved. A shortcut shows **Used shortcut:** with its name.
+
+Analysts and Agency partners have no **/** menu, but Chat still uses a skill for them when one fits.
+
+## Save your own skill
+
+Admins and Managers can keep steps they repeat as a skill of their own. Start with "Create a skill that…", or pick **New skill** › **Create in Chat** on the **Skills** page. Chat asks at most two questions, then shows a draft you can edit: the skill's name, title, what it does and its steps. Nothing is kept until you click **Save skill**, in every mode, Full auto too.
+
+After an answer that did a few things, click **Save these steps as a skill** under it. Chat drafts the skill from those steps, keeping their date range and platforms, without numbers or your brand's details.
+
+The skill is private to you and joins your **/** menu right away. It can't take the name of an Ansvisor skill or a shortcut, such as **/analyze**. Your plan sets how many skills your workspace keeps.
+
+## Import a skill
+
+Admins and Managers on a paid plan can bring in a skill from outside. On the **Skills** page, click **New skill**, then **Upload a SKILL.md or .zip** (up to 5 MB), or **Import from GitHub** and paste a public github.com link. A skills.sh page that links to the skill on GitHub works too. Only the skill's instructions come in: scripts, commands and allowed tools are removed, and nothing runs. A GitHub skill is read at today's commit and never updates by itself. Only MIT, Apache-2.0, BSD and ISC licenses are accepted.
+
+An imported skill stays off until an Admin reviews it. **Review** shows the cleaned file with any hidden characters marked, what the safety scan found, what was removed and where it came from. The Admin approves or rejects it; a skill the scan blocks can't be approved. A Manager's import asks the Admins to review it.
+
+## Why you can't approve a skill
+
+Only an Admin approves a skill, while the workspace's plan is active. Anyone else who opens **Review** sees why they can't, and the Admins to ask by name. On a plan that ended, an Admin sees why too, with **See plans**.
+
+## The Library
+
+The **Library** tab lists 701 skills that other people share on GitHub under the MIT license, for SEO, content, brand, analytics, social, CRO, email, paid ads, growth and go-to-market work. Pick a topic, or search by a skill's name, what it does or its repository. **Most stars** sorts by the repository's GitHub stars, **Most installs** by its installs on skills.sh. The first 30 show; **Show more** adds 30 at a time.
+
+Click a skill to read it before you add it: its SKILL.md at the version the Library lists, Ansvisor's own safety scan, what adding it leaves out, its file on GitHub and its license. **Edited by Ansvisor** says what Ansvisor took out of a few skills, such as a promotion.
+
+## Add a skill from the Library
+
+Admins and Managers on a paid plan can click **Add**. The skill comes in as an imported skill does: instructions only, cleaned, scanned again and kept with its license and source. Ansvisor already checked the Library, so no Admin's review is needed: it's on at once for you, private, under **My skills**, and the card says **Added**. Share it there to give it to your team; a Manager's share asks the Admins. Uploads and GitHub imports still wait for an Admin.
+
+Each skill is added once per workspace and stays at the version it was added at. Analysts and Agency partners can browse the Library but can't add. Its page lists a price, an email address or a tracking link in the skill as worth a look. A skill the scan blocks as unsafe, or whose file Ansvisor can't read, can't be added: its page says why.
+
+## Updates to an imported skill
+
+Once a week, Ansvisor checks the source of each approved GitHub skill. When its SKILL.md changed, its card in **My skills** shows **Update available**. **Review update** shows what changed, line by line, and the safety scan of the new version. Nothing changes until an Admin clicks **Approve update**, and the new version is cleaned and scanned again first. A skill whose saved file was changed some other way is turned off.
+## What a skill can't change
+
+A skill shapes how Chat works, not what it may do. It gives Chat no new tools, doesn't skip the card a change waits on, and doesn't publish by itself: only an agent an Admin allows may send pages on its own. Your role, your plan and your workspace's Chat settings still decide what Chat can change, and a change still asks you first where it should.
+
+## The Ansvisor skills
+
+Win back lost citations, Complete this week’s tasks, Quality pass, FAQ from fan-outs, Weekly report, Beat a competitor, Refresh for this year, Ready to publish, AI shopping readiness, Fix wrong claims about us, Answer-first rewrite, Brand facts check, Comparison page, Translate a page, Buyer questions, How AI compares us, No clear leader, Who AI recommends by market, Listing gaps, Rival brief, Site audit fixes, Setup guide, Fan-out gaps, Prompt portfolio, 30-day plan, Weekly content plan, Seasonal prompts, AI traffic and sign-ups and Customers and revenue from AI.
+
+**Setup guide** (**/setup**) walks you through the open set-up steps of **Finish setting up**, then recommends 3 to 5 ready-to-use agents for your brand's site type and your work areas, each linked to its card in **Action Center › Agents**. It never turns an agent on. It is the skill of the **Onboarding & Help** agent.
+
+## Fan-out gaps
+
+**Fan-out gaps** (**/fanout**) finds the sub-questions AI engines searched while answering your tracked prompts where no answer named your brand, and drafts an answer-first section for each. It shows which engines searched each one and which competitors were named instead, and saves the sections as a draft.
+
+## Prompt portfolio
+
+**Prompt portfolio** (**/prompts**) proposes prompts to track, from your prompt suggestions, the sub-questions AI engines search and your Search Console queries, and prompts to pause: ones tracked for 8 weeks or more whose answers never named or cited your brand in that time, with little or no known search demand. Each change is a card you approve, and the **Activity** log can undo it.
+
+## 30-day plan
+
+**30-day plan** (**/plan**) reads your brand's visibility, prompts, competitors, content opportunities and open actions over your date range, and proposes a plan for four weeks: 8 to 12 actions, each with why, its effort and the prompts and pages it covers. Chat asks you once before it adds them to the **Action Center**, then links each one (AC-n) and says what to do first. Where an open action already covers something, the plan links that action instead of adding another.
+
+## Weekly content plan
+
+**Weekly content plan** (**/content-plan**) turns your content opportunities, the sub-questions AI engines search where your brand is missing, and your open content actions into a plan for the week: three to five pages to write or update, in order, each with the prompts it serves, why now and a brief. It leaves out pages an open action or a draft already covers. Starting a draft or sending an action is a card you approve.
+
+## Seasonal prompts
+
+**Seasonal prompts** (**/seasonal**) is for online stores. It proposes prompts to track and pages to prepare before the events and seasons coming for your markets, with the evidence from your data. It dates only fixed days, such as Christmas Day; for events that move, such as Black Friday, it asks you for the date. Each prompt it adds is a card you approve.
+
+## AI traffic and sign-ups
+
+**AI traffic and sign-ups** (**/traffic**) reports the visits AI assistants send to your site, by assistant and by landing page, against the week before. With Google Analytics connected, it adds the key events, such as sign-ups, from AI sessions. It says plainly what isn't measured: sign-ups by assistant or page, and the prompt behind a visit. For sign-ups, orders and revenue by page and assistant, use **Customers and revenue from AI**.
+
+## Customers and revenue from AI
+
+**Customers and revenue from AI** (**/ai-revenue**) answers which pages and AI assistants bring sign-ups, forms, orders and revenue, from your conversions from AI visits, and from Google Analytics and HubSpot when they are connected. It starts with what isn't set up yet, with the step and the page to set it up, and says **Not measured** where nothing measures it. Each currency's revenue is shown on its own. Prompts come only as an association: AI assistants don't pass on the question. It ends with one to three next steps.

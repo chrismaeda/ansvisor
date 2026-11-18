@@ -10,7 +10,7 @@ import { ALL_MODELS, ALL_SCRAPERS } from '@/config/prompt-options';
  * `allowedModels` is **absent** on the plan, every engine / model is allowed
  * (Growth, Enterprise, Self-hosted). If it's an **array** — even an empty
  * one — only the listed ids are allowed (Starter ships
- * `allowedScrapers: ['chatgpt-web', 'copilot-web']` and
+ * `allowedScrapers: ['chatgpt-web', 'gemini-web']` and
  * `allowedModels: []`).
  *
  * Used by the Stripe success route to align onboarding-created prompts to
@@ -41,10 +41,10 @@ export function getActiveEngineIdsForPlan(planId: PlanId | string | null | undef
  * `models` arrays match what the given plan allows. Handles both directions:
  *
  *   - **Expansion** (Starter → Growth): Growth has no `allowedScrapers`,
- *     so every prompt's platforms array becomes all 8 engine ids. Without
+ *     so every prompt's platforms array becomes every engine id. Without
  *     this an upgraded Growth customer keeps tracking only 2 engines (#79).
  *   - **Contraction** (Growth → Starter on downgrade / cancellation):
- *     Starter restricts to `['chatgpt-web', 'copilot-web']`, so prompts
+ *     Starter restricts to `['chatgpt-web', 'gemini-web']`, so prompts
  *     get trimmed down. Without this a downgraded org would keep paying
  *     scraper cost on engines the plan no longer covers.
  *
@@ -77,10 +77,12 @@ export async function alignPromptsToPlanForOrg(
     }
   }
 
+  // Never the demo brand's prompts (00380): they are sample data on every engine.
   const { data: brands, error: brandsErr } = await supabaseAdmin
     .from('brands')
     .select('id')
-    .eq('organization_id', orgId);
+    .eq('organization_id', orgId)
+    .eq('is_demo', false);
   if (brandsErr) throw new Error(`brands lookup: ${brandsErr.message}`);
 
   const brandIds = (brands ?? []).map((b) => b.id);

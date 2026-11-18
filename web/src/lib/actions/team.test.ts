@@ -14,20 +14,31 @@ interface Call {
   table: string;
   op: string;
   row?: unknown;
+  columns?: string;
   filters: [string, unknown][];
+  order?: [string, unknown];
 }
 const sessionCalls: Call[] = [];
 let adminCalls: Call[] = [];
-/** What a write of each table answers through the service client. */
+/** What a read or write of each table answers through the service client. */
 let adminAnswers: Record<string, { data: unknown; error: null | { message: string } }> = {};
+/** The signed-in person's role. */
+let sessionRole = 'admin';
 
 function builder(calls: Call[], answerOf: (call: Call) => unknown) {
   return (table: string) => {
     const call: Call = { table, op: 'select', filters: [] };
     calls.push(call);
     const chain = {
-      select: () => chain,
+      select: (columns?: string) => {
+        if (columns !== undefined) call.columns = columns;
+        return chain;
+      },
       update: (row: unknown) => Object.assign(call, { op: 'update', row }) && chain,
+      order: (column: string, options?: unknown) => {
+        call.order = [column, options];
+        return chain;
+      },
       eq: (column: string, value: unknown) => {
         call.filters.push([column, value]);
         return chain;
@@ -40,13 +51,17 @@ function builder(calls: Call[], answerOf: (call: Call) => unknown) {
 }
 
 vi.mock('next/cache', () => ({ revalidatePath: vi.fn() }));
-vi.mock('@/lib/member-emails', () => ({ readMemberEmails: vi.fn() }));
+const readMemberEmails = vi.hoisted(() => vi.fn());
+vi.mock('@/lib/member-emails', () => ({ readMemberEmails }));
+// Who may use a brand (BRAND-ACCESS): person id → the brands they may.
+const brandReaders = vi.hoisted(() => vi.fn());
+vi.mock('@/lib/brand-access', () => ({ brandReaders }));
 vi.mock('@/lib/guards/plan-guard', () => ({ enforceLimit: vi.fn(), getOrgPlan: vi.fn() }));
 vi.mock('@/lib/supabase/server', () => ({
   createClient: vi.fn(async () => ({
     auth: { getUser: async () => ({ data: { user: { id: ADMIN } } }) },
     from: builder(sessionCalls, () => ({
-      data: { id: ADMIN, role: 'admin', organization_id: ORG },
+      data: { id: ADMIN, role: sessionRole, organization_id: ORG },
       error: null,
     })),
   })),
@@ -61,12 +76,13 @@ vi.mock('@/lib/supabase/admin', () => ({
   },
 }));
 
-const { removeMember } = await import('./team');
+const { listBrandMembers, listInvitations, removeMember } = await import('./team');
 
 beforeEach(() => {
   sessionCalls.length = 0;
   adminCalls = [];
   adminAnswers = {};
+  sessionRole = 'admin';
 });
 
 describe('removeMember', () => {
@@ -111,5 +127,125 @@ describe('removeMember', () => {
   it('refuses to remove yourself', async () => {
     await expect(removeMember(ADMIN)).rejects.toThrow('You cannot remove yourself');
     expect(adminCalls).toEqual([]);
+  });
+});
+
+describe('listInvitations', () => {
+  const PENDING = {
+    id: 'i1',
+    email: 'new@example.com',
+    role: 'analyst',
+    status: 'pending',
+    invited_by: ADMIN,
+    expires_at: '2026-11-07T00:00:00Z',
+    created_at: '2026-10-31T00:00:00Z',
+    accepted_at: null,
+  };
+
+  it.each(['admin', 'analyst'])(
+    'lists the pending invitations to an %s from the server, without their token (00390)',
+    async (role) => {
+      sessionRole = role;
+      adminAnswers['invitations.select'] = { data: [PENDING], error: null };
+
+      const list = await listInvitations();
+
+      expect(adminCalls).toEqual([
+        {
+          table: 'invitations',
+          op: 'select',
+          columns:
+            'id, email, role, status, invited_by, expires_at, created_at, accepted_at, brand_scope, brand_ids',
+          filters: [
+            ['organization_id', ORG],
+            ['status', 'pending'],
+          ],
+          order: ['created_at', { ascending: false }],
+        },
+      ]);
+      // Only admins read invitations themselves now (00390).
+      expect(sessionCalls.map((c) => c.table)).toEqual(['profiles']);
+      expect(list).toEqual([
+        {
+          id: 'i1',
+          email: 'new@example.com',
+          role: 'analyst',
+          status: 'pending',
+          invitedBy: ADMIN,
+          expiresAt: '2026-11-07T00:00:00Z',
+          createdAt: '2026-10-31T00:00:00Z',
+          acceptedAt: null,
+          brandAccess: { scope: 'all', brandIds: [] },
+        },
+      ]);
+    },
+  );
+
+  it('names the brands an invitation shares to admins only (BRAND-ACCESS §3.2)', async () => {
+    const BRAND = '55555555-5555-4555-8555-555555555555';
+    adminAnswers['invitations.select'] = {
+      data: [{ ...PENDING, brand_scope: 'selected', brand_ids: [BRAND] }],
+      error: null,
+    };
+    expect((await listInvitations())[0].brandAccess).toEqual({
+      scope: 'selected',
+      brandIds: [BRAND],
+    });
+    sessionRole = 'analyst';
+    expect((await listInvitations())[0].brandAccess).toEqual({ scope: 'all', brandIds: [] });
+  });
+
+  it('says so when the invitations could not be read', async () => {
+    adminAnswers['invitations.select'] = { data: null, error: { message: 'down' } };
+
+    await expect(listInvitations()).rejects.toThrow('down');
+  });
+});
+
+describe('listBrandMembers', () => {
+  const NARROW = '44444444-4444-4444-8444-444444444444';
+  const BRAND = '55555555-5555-4555-8555-555555555555';
+  beforeEach(() => {
+    adminAnswers['profiles.select'] = {
+      data: [
+        { id: ADMIN, full_name: 'Ada', avatar_url: null, role: 'admin', created_at: '2026-01-01' },
+        {
+          id: MEMBER,
+          full_name: 'Bo',
+          avatar_url: null,
+          role: 'manager',
+          created_at: '2026-02-01',
+        },
+        {
+          id: NARROW,
+          full_name: 'Cy',
+          avatar_url: null,
+          role: 'analyst',
+          created_at: '2026-03-01',
+        },
+      ],
+      error: null,
+    };
+    readMemberEmails.mockResolvedValue(new Map([[MEMBER, 'bo@acme.example']]));
+  });
+
+  it('lists the members who can see the brand, in the team’s order', async () => {
+    brandReaders.mockResolvedValue(
+      new Map([
+        [ADMIN, new Set([BRAND])],
+        [MEMBER, new Set([BRAND])],
+      ]),
+    );
+    const members = await listBrandMembers(BRAND);
+    expect(brandReaders).toHaveBeenCalledWith(ORG, [BRAND]);
+    expect(members.map((m) => [m.userId, m.email, m.isCurrentUser])).toEqual([
+      [ADMIN, '', true],
+      [MEMBER, 'bo@acme.example', false],
+    ]);
+  });
+
+  it('answers a brand the caller can’t see as not found', async () => {
+    brandReaders.mockResolvedValue(new Map([[MEMBER, new Set([BRAND])]]));
+    await expect(listBrandMembers(BRAND)).rejects.toThrow('Brand not found');
   });
 });

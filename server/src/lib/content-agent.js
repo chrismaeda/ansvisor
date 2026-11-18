@@ -3,9 +3,24 @@ import { NoObjectGeneratedError, generateObject } from 'ai';
 import * as cheerio from 'cheerio';
 import { z } from 'zod';
 import supabaseAdmin from '../config/supabase.js';
+import { brandRulesSection } from './brand-rules.js';
+import { readBrandRules } from './brand-rules-read.js';
 import { resolveModel } from './ai-provider.js';
-import { contentBriefModelId, rebuildSources } from './content-brief.js';
+import {
+  CONTENT_WRITE_MAX_TOKENS,
+  contentReadModelId,
+  contentWriteModelId,
+  rebuildSources,
+} from './content-brief.js';
 import { inputSources, readDraftInputs } from './content-inputs.js';
+import { bannedPhrasesIn, readBannedPhrases } from './content-rules.js';
+import {
+  RESEARCH_RULE,
+  lookUpSuggestionFacts,
+  pageOwn,
+  withFactLinks,
+} from './content-research.js';
+import { HEALTH_RULE, addsHealthClaim, healthGuard, withoutHealthFinds } from './content-health.js';
 import { linkAllowList, linkKey, linkTargetsPrompt, readLinkTargets } from './content-links.js';
 import { shoppingGiven, shoppingPathFor, withShopping } from './shopping-links.js';
 import { siteTypeLine, pageTypeFormat } from './content-page-types.js';
@@ -51,7 +66,9 @@ import { getLanguageName } from './languages.js';
 import { PlanLimitError, reserveAiBudget } from './plan-guard.js';
 import { carefulLine, carefulRules } from './content-suggestion-stats.js';
 import { livePageLine, readLivePage } from './content-live-page.js';
+import { factsForPage, pageNames } from './fact-scope.js';
 import { logger } from './logger.js';
+import { objectOptions } from './structured-output.js';
 
 /**
  * Fix open rules with agent (Content Editor CE-018, spec §8): the Content
@@ -96,15 +113,6 @@ export const FANOUT_RULE = `- Fan-outs are the searches AI engines run for the p
 
 /** The links rule both agent prompts give the model: only the URLs listed, never invented. */
 export const LINK_RULE = `- Links: link only to a URL listed under the pages or sources you may link to, copied exactly, as <a href="URL">the words it explains</a>, in a replace's "after" or in an insert. Cite a source by linking the words it supports. Never invent a URL, never link a heading, and when no listed page fits, add no link.`;
-
-/**
- * What a placeholder is for: each one holds a send to a CMS or an export
- * until the person fills it (CE-044, CE-057), so only for a fact they must
- * find. A page, a document or a competitor is written as words: the agent
- * wrote "[About]", "[OpenAI release notes]" and "[competitor]" where plain
- * words do, and a page waited on six.
- */
-export const PLACEHOLDER_RULE = `- A placeholder in square brackets is only for a fact the person must find: a number, a price, a date, a person's name, a customer's name or a quote. Never put a page, a document, a link, a product, a brand, a company or a competitor in brackets: write it in plain words ("your About page", "OpenAI's release notes"), name the competitors given, or write "competitors". Each placeholder holds the page back until the person fills it, so write as few as the facts need.`;
 
 /** What the agent may say of a source, and the names a list keeps (editor test 2026-10-25). */
 export const ATTRIBUTION_RULE = `- Never give a claim to a source that neither the page nor Your input gives ("According to X…", "X says…", "X found that…"): you don't see what a cited page or a link says. A link goes on the words it explains, never as a source for a claim. Keep every name a list has (products, brands, people): never drop one.`;
@@ -154,6 +162,19 @@ export const fixRulesInput = z.object({
     })
     .optional()
     .catch(undefined),
+  /**
+   * The page's characters now and the most its Length allows, whenever the
+   * Length is on (editor UX review 2026-11-03, decision b): what the run
+   * adds together never takes the page past it (capToLength). Dropped when
+   * it doesn't read, as overLength is.
+   */
+  lengthCap: z
+    .object({
+      count: z.number().int().min(0).max(10_000_000),
+      max: z.number().int().min(1).max(10_000_000),
+    })
+    .optional()
+    .catch(undefined),
 });
 
 export const suggestionsSchema = z.object({
@@ -181,7 +202,9 @@ export const suggestionsSchema = z.object({
         marks: marksField,
       }),
     )
-    .max(MAX_AGENT_SUGGESTIONS),
+    // Told, never checked: a ninth would throw the whole answer away
+    // (NoObjectGeneratedError), and keepSuggestions keeps the first eight.
+    .describe(`(at most ${MAX_AGENT_SUGGESTIONS} items)`),
 });
 
 export const SYSTEM_PROMPT = `You are the Content Agent for Answer Engine Optimization (AEO). You improve one web page so it meets its writing rules, by suggesting small changes that a person reviews.
@@ -194,8 +217,9 @@ ${HEADING_RULE}
 ${LINK_RULE}
 ${FANOUT_RULE}
 - Never change a passage marked LOCKED: AI assistants quote its wording today. You may insert after it.
-- Use only facts from the page, the brand and your data. Never invent numbers, prices, dates, names, sources or quotes. When a rule needs a fact you don't have, write a placeholder in square brackets, e.g. [figure, source, year].
-${PLACEHOLDER_RULE}
+- Use only facts from the page, the brand and your data, and the ones you ask to have looked up. Never invent numbers, prices, dates, names, sources or quotes.
+${RESEARCH_RULE}
+${HEALTH_RULE}
 ${SOURCES_RULE}
 ${ATTRIBUTION_RULE}
 - Keep the page's voice and change as little as each rule needs. At most ${MAX_AGENT_SUGGESTIONS} suggestions.
@@ -800,6 +824,17 @@ export function dropsName(passageText, before, words, rules = [], blocksText = '
 }
 
 /**
+ * The brand's banned phrases (Settings › Content rules) a change brings in:
+ * in its new text and not in its old, as the editor and Chat find them
+ * (whole words, any case). Pure.
+ */
+export function bannedAdded(phrases, before, after) {
+  if (!phrases.length) return [];
+  const had = bannedPhrasesIn([before], phrases);
+  return bannedPhrasesIn([after], phrases).filter((p) => !had.includes(p));
+}
+
+/**
  * Whether a replace makes a heading ask more than one question: an FAQ
  * question with a fan-out's question added to it ("What is X? What is an
  * AEO tracker?"). A new question goes in as its own heading and answer.
@@ -881,6 +916,8 @@ export function splitReplace(after, tag, links = null) {
  * adds a number with no source is not kept. A person's name or a quote
  * that what it was given doesn't have becomes a placeholder, read in its
  * words as written, blockquotes too, before they are cleaned (CE-044).
+ * On a health brand's page (`sourcing.health`, content-health.js), one that
+ * adds a health claim the brand didn't make, or asks for one, is not kept.
  * `sourcing` is the numbered sources, the numbers known already
  * (the page's, the brand's) and the words names and quotes are looked up in
  * (knownPeople): without it, the page's.
@@ -897,6 +934,11 @@ export function keepSuggestions(raw, passages, lockedKeys, ruleKeys, links = nul
   const attributable = sourcing.attributable ?? people;
   // The Banned words rule's words: a change taking one out may drop that item only.
   const banned = sourcing.banned ?? [];
+  // A health brand's guard (content-health.js healthGuard): null for any other brand.
+  const health = sourcing.health ?? null;
+  // The brand's banned phrases (Content rules): no change brings one in.
+  const bannedPhrases = sourcing.bannedPhrases ?? [];
+  let droppedBanned = 0;
   const kept = [];
   const seen = new Set();
   for (const answer of raw) {
@@ -911,6 +953,21 @@ export function keepSuggestions(raw, passages, lockedKeys, ruleKeys, links = nul
     // The card shows it: a source number the model wrote in ("(S2)") goes.
     const reason = stripSourceIds(s.reason).trim().slice(0, 300);
     if (!passage || !reason || passage.text.length > MAX_PASSAGE_CHARS) continue;
+    // One that brings in a banned phrase, in its words or the passage as
+    // changed, goes whole: never half a change.
+    const said = s.kind === 'replace' ? s.before.trim() : '';
+    if (
+      bannedAdded(bannedPhrases, said, s.after).length ||
+      (said &&
+        bannedAdded(
+          bannedPhrases,
+          passage.text,
+          passage.text.replace(said, () => s.after),
+        ).length)
+    ) {
+      droppedBanned += 1;
+      continue;
+    }
     const rules = [...new Set(s.rules.filter((key) => ruleKeys.has(key)))];
     // Blocks read line by line (htmlLines): compact HTML
     // ("<li>ChatGPT</li><li>Gemini</li>") never runs their words together,
@@ -920,7 +977,9 @@ export function keepSuggestions(raw, passages, lockedKeys, ruleKeys, links = nul
       return lines.some((line) => line.trim()) &&
         html.length <= 20_000 &&
         // A claim given to a source it wasn't given (editor test 2026-10-25).
-        !lines.some((line) => addsAttribution('', line, attributable))
+        !lines.some((line) => addsAttribution('', line, attributable)) &&
+        // A health claim the brand didn't make (owner's safety rule, 2026-11-03).
+        !lines.some((line) => addsHealthClaim(line, health))
         ? {
             id: `insert:${passage.text}:${html}`,
             row: {
@@ -968,6 +1027,11 @@ export function keepSuggestions(raw, passages, lockedKeys, ruleKeys, links = nul
           growsPastLimit(passage, before, words) ||
           asksMoreThanOne(passage, before, words) ||
           addsAttribution(before, words, attributable) ||
+          // Read in the passage as changed: a question it asks claims nothing.
+          addsHealthClaim(
+            passage.text.replace(before, () => words),
+            health,
+          ) ||
           (!/^h[1-6]$/.test(passage.tag) &&
             dropsName(passage.text, before, words, rules, htmlLines(blocks).join(' '), banned)))
       )
@@ -998,6 +1062,13 @@ export function keepSuggestions(raw, passages, lockedKeys, ruleKeys, links = nul
       seen.add(c.id);
       kept.push(rows[i]);
     });
+  }
+  // Counted, never the phrases.
+  if (droppedBanned) {
+    logger.info(
+      { draftId: sourcing.draftId, banned: droppedBanned },
+      '[content-agent] suggestions adding a banned phrase dropped',
+    );
   }
   return kept;
 }
@@ -1116,6 +1187,45 @@ export function overLengthLine(over) {
   return `The page is already ${over.count.toLocaleString('en-US')} characters, past the most its Length allows (${over.max.toLocaleString('en-US')}). The Length isn't among the rules here, so don't cut the page for it. Fix each rule with as few words as it needs: an answer in one or two sentences, no section, list, table or example a rule doesn't ask for, and a replace no longer than the words it replaces unless the rule needs words added (a keyword, a figure, a name).`;
 }
 
+/**
+ * What the model is told of the room its Length leaves (lengthCap), when
+ * overLengthLine says nothing: how much its changes may add together.
+ */
+export function lengthCapLine(cap) {
+  if (!cap) return '';
+  const room = cap.max - cap.count;
+  const fmt = (n) => n.toLocaleString('en-US');
+  return room > 0
+    ? `The page is ${fmt(cap.count)} characters and its Length allows up to ${fmt(cap.max)}: all your changes together may add at most ${fmt(room)} characters. Where a rule needs more, cut as much elsewhere.`
+    : `The page is ${fmt(cap.count)} characters, at or past the most its Length allows (${fmt(cap.max)}): add no words without cutting as many elsewhere.`;
+}
+
+/** The characters a suggestion row adds to the page (a cut is negative). */
+function rowAdds(row) {
+  if (row.kind === 'insert') return htmlLines(row.after_text ?? '').join('').length;
+  return (row.after_text ?? '').length - (row.before_text ?? '').length;
+}
+
+/**
+ * The rows a run keeps within the room its Length leaves (lengthCap,
+ * editor UX review 2026-11-03: a Fix took an 800-character page to 2,706):
+ * in their order, each that adds while what is kept so far, cuts counted,
+ * stays within the room; every cut. All of them without a cap.
+ */
+export function capToLength(rows, cap) {
+  if (!cap) return { rows, dropped: 0 };
+  const room = cap.max - cap.count;
+  let added = 0;
+  const kept = [];
+  for (const row of rows) {
+    const adds = rowAdds(row);
+    if (adds > 0 && added + adds > Math.max(0, room)) continue;
+    added += adds;
+    kept.push(row);
+  }
+  return { rows: kept, dropped: rows.length - kept.length };
+}
+
 /** What the model is told: the brand, the page's passages, and the rules to fix. */
 export function buildFixPrompt({
   brand,
@@ -1137,8 +1247,21 @@ export function buildFixPrompt({
   if (more) lines.push('(The page goes on; suggest changes only to the passages above.)');
   const rules = input.rules.map((r) => `- ${r.key}: ${r.name}${r.detail ? ` — ${r.detail}` : ''}`);
   const own = input.textRules.map((text) => `- ${text}`);
+  // The brand's rules (Settings › Content, 00450): before the writer's own, which they outrank.
+  const brandRules = brandRulesSection(
+    brand.rules,
+    "The brand's rules, to follow in every change, before the writer's own:",
+  );
+  // Its banned phrases (Settings › Content rules): said only when it has some.
+  const banned = brand?.bannedPhrases ?? [];
+  const bannedLine = banned.length
+    ? `The brand never uses these phrases: ${banned.map((p) => `"${p}"`).join(', ')}. Never write one in a change.`
+    : '';
   // Said only when the Length isn't among the rules: the line says it isn't.
-  const over = input.rules.some((r) => r.key === 'length') ? '' : overLengthLine(input.overLength);
+  // Else the room it leaves (lengthCap).
+  const over =
+    (input.rules.some((r) => r.key === 'length') ? '' : overLengthLine(input.overLength)) ||
+    lengthCapLine(input.lengthCap);
   return `Brand: ${brand?.name || 'Unknown'}
 Industry: ${brand?.industry || 'Not specified'}
 ${siteTypeLine(brand)}Description: ${brand?.description || 'N/A'}
@@ -1148,7 +1271,7 @@ Page type: ${pageTypeFormat(draft.page_type)}
 
 Rules the page doesn't meet yet (key: rule — what it asks and how the page reads now):
 ${rules.join('\n')}
-${over ? `${over}\n` : ''}${careful ? `${careful}\n` : ''}${livePage ? `${livePage}\n` : ''}${handoff ? `${KEEP_PLACEHOLDERS}\n` : ''}${own.length ? `\nThe writer's own rules, to follow in every change:\n${own.join('\n')}\n` : ''}${sources ? `\n${sources}\n` : ''}${linkTargets ? `\n${linkTargets}\n` : ''}
+${over ? `${over}\n` : ''}${careful ? `${careful}\n` : ''}${livePage ? `${livePage}\n` : ''}${handoff ? `${KEEP_PLACEHOLDERS}\n` : ''}${brandRules ? `\n${brandRules}\n` : ''}${bannedLine ? `\n${bannedLine}\n` : ''}${own.length ? `\nThe writer's own rules, to follow in every change:\n${own.join('\n')}\n` : ''}${sources ? `\n${sources}\n` : ''}${linkTargets ? `\n${linkTargets}\n` : ''}
 The page, passage by passage:
 ${lines.join('\n')}
 
@@ -1221,7 +1344,7 @@ export async function fixDraftRules({ draftId, brandId, input, handoff = null })
   const { data: draft, error: draftError } = await supabaseAdmin
     .from('content_drafts')
     .select(
-      `id, brand_id, title, body_html, page_type, rules, action_id, status, source_url, published_url, agent_state, agent_state_at, shopping_path${handoff ? ', quality_handoff' : ''}`,
+      `id, brand_id, title, body_html, page_type, rules, action_id, status, source_url, published_url, slug, agent_state, agent_state_at, shopping_path${handoff ? ', quality_handoff' : ''}`,
     )
     .eq('id', draftId)
     .maybeSingle();
@@ -1273,6 +1396,10 @@ export async function fixDraftRules({ draftId, brandId, input, handoff = null })
     .eq('id', brandId)
     .single();
   if (brandError) throw brandError;
+  // The brand's rules (00450), read here: the prompt puts them first.
+  brand.rules = await readBrandRules(brandId);
+  // Its banned phrases: the prompt names them, and no suggestion brings one in.
+  brand.bannedPhrases = await readBannedPhrases(brandId);
   // Turned off since the draft was made: its automatic hand-off doesn't run.
   if (handoff?.origin === 'auto' && brand.content_quality_handoff !== true) {
     throw Object.assign(new Error('The brand hands off no quality fixes'), {
@@ -1336,16 +1463,27 @@ const SOURCE_CHECKS = new Set([
   'trust:noBrokenLinks',
 ]);
 
-/** The brand's approved facts still on its site (CE-047), as their words. */
-async function approvedFacts(brandId) {
+/**
+ * The brand's approved facts still on its site (CE-047), as their words:
+ * the brand-wide ones and those whose scope the page names (00539), so one
+ * island's price never goes on another's page.
+ */
+async function approvedFacts(brandId, draft) {
   const { data, error } = await supabaseAdmin
     .from('brand_facts')
-    .select('quote')
+    .select('quote, scope')
     .eq('brand_id', brandId)
     .eq('status', 'approved')
     .is('gone_at', null);
   if (error) throw error;
-  return (data ?? []).map((f) => f.quote).filter(Boolean);
+  const names = pageNames({
+    html: draft.body_html,
+    title: draft.title,
+    urls: [draft.slug, draft.published_url, draft.source_url],
+  });
+  return factsForPage(data ?? [], names)
+    .map((f) => f.quote)
+    .filter(Boolean);
 }
 
 /** Fix open rules' run itself, step by step: nothing is kept once it is stopped. */
@@ -1360,7 +1498,7 @@ async function fixWithRun({
   run,
   handoff = false,
 }) {
-  const modelId = contentBriefModelId();
+  const modelId = contentWriteModelId();
   const lockedKeys = new Set(input.locked.map(passageKey));
   const ruleKeys = new Set(input.rules.map((r) => r.key));
   // The rules here people at the brand mostly reject its changes for
@@ -1424,12 +1562,17 @@ async function fixWithRun({
     queries: input.sources?.queries,
     inputs: inputSources(inputRow, brand.name),
   });
-  // A hand-off's details and the person's own rules are the editor's words:
-  // no fact the agent may write. The brand's approved facts are, read here.
+  // A hand-off's details and the person's and brand's rules are the editor's
+  // words: no fact the agent may write. The brand's approved facts are, read here.
   const ruleWords = handoff
     ? input.rules.map((r) => r.name)
-    : [...input.rules.flatMap((r) => [r.name, r.detail]), ...input.textRules];
-  const facts = handoff && ruleKeys.has('trust:brandFacts') ? await approvedFacts(brandId) : [];
+    : [
+        ...input.rules.flatMap((r) => [r.name, r.detail]),
+        ...input.textRules,
+        ...(brand.rules ?? []),
+      ];
+  const facts =
+    handoff && ruleKeys.has('trust:brandFacts') ? await approvedFacts(brandId, draft) : [];
   // The shopping path's prices and names: the catalog's, written unmarked.
   const shopping = shoppingGiven(shoppingPath);
   const known = withNamedNumbers(
@@ -1459,6 +1602,21 @@ async function fixWithRun({
     ...numbered.map(sourceWords),
     ...authors,
   );
+  // A health brand's guard: the claims it made in its own words (the page,
+  // its description, Your input, its approved facts and the rules people
+  // wrote), never the brief's or a buyer's (content-health.js).
+  const health = healthGuard(brand, {
+    html: draft.body_html,
+    texts: [
+      draft.title,
+      brand.name,
+      brand.description,
+      ...facts,
+      ...shopping.names,
+      ...(handoff ? [] : [...input.textRules, ...(brand.rules ?? [])]),
+    ],
+    numbered,
+  });
   // The sources a claim may be given to: the ones the page gives claims to,
   // and its Your input and authors (never just a name the page lists).
   const attributable = attributableSources(
@@ -1496,7 +1654,7 @@ async function fixWithRun({
     const generated = await runCall(run, budget, CALL_TIMEOUT_MS, (abortSignal) =>
       generateObject({
         model: resolveModel(modelId),
-        schema: suggestionsSchema,
+        ...objectOptions(modelId, suggestionsSchema, { maxOutputTokens: CONTENT_WRITE_MAX_TOKENS }),
         system: SYSTEM_PROMPT,
         prompt: buildFixPrompt({
           brand,
@@ -1527,12 +1685,41 @@ async function fixWithRun({
   }
 
   await advanceRun(run, 3);
-  const rows = keepSuggestions(
-    object.suggestions,
+  // One that asks for a health claim to be looked up ({{find: …}}) goes
+  // first: none is searched (content-health.js). The claims the rest make
+  // are read once placed (keepSuggestions).
+  const asked = withoutHealthFinds(object.suggestions, health);
+  if (asked.length < object.suggestions.length) {
+    logger.info(
+      { draftId, health: object.suggestions.length - asked.length },
+      '[content-agent] suggestions asking for a health claim dropped',
+    );
+  }
+  // The facts it asked for, and the figures it wrote with no source, looked
+  // up on the web and written in with their links, or their sentences
+  // written without them (content-research.js). The figures its data's
+  // words have are its sources' (sourceSuggestion), not ones to look up.
+  const looked = await lookUpSuggestionFacts({
+    suggestions: asked,
+    known: withNamedNumbers(
+      new Set([...known, ...knownNumbers(...numbered.map(sourceWords))]),
+      shopping.names,
+    ),
+    own: pageOwn(draft.body_html),
+    products: shopping.names,
+    orgId: brand.organization_id,
+    draftId,
+    modelId: contentReadModelId(),
+    run,
+    context: { brand: brand.name, title: draft.title },
+  });
+  for (const value of looked.learned) known.add(value);
+  const suggested = keepSuggestions(
+    looked.suggestions,
     passages,
     lockedKeys,
     ruleKeys,
-    linkAllowList(targets),
+    withFactLinks(linkAllowList(targets), looked.links),
     {
       numbered,
       known,
@@ -1540,8 +1727,19 @@ async function fixWithRun({
       attributable,
       keepPlaceholders: handoff,
       banned: bannedWordsOf(input.rules),
+      health,
+      bannedPhrases: brand.bannedPhrases,
+      draftId,
     },
   );
+  // Never past the Length the person set (decision b): what doesn't fit goes.
+  const { rows, dropped } = capToLength(suggested, input.lengthCap);
+  if (dropped) {
+    logger.info(
+      { draftId, dropped, cap: input.lengthCap },
+      '[content-agent] past the Length, dropped',
+    );
+  }
   // Stopped meanwhile: nothing it wrote is kept.
   await stopIfStopped(run);
   if (!rows.length) {

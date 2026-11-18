@@ -1,0 +1,650 @@
+import { API_BASE_URL } from '@/config/api';
+import { getContentDraftPackageFor } from '@/lib/mcp/content-package';
+import { supabaseAdmin } from '@/lib/supabase/admin';
+import { readContentAuthors } from './authors-read';
+import { pagePrices, type BrandFact, type BrandFactsRead } from './brand-facts';
+import { catalogMatchFor } from './catalog-match';
+import { CLAIM_KINDS, type ClaimBlock } from './claims';
+import { keptInputs, NO_INPUTS } from './draft-inputs';
+import { brandSiteType } from './draft-page-type';
+import { openSpotPlaces, pageDoc } from './doc-text';
+import { isPageType } from './drafts';
+import type { PageRead } from './page-read';
+import { qualityAverage, qualityPhase } from './quality';
+import { trustBlocks, unplacedSites, type LinkCheck, type TrustBlock } from './quality-checks';
+import { pageFactsOf, qualityState, type QualityReads, type QualityState } from './quality-inputs';
+import { profileFor } from './quality-profiles';
+import { sentencesOf } from './readability';
+import {
+  activeRules,
+  checkRule,
+  draftLanguage,
+  draftRulesSchema,
+  effectiveRules,
+  NO_DRAFT_RULES,
+  pageTextLength,
+  readPage,
+  ruleSet,
+  ruleSetType,
+  rulesPageType,
+  savedRuleSetSchema,
+  type SavedRuleSet,
+} from './rules';
+import { withContentDom } from './server-dom';
+import type { SiteTrust } from './site-trust';
+import { SOURCES_DAYS } from './sources';
+
+/**
+ * The quality gate a page passes to go live on its own (AUTONOMOUS-GO-LIVE
+ * §6.2, PR 2b-2): the page as it will go out, with the same scores the
+ * Content Editor shows (lib/content/quality-inputs.ts qualityState, from the
+ * same reads), on the server, for an agent run with no one's session.
+ *
+ * In order, the first that fails holds the page for a click:
+ *   1. quality_off: Content Quality isn't on;
+ *   2. placeholders / fields: the page as Send to CMS would send it
+ *      (bulkCmsItems' problem);
+ *   3. suggestions: suggestions on the draft still wait for review;
+ *   4. quality_unread: a read the scores need couldn't be made (its AI read
+ *      failed or reached the run's cap or the month's budget, the claims or
+ *      the sources' kinds weren't all read, a database read failed): what
+ *      can't be counted never passes;
+ *   5. facts: a price, trial or founding year that differs from an approved
+ *      brand fact; facts_unchecked: no approved facts, and the page states
+ *      one of those;
+ *   6. qualityLow: E-E-A-T, Trust or Readability under 60; quality: their
+ *      average under 75. A score with nothing to judge on the page is left
+ *      out, as the editor's Quality average leaves it.
+ * The AI reads the editor makes as the page is saved are made here when the
+ * draft has none kept for its text: the agent run's own steps (the server's
+ * /api/internal/chat/go-live/quality-reads, on the run's cap and the
+ * month's budget). Link checks are network reads, no AI. Server only.
+ */
+
+/** Each score's lowest, and their average's (spec §6.2: no score in Needs work, near Strong). */
+export const GATE_MIN_EACH = 60;
+export const GATE_MIN_AVERAGE = 75;
+
+export type GateHold =
+  | 'quality_off'
+  | 'placeholders'
+  | 'fields'
+  | 'suggestions'
+  | 'quality_unread'
+  | 'facts'
+  | 'facts_unchecked'
+  | 'qualityLow'
+  | 'quality';
+
+/** What the gate couldn't read, as the hold names it. */
+export type GateRead =
+  | 'draft'
+  | 'authors'
+  | 'inputs'
+  | 'sources'
+  | 'rules'
+  | 'confirmations'
+  | 'images'
+  | 'catalog'
+  | 'links'
+  | 'claims'
+  | 'page'
+  | 'classes'
+  | 'facts'
+  | 'siteTrust'
+  | 'spots'
+  | 'scores';
+
+type GateCheck = 'eeat' | 'trust' | 'readability';
+
+/** The scores a page passed with: null for one with nothing to judge on it. */
+export type GateScores = {
+  eeat: number | null;
+  trust: number | null;
+  readability: number | null;
+  average: number;
+};
+
+export type GateResult =
+  | { pass: true; scores: GateScores }
+  | { pass: false; hold: 'quality_off' | 'placeholders' | 'fields' | 'suggestions' }
+  | { pass: false; hold: 'quality_unread'; read: GateRead; why: string }
+  | { pass: false; hold: 'facts'; page: string; fact: string }
+  | { pass: false; hold: 'facts_unchecked' }
+  | { pass: false; hold: 'qualityLow'; check: GateCheck; score: number }
+  | { pass: false; hold: 'quality'; score: number };
+
+/** A read the gate couldn't make: it holds the page with its name and why. */
+class Unread extends Error {
+  constructor(
+    readonly read: GateRead,
+    readonly why: string,
+  ) {
+    super(`${read}: ${why}`);
+  }
+}
+
+// ─── The verdict ─────────────────────────────────────────────────────────────
+
+/** A trial's length or a founding year the page states about the brand, read wide (the safe side). */
+const TRIAL =
+  /\b\d+[\s-]*(?:day|days|week|weeks|month|months)\b[^.!?]{0,20}\btrial\b|\btrial\b[^.!?]{0,20}\b\d+[\s-]*(?:day|days|week|weeks)\b/i;
+const FOUNDED = /\b(?:founded|established|started|since)\b[^.!?]{0,40}\b(?:1[89]\d{2}|20\d{2})\b/i;
+
+/** Whether the page states a price, a trial or a founding year (facts_unchecked's test). */
+export function statesBrandFacts(sentences: string[]): boolean {
+  return sentences.some(
+    (sentence) =>
+      pagePrices(sentence).some((price) => price.amount > 0) ||
+      TRIAL.test(sentence) ||
+      FOUNDED.test(sentence),
+  );
+}
+
+/**
+ * The verdict, from what the reads gave (pure): facts, then the scores. The
+ * page's own checks (placeholders, fields, suggestions) are made before.
+ */
+export function gateVerdict({
+  state,
+  facts,
+  sentences,
+}: {
+  state: QualityState;
+  facts: BrandFact[];
+  sentences: string[];
+}): GateResult {
+  const mismatch = state.factCheck?.mismatches[0];
+  if (mismatch) return { pass: false, hold: 'facts', page: mismatch.page, fact: mismatch.fact };
+  const approved = facts.some((fact) => fact.status === 'approved' && !fact.gone);
+  if (!approved && statesBrandFacts(sentences)) return { pass: false, hold: 'facts_unchecked' };
+
+  // A score with nothing to judge on the page (no check applies) is left
+  // out, as the editor's Quality average leaves it: every read it needs was
+  // made before this. None at all can't pass.
+  const scores = (
+    [
+      ['eeat', state.eeatScore?.score ?? null],
+      ['trust', state.trustScore?.score ?? null],
+      ['readability', state.readable?.score ?? null],
+    ] as const
+  ).filter((entry): entry is readonly [GateCheck, number] => entry[1] !== null);
+  if (scores.length === 0) {
+    return { pass: false, hold: 'quality_unread', read: 'scores', why: 'none' };
+  }
+  const [lowest, low] = scores.reduce((a, b) => (b[1] < a[1] ? b : a));
+  if (low < GATE_MIN_EACH) return { pass: false, hold: 'qualityLow', check: lowest, score: low };
+  const average = qualityAverage(scores.map(([, score]) => score)) ?? 0;
+  if (average < GATE_MIN_AVERAGE) return { pass: false, hold: 'quality', score: average };
+  const by = Object.fromEntries(scores) as Partial<Record<GateCheck, number>>;
+  return {
+    pass: true,
+    scores: {
+      eeat: by.eeat ?? null,
+      trust: by.trust ?? null,
+      readability: by.readability ?? null,
+      average,
+    },
+  };
+}
+
+// ─── The reads ───────────────────────────────────────────────────────────────
+
+/** A read the server's endpoint answers: its value, or why it couldn't be made. */
+type Answer<T> = { ok: true; value: T } | { ok: false; code: string };
+
+interface ServerReads {
+  links: Answer<{ links: LinkCheck[]; skipped: string[] }>;
+  claims: Answer<{ paragraphs: ClaimBlock[]; pending: number; limited: boolean }>;
+  page: Answer<PageRead & { pending: boolean; limited: boolean; paused: boolean }>;
+  classes: Answer<{ classes: { site: string; kind: string }[]; limited: boolean }>;
+  facts: Answer<Partial<BrandFactsRead>>;
+  siteTrust: Answer<(SiteTrust & { complete?: boolean }) | null>;
+}
+
+/** The value of a read the gate needs, or Unread with why. */
+function needed<T>(read: GateRead, answer: Answer<T>): T {
+  if (!answer.ok) throw new Unread(read, answer.code);
+  return answer.value;
+}
+
+/** The server's reads (CRON_SECRET) from one of its endpoints, the run's own steps where new ones are made. */
+async function serverReads(path: string, body: Record<string, unknown>): Promise<ServerReads> {
+  const secret = process.env.CRON_SECRET;
+  if (!secret) throw new Unread('links', 'no_secret');
+  const res = await fetch(`${API_BASE_URL}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${secret}` },
+    body: JSON.stringify(body),
+    cache: 'no-store',
+  });
+  const answer = (await res.json().catch(() => null)) as (ServerReads & { code?: string }) | null;
+  if (!res.ok || !answer) throw new Unread('links', answer?.code ?? `http_${res.status}`);
+  return answer;
+}
+
+/** An agent's go-live gate's reads (internal-chat-go-live.js): within its run's cap. */
+const goLiveReads = (input: GateInput) => (sites: string[]) =>
+  serverReads('/api/internal/chat/go-live/quality-reads', {
+    orgId: input.organizationId,
+    agentRunId: input.agentRunId,
+    runId: input.runId,
+    actingUserId: input.actingUserId,
+    draftId: input.draftId,
+    sites,
+  });
+
+export interface GateInput {
+  organizationId: string;
+  draftId: string;
+  agentRunId: string;
+  runId: string;
+  /** The person the run acts as (its owner, or who clicked Run now). */
+  actingUserId: string;
+  actingRole: 'admin' | 'manager';
+}
+
+/** One database read the gate needs; a failure holds the page. */
+async function dbRead<T>(
+  read: GateRead,
+  run: () => PromiseLike<{ data: T; error: { message: string } | null }>,
+): Promise<T> {
+  const { data, error } = await run();
+  if (error) throw new Unread(read, error.message.slice(0, 200));
+  return data;
+}
+
+/** The page type's own page rules, as the Rules tab reads them (only `met` scores). */
+function typeRulesOf(
+  html: string,
+  draftRules: unknown,
+  mine: Partial<Record<string, SavedRuleSet>>,
+  pageType: string | null,
+  language: string | null,
+  sources: { brandDomains: string[]; competitorDomains: string[] },
+  catalog: QualityReads['catalog'],
+): QualityReads['typeRules'] {
+  const choices = draftRulesSchema.safeParse(draftRules).data ?? NO_DRAFT_RULES;
+  const draftType = isPageType(pageType) ? pageType : null;
+  const setType = ruleSetType(choices, draftType);
+  const effective = effectiveRules(choices, setType ? mine[setType] : undefined);
+  const rules = activeRules(
+    ruleSet(setType, { language, length: effective.importLength, shopping: false }),
+    effective,
+  );
+  const page = readPage(html, pageTextLength(html));
+  const ctx = {
+    brandDomains: sources.brandDomains,
+    competitorDomains: sources.competitorDomains,
+    fanouts: [],
+    language,
+    catalog: catalog ?? null,
+    shopping: null,
+    pageType: rulesPageType(choices, draftType),
+  };
+  return rules.flatMap((rule) => {
+    if (rule.group !== 'type' || rule.check !== 'page' || !rule.on) return [];
+    const status = checkRule(rule, page, ctx);
+    return status.state === 'info'
+      ? []
+      : [{ name: rule.key, met: status.state === 'ok', detail: '' }];
+  });
+}
+
+/**
+ * Whether a page an agent wants to take live on its own passes the gate, and
+ * if not, why. Never throws for a read that fails: it holds the page.
+ */
+export async function goLiveGate(input: GateInput): Promise<GateResult> {
+  const phase = qualityPhase();
+  if (phase < 1) return { pass: false, hold: 'quality_off' };
+  try {
+    return await gate(input, phase);
+  } catch (err) {
+    if (err instanceof Unread) {
+      return { pass: false, hold: 'quality_unread', read: err.read, why: err.why };
+    }
+    console.error('[go-live] the quality gate failed:', err);
+    return { pass: false, hold: 'quality_unread', read: 'draft', why: 'failed' };
+  }
+}
+
+async function gate(input: GateInput, phase: number): Promise<GateResult> {
+  // The page as Send to CMS sends it: placeholders and fields first (its DOM too).
+  const packaged = await getContentDraftPackageFor(
+    {
+      userId: input.actingUserId,
+      email: null,
+      organizationId: input.organizationId,
+      role: input.actingRole,
+      apiKeyId: '',
+    },
+    input.draftId,
+  );
+  if ('error' in packaged) {
+    if (packaged.error === 'not_found') throw new Unread('draft', 'not_found');
+    return { pass: false, hold: packaged.problem === 'placeholders' ? 'placeholders' : 'fields' };
+  }
+
+  const open = await dbRead('draft', () =>
+    supabaseAdmin
+      .from('content_draft_suggestions')
+      .select('id')
+      .eq('draft_id', input.draftId)
+      .eq('status', 'open')
+      .limit(1),
+  );
+  if ((open ?? []).length > 0) return { pass: false, hold: 'suggestions' };
+  const { state, facts, sentences } = await readDraftQuality(input, phase, goLiveReads(input));
+  return gateVerdict({ state, facts, sentences });
+}
+
+/** Who a Quality read is for: the workspace, the draft, and the person the run acts as. */
+export interface QualityReadFor {
+  organizationId: string;
+  draftId: string;
+  actingUserId: string;
+  actingRole: string;
+}
+
+/** The draft scored as the editor scores it, with what the verdict and the words need. */
+export interface DraftQuality {
+  state: QualityState;
+  facts: BrandFact[];
+  sentences: string[];
+  brandName: string;
+}
+
+/**
+ * The draft as saved, read and scored as the Content Editor scores it
+ * (qualityState, from the same reads): the server's reads come from
+ * `fetchReads`, given the sites the rules can't place. Throws Unread for a
+ * read it needs that couldn't be made.
+ */
+async function readDraftQuality(
+  input: QualityReadFor,
+  phase: number,
+  fetchReads: (sites: string[]) => Promise<ServerReads>,
+): Promise<DraftQuality> {
+  const draft = await dbRead('draft', () =>
+    supabaseAdmin
+      .from('content_drafts')
+      .select(
+        'id, brand_id, title, slug, source_url, published_url, body_html, page_type, author_id, author_real_at, author_profile_at, rules, kept_sources, brands!inner(organization_id, name, language, site_type, industry, shopping_mode_enabled)',
+      )
+      .eq('id', input.draftId)
+      .eq('brands.organization_id', input.organizationId)
+      .maybeSingle(),
+  );
+  if (!draft) throw new Unread('draft', 'not_found');
+  const brand = (Array.isArray(draft.brands) ? draft.brands[0] : draft.brands) as {
+    name: string;
+    language: string | null;
+    site_type: string | null;
+    industry: string | null;
+    shopping_mode_enabled: boolean | null;
+  };
+
+  await withContentDom();
+  const html = draft.body_html ?? '';
+  const blocks: TrustBlock[] = trustBlocks(html);
+  const language = draftLanguage(draft.rules) ?? brand.language;
+  const sourcesOn = phase >= 2;
+
+  const [authors, inputsRow, sources, mineRows, confirms, own] = await Promise.all([
+    readContentAuthors(supabaseAdmin, input.organizationId, {
+      me: { id: input.actingUserId, role: input.actingRole },
+    }).catch((err: Error) => {
+      throw new Unread('authors', err.message.slice(0, 200));
+    }),
+    sourcesOn
+      ? dbRead('inputs', () =>
+          supabaseAdmin
+            .from('content_draft_inputs')
+            .select('experience, data, ansvisor_data, quotes')
+            .eq('draft_id', input.draftId)
+            .maybeSingle(),
+        )
+      : null,
+    dbRead('sources', () =>
+      supabaseAdmin.rpc('content_draft_sources', {
+        p_draft_id: input.draftId,
+        p_days: SOURCES_DAYS,
+      }),
+    ),
+    dbRead('rules', () =>
+      supabaseAdmin
+        .from('content_rule_sets')
+        .select('page_type, overrides, text_rules')
+        .eq('organization_id', input.organizationId)
+        .eq(
+          'site_type',
+          brandSiteType({ ...brand, shopping_mode_enabled: brand.shopping_mode_enabled === true }),
+        ),
+    ),
+    phase >= 3
+      ? dbRead('confirmations', () =>
+          supabaseAdmin
+            .from('content_draft_confirmations')
+            .select('kind, key')
+            .eq('draft_id', input.draftId),
+        )
+      : [],
+    sourcesOn
+      ? dbRead('images', () =>
+          supabaseAdmin
+            .from('content_draft_own_images')
+            .select('src')
+            .eq('draft_id', input.draftId),
+        )
+      : [],
+  ]);
+  const sourcesData = (sources ?? {}) as { brandDomains?: string[]; competitorDomains?: string[] };
+  const brandDomains = sourcesData.brandDomains ?? [];
+  const competitorDomains = sourcesData.competitorDomains ?? [];
+  const keptSources: string[] = draft.kept_sources ?? [];
+  const pageType = draft.page_type ?? null;
+
+  // The sites the rules can't place, for the model's read of their kinds.
+  const sites = sourcesOn
+    ? unplacedSites(blocks, brandDomains, {
+        competitorDomains,
+        pageType,
+        kept: new Set(keptSources),
+      })
+    : [];
+  const reads = await fetchReads(sites);
+  const linkList = needed('links', reads.links);
+  const linkChecks = new Map(linkList.links.map((link) => [link.href, link]));
+
+  let claimBlocks: ClaimBlock[] | null = null;
+  let pageRead: PageRead | null = null;
+  let aiKinds: QualityReads['aiKinds'] = new Map();
+  let facts: BrandFact[] = [];
+  if (sourcesOn) {
+    const claims = needed('claims', reads.claims);
+    if (claims.pending > 0 || claims.limited) throw new Unread('claims', 'not_all_read');
+    const kinds: readonly string[] = CLAIM_KINDS;
+    claimBlocks = claims.paragraphs.map((block) => ({
+      text: block.text,
+      claims: block.claims.filter((claim) => kinds.includes(claim.kind)),
+    }));
+    const page = needed('page', reads.page);
+    if (page.pending || page.limited || page.paused) {
+      throw new Unread('page', page.paused ? 'ai_budget' : page.limited ? 'limited' : 'pending');
+    }
+    pageRead = {
+      spots: page.spots,
+      proofs: page.proofs,
+      regulated: page.regulated,
+      checks: page.checks,
+    };
+    const classes = needed('classes', reads.classes);
+    if (classes.limited) throw new Unread('classes', 'limited');
+    aiKinds = new Map(
+      classes.classes.map((c) => [c.site, c.kind]),
+    ) as unknown as QualityReads['aiKinds'];
+    facts = needed('facts', reads.facts).facts ?? [];
+  }
+  const siteTrust = needed('siteTrust', reads.siteTrust);
+
+  // The visual proof spots still open, in the editor's own document.
+  let openSpots = 0;
+  if (pageRead?.spots.length) {
+    try {
+      openSpots = openSpotPlaces(pageDoc(html), pageRead.spots).length;
+    } catch (err) {
+      throw new Unread('spots', (err as Error).message.slice(0, 200));
+    }
+  }
+
+  // A product page's product in the brand's feed, as the editor reads it (its feedOn).
+  const catalog =
+    profileFor(pageType, phase) === 'product'
+      ? await catalogMatchFor(supabaseAdmin, input.draftId, draft.title).catch((err: Error) => {
+          throw new Unread('catalog', err.message.slice(0, 200));
+        })
+      : null;
+
+  const mine: Partial<Record<string, SavedRuleSet>> = {};
+  for (const row of mineRows ?? []) {
+    const set = savedRuleSetSchema.safeParse({
+      overrides: row.overrides,
+      textRules: row.text_rules,
+    });
+    if (set.success && isPageType(row.page_type)) mine[row.page_type] = set.data;
+  }
+  const author = authors.authors.find((a) => a.id === draft.author_id) ?? null;
+  const caseConfirms = new Set(
+    (confirms ?? []).filter((r) => r.kind === 'customer_case').map((r) => r.key),
+  );
+  const introConfirms = new Set(
+    (confirms ?? []).filter((r) => r.kind === 'intro_fact').map((r) => r.key),
+  );
+
+  // Its title and addresses, which with its H1 say which places' facts are its own (00539).
+  const pageTitle = draft.title;
+  const pageUrls = [draft.slug, draft.published_url, draft.source_url];
+  const state = qualityState({
+    html,
+    blocks,
+    language,
+    brandName: authors.brands.find((b) => b.id === draft.brand_id)?.name ?? brand.name,
+    pageType,
+    phase,
+    authorsRead: true,
+    author,
+    authorConfirmed: { real: !!draft.author_real_at, profile: !!draft.author_profile_at },
+    inputs: sourcesOn
+      ? inputsRow
+        ? keptInputs({
+            experience: inputsRow.experience,
+            data: inputsRow.data,
+            ansvisorData: inputsRow.ansvisor_data,
+            quotes: inputsRow.quotes,
+          })
+        : NO_INPUTS
+      : null,
+    inputsPending: false,
+    linkChecks,
+    brandDomains,
+    competitorDomains,
+    siteTrust: siteTrust
+      ? {
+          checks: siteTrust.checks,
+          score: siteTrust.score,
+          checkedAt: siteTrust.checkedAt,
+          ...(typeof siteTrust.complete === 'boolean' && { complete: siteTrust.complete }),
+        }
+      : null,
+    siteTrustRead: true,
+    brandFacts: sourcesOn ? facts : null,
+    pageTitle,
+    pageUrls,
+    keptSources,
+    aiKinds,
+    claimBlocks,
+    pageRead: { read: pageRead, paused: false, limited: false, settled: true, changing: false },
+    typeRules: typeRulesOf(
+      html,
+      draft.rules,
+      mine,
+      pageType,
+      language,
+      { brandDomains, competitorDomains },
+      catalog,
+    ),
+    caseConfirms,
+    introConfirms,
+    casesRead: true,
+    ownImages: sourcesOn ? new Set((own ?? []).map((row) => row.src)) : null,
+    openSpots,
+    catalog,
+    now: Date.now(),
+  });
+  return {
+    state,
+    // The facts this page is checked against: with only other places', it is unchecked.
+    facts: pageFactsOf({ html, brandFacts: facts, pageTitle, pageUrls }) ?? facts,
+    sentences: blocks.flatMap((b) => sentencesOf(b.text)),
+    brandName: authors.brands.find((b) => b.id === draft.brand_id)?.name ?? brand.name,
+  };
+}
+
+/** A page's Quality in Chat: its score, and what it was read from. */
+export interface PageQuality extends DraftQuality {
+  /** The Quality figure the editor's header shows: the scores read, averaged; null with none. */
+  score: number | null;
+}
+
+/**
+ * A page's Quality in Chat (CHAT-25 §6, W4-12b part 2): the editor's
+ * scores, read as the go-live gate reads them (the owner's 2026-11-05
+ * decision), for a page's version card and check_draft_rules. The reads are
+ * the run's own (internal-chat-quality.js): `spend` for a new version, where
+ * a read the draft hasn't kept is the run's step (Quality's phase 2 on);
+ * check_draft_rules spends nothing and takes only kept reads. Null while
+ * Content Quality is off, or when a read it needs couldn't be made: no
+ * figure is ever guessed.
+ */
+export async function readPageQuality(
+  input: QualityReadFor & {
+    runId: string;
+    agentRunId?: string | null;
+    scheduleId?: string | null;
+    spend: boolean;
+  },
+): Promise<PageQuality | null> {
+  const phase = qualityPhase();
+  if (phase < 1) return null;
+  try {
+    const read = await readDraftQuality(input, phase, (sites) =>
+      serverReads('/api/internal/chat/quality/reads', {
+        orgId: input.organizationId,
+        runId: input.runId,
+        actingUserId: input.actingUserId,
+        draftId: input.draftId,
+        sites,
+        spend: input.spend,
+        ...(input.agentRunId ? { agentRunId: input.agentRunId } : {}),
+        ...(input.scheduleId ? { scheduleId: input.scheduleId } : {}),
+      }),
+    );
+    const { eeatScore, trustScore, readable } = read.state;
+    return {
+      ...read,
+      score: qualityAverage([
+        eeatScore?.score ?? null,
+        trustScore?.score ?? null,
+        readable?.score ?? null,
+      ]),
+    };
+  } catch (err) {
+    if (err instanceof Unread) {
+      console.warn(`[chat/quality] the page's Quality wasn't read: ${err.message}`);
+      return null;
+    }
+    console.error('[chat/quality] the page’s Quality read failed:', err);
+    return null;
+  }
+}

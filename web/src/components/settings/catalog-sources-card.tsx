@@ -12,6 +12,7 @@ import { Link } from '@/i18n/navigation';
 import { useUserRole } from '@/hooks/use-user-role';
 import { useUpgradeGate } from '@/components/providers/upgrade-gate';
 import { addFeedSource, listCatalogSources, removeCatalogSource } from '@/lib/actions/catalog';
+import { withReadTimeout } from '@/lib/integrations-client';
 import { isStoreSource, SIGN_IN_PLATFORM_LABELS, type CatalogSource } from '@/lib/catalog';
 import {
   connectStore,
@@ -106,7 +107,8 @@ export function CatalogSourcesCard({
   useEffect(() => {
     if (!activeBrandId) return;
     let cancelled = false;
-    listCatalogSources(activeBrandId).then(
+    // A read that takes too long says the sources can't be read, like one that fails.
+    withReadTimeout(listCatalogSources(activeBrandId)).then(
       (sources) => {
         if (!cancelled) setLoaded({ brandId: activeBrandId, sources, at: new Date() });
       },
@@ -233,7 +235,7 @@ export function CatalogSourcesCard({
   };
 
   return (
-    <div className="space-y-4 rounded-lg border p-4">
+    <div className="space-y-4 rounded-lg border bg-card p-4">
       <div className="flex items-start gap-3">
         <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border bg-muted/50">
           <Package className="h-5 w-5 text-muted-foreground" />
@@ -256,7 +258,7 @@ export function CatalogSourcesCard({
             {sources.length === 0 ? (
               <p className="text-sm text-muted-foreground">{t('empty')}</p>
             ) : (
-              <ul className="divide-y rounded-md border">
+              <ul className="divide-y rounded-md border bg-card">
                 {sources.map((source) => (
                   <li key={source.id} className="space-y-1 p-3 text-sm">
                     <div className="flex flex-wrap items-center justify-between gap-2">
@@ -327,9 +329,18 @@ export function CatalogSourcesCard({
                         ` · ${t('issues', { count: source.lastCounts!.issues!.items })}`}
                       {(source.lastCounts?.repeated ?? 0) > 0 &&
                         ` · ${t('repeated', { count: source.lastCounts!.repeated! })}`}
-                      {source.lastSyncedAt &&
+                      {source.kind !== 'upload' &&
+                        source.lastSyncedAt &&
                         ` · ${t('lastSync', { when: format.relativeTime(new Date(source.lastSyncedAt), now) })}`}
                     </p>
+                    {/* An upload is read once: it says so, with when, rather than "synced". */}
+                    {source.kind === 'upload' && source.lastSyncedAt && (
+                      <p className="text-xs text-amber-700 dark:text-amber-400">
+                        {t('uploadStale', {
+                          when: format.relativeTime(new Date(source.lastSyncedAt), now),
+                        })}
+                      </p>
+                    )}
                     {source.lastStatus !== 'ok' && source.lastError && (
                       <p className="text-xs text-destructive">{source.lastError}</p>
                     )}
@@ -380,6 +391,10 @@ export function CatalogSourcesCard({
 
             {canManage ? (
               <div className="space-y-2">
+                <p className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                  <Badge variant="secondary">{t('recommended')}</Badge>
+                  {t('feedRecommended')}
+                </p>
                 <form
                   className="flex flex-col gap-2 sm:flex-row"
                   onSubmit={(e) => {

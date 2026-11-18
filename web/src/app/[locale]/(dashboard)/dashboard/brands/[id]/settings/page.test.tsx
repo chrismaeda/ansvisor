@@ -106,6 +106,11 @@ vi.mock('./_brand-facts-tab', () => ({
   BrandFactsTab: ({ brandId }: { brandId: string }) => <p data-testid="brand-facts">{brandId}</p>,
 }));
 
+// The client logo is _client-logo-card.test.tsx's.
+vi.mock('./_client-logo-card', () => ({ ClientLogoCard: () => null }));
+vi.mock('./_people-tab', () => ({ PeopleTab: () => null }));
+vi.mock('./_integrations-tab', () => ({ IntegrationsTab: () => null }));
+
 import BrandSettingsPage from './page';
 
 afterEach(() => {
@@ -211,6 +216,14 @@ describe('brand settings site type', () => {
     const { container, root, siteType } = await render();
     expect(siteType?.textContent).toBe('siteTypes.ecommerce');
     expect(container.textContent).toContain('settings.siteTypeHint');
+    expect(container.textContent).not.toContain('settings.siteTypeGuessed');
+    await act(async () => root.unmount());
+  });
+
+  it('shows Mobile app when the brand chose it', async () => {
+    brand.siteType = 'app';
+    const { container, root, siteType } = await render();
+    expect(siteType?.textContent).toBe('siteTypes.app');
     expect(container.textContent).not.toContain('settings.siteTypeGuessed');
     await act(async () => root.unmount());
   });
@@ -339,8 +352,32 @@ describe('brand settings role gates', () => {
     await openTab('settings.dangerTab');
     expect(fieldset().disabled).toBe(false);
     expect(container.textContent).not.toContain('settings.adminsOnlyDelete');
+    expect(container.textContent).not.toContain('settings.demoCantDelete');
 
     await act(async () => root.unmount());
+  });
+
+  it('never deletes the demo brand: it says to hide it instead', async () => {
+    brand.isDemo = true;
+    try {
+      const { container, root, openTab, fieldset } = await render();
+      await openTab('settings.dangerTab');
+      const panel = container.querySelector('[role="tabpanel"]:not([hidden])')!;
+      expect(panel.querySelector('[data-slot="demo-cant-delete"]')?.textContent).toBe(
+        'settings.demoCantDelete',
+      );
+      expect(panel.querySelector('input')).toBeNull();
+      expect(fieldset().disabled).toBe(true);
+      const remove = [...panel.querySelectorAll('button')].find(
+        (b) => b.textContent === 'settings.deleteButton',
+      )!;
+      expect(remove.disabled).toBe(true);
+      await act(async () => remove.click());
+      expect(deleteBrand).not.toHaveBeenCalled();
+      await act(async () => root.unmount());
+    } finally {
+      brand.isDemo = undefined;
+    }
   });
 });
 
@@ -477,6 +514,75 @@ describe('brand settings on a read-only workspace', () => {
     await act(async () => button('Pause tracking').click());
     expect(setBrandActive).toHaveBeenCalledWith(brand.id, false);
     expect(openUpgrade).not.toHaveBeenCalled();
+    await act(async () => root.unmount());
+  });
+});
+
+// Competitor types (00542): each row shows its type, and Set type opens its
+// dialog for admins and managers, the upgrade dialog on a read-only
+// workspace (next-intl is mocked: labels are their keys).
+describe('competitor types in brand settings', () => {
+  const openUpgrade = vi.fn();
+  beforeEach(() => {
+    openUpgrade.mockReset();
+    getCompetitors.mockResolvedValue([
+      { id: 'c1', brandId: brand.id, name: 'Sky Air', domain: 'sky.example', type: 'Airline' },
+      { id: 'c2', brandId: brand.id, name: 'Rival', domain: 'rival.com', type: 'direct' },
+    ]);
+  });
+
+  async function renderCompetitors(isLocked: boolean) {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const root = createRoot(container);
+    await act(async () => {
+      root.render(
+        <UpgradeDialogContext.Provider
+          value={{ isLocked, reason: 'ended', adminName: null, openUpgrade }}
+        >
+          <Suspense>
+            <BrandSettingsPage params={Promise.resolve({ id: brand.id })} />
+          </Suspense>
+        </UpgradeDialogContext.Provider>,
+      );
+    });
+    const tab = [...container.querySelectorAll<HTMLElement>('[role="tab"]')].find(
+      (el) => el.textContent?.trim() === 'Competitors',
+    )!;
+    await act(async () => {
+      tab.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true }));
+      tab.click();
+    });
+    const panel = container.querySelector<HTMLElement>('[role="tabpanel"]:not([hidden])')!;
+    const setType = () => panel.querySelectorAll<HTMLButtonElement>('button[aria-label="setFor"]');
+    return { root, panel, setType };
+  }
+
+  it('labels each competitor with its type and opens its Set type dialog', async () => {
+    const { root, panel, setType } = await renderCompetitors(false);
+    expect(panel.textContent).toContain('Airline');
+    expect(panel.textContent).toContain('Direct competitor');
+    expect(setType()).toHaveLength(2);
+    await act(async () => setType()[0].click());
+    expect(openUpgrade).not.toHaveBeenCalled();
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain('setTitle');
+    await act(async () => root.unmount());
+  });
+
+  it('opens the upgrade dialog for Set type on a read-only workspace', async () => {
+    const { root, setType } = await renderCompetitors(true);
+    await act(async () => setType()[0].click());
+    expect(openUpgrade).toHaveBeenLastCalledWith('setCompetitorTypes');
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    await act(async () => root.unmount());
+  });
+
+  it("leaves an analyst's Set type off, with the rest of the tab", async () => {
+    Object.assign(role, { canAdmin: false, canManage: false });
+    const { root, panel, setType } = await renderCompetitors(false);
+    expect(panel.textContent).toContain('Airline');
+    expect(panel.querySelector('fieldset')!.disabled).toBe(true);
+    expect(panel.querySelector('fieldset')!.contains(setType()[0])).toBe(true);
     await act(async () => root.unmount());
   });
 });

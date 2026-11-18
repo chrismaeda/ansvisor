@@ -1,0 +1,112 @@
+/**
+ * The new Chat (the Drive Chat specs, CHAT-00…25) behind CHAT_AGENTIC.
+ *
+ * Off unless "true", so a self-hosted install — or the cloud with it unset —
+ * keeps today's /dashboard/agent and sees nothing new. With it on,
+ * CHAT_AGENTIC_ORGS (organization ids, comma-separated) narrows it to those
+ * workspaces; unset or empty, it is on for every one. The API server's
+ * lib/chat-flag.js reads the same two variables the same way.
+ *
+ * Read from the process's environment each time it is asked: not a
+ * NEXT_PUBLIC_ variable, so nothing is written into the browser's code.
+ * The process sees a change only when it starts again: self-hosted, a
+ * restart; on Vercel, a new deployment (a changed environment variable
+ * applies to the next deployment, not the running one).
+ *
+ * Dynamic server code only — route handlers, server actions, and pages and
+ * layouts rendered per request. A page rendered at build time would keep the
+ * build's value in its HTML; in the browser both variables are missing, so
+ * there it is off.
+ */
+export function chatAgenticEnabled(organizationId?: string | null): boolean {
+  if (process.env.CHAT_AGENTIC !== 'true') return false;
+  const orgs = chatAgenticOrgs();
+  if (orgs.length === 0) return true;
+  return !!organizationId && orgs.includes(organizationId.trim().toLowerCase());
+}
+
+/**
+ * The workspaces CHAT_AGENTIC is on for, for a read that serves only them
+ * (the sweep's): null when it is on for every one, none when it is off.
+ */
+export function chatAgenticOrgScope(): string[] | null {
+  if (process.env.CHAT_AGENTIC !== 'true') return [];
+  const orgs = chatAgenticOrgs();
+  return orgs.length === 0 ? null : orgs;
+}
+
+/** CHAT_AGENTIC_ORGS as a list: trimmed, lower-cased, blanks dropped. */
+function chatAgenticOrgs(): string[] {
+  return (process.env.CHAT_AGENTIC_ORGS ?? '')
+    .split(',')
+    .map((id) => id.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+/**
+ * Agents that publish and send on their own (AUTONOMOUS-GO-LIVE §9) behind
+ * CHAT_AUTO_GO_LIVE, on top of CHAT_AGENTIC: off unless "true", and
+ * CHAT_AUTO_GO_LIVE_ORGS narrows it as CHAT_AGENTIC_ORGS does. Staff's
+ * rollout list and kill switch on the cloud; a self-hosted operator's own
+ * opt-in. Off, Settings › Chat hides the switch and no agent goes live on
+ * its own. The API server reads the same two variables the same way
+ * (lib/chat-flag.js autoGoLiveEnabled) and, off, refuses every go-live step
+ * (routes/internal-chat-go-live.js, 403 auto_go_live_off) whatever the
+ * workspace's saved switch says: set both sides to the same values.
+ */
+export function autoGoLiveEnabled(organizationId?: string | null): boolean {
+  if (!chatAgenticEnabled(organizationId)) return false;
+  if (process.env.CHAT_AUTO_GO_LIVE !== 'true') return false;
+  const orgs = (process.env.CHAT_AUTO_GO_LIVE_ORGS ?? '')
+    .split(',')
+    .map((id) => id.trim().toLowerCase())
+    .filter(Boolean);
+  if (orgs.length === 0) return true;
+  return !!organizationId && orgs.includes(organizationId.trim().toLowerCase());
+}
+
+/**
+ * The AEO Operator (AEO Operator plan §4.5) behind CHAT_OPERATOR, on top of
+ * CHAT_AGENTIC: off unless "true", and CHAT_OPERATOR_ORGS narrows it as
+ * CHAT_AGENTIC_ORGS does. Off, the /operator skill is in no list
+ * (skills/flagged.ts), no Operator can be made, turned on or run, and an
+ * Operator's run already queued stops before it starts. Web only: the API
+ * server never reads it.
+ */
+export function chatOperatorEnabled(organizationId?: string | null): boolean {
+  if (!chatAgenticEnabled(organizationId)) return false;
+  return chatOperatorOn(organizationId);
+}
+
+/**
+ * CHAT_OPERATOR alone, for a list with no workspace to ask about (the
+ * install's skills, its ready-to-use agents); with one, its CHAT_OPERATOR_ORGS
+ * too. CHAT_AGENTIC is chatOperatorEnabled's to check.
+ */
+export function chatOperatorOn(organizationId?: string | null): boolean {
+  if (process.env.CHAT_OPERATOR !== 'true') return false;
+  if (organizationId === undefined) return true;
+  const orgs = chatOperatorOrgs();
+  if (orgs.length === 0) return true;
+  return !!organizationId && orgs.includes(organizationId.trim().toLowerCase());
+}
+
+/**
+ * The workspaces chatOperatorEnabled is on for, for a read that serves only
+ * them (the sweep's): null when it is on for every one, none when it is off.
+ */
+export function chatOperatorOrgScope(): string[] | null {
+  const agentic = chatAgenticOrgScope();
+  if (process.env.CHAT_OPERATOR !== 'true') return [];
+  const orgs = chatOperatorOrgs();
+  if (agentic === null) return orgs.length === 0 ? null : orgs;
+  return orgs.length === 0 ? agentic : agentic.filter((id) => orgs.includes(id));
+}
+
+/** CHAT_OPERATOR_ORGS as a list: trimmed, lower-cased, blanks dropped. */
+function chatOperatorOrgs(): string[] {
+  return (process.env.CHAT_OPERATOR_ORGS ?? '')
+    .split(',')
+    .map((id) => id.trim().toLowerCase())
+    .filter(Boolean);
+}

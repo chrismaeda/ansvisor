@@ -2,7 +2,9 @@
  * The task registry (#818).
  *
  * The shared Task Library of the V1 specification: sixty-two primitives with
- * stable ids, which every definition builds its plan from. An action tells the
+ * stable ids, which every definition builds its plan from, and one added
+ * since (learning C4's analyze_winning_pages, AC plan P-10's
+ * review_link_plan). An action tells the
  * user what to achieve; its tasks say how, and a task is one of these.
  *
  * Each primitive declares, in the specification's terms:
@@ -79,6 +81,7 @@ const EXECUTION = [
   'publish_content',
   'fix_crawler_access',
   'fix_structured_data',
+  'fix_canonical',
   'fix_broken_target',
   'fix_technical_issue',
   'execute_outreach',
@@ -147,6 +150,8 @@ export const TASKS = Object.freeze({
   analyze_competitor_content: agent('analyze_competitor_content', {
     requires: ['competitors'],
     outputs: ['findings'],
+    // Read free from the pages the brand's answers cite (learning C1).
+    tool: 'competitor_page_features',
   }),
   analyze_ai_traffic: system('analyze_ai_traffic', {
     requires: ['ai_traffic'],
@@ -168,6 +173,13 @@ export const TASKS = Object.freeze({
   analyze_site_audit: system('analyze_site_audit', {
     requires: ['site_audits'],
     outputs: ['failingSignals'],
+  }),
+  // Learning C4: what the brand's winning pages have that its other audited
+  // pages don't, read by Ansvisor overnight.
+  analyze_winning_pages: system('analyze_winning_pages', {
+    requires: ['site_audits'],
+    outputs: ['patterns', 'missingPages'],
+    tool: 'winning_page_features',
   }),
   analyze_entity_signals: agent('analyze_entity_signals', { outputs: ['findings'] }),
   analyze_internal_links: system('analyze_internal_links', {
@@ -204,6 +216,9 @@ export const TASKS = Object.freeze({
     outputs: ['paths'],
   }),
   prioritize_targets: system('prioritize_targets', { outputs: ['orderedTargets'] }),
+  // The bridge links' pairs and anchors, read by a person before they go on
+  // the pages (AC plan P-10).
+  review_link_plan: human('review_link_plan', { outputs: ['links'] }),
   define_validation_baseline: system('define_validation_baseline', {
     outputs: ['baseline', 'window'],
   }),
@@ -255,6 +270,8 @@ export const TASKS = Object.freeze({
   // ── Technical execution ───────────────────────────────────────────────────
   fix_crawler_access: human('fix_crawler_access', { permission: 'write', outputs: ['changes'] }),
   fix_structured_data: human('fix_structured_data', { permission: 'write', outputs: ['changes'] }),
+  // A canonical tag pointing to the page itself or a live page (AC plan P-11).
+  fix_canonical: human('fix_canonical', { permission: 'write', outputs: ['changes'] }),
   fix_broken_target: human('fix_broken_target', { permission: 'write', outputs: ['changes'] }),
   fix_technical_issue: human('fix_technical_issue', { permission: 'write', outputs: ['changes'] }),
   validate_technical_fix: validation('validate_technical_fix', { requires: ['site_audits'] }),

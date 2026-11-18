@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import messages from '../../../messages/en.json';
 import type { ContentOpportunity } from '@/types';
 import { UpgradeDialogContext } from '@/components/providers/upgrade-gate';
+import { keywordVolumeEstimate } from '@/lib/volume-estimate';
 
 /**
  * The opportunity panel on a read-only workspace (plan not active): its
@@ -33,10 +34,16 @@ const plan = vi.hoisted(() => ({
   setPlanRowPriority: vi.fn(async () => undefined),
 }));
 vi.mock('@/lib/actions/content-plan', () => plan);
+const NO_VOLUME = { basket: null, basketFailed: false, volume: null, question: null, prompts: 1 };
+const volumeRead = vi.hoisted(() => ({ value: null as unknown }));
 vi.mock('@/hooks/use-opportunity-volume', () => ({
-  useOpportunityVolume: () => ({ basket: null, basketFailed: false, volume: null }),
+  useOpportunityVolume: () => volumeRead.value ?? NO_VOLUME,
 }));
-vi.mock('@/hooks/use-user-role', () => ({ useUserRole: () => ({ canManage: true }) }));
+// An admin or a manager unless a test says otherwise.
+const viewer = vi.hoisted(() => ({ canManage: true }));
+vi.mock('@/hooks/use-user-role', () => ({
+  useUserRole: () => ({ canManage: viewer.canManage }),
+}));
 const brandState = vi.hoisted(() => ({
   activeBrandId: 'b1',
   brands: [{ id: 'b1', name: 'Acme', siteType: 'b2b' }],
@@ -119,6 +126,8 @@ const moreItem = async (item: string) => {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  volumeRead.value = null;
+  viewer.canManage = true;
   newContent.open = false;
   content.getOpportunity.mockResolvedValue(OPPORTUNITY);
   content.getBriefQuota.mockResolvedValue({ limit: -1, remaining: -1 });
@@ -195,5 +204,101 @@ describe('the brief quota without an active plan', () => {
     expect(container.textContent).toContain('Monthly Brief Limit Reached');
     expect(container.textContent).not.toContain('No active plan');
     expect(buttonNamed('Generate Brief').disabled).toBe(true);
+  });
+});
+
+describe("the opportunity panel's costly AI work", () => {
+  const labels = () =>
+    [...document.body.querySelectorAll('button, [role="menuitem"]')].map((el) =>
+      el.textContent?.trim(),
+    );
+  const openMore = () =>
+    act(async () => container.querySelector<HTMLElement>('[aria-label="More actions"]')!.click());
+
+  it('offers an admin or a manager Generate Brief and Another angle', async () => {
+    await render(false);
+    expect(labels()).toContain('Generate Brief');
+    expect(labels()).toContain('Generate Content Brief');
+    await openMore();
+    expect(labels()).toContain('Another angle');
+  });
+
+  it('leaves them out for an analyst or an agency partner, saying who generates a brief', async () => {
+    viewer.canManage = false;
+    await render(false);
+    expect(labels()).not.toContain('Generate Brief');
+    expect(labels()).not.toContain('Generate Content Brief');
+    expect(container.textContent).toContain('Ask an admin or a manager to generate a brief.');
+    await openMore();
+    expect(labels()).not.toContain('Another angle');
+  });
+});
+
+// Sending to the webhook is for admins and managers too (2026-11-03).
+describe("the opportunity panel's Send to Workflow and Dismiss", () => {
+  const menuItems = async () => {
+    await act(async () =>
+      container.querySelector<HTMLElement>('[aria-label="More actions"]')!.click(),
+    );
+    return [...document.body.querySelectorAll('[role="menuitem"]')].map((el) => el.textContent);
+  };
+
+  it('is offered to an admin or a manager', async () => {
+    await render(false);
+    const items = await menuItems();
+    expect(items).toContain('Send to Workflow');
+    expect(items).toContain('Dismiss');
+  });
+
+  it('is left out for an analyst or an agency partner, who keep Mark as reviewed', async () => {
+    viewer.canManage = false;
+    await render(false);
+    const items = await menuItems();
+    expect(items).toContain('Mark as reviewed');
+    expect(items).not.toContain('Send to Workflow');
+    expect(items).not.toContain('Dismiss');
+  });
+});
+
+describe("the opportunity's volume (2026-11-01)", () => {
+  it("is its question's, one of its prompts, from head terms with the closest measured phrase", async () => {
+    const now = new Date('2026-11-01T00:00:00Z');
+    const question = 'What are the best coffee subscription services in 2026?';
+    volumeRead.value = {
+      ...NO_VOLUME,
+      volume: keywordVolumeEstimate(6751, 0.45, '2026-10-20T00:00:00Z', now),
+      question: {
+        question,
+        estimate: keywordVolumeEstimate(6751, 0.45, '2026-10-20T00:00:00Z', now),
+        fromHeadTerms: true,
+        closest: {
+          phrase: 'best coffee subscription 2026',
+          estimate: keywordVolumeEstimate(1300, 0.45, '2026-10-20T00:00:00Z', now),
+        },
+      },
+      prompts: 3,
+    };
+    await render(false);
+    const text = container.textContent ?? '';
+    expect(text).toContain('Estimate');
+    expect(text).toContain(`For “${question}”, one of 3 prompts`);
+    expect(text).toContain(
+      'From head terms. Closest measured phrase: “best coffee subscription 2026”',
+    );
+  });
+});
+
+describe("its own page (the owner's plan, step 9's detail pages)", () => {
+  it('hands the page the opportunity once read, for Chat’s side panel', async () => {
+    const onOpportunity = vi.fn();
+    await act(async () => {
+      root.render(
+        <NextIntlClientProvider locale="en" messages={messages} timeZone="UTC">
+          <OpportunityDetail id="o1" onOpportunity={onOpportunity} />
+        </NextIntlClientProvider>,
+      );
+    });
+    await act(async () => {});
+    expect(onOpportunity).toHaveBeenLastCalledWith(OPPORTUNITY);
   });
 });

@@ -1,0 +1,52 @@
+---
+title: Change your Chat settings
+route: /dashboard/chat/settings
+keywords: [chat settings, general settings, settings tabs, activity tab, what chat can do, tool policy tab, date range, default date range, time range, ask me before the first analysis, default mode, product tour, take the tour, your focus, answer language, chat language, notify me, agent needs me, email when an agent waits, slack when an agent waits, thought for, thinking time, ask chat on every page, full auto]
+synonyms: [chat preferences, chat options, run mode default]
+plan: all
+updated: 2026-11-16
+last_checked: 2026-11-16
+owner: Cihan
+app_version: 0.3.0
+approved: true
+sources: [web/messages/en.json, web/src/lib/chat/range.ts]
+---
+Click **Settings** in the chat menu, then **General**, for your own Chat preferences. They are yours alone and follow you to every device. A change is kept as soon as you make it; if it can't be kept, it goes back and Chat says so.
+
+## Settings tabs
+
+The **Settings** page has its own tabs on the left: **General**, **Activity**, **What Chat can do** and **Tool policy**, in the same order as under **Settings** in the chat menu. Click one to open it on the right: the page's title and the tabs stay, and the tab you are on is highlighted. **General** holds your own preferences, below. **Activity** logs every change Chat made, with **Undo**. **What Chat can do** lists the tools Chat may use, by area. **Tool policy** holds the workspace's rules: everyone reads them, and only Admins change them. On a narrow screen the tabs sit in a row above the page.
+
+## Default mode
+
+**Default mode** is how much the agent does on its own when you start a job: **Ask me first**, **Auto, ask before changes** or **Full auto**. New chats start in it. In your own chats nothing is published or sent without your click. Agents an Admin allows can publish on their own. **Full auto** needs the Growth plan, and your Admin can turn it off for everyone but Admins; when it is locked, point at it to see why. Analysts and Agency partners only read, so they have no default mode.
+
+## Your focus
+
+**Your focus** starts with **Default view**, which keeps Chat Home to a greeting, one line and the chat box. Under it are the eight areas Chat can focus on for you, such as **Competitors** or **Content**. Tick the ones you work on: Chat Home and its suggestions follow them. Clearing every area goes back to the Default view. Your focus doesn't change what you can do; your role decides that.
+
+## Answer language
+
+**Answer language** sets the language Chat answers in. **Same as my question**, the default, answers in the language you write in. Pick a language, such as English, and Chat answers in it whatever language you write in: useful for agencies and teams that write in several languages. Asking for a language in a message, such as "answer in German", always wins for that answer. The app itself stays in English.
+
+## Date range
+
+**Date range** is the period Chat reads when your message names none, in Chat and in the panel beside every page, for every brand. Pick **Last 24 hours**, **Last 7 days**, **Last 30 days**, **Last 90 days**, or **Custom** with a first and a last day: it is kept at once. **Ask me before the first analysis** clears it, so Chat asks again on the next analysis that reads data. The date range chip above the message box shows the same range; click it to change it.
+
+## Notify me when an agent needs me
+
+When one of your agents stops to ask you something or to wait for your OK on a change, its chat moves to **Needs you** in your Inbox. **Notify me when an agent needs me** sets what else you get, once per run, with a link to open it: **Inbox + email**, the default, sends an email; **Inbox only** sends nothing more; **Inbox + Slack** posts in the brand's Slack channel and mentions you. **Inbox + Slack** can be picked once a brand you can see posts to Slack. For a brand that doesn't, you get the email instead, and notices Slack doesn't carry, such as an agent going live, still come by email.
+
+## Thought for N s
+
+**Show “Thought for N s”** puts a short line above each answer, such as "Thought for 12 s": how long Chat worked, reading your data, before it started writing. It is on by default; turn it off to hide the line on new answers.
+
+## Chat on every page
+
+**Open Chat on every page** shows or hides **Ask Chat** with Ctrl J in each page's header.
+
+## Product tour
+
+**Take the tour**, under **Product tour**, starts the product tour again from its first topic: each page opens with Chat beside it, explaining the page in a few lines. It shows only while **Open Chat on every page** is on, since the tour runs in that side panel.
+
+Workspace rules, such as which tools Chat may use on its own, are in the **Tool policy** tab; only Admins change them.

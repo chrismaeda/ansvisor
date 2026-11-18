@@ -1,0 +1,19 @@
+{
+  "id": "onboarding-help",
+  "goal": "help",
+  "businessTypes": [],
+  "industries": [],
+  "roles": [],
+  "skills": [
+    "setup"
+  ],
+  "triggers": [
+    {
+      "kind": "brand_added"
+    }
+  ],
+  "mode": "ask_first",
+  "connections": [],
+  "status": "ready",
+  "needs": []
+}

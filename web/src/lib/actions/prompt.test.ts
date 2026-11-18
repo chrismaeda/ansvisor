@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PLANS, type Plan } from '@/config/plans';
 import { getPromptVolumes, type VolumeQuota } from '@/lib/actions/volumes';
 import { getPromptVisibilitySummaries, type PromptVisibilitySummary } from '@/lib/actions/tracking';
+import { planFromOrgRow } from '@/lib/guards/plan-guard';
+import { normalizeTags } from '@/lib/prompt-tags';
 
 /**
  * setPromptActive meters resuming like adding (00128): only active prompts
@@ -24,10 +26,19 @@ let previousPositionData: Record<string, unknown>[] | null = null;
 let positionsNull = false;
 /** The web deployed before 00153: PostgREST can't find the jsonb RPC. */
 let jsonRpcMissing = false;
+/** The brand read is the organization's demo brand (00380). */
+let brandIsDemo = false;
 /** The position RPC calls, and whether any asked for a slice. */
 let positionCalls: { fn: string; ranged: boolean }[] = [];
+/** The brand's organization, as its row embeds it for the Positions column's plan. */
+const ORG_ROW = { plan: 'growth', subscription_status: 'active', plan_overrides: null };
+/** When set, reading the brand's row fails with it. */
+let brandReadError: string | null = null;
 /** When set, each heavy read takes a moment, counted while it runs. */
 let slowReads: { running: number; most: number } | null = null;
+/** The prompts a bulk location change reads, and what it writes back. */
+let bulkRows: { id: string; regions: string[]; is_active: boolean; tags?: string[] }[] = [];
+let appliedLocations: unknown[] = [];
 const slowRead = async <T>(read: () => T | Promise<T>): Promise<T> => {
   if (!slowReads) return read();
   const reads = slowReads;
@@ -40,16 +51,34 @@ const slowRead = async <T>(read: () => T | Promise<T>): Promise<T> => {
 vi.mock('next/cache', () => ({ revalidatePath: vi.fn() }));
 vi.mock('@/lib/actions/volumes', () => ({ getPromptVolumes: vi.fn() }));
 vi.mock('@/lib/actions/tracking', () => ({ getPromptVisibilitySummaries: vi.fn() }));
+// What the table's first read brings besides the rows (getPromptsPageData).
+const extras = vi.hoisted(() => ({
+  readBrandImprovingActions: vi.fn(),
+  readUnansweredPromptIds: vi.fn(),
+  getPromptTableViews: vi.fn(),
+}));
+vi.mock('@/lib/improving-actions', () => ({
+  readBrandImprovingActions: extras.readBrandImprovingActions,
+}));
+vi.mock('@/lib/prompts-without-answers', () => ({
+  readUnansweredPromptIds: extras.readUnansweredPromptIds,
+}));
+vi.mock('@/lib/actions/prompt-table-views', () => ({
+  getPromptTableViews: extras.getPromptTableViews,
+}));
 
 vi.mock('@/lib/guards/plan-guard', () => ({
   getOrgPlan: vi.fn(async () => plan),
+  // The Positions column reads the organization's plan from its brand's row.
+  ORG_PLAN_COLUMNS: 'plan, subscription_status, plan_overrides',
+  planFromOrgRow: vi.fn(() => plan),
 }));
 
 vi.mock('@/lib/supabase/server', () => ({
   createClient: vi.fn(async () => ({
     // The position sums come as one jsonb value (00153), which PostgREST's
     // 1000-row cap doesn't cut; the old row-returning RPC would have been cut.
-    rpc: (fn: string, args?: { p_date_to?: string }) => {
+    rpc: (fn: string, args?: { p_date_to?: string; p_updates?: unknown[] }) => {
       const call = { fn, ranged: false };
       if (fn.startsWith('prompt_position_summaries')) positionCalls.push(call);
       const result = () => {
@@ -67,6 +96,10 @@ vi.mock('@/lib/supabase/server', () => ({
         }
         if (fn === 'prompt_position_summaries') {
           return { data: positionData.slice(0, 1000), error: null };
+        }
+        if (fn === 'apply_prompt_locations') {
+          appliedLocations.push(args?.p_updates);
+          return { data: args?.p_updates?.length ?? 0, error: null };
         }
         return usageFails
           ? { data: null, error: { message: 'rpc failed' } }
@@ -87,12 +120,27 @@ vi.mock('@/lib/supabase/server', () => ({
     },
     from: (table: string) => ({
       select: () => ({
+        in: async (_column: string, ids: string[]) => ({
+          data: bulkRows
+            .filter((row) => ids.includes(row.id))
+            .map((row) => ({
+              ...row,
+              prompt_sets: { brands: { organization_id: 'org-1' } },
+            })),
+          error: null,
+        }),
         eq: () => ({
           order: async () =>
             table === 'prompt_sets'
               ? { data: promptSetRows, error: null }
               : { data: null, error: { message: `unexpected ${table}` } },
-          maybeSingle: async () => ({ data: { organization_id: 'org-1' }, error: null }),
+          maybeSingle: async () =>
+            brandReadError
+              ? { data: null, error: { message: brandReadError } }
+              : {
+                  data: { organization_id: 'org-1', is_demo: brandIsDemo, organizations: ORG_ROW },
+                  error: null,
+                },
           single: async () =>
             promptRow
               ? {
@@ -119,8 +167,14 @@ vi.mock('@/lib/supabase/server', () => ({
   })),
 }));
 
-const { getPromptLocationMatrix, getPromptsPageData, setPromptActive, updatePromptLocations } =
-  await import('./prompt');
+const {
+  bulkUpdatePromptLocations,
+  bulkUpdatePromptTags,
+  getPromptLocationMatrix,
+  getPromptsPageData,
+  setPromptActive,
+  updatePromptLocations,
+} = await import('./prompt');
 
 const capped = (maxPrompts: number): Plan => ({
   ...PLANS.starter,
@@ -153,7 +207,26 @@ describe('setPromptActive', () => {
     const result = await setPromptActive('p1', true);
 
     expect(result).toMatchObject({ prompt: { id: 'p1', isActive: true } });
-    expect(writes).toEqual([{ is_active: true }]);
+    // Resuming also ends any wait for a spot (00535's check refuses an active waiting prompt).
+    expect(writes).toEqual([{ is_active: true, waiting_since: null }]);
+  });
+
+  it('tracks a prompt waiting for a spot once there is room, ending its wait', async () => {
+    promptRow = { regions: ['US'], is_active: false };
+    usedLocations = 49;
+
+    const result = await setPromptActive('p1', true);
+
+    expect(result).toMatchObject({ prompt: { isActive: true } });
+    expect(writes).toEqual([{ is_active: true, waiting_since: null }]);
+  });
+
+  it('still refuses to track a waiting prompt when the plan is full', async () => {
+    promptRow = { regions: ['US'], is_active: false };
+    usedLocations = 50;
+
+    expect(await setPromptActive('p1', true)).toMatchObject({ code: 'plan_limit' });
+    expect(writes).toEqual([]);
   });
 
   it('always lets a prompt be paused, even over the limit', async () => {
@@ -232,10 +305,87 @@ describe('updatePromptLocations on paused prompts', () => {
   });
 });
 
+describe('bulkUpdatePromptLocations (PROMPT-015)', () => {
+  beforeEach(() => {
+    appliedLocations = [];
+    usageFails = false;
+    plan = capped(50);
+    usedLocations = 10;
+    // A city no list names any more: never run, and still on the prompts.
+    bulkRows = [
+      { id: 'p1', regions: ['US', 'TR~ATLANTIS'], is_active: true },
+      { id: 'p2', regions: ['TR~ATLANTIS'], is_active: true },
+    ];
+  });
+
+  it("stops a location no list names any more, but never a prompt's last one", async () => {
+    const result = await bulkUpdatePromptLocations(['p1', 'p2'], 'remove', ['tr~atlantis']);
+
+    expect(result).toEqual({ updated: 1, unchanged: 0, blocked: 1, delta: -1 });
+    expect(appliedLocations).toEqual([[{ id: 'p1', regions: ['US'] }]]);
+  });
+
+  it('still refuses to add one, and writes nothing', async () => {
+    const result = await bulkUpdatePromptLocations(['p1'], 'add', ['TR~ATLANTIS', 'DE']);
+
+    expect(result).toEqual({ error: 'Unknown location code: TR~ATLANTIS' });
+    expect(appliedLocations).toEqual([]);
+  });
+});
+
+describe('bulkUpdatePromptTags (#2378)', () => {
+  beforeEach(() => {
+    writes = [];
+    bulkRows = [
+      { id: 'p1', regions: ['US'], is_active: true, tags: ['campaign-x'] },
+      { id: 'p2', regions: ['US'], is_active: true, tags: ['campaign-x', 'bottom-funnel'] },
+      {
+        id: 'p3',
+        regions: ['US'],
+        is_active: true,
+        tags: Array.from({ length: 10 }, (_, i) => `t${i + 1}`),
+      },
+    ];
+  });
+
+  it('adds the missing tags only, and skips a prompt at the cap', async () => {
+    const result = await bulkUpdatePromptTags(['p1', 'p2', 'p3'], 'add', ['priority']);
+
+    expect(result).toEqual({ updated: 2, unchanged: 0, blocked: 1 });
+    expect(writes).toEqual([
+      { tags: ['campaign-x', 'priority'] },
+      { tags: ['campaign-x', 'bottom-funnel', 'priority'] },
+    ]);
+  });
+
+  it('takes tags off, counting prompts without them as unchanged', async () => {
+    const result = await bulkUpdatePromptTags(['p1', 'p2'], 'remove', ['campaign-x']);
+
+    expect(result).toEqual({ updated: 2, unchanged: 0, blocked: 0 });
+    expect(writes).toEqual([{ tags: [] }, { tags: ['bottom-funnel'] }]);
+  });
+
+  it('writes nothing when every prompt already has the tags', async () => {
+    const result = await bulkUpdatePromptTags(['p1', 'p2'], 'add', ['campaign-x']);
+
+    expect(result).toEqual({ updated: 0, unchanged: 2, blocked: 0 });
+    expect(writes).toEqual([]);
+  });
+
+  it('refuses an empty tag list before reading anything', async () => {
+    const result = await bulkUpdatePromptTags(['p1'], 'add', ['  ', '']);
+
+    expect(result).toEqual({ error: 'Enter at least one tag.' });
+    expect(writes).toEqual([]);
+  });
+});
+
 describe('getPromptsPageData', () => {
   beforeEach(() => {
     plan = capped(50);
+    brandIsDemo = false;
     promptRow = null;
+    brandReadError = null;
     promptSetRows = [
       {
         id: 'ps1',
@@ -277,12 +427,65 @@ describe('getPromptsPageData', () => {
     positionCalls = [];
     vi.mocked(getPromptVolumes).mockResolvedValue({ volumes: [], quota: {} as VolumeQuota });
     vi.mocked(getPromptVisibilitySummaries).mockResolvedValue({});
+    extras.readBrandImprovingActions.mockReset().mockResolvedValue(new Map());
+    extras.readUnansweredPromptIds.mockReset().mockResolvedValue([]);
+    extras.getPromptTableViews.mockReset().mockResolvedValue({ mine: null, brand: null });
     // The location quota fails here (no brand row), which the page also absorbs.
     vi.spyOn(console, 'error').mockImplementation(() => {});
   });
 
+  const AC12 = { actionId: 'a12', actionNo: 1497, brandNo: 12, avgBefore: null, avgAfter: null };
+  const VIEW = { order: ['topic'], hidden: [] };
+
+  it('brings the Improve links with the rows, and the rest only when asked', async () => {
+    extras.readBrandImprovingActions.mockResolvedValue(new Map([['p1', AC12]]));
+    const page = await getPromptsPageData('b1');
+
+    expect(page.improving).toEqual({ p1: AC12 });
+    expect(extras.readBrandImprovingActions).toHaveBeenCalledWith(expect.anything(), 'b1');
+    expect(page).not.toHaveProperty('withoutAnswers');
+    expect(page).not.toHaveProperty('tableViews');
+    expect(extras.readUnansweredPromptIds).not.toHaveBeenCalled();
+    expect(extras.getPromptTableViews).not.toHaveBeenCalled();
+    // The volumes, as before, unless left out.
+    expect(getPromptVolumes).toHaveBeenCalledOnce();
+  });
+
+  it("reads the columns and Track now's prompts in the same round, on request", async () => {
+    extras.readUnansweredPromptIds.mockResolvedValue(['p1']);
+    extras.getPromptTableViews.mockResolvedValue({ mine: VIEW, brand: null });
+    const page = await getPromptsPageData('b1', { first: true, withoutAnswers: true });
+
+    expect(page.withoutAnswers).toEqual(['p1']);
+    expect(page.tableViews).toEqual({ mine: VIEW, brand: null });
+    expect(extras.getPromptTableViews).toHaveBeenCalledWith('b1');
+  });
+
+  it('leaves the volumes out with volumes: false, without calling the volumes API', async () => {
+    const page = await getPromptsPageData('b1', { volumes: false });
+
+    expect(getPromptVolumes).not.toHaveBeenCalled();
+    expect(page.volumes).toEqual([]);
+    expect(page.quota).toBeNull();
+    expect(page.volumesDegraded).toBe(false);
+    expect(page.promptSets[0].prompts.map((p) => p.id)).toEqual(['p1']);
+  });
+
+  it('keeps the rows when an extra fails, each said unread on its own', async () => {
+    extras.readBrandImprovingActions.mockRejectedValue(new Error('timeout'));
+    extras.readUnansweredPromptIds.mockRejectedValue(new Error('timeout'));
+    extras.getPromptTableViews.mockRejectedValue(new Error('timeout'));
+    const page = await getPromptsPageData('b1', { first: true, withoutAnswers: true });
+
+    expect(page.promptSets[0].prompts.map((p) => p.id)).toEqual(['p1']);
+    expect(page.improving).toEqual({});
+    expect(page.withoutAnswers).toBeNull();
+    expect(page.tableViews).toBeNull();
+  });
+
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
   });
 
   it('fills the Positions column from the position summaries', async () => {
@@ -290,6 +493,34 @@ describe('getPromptsPageData', () => {
 
     expect(page.positions.p1.avg).toBe(2);
     expect(page.positions.p1.dots.map((d) => d.id)).toEqual(['chatgpt-web']);
+    // The engines the plan includes, from the organization the brand's row embeds.
+    expect(planFromOrgRow).toHaveBeenCalledWith(ORG_ROW);
+  });
+
+  it('says when the brand’s plan could not be read, the column then reading —', async () => {
+    brandReadError = 'could not embed organizations';
+    const page = await getPromptsPageData('b1');
+
+    expect(page.positions.p1.avg).toBeNull();
+    expect(console.error).toHaveBeenCalledWith(
+      expect.stringContaining('brand plan read failed'),
+      'could not embed organizations',
+    );
+  });
+
+  it("gives the demo brand Growth's engines in the Positions column, on any plan", async () => {
+    vi.stubEnv('NEXT_PUBLIC_IS_CLOUD', 'true');
+    const [p1] = promptSetRows[0].prompts as Record<string, unknown>[];
+    p1.platforms = ['chatgpt-web', 'google-aio'];
+
+    // Starter's engines alone on the organization's own brand…
+    const own = await getPromptsPageData('b1');
+    expect(own.positions.p1.dots.map((d) => d.id)).toEqual(['chatgpt-web']);
+
+    // …and Growth's on its demo brand.
+    brandIsDemo = true;
+    const demo = await getPromptsPageData('b1');
+    expect(demo.positions.p1.dots.map((d) => d.id)).toEqual(['chatgpt-web', 'google-aio']);
   });
 
   /** 1000 rows of other prompts, which come before p1's in the RPC's order. */
@@ -466,5 +697,20 @@ describe('getPromptLocationMatrix (PROMPT-015b)', () => {
     } finally {
       slowReads = null;
     }
+  });
+});
+
+describe('normalizeTags', () => {
+  it('trims, drops empties and duplicates, and caps each tag at 50 characters', () => {
+    expect(normalizeTags([' q4 ', '', 'q4', 'x'.repeat(60)])).toEqual(['q4', 'x'.repeat(50)]);
+  });
+
+  it('caps the list at 10 tags', () => {
+    const many = Array.from({ length: 15 }, (_, i) => `tag-${i}`);
+    expect(normalizeTags(many)).toHaveLength(10);
+  });
+
+  it('returns an empty list when there are no tags', () => {
+    expect(normalizeTags([])).toEqual([]);
   });
 });

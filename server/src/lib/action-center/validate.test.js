@@ -380,6 +380,46 @@ describe('validateAction', () => {
     expect(patch.validation.beforeWindow.to < patch.validation.afterWindow.from).toBe(true);
   });
 
+  /** Sent with negative answers, it's judged by how the brand is spoken of (learning D1). */
+  it('judges answers sent from Mentions by their positive sentiment', async () => {
+    const writes = mockWrites();
+    let reads = 0;
+    // Named as often after as before, but 2 of 10 positive became 6 of 10.
+    rpc.mockImplementation(async (name) => {
+      if (name !== 'opportunity_basket_metrics') return { data: {}, error: null };
+      const after = reads++ % 2 === 1;
+      return {
+        data: {
+          cells: 10,
+          visible: 10,
+          mention_answers: 10,
+          named_answers: 10,
+          positive_answers: after ? 6 : 2,
+        },
+        error: null,
+      };
+    });
+
+    await validateAction(
+      action({
+        kind: 'mention_review',
+        kpi_keys: ['positive_sentiment', 'mentions', 'ai_visibility'],
+        payload: { promptIds: ['p1'] },
+      }),
+      { now: NOW },
+    );
+
+    const patch = writes.updated.find((w) => w.table === 'actions').patch;
+    expect(patch.validation.primary).toBe('positive_sentiment');
+    expect(patch.validation.metrics).toContainEqual({
+      metric: 'positive_sentiment',
+      unit: 'percent',
+      before: 20,
+      after: 60,
+    });
+    expect(patch.outcome).toBe('improved');
+  });
+
   it("measures answers sent from Mentions on their prompts' basket", async () => {
     const writes = mockWrites();
     rpc.mockResolvedValue({ data: {}, error: null });
@@ -581,6 +621,53 @@ describe('validateAction', () => {
         { metric: 'citations', unit: 'count', before: null, after: null },
       ]);
       expect(validation.brandWide.map((m) => m.metric)).toEqual(['ai_visibility', 'citations']);
+    });
+
+    it("measures a topic's action on its topic's prompts, and keeps its play (AC plan P-4)", async () => {
+      const T1 = '33333333-3333-4333-8333-333333333333';
+      const writes = mockWrites({ prompts: [{ id: P1 }, { id: P2 }] });
+      answers({ cells: 10, visible: 2 }, { cells: 10, visible: 5 });
+
+      const outcome = await validateAction(
+        action({
+          kind: 'create_content_for_topics',
+          kpi_keys: ['ai_visibility', 'share_of_voice'],
+          payload: {
+            targetEntity: 'topics',
+            targetCount: 1,
+            targets: [{ id: T1, label: 'Forecasting' }],
+            play: { version: 1, id: 'comparison', assetType: 'comparison' },
+          },
+        }),
+        { now: NOW },
+      );
+
+      expect(outcome).toBe('improved');
+      const basketCall = rpc.mock.calls.find(([name]) => name === 'opportunity_basket_metrics');
+      // Opened before it kept its prompts: the topic's now.
+      expect(basketCall[1].p_prompt_ids).toEqual([P1, P2]);
+      const { validation } = writes.updated.find((w) => w.table === 'actions').patch;
+      expect(validation.scope).toEqual({ kind: 'targets', entity: 'topics', prompts: 2, pages: 0 });
+      expect(validation.primary).toBe('ai_visibility');
+      // The brand-wide figures stay as a second line, as G15's do.
+      expect(validation.brandWide.map((m) => m.metric)).toEqual([
+        'ai_visibility',
+        'share_of_voice',
+      ]);
+      expect(validation.play).toBe('comparison');
+
+      // The prompts it kept as it opened, when it has them.
+      rpc.mockClear();
+      await validateAction(
+        action({
+          kind: 'create_content_for_topics',
+          kpi_keys: ['ai_visibility'],
+          payload: { targetEntity: 'topics', targets: [{ id: T1 }], promptIds: [P2] },
+        }),
+        { now: NOW },
+      );
+      const kept = rpc.mock.calls.find(([name]) => name === 'opportunity_basket_metrics');
+      expect(kept[1].p_prompt_ids).toEqual([P2]);
     });
 
     it("keeps the prompts it names net of the brand's others beside (learning B2)", async () => {
@@ -1126,5 +1213,28 @@ describe('validateAction', () => {
 
     expect(outcome).toBeNull();
     expect(writes.updated).toHaveLength(0);
+  });
+});
+
+describe('sweepActionValidation', () => {
+  it("never reads a demo brand's actions (00380): their outcomes are written with them", async () => {
+    const asked = [];
+    from.mockImplementation((table) => {
+      const builder = {
+        select: (columns) => (asked.push(['select', table, columns]), builder),
+        eq: (column, value) => (asked.push(['eq', column, value]), builder),
+        or: () => builder,
+        not: () => builder,
+        lte: () => builder,
+        order: () => builder,
+        limit: () => builder,
+        then: (resolve, reject) => Promise.resolve({ data: [], error: null }).then(resolve, reject),
+      };
+      return builder;
+    });
+
+    expect(await sweepActionValidation({ now: NOW })).toEqual({ measured: 0, failed: 0 });
+    expect(asked[0][2]).toContain('brands!inner(is_demo)');
+    expect(asked).toContainEqual(['eq', 'brands.is_demo', false]);
   });
 });

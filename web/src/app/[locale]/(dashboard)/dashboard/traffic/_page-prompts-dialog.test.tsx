@@ -34,6 +34,8 @@ vi.mock('@/i18n/navigation', () => ({
   useRouter: () => ({ push }),
 }));
 vi.mock('sonner', () => ({ toast }));
+// Adding a topic is for admins and managers.
+vi.mock('@/hooks/use-user-role', () => ({ useUserRole: () => ({ canManage: true }) }));
 
 const { PagePromptsDialog } = await import('./_page-prompts-dialog');
 
@@ -85,7 +87,10 @@ afterEach(() => {
   container.remove();
 });
 
-async function render({ domain = 'acme-coffee.example.com' }: { domain?: string } = {}) {
+async function render({
+  domain = 'acme-coffee.example.com',
+  page = '/gifts',
+}: { domain?: string; page?: string | null } = {}) {
   await act(async () => {
     root.render(
       <NextIntlClientProvider locale="en" messages={messages} timeZone="UTC">
@@ -93,7 +98,7 @@ async function render({ domain = 'acme-coffee.example.com' }: { domain?: string 
           brandId={BRAND}
           dateWindow={WEEK}
           domain={domain}
-          page="/gifts"
+          page={page}
           onClose={onClose}
           onTracked={onTracked}
         />
@@ -111,23 +116,18 @@ const trackButton = () =>
   )!;
 
 describe('PagePromptsDialog', () => {
-  it("shows the page's suggestions, ticking as many as the plan has slots for", async () => {
+  it("shows the page's suggestions, all ticked, and says which wait for a spot past the plan's slots", async () => {
     await render();
     expect(suggestPagePrompts).toHaveBeenCalledWith(BRAND, WEEK, '/gifts');
     expect(text()).toContain('The page: Coffee gifts');
     expect(text()).toContain('What coffee gift box should I buy for a coffee lover?');
     expect(text()).toContain('From Search Console: “coffee gift box ideas” · 1,400 impressions');
-    expect(ticked()).toEqual([true, true, false]);
-    expect(text()).toContain('2 prompts left to add on your plan');
-    expect(trackButton().textContent).toBe('Track 2 prompts');
-  });
-
-  it('never tracks more than the slots left', async () => {
-    await render();
-    await act(async () => boxes()[2].click());
     expect(ticked()).toEqual([true, true, true]);
-    expect(text()).toContain("Select up to 2 prompts: that's what your plan has left");
-    expect(trackButton().disabled).toBe(true);
+    expect(text()).toContain("1 prompt past your plan's limit will be saved as waiting for a spot");
+    expect(trackButton().textContent).toBe('Track 3 prompts');
+    expect(trackButton().disabled).toBe(false);
+    await act(async () => boxes()[2].click());
+    expect(text()).toContain('2 prompts left to add on your plan');
   });
 
   it('ticks every suggestion on a plan without a prompt limit', async () => {
@@ -140,6 +140,7 @@ describe('PagePromptsDialog', () => {
   it('tracks the ticked prompts pointing at the page, then refreshes the list', async () => {
     trackPagePrompts.mockResolvedValue({ promptIds: ['p1', 'p2'] });
     await render({ domain: 'https://acme-coffee.example.com/' });
+    await act(async () => boxes()[2].click());
     await act(async () => trackButton().click());
 
     expect(trackPagePrompts).toHaveBeenCalledWith(BRAND, 'https://acme-coffee.example.com/gifts', [
@@ -165,7 +166,7 @@ describe('PagePromptsDialog', () => {
     await render();
     await act(async () => trackButton().click());
     expect(toast.warning).toHaveBeenCalledWith(
-      "Tracked 1 of 2: your plan's prompt locations are full.",
+      "Tracked 1 of 3: your plan's prompt locations are full.",
       expect.anything(),
     );
     expect(onTracked).toHaveBeenCalled();
@@ -183,6 +184,50 @@ describe('PagePromptsDialog', () => {
     expect(text()).toContain("Couldn't suggest prompts for this page.");
     expect(text()).toContain('Try again.');
     expect(trackButton().disabled).toBe(true);
+  });
+
+  it('asks for a topic first on a brand without one, before any prompt is suggested', async () => {
+    suggestPagePrompts.mockResolvedValue({
+      error: 'Add a topic first: prompts are grouped under topics.',
+      code: 'no_topics',
+    });
+    await render();
+    expect(text()).toContain('Add a topic first');
+    expect(text()).not.toContain("Couldn't suggest prompts for this page.");
+    const link = [...document.body.querySelectorAll('a')].find(
+      (a) => a.textContent === 'Add a topic',
+    );
+    expect(link?.getAttribute('href')).toBe('/dashboard/prompts/topics?new=1');
+    expect(trackButton()).toBeUndefined();
+  });
+
+  it('asks for a topic first when Track finds the brand has none left', async () => {
+    trackPagePrompts.mockResolvedValue({
+      promptIds: [],
+      error: 'Add a topic first: prompts are grouped under topics.',
+      code: 'no_topics',
+    });
+    await render();
+    await act(async () => trackButton().click());
+    expect(text()).toContain('Add a topic first');
+    expect(toast.error).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it('asks again on the next open: a topic may have been added since', async () => {
+    trackPagePrompts.mockResolvedValue({
+      promptIds: [],
+      error: 'Add a topic first: prompts are grouped under topics.',
+      code: 'no_topics',
+    });
+    await render();
+    await act(async () => trackButton().click());
+    expect(text()).toContain('Add a topic first');
+
+    await render({ page: null });
+    await render();
+    expect(text()).not.toContain('Add a topic first');
+    expect(trackButton().textContent).toBe('Track 3 prompts');
   });
 
   it('says when every prompt the page answers is tracked already', async () => {

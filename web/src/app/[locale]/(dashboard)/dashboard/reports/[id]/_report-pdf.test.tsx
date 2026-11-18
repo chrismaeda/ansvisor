@@ -1,0 +1,233 @@
+import { act, type ReactNode } from 'react';
+import { createRoot, type Root } from 'react-dom/client';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Report } from '@/lib/actions/reports';
+import type { ReportBranding } from '@/lib/white-label/kit';
+
+/**
+ * The report's PDF with and without a white label kit (00429): Ansvisor's
+ * name, footer and indigo without one; the agency's name, footer, color,
+ * logo and "Prepared for" with one. The renderer's parts are drawn as plain
+ * elements here, so the document reads as a page would.
+ */
+
+type Props = { children?: ReactNode; style?: unknown };
+const styleOf = (style: unknown) =>
+  JSON.stringify(Array.isArray(style) ? Object.assign({}, ...style.flat()) : (style ?? {}));
+vi.mock('@react-pdf/renderer', () => ({
+  Document: ({ children, ...props }: Props & { author?: string; creator?: string }) => (
+    <div data-author={props.author ?? ''} data-creator={props.creator ?? ''}>
+      {children}
+    </div>
+  ),
+  Page: ({ children }: Props) => <div>{children}</div>,
+  View: ({ children, style }: Props) => <div data-style={styleOf(style)}>{children}</div>,
+  Text: ({
+    children,
+    style,
+    render,
+  }: Props & { render?: (p: { pageNumber: number; totalPages: number }) => string }) => (
+    <span data-style={styleOf(style)}>
+      {render ? render({ pageNumber: 1, totalPages: 1 }) : children}
+    </span>
+  ),
+  // eslint-disable-next-line @next/next/no-img-element -- a stand-in for the PDF's image
+  Image: ({ src }: { src: string }) => <img src={src} alt="" />,
+  Svg: () => null,
+  Path: () => null,
+  Polyline: () => null,
+  Line: () => null,
+  StyleSheet: { create: <T,>(styles: T) => styles },
+  Font: { register: () => {}, registerHyphenationCallback: () => {} },
+}));
+
+const { ReportPdfDocument } = await import('./_report-pdf');
+
+(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT =
+  true;
+
+const report: Report = {
+  id: 'r1',
+  brandId: 'b1',
+  title: 'October report',
+  template: 'monthly',
+  dateFrom: '2026-10-01',
+  dateTo: '2026-10-31',
+  createdAt: '2026-10-31T09:00:00Z',
+  payload: {
+    brandName: 'Northwind',
+    summaryText: 'Visibility rose.',
+    shareOfVoice: {
+      overallSov: 40,
+      overallSovChange: null,
+      byPlatform: [{ provider: 'ChatGPT', sov: 40 }],
+    },
+  } as Report['payload'],
+};
+
+const kit: ReportBranding = {
+  companyName: 'Acme Agency',
+  accentColor: '#ffff00',
+  footerText: 'Prepared by Acme Agency · acme.com',
+  logo: 'data:image/png;base64,AAAA',
+  clientLogo: 'data:image/jpeg;base64,BBBB',
+};
+
+let container: HTMLDivElement;
+let root: Root;
+
+beforeEach(() => {
+  container = document.createElement('div');
+  document.body.appendChild(container);
+  root = createRoot(container);
+});
+afterEach(() => {
+  act(() => root.unmount());
+  container.remove();
+});
+
+async function draw(branding: ReportBranding | null, drawn: Report = report) {
+  await act(async () =>
+    root.render(<ReportPdfDocument report={drawn} branding={branding} fontFamily="Inter-1" />),
+  );
+  return container;
+}
+
+describe('ReportPdfDocument', () => {
+  it('stays Ansvisor’s without a kit', async () => {
+    const pdf = await draw(null);
+    const doc = pdf.firstElementChild!;
+    expect(doc.getAttribute('data-author')).toBe('Ansvisor');
+    expect(doc.getAttribute('data-creator')).toBe('Ansvisor');
+    expect(pdf.textContent).toContain('Generated with Ansvisor · www.ansvisor.com');
+    expect(pdf.textContent).not.toContain('Prepared for');
+    expect(pdf.querySelector('img')).toBeNull();
+    expect(pdf.innerHTML).toContain('#6366f1');
+  });
+
+  it('carries the agency’s name, footer, logos and color with a kit, and no Ansvisor', async () => {
+    const pdf = await draw(kit);
+    const doc = pdf.firstElementChild!;
+    expect(doc.getAttribute('data-author')).toBe('Acme Agency');
+    expect(doc.getAttribute('data-creator')).toBe('Acme Agency');
+    expect(pdf.textContent).toContain('Prepared for Northwind');
+    expect(pdf.textContent).toContain('Prepared by Acme Agency · acme.com');
+    expect(pdf.textContent).not.toMatch(/ansvisor/i);
+    expect([...pdf.querySelectorAll('img')].map((img) => img.getAttribute('src'))).toEqual([
+      kit.logo,
+      kit.clientLogo,
+    ]);
+    // The rule and bars keep the kit's color; Ansvisor's indigo is gone.
+    expect(pdf.innerHTML).toContain('#ffff00');
+    expect(pdf.innerHTML).not.toContain('#6366f1');
+  });
+
+  it('names the company where there is no logo, and leaves the footer empty without one', async () => {
+    const pdf = await draw({ ...kit, logo: null, clientLogo: null, footerText: null });
+    expect(pdf.textContent).toContain('Acme Agency');
+    expect(pdf.textContent).not.toMatch(/ansvisor/i);
+    expect(pdf.querySelector('img')).toBeNull();
+  });
+
+  it('names no author for a kit with only a logo', async () => {
+    const pdf = await draw({ ...kit, companyName: null });
+    expect(pdf.firstElementChild!.getAttribute('data-author')).toBe('');
+    expect(pdf.textContent).not.toMatch(/ansvisor/i);
+  });
+});
+
+describe('ReportPdfDocument › Site Audit Score', () => {
+  const withAudit = (auditScore: NonNullable<Report['payload']['auditScore']>): Report => ({
+    ...report,
+    payload: { ...report.payload, auditScore },
+  });
+  const section = (pdf: HTMLElement) =>
+    [...pdf.querySelectorAll('div')].find((d) =>
+      d.firstElementChild?.textContent?.startsWith('Site Audit Score'),
+    );
+
+  it('shows the score in points, and the change since the same page’s audit before', async () => {
+    const pdf = await draw(
+      null,
+      withAudit({
+        url: 'https://shop.com/bags',
+        totalScore: 58,
+        previousScore: 63,
+        auditedAt: '2026-10-30T00:00:00Z',
+        scale: 100,
+      }),
+    );
+    const text = section(pdf)!.textContent!;
+    expect(text).toContain('58-5');
+    expect(text).not.toContain('%');
+  });
+
+  it('shows the score’s range from the page’s own audits, and says what it means', async () => {
+    const pdf = await draw(
+      null,
+      withAudit({
+        url: 'https://shop.com/bags',
+        totalScore: 64,
+        previousScore: 62,
+        auditedAt: '2026-10-30T00:00:00Z',
+        scale: 100,
+        range: { plusMinus: 2, low: 62, high: 66, audits: 5 },
+      }),
+    );
+    const text = section(pdf)!.textContent!;
+    expect(text).toContain('64± 2+2');
+    expect(text).toContain(
+      "This page's last 5 audits scored 62 to 66, changes to the page included.",
+    );
+  });
+
+  it('says the audits scored the same when the range is ± 0', async () => {
+    const pdf = await draw(
+      null,
+      withAudit({
+        url: 'https://shop.com/bags',
+        totalScore: 64,
+        previousScore: null,
+        auditedAt: '2026-10-30T00:00:00Z',
+        scale: 100,
+        range: { plusMinus: 0, low: 64, high: 64, audits: 3 },
+      }),
+    );
+    const text = section(pdf)!.textContent!;
+    expect(text).toContain('64± 0');
+    expect(text).toContain("This page's last 3 audits all scored 64.");
+  });
+
+  it('shows no range on a report saved before it', async () => {
+    const pdf = await draw(
+      null,
+      withAudit({
+        url: 'https://shop.com/bags',
+        totalScore: 64,
+        previousScore: 60,
+        auditedAt: '2026-10-30T00:00:00Z',
+        scale: 100,
+      }),
+    );
+    const text = section(pdf)!.textContent!;
+    expect(text).toContain('64+4');
+    expect(text).not.toContain('±');
+    expect(text).not.toContain('audits scored');
+  });
+
+  it('shows a report saved on the 0–1 scale as about that many points, with no change', async () => {
+    const pdf = await draw(
+      null,
+      withAudit({
+        url: 'https://shop.com/bags',
+        totalScore: 0.6,
+        previousScore: 0.6,
+        auditedAt: '2026-10-30T00:00:00Z',
+      }),
+    );
+    const text = section(pdf)!.textContent!;
+    expect(text).toContain('~60');
+    expect(text).not.toContain('0.6');
+    expect(text).not.toContain('+0');
+  });
+});

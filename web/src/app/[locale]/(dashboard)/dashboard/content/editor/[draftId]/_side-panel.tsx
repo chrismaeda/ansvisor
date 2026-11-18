@@ -1,11 +1,19 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useTranslations } from 'next-intl';
 import { toast } from 'sonner';
+import { ChevronDown, PanelRight, X } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { rulesForBrief, useRuleDescriber } from '@/lib/content/agent-write';
-import { isPageType, type ContentDraft } from '@/lib/content/drafts';
+import { isPageType, type ContentDraft, type DraftConversation } from '@/lib/content/drafts';
 import type { SiteType } from '@/lib/content/page-types';
 import { inputsGiven } from '@/lib/content/draft-inputs';
 import { shoppingPathFits } from '@/lib/content/shopping-path';
@@ -18,7 +26,7 @@ import { ShoppingPathSection } from './_shopping-path';
 import { BriefTab, type AgentRewrite } from './_brief-tab';
 import { DataNote, UsesYourData } from './_data-note';
 import { ImpactTab } from './_impact-tab';
-import { QualityTab, type HandOff, type QualityRead } from './_quality-tab';
+import { QualityTab, type HandOff, type QualityFocus, type QualityRead } from './_quality-tab';
 import { RulesTab, type AgentFix, type PageRewrite } from './_rules-tab';
 import { SourcesTab } from './_sources-tab';
 import { useBriefRebuild, type PageNow } from './_use-brief-rebuild';
@@ -27,6 +35,8 @@ import type { DraftReads } from './_use-draft-reads';
 import type { DraftRulesState } from './_use-draft-rules';
 import { YourInput, type InputPrompt } from './_your-input';
 import { useUpgradeGate } from '@/components/providers/upgrade-gate';
+import { EditorChat } from '@/components/chat/panel/editor-chat';
+import type { ComposerDraft } from '@/components/chat/composer/chat-composer';
 
 /** Remembers whether the panel is open, across drafts and visits. */
 const PANEL_OPEN_KEY = 'aeo:content-editor-panel';
@@ -61,9 +71,12 @@ export function useSidePanelOpen(): [boolean, () => void] {
 }
 
 // Instructions first (Content Editor v1.1, CE-028): Brief and Rules, what
-// the agent follows, in one tab, which the panel opens on (on Rules).
-const PANEL_TABS = ['instructions', 'sources', 'impact'] as const;
+// the agent follows, in one tab, which the panel opens on (on Rules). Chat
+// before them while the new Chat is on (CHAT-25 §5, W4-16).
+const PANEL_TABS = ['chat', 'instructions', 'sources', 'impact'] as const;
 export type PanelTab = (typeof PANEL_TABS)[number];
+/** The panel's tabs: Chat only while it is on. */
+const tabsOf = (chat: boolean) => PANEL_TABS.filter((value) => value !== 'chat' || chat);
 /**
  * Instructions' segments: what to write (Brief), how to write it (Rules), and
  * how well it reads (Quality, Quality spec §3, once its first phase is live).
@@ -74,20 +87,47 @@ export type InstructionSegment = (typeof SEGMENTS)[number];
 export type PanelTarget = PanelTab | InstructionSegment;
 const isSegment = (target: PanelTarget): target is InstructionSegment =>
   (SEGMENTS as readonly string[]).includes(target);
+/** What the bottom bar opens (CHAT-25 §4): Instructions' segments, then More's tabs. */
+type BarItem = InstructionSegment | 'sources' | 'impact';
+/** A bottom bar's item: the segment control's look, as a button. */
+const BAR_ITEM =
+  'group inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-[13px] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none aria-expanded:bg-muted aria-expanded:text-foreground';
 
 /**
  * The panel's tabs while it is closed, down the editor's right edge, so the
  * panel is never out of sight (it starts closed on a narrow window). A tab
- * opens the panel on it.
+ * opens the panel on it; Show side panel, on top, as the panel last was.
  */
-export function EditorPanelRail({ onOpen }: { onOpen: (tab: PanelTab) => void }) {
+export function EditorPanelRail({
+  onOpen,
+  onShow,
+  chat = false,
+}: {
+  onOpen: (tab: PanelTab) => void;
+  /** Opens the panel, as the header's toggle above it does. */
+  onShow?: () => void;
+  /** Chat is a tab (W4-16). */
+  chat?: boolean;
+}) {
   const t = useTranslations('contentEditor.editor.panel');
   return (
     <nav
       aria-label={t('label')}
       className="flex w-9 shrink-0 flex-col items-center gap-1 border-l bg-card py-2"
     >
-      {PANEL_TABS.map((value) => (
+      {onShow && (
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          aria-pressed={false}
+          aria-label={t('show')}
+          title={t('show')}
+          onClick={onShow}
+        >
+          <PanelRight className="h-4 w-4" />
+        </Button>
+      )}
+      {tabsOf(chat).map((value) => (
         <button
           key={value}
           type="button"
@@ -103,7 +143,7 @@ export function EditorPanelRail({ onOpen }: { onOpen: (tab: PanelTab) => void })
 }
 
 /**
- * The editor's right panel (Content Editor spec v2 §6), 400px beside the page.
+ * The editor's right panel (Content Editor spec v2 §6), 440px beside the page: room for Chat's box and the line under it.
  * Its tabs are Instructions · Sources · Live page (v1.1, CE-028): Instructions
  * holds what the agent follows, the Brief (CE-007) and the Rules (CE-009),
  * under a Brief | Rules control, with the rules still open on both. The panel
@@ -112,6 +152,13 @@ export function EditorPanelRail({ onOpen }: { onOpen: (tab: PanelTab) => void })
  * it was. The brief and the sources are the editor's one read
  * (useDraftReads), which the rules check against too: Sources' "Rebuild with
  * selection" and Impact's "Use lost prompts" rebuild the brief, and open it.
+ *
+ * `layout="bar"`, in a narrow, embedded editor (Chat's Open here, CHAT-25 §4):
+ * the same parts, from a bar under the page instead of beside it: Brief ▾ ·
+ * Rules · {n} open ▾ · Quality {score} ▾ · More ▾ (Sources, Live page). Each
+ * opens as a panel above the bar, one at a time; the item again, its ×, or
+ * Esc closes it. A request from the page (the header's chips, Next step,
+ * Quality's to-dos) opens its part there.
  */
 export function EditorSidePanel({
   draft,
@@ -122,6 +169,7 @@ export function EditorSidePanel({
   bodyHtml,
   pageType,
   rules,
+  brandRules,
   reads,
   tabRequest,
   agentFix,
@@ -152,6 +200,8 @@ export function EditorSidePanel({
   onChangeType,
   handOff = null,
   onShoppingPathChange,
+  chat,
+  layout = 'side',
 }: {
   draft: ContentDraft;
   /**
@@ -169,6 +219,8 @@ export function EditorSidePanel({
   pageType: string | null;
   /** The rules, as the editor checks them (the header's chip shows the same). */
   rules: DraftRulesState;
+  /** The brand's rules from Settings › Content (00450), above the page's own in Rules. */
+  brandRules?: { rules: string[]; brandName: string };
   /** The draft's brief and sources, read once for the editor. */
   reads: DraftReads;
   /**
@@ -183,6 +235,10 @@ export function EditorSidePanel({
     build?: boolean;
     /** Brief › Your input to show (Quality's Add, CE-048). */
     input?: boolean;
+    /** Quality's part to show (the Next step basket's Show to-dos, Show what raises Trust). */
+    focus?: QualityFocus;
+    /** A rule whose value Rules focuses (the Next step basket's Ask for fewer). */
+    rule?: string;
   } | null;
   /** Run Agent's Fix open rules, for Rules (CE-018, v1.1 CE-029). */
   agentFix?: AgentFix;
@@ -196,8 +252,11 @@ export function EditorSidePanel({
   onSourceShown?: () => void;
   /** The brief asked for is being built: the request is spent. */
   onBuildStarted?: () => void;
-  /** Whether the agent is writing the brief: the agent card shows it working (CE-027). */
-  onBriefRebuilding?: (rebuilding: boolean) => void;
+  /**
+   * Whether the agent is writing the brief: the agent card shows it working
+   * (CE-027); `onServer` once the server writes it (the page can be left).
+   */
+  onBriefRebuilding?: (rebuilding: boolean, onServer: boolean) => void;
   /** Why the brief's Run Agent waits (another agent run from this page), or null. */
   briefBlocked?: string | null;
   /** What Quality reads from the draft and its author (CE-036/039), with Quality on. */
@@ -233,18 +292,41 @@ export function EditorSidePanel({
   onConfirmCase?: (key: string) => void;
   /** Quality's Confirm on a category intro's facts (CE-054). */
   onConfirmIntro?: () => void;
-  /** Quality's Change: the header's page type menu (CE-052). */
+  /** Quality's Change and the Rules tab's Set page type: the header's page type menu (CE-052). */
   onChangeType?: () => void;
   /** Hand it off to Content Agent, Quality's (CE-051). */
   handOff?: HandOff | null;
   /** Brief › Shopping path changed: the Shopping rules read it again (shopping path, part 6). */
   onShoppingPathChange?: () => void;
+  /**
+   * Chat, the panel's first tab while the new Chat is on (CHAT-25 §5, W4-16):
+   * the chat that made the draft, and what to do once the Content Agent left
+   * suggestions in the page.
+   */
+  chat?: {
+    conversation: DraftConversation | null;
+    onSuggestions: (count: number) => void;
+    /** A passage asked about (Ask Chat on a selection), for the Chat tab's box. */
+    draft?: ComposerDraft | null;
+  };
+  /** `bar`: a bottom bar in place of the side panel (embedded in Chat, CHAT-25 §4). */
+  layout?: 'side' | 'bar';
 }) {
   const t = useTranslations('contentEditor.editor.panel');
   const tEditor = useTranslations('contentEditor.editor');
-  const [tab, setTab] = useState<PanelTab>('instructions');
+  // A draft the member's own chat made opens on that chat, continued (CHAT-25 §5, W4-16); a
+  // teammate's shared chat doesn't.
+  const ownChat = !!chat?.conversation?.mine;
+  const [tab, setTab] = useState<PanelTab>(ownChat ? 'chat' : 'instructions');
   const [segment, setSegment] = useState<InstructionSegment>('rules');
-  const [opened, setOpened] = useState<Set<PanelTarget>>(() => new Set(['instructions', 'rules']));
+  const [opened, setOpened] = useState<Set<PanelTarget>>(
+    () => new Set(['instructions', 'rules', ...(ownChat ? (['chat'] as const) : [])]),
+  );
+  // The bottom bar's panel: open on what it (or a request) last opened, or closed.
+  const bar = layout === 'bar';
+  const [barOpen, setBarOpen] = useState(false);
+  const barRef = useRef<HTMLElement>(null);
+  const barPanelId = useId();
   const describeRule = useRuleDescriber();
   // A read-only workspace (plan not active): Your input's changes open the
   // upgrade dialog instead (the tabs gate their own actions).
@@ -265,11 +347,44 @@ export function EditorSidePanel({
     setOpened((prev) =>
       prev.has(next) && prev.has(nextTab) ? prev : new Set([...prev, next, nextTab]),
     );
+    setBarOpen(true);
   };
   // None said while the count is still read (the header's chip says so).
   const rulesOpen = rules.settled === false ? 0 : Math.max(0, rules.total - rules.met);
+  // Every rule open is the person's to decide (tried by the agent, or held): amber, not red.
+  const rulesYours = rules.rules
+    .filter(({ rule, status }) => rule.on && status.state === 'bad')
+    .every(({ rule }) => agentFix?.tried?.has(rule.key) || agentFix?.held?.has(rule.key));
   // Quality shows once its first phase is live (NEXT_PUBLIC_CONTENT_QUALITY_PHASE).
   const segments = SEGMENTS.filter((value) => value !== 'quality' || qualityPhase() >= 1);
+  // The rules open and the quality score, on Rules and Quality: the segments' and the bar's.
+  const rulesBadge = rulesOpen > 0 && (
+    <span
+      className={cn(
+        'rounded-md px-1.5 text-[10.5px] font-medium',
+        // Red only for what blocks: open rules don't (editor UX review 2026-11-03).
+        rulesYours
+          ? 'bg-amber-50 text-amber-700 dark:bg-amber-950 dark:text-amber-300'
+          : 'border border-amber-200 text-amber-700 dark:border-amber-900 dark:text-amber-300',
+      )}
+    >
+      {t('segments.open', { count: rulesOpen })}
+    </span>
+  );
+  const qualityBadge = qualityScore !== null && (
+    <span
+      className={cn(
+        'rounded-md border px-1.5 text-[10.5px] font-medium tabular-nums',
+        BAND_CLASSES[qualityBand(qualityScore)],
+      )}
+    >
+      {qualityScore}
+      <span className="sr-only">
+        {' · '}
+        {tEditor(`quality.bands.${qualityBand(qualityScore)}`)}
+      </span>
+    </span>
+  );
 
   // The sources the agent writes from, as the Sources tab keeps them (v1.1
   // CE-032/034): counted under each Run Agent and on the tab, so turning one
@@ -320,7 +435,7 @@ export function EditorSidePanel({
 
   const briefOpened = opened.has('brief');
 
-  const { rebuilding, rebuild } = useBriefRebuild({
+  const { rebuilding, onServer, rebuild } = useBriefRebuild({
     draft,
     pageNow: (): PageNow => {
       const { checks, ...now } = page.current;
@@ -348,58 +463,139 @@ export function EditorSidePanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [requested]);
 
-  // The agent card shows the brief's run too, with its steps and Stop; a
-  // panel closed meanwhile says it no longer waits on it.
+  // The agent card shows the brief's run too, with its steps and Stop, and
+  // whether it is on the server yet; a panel closed meanwhile says it no
+  // longer waits on it.
   useEffect(() => {
-    onBriefRebuilding?.(rebuilding);
-    return () => onBriefRebuilding?.(false);
-  }, [rebuilding, onBriefRebuilding]);
+    onBriefRebuilding?.(rebuilding, onServer);
+    return () => onBriefRebuilding?.(false, false);
+  }, [rebuilding, onServer, onBriefRebuilding]);
+
+  // The bar's part open (or last open), and its name: never Chat, which is beside the editor.
+  const current: BarItem = tab === 'instructions' || tab === 'chat' ? segment : tab;
+  const barName = isSegment(current) ? t(`segments.${current}`) : t(`tabs.${current}`);
+  /** Closes the bar's panel, the focus back on the item that opened it (its ×, Esc). */
+  const closeBar = () => {
+    setBarOpen(false);
+    barRef.current
+      ?.querySelector<HTMLElement>(`[data-bar-item="${isSegment(current) ? current : 'more'}"]`)
+      ?.focus();
+  };
 
   return (
-    <aside aria-label={t('label')} className="flex w-[400px] shrink-0 flex-col border-l bg-card">
-      <Tabs
-        value={tab}
-        onValueChange={(value) => open(value as PanelTab)}
-        className="border-b px-3 pt-1.5"
+    <aside
+      ref={barRef}
+      aria-label={bar ? t('bar.label') : t('label')}
+      data-slot={bar ? 'editor-bottom-bar' : undefined}
+      // Esc closes the bar's panel; in a field it only leaves the field, as in Rules.
+      onKeyDown={
+        bar
+          ? (e) => {
+              const target = e.target as HTMLElement;
+              if (e.key !== 'Escape' || !barOpen || !e.currentTarget.contains(target)) return;
+              if (target.closest('input, textarea, select, [contenteditable="true"]')) return;
+              e.preventDefault();
+              closeBar();
+            }
+          : undefined
+      }
+      className={
+        bar
+          ? 'flex max-h-[60%] shrink-0 flex-col border-t bg-card'
+          : 'flex w-[440px] shrink-0 flex-col border-l bg-card'
+      }
+    >
+      {bar ? (
+        <div hidden={!barOpen} className="flex items-center gap-2 border-b py-1 pr-2 pl-4">
+          <h2 className="min-w-0 flex-1 truncate text-[13px] font-medium">{barName}</h2>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            aria-label={t('bar.close', { name: barName })}
+            title={t('bar.close', { name: barName })}
+            onClick={closeBar}
+          >
+            <X className="h-4 w-4" />
+          </Button>
+        </div>
+      ) : (
+        <Tabs
+          value={tab}
+          onValueChange={(value) => open(value as PanelTab)}
+          // The tabs alone: Hide side panel is in the header, above the panel (the
+          // owner, 2026-11-14), so nothing here is cut off at the panel's edge.
+          className="border-b px-3 pt-1.5"
+        >
+          <TabsList variant="line">
+            {tabsOf(!!chat).map((value) => (
+              <TabsTrigger key={value} value={value}>
+                {t(`tabs.${value}`)}
+                {/* The rules still open, on the tab that holds them. */}
+                {value === 'instructions' && rulesOpen > 0 && (
+                  <>
+                    <span
+                      aria-hidden
+                      className="rounded-md bg-amber-50 px-1.5 text-[10.5px] font-semibold text-amber-700 dark:bg-amber-950 dark:text-amber-400"
+                    >
+                      {rulesOpen}
+                    </span>
+                    <span className="sr-only">{t('openRules', { count: rulesOpen })}</span>
+                  </>
+                )}
+                {/* The sources in use (CE-034), the number in full on hover. */}
+                {value === 'sources' && !!sourcesInUse && (
+                  <>
+                    <span
+                      aria-hidden
+                      title={t('sourcesInUse', { count: sourcesInUse })}
+                      className="rounded-md bg-muted px-1.5 text-[10.5px] font-medium text-muted-foreground"
+                    >
+                      {formatNumber(sourcesInUse)}
+                    </span>
+                    <span className="sr-only">{t('sourcesInUse', { count: sourcesInUse })}</span>
+                  </>
+                )}
+              </TabsTrigger>
+            ))}
+          </TabsList>
+        </Tabs>
+      )}
+      {/* Chat keeps its own scroll, its box at the bottom (W4-16); mounted once opened.
+          The thread's box is sticky to this scroll, as in Chat's side panel: without
+          it the conversation grew the page and scrolled the editor away. Relative:
+          the thread's screen-reader text is placed (and clipped) here, not on the
+          page, where it made the window taller than the screen. No padding under
+          it: the box keeps its own. The box's strip takes the panel's colour (card):
+          Chat fills it with the page's background, which showed as a black block on
+          this grey panel (the owner's report, 15 Nov). */}
+      {chat && opened.has('chat') && (
+        <div
+          hidden={tab !== 'chat'}
+          data-slot="editor-chat-scroll"
+          className="relative min-h-0 flex-1 overflow-y-auto px-2 pt-3 [&_[data-slot=thread-composer]]:bg-card"
+        >
+          <EditorChat
+            draftId={draft.id}
+            conversation={chat.conversation}
+            onSuggestions={chat.onSuggestions}
+            draft={chat.draft}
+          />
+        </div>
+      )}
+      {/* The panel's own scroll: a part shown in it scrolls here, never the page (scrollInPanel).
+          Relative, as Chat's: what is placed absolutely in it stays in it. */}
+      <div
+        id={barPanelId}
+        data-panel-scroll
+        hidden={tab === 'chat' || (bar && !barOpen)}
+        className="relative min-h-0 flex-1 overflow-y-auto px-4 py-4"
       >
-        <TabsList variant="line">
-          {PANEL_TABS.map((value) => (
-            <TabsTrigger key={value} value={value}>
-              {t(`tabs.${value}`)}
-              {/* The rules still open, on the tab that holds them. */}
-              {value === 'instructions' && rulesOpen > 0 && (
-                <>
-                  <span
-                    aria-hidden
-                    className="rounded-md bg-amber-50 px-1.5 text-[10.5px] font-semibold text-amber-700 dark:bg-amber-950 dark:text-amber-400"
-                  >
-                    {rulesOpen}
-                  </span>
-                  <span className="sr-only">{t('openRules', { count: rulesOpen })}</span>
-                </>
-              )}
-              {/* The sources in use (CE-034), the number in full on hover. */}
-              {value === 'sources' && !!sourcesInUse && (
-                <>
-                  <span
-                    aria-hidden
-                    title={t('sourcesInUse', { count: sourcesInUse })}
-                    className="rounded-md bg-muted px-1.5 text-[10.5px] font-medium text-muted-foreground"
-                  >
-                    {formatNumber(sourcesInUse)}
-                  </span>
-                  <span className="sr-only">{t('sourcesInUse', { count: sourcesInUse })}</span>
-                </>
-              )}
-            </TabsTrigger>
-          ))}
-        </TabsList>
-      </Tabs>
-      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
         <div hidden={tab !== 'instructions'} className="space-y-4">
           <DataNote />
           <div
             role="radiogroup"
+            // The bar picks them itself.
+            hidden={bar}
             aria-label={t(segments.length > 2 ? 'segmentsLabelQuality' : 'segmentsLabel')}
             className="flex rounded-[10px] border bg-muted p-[3px]"
             // Arrow keys move between them, as in any radio group.
@@ -428,25 +624,8 @@ export function EditorSidePanel({
                 )}
               >
                 {t(`segments.${value}`)}
-                {value === 'rules' && rulesOpen > 0 && (
-                  <span className="rounded-md bg-red-50 px-1.5 text-[10.5px] font-medium text-red-700 dark:bg-red-950 dark:text-red-400">
-                    {t('segments.open', { count: rulesOpen })}
-                  </span>
-                )}
-                {value === 'quality' && qualityScore !== null && (
-                  <span
-                    className={cn(
-                      'rounded-md border px-1.5 text-[10.5px] font-medium tabular-nums',
-                      BAND_CLASSES[qualityBand(qualityScore)],
-                    )}
-                  >
-                    {qualityScore}
-                    <span className="sr-only">
-                      {' · '}
-                      {tEditor(`quality.bands.${qualityBand(qualityScore)}`)}
-                    </span>
-                  </span>
-                )}
+                {value === 'rules' && rulesBadge}
+                {value === 'quality' && qualityBadge}
               </button>
             ))}
           </div>
@@ -500,6 +679,11 @@ export function EditorSidePanel({
             <div hidden={segment !== 'quality'}>
               <QualityTab
                 quality={quality}
+                focusRequest={
+                  tabRequest?.focus && segment === 'quality'
+                    ? { to: tabRequest.focus, n: tabRequest.n }
+                    : null
+                }
                 onShow={(text) => onShowInPage?.(text)}
                 onShowPlaceholder={() => onShowPlaceholder?.()}
                 onPickAuthor={() => onPickAuthor?.()}
@@ -534,6 +718,9 @@ export function EditorSidePanel({
                 state={rules}
                 siteType={siteType}
                 draftPageType={isPageType(pageType) ? pageType : null}
+                brandRules={brandRules}
+                onChangeType={onChangeType}
+                focusRequest={tabRequest?.rule ? { key: tabRequest.rule, n: tabRequest.n } : null}
               />
             </div>
           )}
@@ -578,6 +765,58 @@ export function EditorSidePanel({
           </div>
         )}
       </div>
+      {bar && (
+        <div className={cn('flex flex-wrap items-center gap-1 px-2 py-1', barOpen && 'border-t')}>
+          {segments.map((value) => (
+            <button
+              key={value}
+              type="button"
+              data-bar-item={value}
+              aria-expanded={barOpen && current === value}
+              aria-controls={barPanelId}
+              onClick={() => (barOpen && current === value ? setBarOpen(false) : open(value))}
+              className={BAR_ITEM}
+            >
+              {t(`segments.${value}`)}
+              {value === 'rules' && rulesBadge}
+              {value === 'quality' && qualityBadge}
+              <ChevronDown
+                aria-hidden
+                className="h-3.5 w-3.5 transition-transform group-aria-expanded:rotate-180"
+              />
+            </button>
+          ))}
+          {/* Sources and Live page, less used while writing: under More, opened the same way. */}
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              data-bar-item="more"
+              title={t('bar.moreHint')}
+              className={cn(BAR_ITEM, barOpen && !isSegment(current) && 'bg-muted text-foreground')}
+            >
+              {t('bar.more')}
+              <ChevronDown aria-hidden className="h-3.5 w-3.5" />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent side="top" align="start" className="w-auto min-w-44">
+              {(['sources', 'impact'] as const).map((value) => (
+                <DropdownMenuItem key={value} onClick={() => open(value)}>
+                  {t(`tabs.${value}`)}
+                  {value === 'sources' && !!sourcesInUse && (
+                    <>
+                      <span
+                        aria-hidden
+                        className="ml-auto rounded-md bg-muted px-1.5 text-[10.5px] font-medium text-muted-foreground"
+                      >
+                        {formatNumber(sourcesInUse)}
+                      </span>
+                      <span className="sr-only">{t('sourcesInUse', { count: sourcesInUse })}</span>
+                    </>
+                  )}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+      )}
     </aside>
   );
 }

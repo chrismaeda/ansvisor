@@ -4,6 +4,7 @@ import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const sdk = {
   initiate: vi.fn(),
+  link: vi.fn(),
   list: vi.fn(),
   delete: vi.fn(),
   execute: vi.fn(),
@@ -14,6 +15,7 @@ vi.mock('@composio/core', () => ({
   Composio: class {
     connectedAccounts = {
       initiate: (...args) => sdk.initiate(...args),
+      link: (...args) => sdk.link(...args),
       list: (...args) => sdk.list(...args),
       delete: (...args) => sdk.delete(...args),
     };
@@ -29,8 +31,17 @@ const {
   entityIdFor,
   executeWebflowTool,
   forgetWebflowAccounts,
+  getActiveConnection,
+  initiateSlackConnection,
+  isSlackConfigured,
+  isHubspotConfigured,
   isWebflowConfigured,
+  linkHubspot,
+  listGaProperties,
+  listGscSites,
   proxyRequest,
+  queryGscSearchAnalytics,
+  runGaReport,
 } = await import('./composio.js');
 
 beforeEach(() => {
@@ -102,6 +113,101 @@ describe('the workspace entity', () => {
   });
 });
 
+/**
+ * Several sign-ins may share one entity (BRAND-ACCESS PR 14): an entity
+ * holds more than one connected account of an auth config when they are
+ * linked with allowMultiple, as Webflow's are. A Google call therefore names
+ * the connected account the brand uses; with only the entity, Composio would
+ * pick one itself.
+ */
+describe('Google calls on a named connected account', () => {
+  const connection = { entityId: 'org_org-1', accountId: 'ca_2' };
+
+  beforeEach(() => {
+    vi.stubEnv('COMPOSIO_GSC_AUTH_CONFIG_ID', 'ac_gsc');
+  });
+
+  it('runs Search Console and Analytics tools on that account', async () => {
+    sdk.execute.mockResolvedValue({ successful: true, data: { siteEntry: [], rows: [] } });
+    await listGscSites(connection);
+    await queryGscSearchAnalytics(connection, { site_url: 'sc-domain:acme.com' });
+    await runGaReport(connection, '123', { limit: 10 });
+    for (const [, body] of sdk.execute.mock.calls) {
+      expect(body).toMatchObject({ userId: 'org_org-1', connectedAccountId: 'ca_2' });
+    }
+    expect(sdk.execute.mock.calls[2][1].arguments).toEqual({
+      property: 'properties/123',
+      limit: 10,
+    });
+  });
+
+  it('reads the property streams on the same account', async () => {
+    sdk.execute
+      .mockResolvedValueOnce({
+        successful: true,
+        data: {
+          accountSummaries: [
+            {
+              displayName: 'Acme',
+              propertySummaries: [{ property: 'properties/9', displayName: 'Web' }],
+            },
+          ],
+        },
+      })
+      .mockResolvedValueOnce({
+        successful: true,
+        data: { dataStreams: [{ webStreamData: { defaultUri: 'https://acme.com' } }] },
+      });
+    expect(await listGaProperties(connection)).toEqual([
+      { propertyId: '9', displayName: 'Web', accountName: 'Acme', siteUrls: ['https://acme.com'] },
+    ]);
+    expect(sdk.execute).toHaveBeenCalledTimes(2);
+    for (const [, body] of sdk.execute.mock.calls) {
+      expect(body).toMatchObject({ userId: 'org_org-1', connectedAccountId: 'ca_2' });
+    }
+  });
+
+  it('lists the property ids alone, without the streams, when asked', async () => {
+    sdk.execute.mockResolvedValueOnce({
+      successful: true,
+      data: {
+        accountSummaries: [
+          {
+            displayName: 'Acme',
+            propertySummaries: [{ property: 'properties/9', displayName: 'Web' }],
+          },
+        ],
+      },
+    });
+    expect(await listGaProperties(connection, { streams: false })).toEqual([
+      { propertyId: '9', displayName: 'Web', accountName: 'Acme', siteUrls: [] },
+    ]);
+    expect(sdk.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs on the entity alone when no account is known, as before', async () => {
+    sdk.execute.mockResolvedValue({ successful: true, data: { siteEntry: [] } });
+    await listGscSites({ entityId: 'org_org-1', accountId: null });
+    expect(sdk.execute.mock.calls[0][1]).not.toHaveProperty('connectedAccountId');
+    expect(sdk.execute.mock.calls[0][1].userId).toBe('org_org-1');
+  });
+
+  it('finds the named account among the entity’s active ones, or none', async () => {
+    sdk.list.mockResolvedValue({ items: [{ id: 'ca_1' }, { id: 'ca_2' }] });
+    expect(await getActiveConnection('google-search-console', 'org_org-1', 'ca_2')).toEqual({
+      id: 'ca_2',
+    });
+    expect(sdk.list).toHaveBeenCalledWith({
+      authConfigIds: ['ac_gsc'],
+      userIds: ['org_org-1'],
+      statuses: ['ACTIVE'],
+    });
+    expect(await getActiveConnection('google-search-console', 'org_org-1', 'ca_9')).toBeNull();
+    // Without one, the first, as the Account's own card reads it.
+    expect(await getActiveConnection('google-search-console', 'org_org-1')).toEqual({ id: 'ca_1' });
+  });
+});
+
 describe('proxyRequest (#1270)', () => {
   const ENDPOINT = 'https://merchantapi.googleapis.com/accounts/v1/accounts';
 
@@ -144,5 +250,102 @@ describe('proxyRequest (#1270)', () => {
     const refused = Object.assign(new Error('403 No permission'), { status: 403 });
     sdk.proxyExecute.mockRejectedValueOnce(refused);
     await expect(proxyRequest('ca_1', { endpoint: ENDPOINT })).rejects.toBe(refused);
+  });
+});
+
+describe('proxyRequest with a body (#2139)', () => {
+  it('POSTs the body as JSON, the query still as parameters', async () => {
+    sdk.proxyExecute.mockResolvedValueOnce({ status: 200, data: { ok: true } });
+    const body = { channel: 'C00000001', text: 'Hi' };
+    await expect(
+      proxyRequest('ca_slack', {
+        endpoint: 'https://slack.com/api/chat.postMessage',
+        method: 'POST',
+        body,
+      }),
+    ).resolves.toEqual({ status: 200, headers: {}, data: { ok: true } });
+    expect(sdk.proxyExecute).toHaveBeenCalledWith(
+      {
+        endpoint: 'https://slack.com/api/chat.postMessage',
+        method: 'POST',
+        parameters: [
+          { in: 'header', name: 'Content-Type', value: 'application/json; charset=utf-8' },
+        ],
+        body,
+        connectedAccountId: 'ca_slack',
+      },
+      undefined,
+    );
+  });
+});
+
+describe('Slack on Composio (#2139)', () => {
+  it('is set up with the API key and the Slack auth config', () => {
+    vi.stubEnv('COMPOSIO_SLACK_AUTH_CONFIG_ID', 'ac_slack');
+    expect(isSlackConfigured()).toBe(true);
+    vi.stubEnv('COMPOSIO_API_KEY', '');
+    expect(isSlackConfigured()).toBe(false);
+    vi.stubEnv('COMPOSIO_API_KEY', 'test-composio-key');
+    vi.stubEnv('COMPOSIO_SLACK_AUTH_CONFIG_ID', '');
+    expect(isSlackConfigured()).toBe(false);
+  });
+
+  it("starts the install as one more account of the Account's entity", async () => {
+    vi.stubEnv('COMPOSIO_SLACK_AUTH_CONFIG_ID', 'ac_slack');
+    sdk.link.mockResolvedValueOnce({
+      redirectUrl: 'https://slack.test/oauth',
+      id: 'ca_new',
+      connectionStatus: 'INITIATED',
+    });
+    await expect(
+      initiateSlackConnection('org_org-1', 'https://app.test/dashboard/settings/integrations'),
+    ).resolves.toEqual({
+      redirectUrl: 'https://slack.test/oauth',
+      connectedAccountId: 'ca_new',
+      status: 'INITIATED',
+    });
+    expect(sdk.link).toHaveBeenCalledWith('org_org-1', 'ac_slack', {
+      callbackUrl: 'https://app.test/dashboard/settings/integrations',
+      allowMultiple: true,
+    });
+  });
+});
+
+describe('proxyRequest writes HubSpot calls (#2140)', () => {
+  it('sends the method HubSpot asks for, with the body as JSON', async () => {
+    sdk.proxyExecute.mockResolvedValueOnce({ status: 200, headers: {}, data: { name: 'x' } });
+    const endpoint = 'https://api.hubapi.com/crm/v3/properties/contacts/ansvisor_ai_source';
+    await expect(
+      proxyRequest('ca_1', { endpoint, method: 'PATCH', body: { options: [] } }),
+    ).resolves.toEqual({ status: 200, headers: {}, data: { name: 'x' } });
+    expect(sdk.proxyExecute).toHaveBeenLastCalledWith(
+      expect.objectContaining({ endpoint, method: 'PATCH', body: { options: [] } }),
+      undefined,
+    );
+  });
+});
+
+describe('HubSpot on Composio (#2140)', () => {
+  it('is configured only with the API key and its own auth config', () => {
+    vi.stubEnv('COMPOSIO_HUBSPOT_AUTH_CONFIG_ID', '');
+    expect(isHubspotConfigured()).toBe(false);
+    vi.stubEnv('COMPOSIO_HUBSPOT_AUTH_CONFIG_ID', 'ac_hubspot');
+    expect(isHubspotConfigured()).toBe(true);
+    vi.stubEnv('COMPOSIO_API_KEY', '');
+    expect(isHubspotConfigured()).toBe(false);
+  });
+
+  it("starts a brand's sign-in as one more account under the entity", async () => {
+    vi.stubEnv('COMPOSIO_HUBSPOT_AUTH_CONFIG_ID', 'ac_hubspot');
+    sdk.link.mockResolvedValueOnce({ redirectUrl: 'https://hs.test/auth', id: 'ca_new' });
+    await expect(linkHubspot('org_org-1', 'https://app.test/back')).resolves.toEqual({
+      redirectUrl: 'https://hs.test/auth',
+      connectedAccountId: 'ca_new',
+      status: 'INITIATED',
+    });
+    expect(sdk.link).toHaveBeenCalledWith('org_org-1', 'ac_hubspot', {
+      callbackUrl: 'https://app.test/back',
+      allowMultiple: true,
+    });
   });
 });

@@ -1,0 +1,1142 @@
+import { z } from 'zod';
+import type { TeamRole } from '@/components/providers/role-provider';
+import { ACTION_CATEGORIES } from '@/lib/action-center/registry';
+import { KPI_KEYS } from '@/lib/kpis/registry';
+import { dayIn, zonedInstant } from '@/lib/time-zone';
+import type { Json } from '@/types/supabase';
+import {
+  MAX_AGENT_TRIGGERS,
+  agentScopeSchema,
+  agentTriggerSchema,
+  defaultAgentName,
+  isOperatorSkills,
+  triggerTimeProblem,
+  type AgentConnection,
+  type AgentEffort,
+  type AgentVisibility,
+} from './agent-rules';
+import {
+  RRULE_DAYS,
+  formatRecurringRule,
+  nextScheduleFire,
+  parseRecurringRule,
+  type RecurringRule,
+  type RruleDay,
+} from './agent-schedule';
+import { skillConnections } from './agent-skills';
+import type { AgentDetail, AgentTriggerView } from './agents';
+import type { AgentPreset, PresetTrigger } from './agents/catalog';
+import { offeredModel, pickedModelOwnKey, runChoiceOf } from './models';
+import {
+  OPERATOR_DAILY_BUDGET_DEFAULT,
+  OPERATOR_DAILY_BUDGET_MAX,
+  OPERATOR_DAILY_BUDGET_MIN,
+  OPERATOR_MAX_RUNS_DEFAULT,
+  OPERATOR_MAX_RUNS_MAX,
+  OPERATOR_MAX_RUNS_MIN,
+  OPERATOR_SKILL,
+} from './operator/defaults';
+import type { ChatMode } from './precedence';
+
+/**
+ * Chat's create-agent flow (CHAT-21 §D; governance mockup #g-agent-new;
+ * CHAT-27 item 19) as data: what the four steps hold, what an agent's
+ * detail fills them with for Edit, what each step needs before Next, the
+ * bodies POST /api/chat/agents and PATCH /{id} take, and the step a
+ * server's refusal belongs to. The server checks it all again
+ * (agent-rules.ts). Pure: the page puts the words around it.
+ */
+
+/** The steps, in the mockup's order: Skill · Trigger · Mode & approvals · Connections & model. */
+export const AGENT_FORM_STEPS = ['skill', 'trigger', 'mode', 'connections'] as const;
+export type AgentFormStep = 0 | 1 | 2 | 3;
+export const LAST_STEP: AgentFormStep = 3;
+
+/** What the page knows before the form opens, read on the server (agent-form-setup.ts). */
+export interface AgentFormSetup {
+  role: TeamRole;
+  /** The brands an agent may work on: the workspace's, never the demo brand. */
+  brands: { id: string; name: string }[];
+  /** Their topics, to narrow the scope. */
+  topics: { id: string; name: string; brandId: string }[];
+  /** The engines the plan tracks, by id (§D item 19). */
+  engines: string[];
+  /** Full auto: open, locked by the plan (Growth and up), or turned off in Settings › Chat. */
+  fullAuto: 'open' | 'plan' | 'policy';
+  /** The workspace's plan, and the one Full auto needs. */
+  planName: string;
+  fullAutoPlan: string;
+  /** Settings › Chat keeps workspace agents to Admins. */
+  workspaceAgentsAdminsOnly: boolean;
+  /** A new agent's Max per run (Settings › Chat), as a share: 0.1 for 10%. */
+  runShareDefault: number;
+  /** The names of the agents the person sees, for a new agent's default name (§O). */
+  takenNames: string[];
+  /**
+   * The provider of the own key Auto runs on (`anthropic`), as
+   * resolveChatModelKey picks it, or null: the monthly AI limit pays.
+   */
+  ownKeyProvider: string | null;
+  /**
+   * The providers of the workspace's own keys for Chat (ownChatKeyProviders),
+   * active or not: a picked model runs on its provider's, else the OpenRouter
+   * one (W4-06).
+   */
+  ownKeyProviders: string[];
+  /** The plan lets an agent run the model it picked (modelChoiceOpen): the free trial runs Auto. */
+  modelChoiceOpen: boolean;
+  /**
+   * The workspace's switch for agents that publish and send on their own
+   * (AUTONOMOUS-GO-LIVE §7.1): the form's box shows unless it's hidden
+   * (CHAT_AUTO_GO_LIVE off). Absent: hidden.
+   */
+  goLive?: 'hidden' | 'off' | 'on';
+  /**
+   * The time zone the person picked in Settings › Account (00468), or null
+   * for Automatic: a new Schedule trigger starts on it, before the browser's.
+   */
+  timeZone: string | null;
+  /**
+   * Can call's choices (CHAT-27 item 14): the workspace's agents the person
+   * sees, on or paused, by name; the form leaves out the one it edits.
+   */
+  callable?: { id: string; name: string }[];
+  /** Running other agents is Growth and up: the row shows, locked. */
+  canCallLocked?: boolean;
+  /**
+   * The skills the workspace added from the Library (CHAT-17, W4-19) that an
+   * Admin approved and the person may run (on, and shared or theirs): the
+   * form's "Library" skill source, by /command, title and repo.
+   */
+  librarySkills?: { name: string; title: string; repo: string | null }[];
+  /**
+   * Ansvisor skills this install doesn't offer now, behind a flag that is
+   * off (skills/flagged.ts): the form's pickers leave them out.
+   */
+  offSkills?: string[];
+  /**
+   * The agents an AEO Operator of the person's may run (AEO Operator plan
+   * §4.3, decision 4): the ones they see that are on or paused, never an
+   * Operator nor a demo brand's, theirs (`mine`) or shared with the
+   * workspace (`workspace`), by name.
+   */
+  operatorAgents?: { id: string; name: string; mine: boolean; workspace: boolean }[];
+}
+
+/** How often a Schedule fires, as its token offers it (mockup: Monday, Weekday, 1st of the month). */
+export type ScheduleRepeat =
+  | 'daily'
+  | 'weekdays'
+  | RruleDay
+  | 'month_first'
+  | 'month_last'
+  | 'once'
+  /** A rule the token can't name (made elsewhere): kept, its time still editable. */
+  | 'custom';
+
+export const SCHEDULE_REPEATS: readonly ScheduleRepeat[] = [
+  'daily',
+  'weekdays',
+  ...RRULE_DAYS,
+  'month_first',
+  'month_last',
+  'once',
+];
+
+/**
+ * A trigger being edited. `raw` is the settings it was read with, sent back
+ * as they were until a field of it changes, so a trigger that is only kept
+ * keeps its exact settings (and its last fire).
+ */
+export type TriggerDraft = { key: string; enabled: boolean; raw: Json | null } & (
+  | {
+      kind: 'schedule';
+      repeat: ScheduleRepeat;
+      /** "07:00", 24-hour, on the clock of `timezone`. */
+      time: string;
+      /** "2026-11-05", for a one-off. */
+      date: string;
+      timezone: string;
+      custom: RecurringRule | null;
+    }
+  | { kind: 'signal'; category: string }
+  | {
+      kind: 'kpi';
+      kpi: string;
+      direction: 'up' | 'down' | 'any';
+      /** As typed. */
+      threshold: string;
+      unit: 'absolute' | 'percent';
+      period: 'day' | 'week' | 'month';
+    }
+  /** Watch rules are picked on the rule itself (CHAT-22): kept here as they are. */
+  | { kind: 'watch_rule' }
+  /** When a brand is added (00482): no settings; the agent needs All brands. */
+  | { kind: 'brand_added' }
+);
+
+export type TriggerKind = TriggerDraft['kind'];
+
+/**
+ * An AEO Operator's own settings as its form edits them (AEO Operator plan
+ * §4.2, §4.3): the agents it may run (null: all its owner's active ones),
+ * workspace agents too, and at most how many a day, as typed. Its daily
+ * budget is the form's `maxRun`; its days and time are its schedule.
+ */
+export interface OperatorFormState {
+  allowed: string[] | null;
+  includeWorkspace: boolean;
+  maxRuns: string;
+}
+
+export interface AgentFormState {
+  /** The primary skill first, then up to 2 follow-on skills. */
+  skills: string[];
+  instructions: string;
+  triggers: TriggerDraft[];
+  allBrands: boolean;
+  brandIds: string[];
+  topicIds: string[];
+  engines: string[];
+  /** As typed: one per line (a URL or a tag may hold a comma). */
+  tagsText: string;
+  urlsText: string;
+  mode: ChatMode;
+  connections: AgentConnection[];
+  model: string;
+  /** Kept as they are: the flow has no field for them yet. */
+  effort: AgentEffort;
+  notifyUserIds: string[];
+  followupDays: number;
+  /** The agents it may run (CHAT-27 item 14), at most 5. */
+  canCall: string[];
+  name: string;
+  /** The person typed a name: a skill or brand change no longer renames it. */
+  nameEdited: boolean;
+  visibility: AgentVisibility;
+  /** Percents as typed: an AEO Operator's daily budget. */
+  maxRun: string;
+  monthCapOn: boolean;
+  maxMonth: string;
+  /**
+   * An AEO Operator's settings: the form is the Operator's (one brand, its
+   * budget and agents; no Can call, connections, engines, topics, tags or
+   * URLs). Null for every other agent.
+   */
+  operator: OperatorFormState | null;
+}
+
+/** Whether the form makes or edits an AEO Operator. */
+export const isOperatorForm = (state: Pick<AgentFormState, 'operator'>) => state.operator !== null;
+
+/** An AEO Operator's preset schedule (aeo-operator.json): weekdays at 07:00, on the person's clock. */
+export const OPERATOR_SCHEDULE: PresetTrigger = {
+  kind: 'schedule',
+  repeat: 'weekdays',
+  time: '07:00',
+};
+
+/** A new AEO Operator's settings: all its owner's active agents, theirs only, 5 a day. */
+export const NEW_OPERATOR: OperatorFormState = Object.freeze({
+  allowed: null,
+  includeWorkspace: false,
+  maxRuns: String(OPERATOR_MAX_RUNS_DEFAULT),
+});
+
+/**
+ * The models the Model step offers (CHAT-16): Auto, or Haiku for Fast and
+ * Sonnet for Best writing, by the ids Auto's two phases price them by
+ * (engine-model.ts AUTO_READ_MODEL / AUTO_WRITE_MODEL `catalog`).
+ */
+export const FAST_MODEL = 'anthropic/claude-haiku-5.5';
+export const WRITING_MODEL = 'anthropic/claude-sonnet-5.5';
+
+/**
+ * The provider of the own key an agent on `model` runs on, as the engine
+ * picks it (engine.ts runModelChoice, engine-model.ts resolveChatModels):
+ * the model as the plan allows it (runChoiceOf: the free trial, and a model
+ * no longer offered, run Auto); a picked model on the own key for its
+ * provider, else the OpenRouter one (pickedModelOwnKey); Auto on the key
+ * Auto runs on. Null: Ansvisor's key, on the monthly AI limit.
+ */
+export function modelKeyProvider(
+  model: string,
+  setup: Pick<AgentFormSetup, 'ownKeyProvider' | 'ownKeyProviders' | 'modelChoiceOpen'>,
+): string | null {
+  const picked = offeredModel(runChoiceOf({ model }, setup.modelChoiceOpen).model);
+  return picked
+    ? pickedModelOwnKey(picked.provider, setup.ownKeyProviders, picked.directOnly)
+    : setup.ownKeyProvider;
+}
+
+export const MAX_INSTRUCTIONS = 2000;
+export const MAX_NAME = 60;
+
+// ─── Small parts ─────────────────────────────────────────────────────────────
+
+/** A name as the server keeps it: spaces folded. */
+export const foldName = (name: string) => name.replace(/\s+/g, ' ').trim();
+
+/** Tags or URLs as typed: one per line, trimmed, once each. A comma stays in its line. */
+export function parseList(text: string): string[] {
+  return [
+    ...new Set(
+      text
+        .split(/\r?\n/)
+        .map((item) => item.trim())
+        .filter(Boolean),
+    ),
+  ];
+}
+
+const TIME = /^([01]\d|2[0-3]):([0-5]\d)$/;
+
+function clockOf(time: string): { hour: number; minute: number } | null {
+  const match = TIME.exec(time);
+  return match ? { hour: Number(match[1]), minute: Number(match[2]) } : null;
+}
+
+const pad = (n: number) => String(n).padStart(2, '0');
+
+/** "07:00" for an instant on a zone's clock. */
+function clockIn(iso: string, timeZone: string): string {
+  return new Date(iso).toLocaleTimeString('en-GB', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+    timeZone,
+  });
+}
+
+/** JSON with its keys in order and nothing undefined, to tell two settings apart. */
+function canonical(value: unknown): string {
+  return JSON.stringify(value, (_key, inner: unknown) =>
+    inner && typeof inner === 'object' && !Array.isArray(inner)
+      ? Object.fromEntries(
+          Object.entries(inner as Record<string, unknown>)
+            .filter(([, v]) => v !== undefined)
+            .sort(([a], [b]) => (a < b ? -1 : 1)),
+        )
+      : inner,
+  );
+}
+
+/** A scope without its empty lists: the same scope either way. */
+function scopeKey(scope: unknown): string {
+  const record = (scope ?? {}) as Record<string, unknown>;
+  return canonical(
+    Object.fromEntries(
+      Object.entries(record).filter(([, v]) => !(Array.isArray(v) && v.length === 0)),
+    ),
+  );
+}
+
+// ─── Triggers ────────────────────────────────────────────────────────────────
+
+const WEEKDAYS: readonly RruleDay[] = ['MO', 'TU', 'WE', 'TH', 'FR'];
+
+/** A new trigger, with the mockup's first values ("Monday at 07:00", "Citation lost", "−10% week over week"). */
+export function newTriggerDraft(
+  kind: Exclude<TriggerKind, 'watch_rule'>,
+  key: string,
+  timeZone: string,
+): TriggerDraft {
+  switch (kind) {
+    case 'schedule':
+      return {
+        key,
+        kind,
+        enabled: true,
+        raw: null,
+        repeat: 'MO',
+        time: '07:00',
+        date: '',
+        timezone: timeZone,
+        custom: null,
+      };
+    case 'signal':
+      return { key, kind, enabled: true, raw: null, category: 'recover' };
+    case 'kpi':
+      return {
+        key,
+        kind,
+        enabled: true,
+        raw: null,
+        kpi: 'citations',
+        direction: 'down',
+        threshold: '10',
+        unit: 'percent',
+        period: 'week',
+      };
+    case 'brand_added':
+      return { key, kind, enabled: true, raw: null };
+  }
+}
+
+/** Which token a stored rule reads as; anything the token can't make itself is `custom`. */
+function repeatOf(rule: RecurringRule): ScheduleRepeat {
+  if (rule.freq === 'MONTHLY') {
+    return rule.byMonthDay === 1 ? 'month_first' : rule.byMonthDay === -1 ? 'month_last' : 'custom';
+  }
+  if (rule.freq === 'DAILY') return rule.byDay === null ? 'daily' : 'custom';
+  const days = rule.byDay ?? [];
+  if (days.length === 1) return days[0];
+  if (days.length === 5 && WEEKDAYS.every((d) => days.includes(d))) return 'weekdays';
+  return 'custom';
+}
+
+const record = (value: unknown): Record<string, unknown> =>
+  value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+
+/** A stored trigger, to edit; its own settings kept in `raw`. */
+export function draftFromView(
+  view: Pick<AgentTriggerView, 'kind' | 'config' | 'enabled'>,
+  key: string,
+  timeZone: string,
+): TriggerDraft {
+  const config = record(view.config);
+  const base = { key, enabled: view.enabled, raw: view.config };
+  switch (view.kind) {
+    case 'schedule': {
+      if (config.type === 'once' && typeof config.at === 'string') {
+        return {
+          ...base,
+          kind: 'schedule',
+          repeat: 'once',
+          date: dayIn(config.at, timeZone),
+          time: clockIn(config.at, timeZone),
+          timezone: timeZone,
+          custom: null,
+        };
+      }
+      const rule = typeof config.rrule === 'string' ? parseRecurringRule(config.rrule) : null;
+      const zone = typeof config.timezone === 'string' ? config.timezone : timeZone;
+      return {
+        ...base,
+        kind: 'schedule',
+        repeat: rule ? repeatOf(rule) : 'MO',
+        time: rule ? `${pad(rule.hour)}:${pad(rule.minute)}` : '07:00',
+        date: '',
+        timezone: zone,
+        custom: rule && repeatOf(rule) === 'custom' ? rule : null,
+      };
+    }
+    case 'signal':
+      return {
+        ...base,
+        kind: 'signal',
+        category: typeof config.category === 'string' ? config.category : '',
+      };
+    case 'kpi':
+      return {
+        ...base,
+        kind: 'kpi',
+        kpi: typeof config.kpi === 'string' ? config.kpi : '',
+        direction:
+          config.direction === 'up' || config.direction === 'any' ? config.direction : 'down',
+        threshold: typeof config.threshold === 'number' ? String(config.threshold) : '',
+        unit: config.unit === 'absolute' ? 'absolute' : 'percent',
+        period: config.period === 'day' || config.period === 'month' ? config.period : 'week',
+      };
+    case 'watch_rule':
+      return { ...base, kind: 'watch_rule' };
+    case 'brand_added':
+      return { ...base, kind: 'brand_added' };
+  }
+}
+
+/** A recurring schedule's rule, from its token and time. */
+function ruleOf(
+  draft: Extract<TriggerDraft, { kind: 'schedule' }>,
+  hour: number,
+  minute: number,
+): RecurringRule | null {
+  const at = { hour, minute };
+  switch (draft.repeat) {
+    case 'daily':
+      return { freq: 'DAILY', byDay: null, byMonthDay: null, ...at };
+    case 'weekdays':
+      return { freq: 'WEEKLY', byDay: [...WEEKDAYS], byMonthDay: null, ...at };
+    case 'month_first':
+      return { freq: 'MONTHLY', byDay: null, byMonthDay: 1, ...at };
+    case 'month_last':
+      return { freq: 'MONTHLY', byDay: null, byMonthDay: -1, ...at };
+    case 'custom':
+      return draft.custom ? { ...draft.custom, ...at } : null;
+    case 'once':
+      return null;
+    default:
+      return { freq: 'WEEKLY', byDay: [draft.repeat], byMonthDay: null, ...at };
+  }
+}
+
+/** A trigger as the API takes it (its `config` as kept), or null while a field is missing. */
+export function triggerInputOf(
+  draft: TriggerDraft,
+): { kind: TriggerKind; config: Json; enabled: boolean } | null {
+  const out = (config: Json) => ({ kind: draft.kind, config, enabled: draft.enabled });
+  if (draft.raw !== null) return out(draft.raw);
+  switch (draft.kind) {
+    case 'schedule': {
+      const clock = clockOf(draft.time);
+      if (!clock) return null;
+      if (draft.repeat === 'once') {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(draft.date)) return null;
+        return out({
+          type: 'once',
+          at: zonedInstant(draft.date, clock.hour, clock.minute, draft.timezone),
+        });
+      }
+      const rule = ruleOf(draft, clock.hour, clock.minute);
+      if (!rule) return null;
+      return out({ type: 'recurring', rrule: formatRecurringRule(rule), timezone: draft.timezone });
+    }
+    case 'signal':
+      return draft.category ? out({ category: draft.category }) : null;
+    case 'kpi': {
+      const threshold = Number(draft.threshold);
+      if (!draft.kpi || !draft.threshold.trim() || !Number.isFinite(threshold)) return null;
+      return out({
+        kpi: draft.kpi,
+        direction: draft.direction,
+        threshold,
+        unit: draft.unit,
+        period: draft.period,
+      });
+    }
+    case 'watch_rule':
+      return null;
+    case 'brand_added':
+      return out({});
+  }
+}
+
+/** When a Schedule draft fires next, or null (event triggers, or not set yet). */
+export function draftNextFire(draft: TriggerDraft, now: Date): string | null {
+  if (draft.kind !== 'schedule' || !draft.enabled) return null;
+  const input = triggerInputOf(draft);
+  return input ? nextScheduleFire(input.config, now) : null;
+}
+
+/** What is wrong with a trigger, or null. A kept one isn't held to the clock (the server doesn't). */
+export function triggerError(draft: TriggerDraft, now: Date): string | null {
+  if (draft.raw === null) {
+    switch (draft.kind) {
+      case 'schedule':
+        if (!clockOf(draft.time)) return 'time_required';
+        if (draft.repeat === 'once' && !draft.date) return 'date_required';
+        break;
+      case 'signal':
+        if (!ACTION_CATEGORIES.some((c) => c === draft.category)) return 'category_required';
+        break;
+      case 'kpi': {
+        if (!KPI_KEYS.some((k) => k === draft.kpi)) return 'kpi_required';
+        const threshold = Number(draft.threshold);
+        if (!draft.threshold.trim() || !Number.isFinite(threshold) || threshold <= 0) {
+          return 'threshold';
+        }
+        if (threshold > 1_000_000) return 'threshold';
+        if (draft.unit === 'percent' && threshold > 1000) return 'threshold_percent';
+        break;
+      }
+      case 'watch_rule':
+        return 'watch_rule_required';
+      case 'brand_added':
+        break;
+    }
+  }
+  const input = triggerInputOf(draft);
+  const parsed = input ? agentTriggerSchema.safeParse(input) : null;
+  if (!parsed?.success) return 'trigger_invalid';
+  if (draft.raw === null) return triggerTimeProblem(parsed.data, now);
+  return null;
+}
+
+// ─── The form ────────────────────────────────────────────────────────────────
+
+/**
+ * The connections an agent's skills use, Required or Optional as the
+ * skills say (§D step 4), and the Optional ones it had that its skills
+ * don't use.
+ */
+export function syncConnections(
+  previous: readonly AgentConnection[],
+  skills: readonly string[],
+): AgentConnection[] {
+  const needed = skillConnections(skills);
+  const keys = new Set(needed.map((c) => c.key));
+  return [
+    ...needed.map(({ key, required }) => ({ key, required })),
+    ...previous.filter((c) => !keys.has(c.key) && !c.required),
+  ];
+}
+
+/** A new agent's name (§O); the server names it again against every agent (`autoName`). */
+export { defaultAgentName };
+
+/**
+ * A new agent's form: the skill it starts from, if any, the brand on screen,
+ * Monday 07:00. From /operator, an AEO Operator's (operatorForm).
+ */
+export function newForm(
+  setup: Pick<AgentFormSetup, 'brands' | 'runShareDefault'>,
+  options: { timeZone: string; brandId: string | null; skill: string | null; triggerKey: string },
+): AgentFormState {
+  const brand = setup.brands.find((b) => b.id === options.brandId) ?? setup.brands[0] ?? null;
+  const skills = options.skill ? [options.skill] : [];
+  const form: AgentFormState = {
+    skills,
+    instructions: '',
+    triggers: [newTriggerDraft('schedule', options.triggerKey, options.timeZone)],
+    allBrands: false,
+    brandIds: brand ? [brand.id] : [],
+    topicIds: [],
+    engines: [],
+    tagsText: '',
+    urlsText: '',
+    mode: 'auto',
+    connections: syncConnections([], skills),
+    model: 'auto',
+    effort: 'normal',
+    notifyUserIds: [],
+    followupDays: 14,
+    canCall: [],
+    name: '',
+    nameEdited: false,
+    visibility: 'private',
+    maxRun: String(Math.round(setup.runShareDefault * 100)),
+    monthCapOn: false,
+    maxMonth: '',
+    operator: null,
+  };
+  return options.skill === OPERATOR_SKILL ? operatorForm(form, options.timeZone) : form;
+}
+
+/**
+ * A form made an AEO Operator's (AEO Operator plan §4.3): /operator alone, on
+ * one brand (the one it had, else none), weekdays at 07:00, private, in Auto,
+ * a 5% daily budget and its settings' defaults; no connections, Can call,
+ * engines, topics, tags or URLs.
+ */
+export function operatorForm(form: AgentFormState, timeZone: string): AgentFormState {
+  return {
+    ...form,
+    skills: [OPERATOR_SKILL],
+    instructions: '',
+    triggers: [presetTriggerDraft(OPERATOR_SCHEDULE, 'k0', timeZone)],
+    allBrands: false,
+    brandIds: form.brandIds.slice(0, 1),
+    topicIds: [],
+    engines: [],
+    tagsText: '',
+    urlsText: '',
+    mode: 'auto',
+    connections: [],
+    canCall: [],
+    visibility: 'private',
+    maxRun: String(Math.round(OPERATOR_DAILY_BUDGET_DEFAULT * 100)),
+    operator: { ...NEW_OPERATOR },
+  };
+}
+
+/** A ready-to-use agent's default trigger as the Trigger step edits it, on the person's clock. */
+export function presetTriggerDraft(
+  trigger: PresetTrigger,
+  key: string,
+  timeZone: string,
+): TriggerDraft {
+  const draft = newTriggerDraft(trigger.kind, key, timeZone);
+  if (draft.kind === 'schedule' && trigger.kind === 'schedule') {
+    return { ...draft, repeat: trigger.repeat, time: trigger.time };
+  }
+  if (draft.kind === 'signal' && trigger.kind === 'signal') {
+    return { ...draft, category: trigger.category };
+  }
+  if (draft.kind === 'kpi' && trigger.kind === 'kpi') {
+    return {
+      ...draft,
+      kpi: trigger.kpi,
+      direction: trigger.direction,
+      threshold: String(trigger.threshold),
+      unit: trigger.unit,
+      period: trigger.period,
+    };
+  }
+  return draft;
+}
+
+/**
+ * A new agent's form from a ready-to-use agent (Agent Center › Ready to
+ * use, "Use this agent"): its skills, triggers, mode and connections, on
+ * the brand on screen, or on All brands when a trigger needs it (When a
+ * brand is added). Full auto where the plan or Settings › Chat keeps it
+ * closed starts on Auto, ask before changes: the card said so. Only filled
+ * in, never saved: the person saves it.
+ */
+export function formFromPreset(
+  setup: Pick<AgentFormSetup, 'brands' | 'runShareDefault' | 'fullAuto'>,
+  preset: Pick<AgentPreset, 'skills' | 'triggers' | 'mode' | 'connections'>,
+  options: { timeZone: string; brandId: string | null },
+): AgentFormState {
+  const skills = [...preset.skills];
+  const allBrands = preset.triggers.some((trigger) => trigger.kind === 'brand_added');
+  // The AEO Operator's preset: the Operator's own form, on its preset's schedule.
+  if (isOperatorSkills(skills)) {
+    const form = operatorForm(
+      newForm(setup, { ...options, skill: null, triggerKey: 'k0' }),
+      options.timeZone,
+    );
+    return {
+      ...form,
+      triggers: preset.triggers.map((trigger, i) =>
+        presetTriggerDraft(trigger, `k${i}`, options.timeZone),
+      ),
+      mode: preset.mode === 'full_auto' && setup.fullAuto !== 'open' ? 'auto' : preset.mode,
+    };
+  }
+  return {
+    ...newForm(setup, { ...options, skill: null, triggerKey: 'k0' }),
+    ...(allBrands ? { allBrands, brandIds: [] } : {}),
+    skills,
+    triggers: preset.triggers.map((trigger, i) =>
+      presetTriggerDraft(trigger, `k${i}`, options.timeZone),
+    ),
+    mode: preset.mode === 'full_auto' && setup.fullAuto !== 'open' ? 'auto' : preset.mode,
+    connections: syncConnections(
+      preset.connections.filter((c) => !c.required),
+      skills,
+    ),
+  };
+}
+
+/** The form an agent's Edit opens with: its current version, triggers and settings. */
+export function formFromAgent(
+  agent: AgentDetail,
+  setup: Pick<AgentFormSetup, 'brands'>,
+  options: { timeZone: string; triggerKey: (i: number) => string },
+): AgentFormState | null {
+  const settings = agent.settings;
+  if (!settings) return null;
+  const scope = settings.scope;
+  const known = new Set(setup.brands.map((b) => b.id));
+  return {
+    skills: [...settings.skills],
+    instructions: settings.instructions ?? '',
+    triggers: agent.triggers.map((view, i) =>
+      draftFromView(view, options.triggerKey(i), options.timeZone),
+    ),
+    allBrands: scope.all_brands === true,
+    brandIds: (scope.brand_ids ?? []).filter((id) => known.has(id)),
+    topicIds: scope.topic_ids ?? [],
+    engines: scope.engines ?? [],
+    tagsText: (scope.tags ?? []).join('\n'),
+    urlsText: (scope.urls ?? []).join('\n'),
+    mode: settings.mode,
+    connections: settings.connections.map((c) => ({ ...c })),
+    model: settings.model,
+    effort: settings.effort,
+    notifyUserIds: settings.notifyUserIds,
+    followupDays: settings.followupDays,
+    canCall: settings.canCall ?? [],
+    name: agent.name,
+    nameEdited: true,
+    visibility: agent.visibility,
+    maxRun: String(Math.round(agent.maxRunShare * 100)),
+    monthCapOn: agent.maxMonthShare !== null,
+    maxMonth: agent.maxMonthShare !== null ? String(Math.round(agent.maxMonthShare * 100)) : '',
+    // An AEO Operator's own settings, as kept (the defaults where they couldn't be read).
+    operator:
+      settings.operator || isOperatorSkills(settings.skills)
+        ? {
+            allowed: settings.operator?.allowed ?? null,
+            includeWorkspace: settings.operator?.includeWorkspace ?? false,
+            maxRuns: String(settings.operator?.maxRuns ?? OPERATOR_MAX_RUNS_DEFAULT),
+          }
+        : null,
+  };
+}
+
+/** The scope as kept (§D step 2): brands or all, then the lists that narrow it. An Operator's: its brand. */
+export function scopeOf(state: AgentFormState): Record<string, unknown> {
+  if (isOperatorForm(state)) return { brand_ids: state.brandIds };
+  const tags = parseList(state.tagsText);
+  const urls = parseList(state.urlsText);
+  return {
+    ...(state.allBrands ? { all_brands: true } : { brand_ids: state.brandIds }),
+    ...(state.topicIds.length > 0 ? { topic_ids: state.topicIds } : {}),
+    ...(tags.length > 0 ? { tags } : {}),
+    ...(state.engines.length > 0 ? { engines: state.engines } : {}),
+    ...(urls.length > 0 ? { urls } : {}),
+  };
+}
+
+// ─── What each step needs ────────────────────────────────────────────────────
+
+/** Where a problem is shown: a field of a step, or the step's own line (`form`). */
+export type FormField =
+  | 'skills'
+  | 'instructions'
+  | 'triggers'
+  | 'brands'
+  | 'engines'
+  | 'tags'
+  | 'urls'
+  | 'mode'
+  | 'connections'
+  | 'name'
+  | 'visibility'
+  | 'maxRun'
+  | 'maxMonth'
+  /** An AEO Operator's: the agents it may run, and at most how many a day. */
+  | 'operatorAgents'
+  | 'maxRuns'
+  | 'form';
+
+/** A step's problems: by field, and by trigger (its key). */
+export interface StepProblems {
+  fields: Partial<Record<FormField, string>>;
+  triggers: Record<string, string>;
+}
+
+export interface FormContext {
+  setup: Pick<AgentFormSetup, 'role' | 'brands' | 'fullAuto' | 'workspaceAgentsAdminsOnly'>;
+  /** The agent being edited, or null for a new one. */
+  agent: Pick<AgentDetail, 'visibility' | 'maxMonthShare'> | null;
+  now: Date;
+}
+
+const httpUrl = z.url({ protocol: /^https?$/ }).max(2048);
+const wholeIn = (text: string, min: number, max: number) =>
+  /^\d{1,3}$/.test(text.trim()) && Number(text) >= min && Number(text) <= max;
+
+export function stepProblems(
+  step: AgentFormStep,
+  state: AgentFormState,
+  ctx: FormContext,
+): StepProblems {
+  const fields: StepProblems['fields'] = {};
+  const triggers: StepProblems['triggers'] = {};
+  if (state.operator) return operatorStepProblems(step, state, state.operator, ctx);
+  switch (step) {
+    case 0:
+      if (state.skills.length === 0) fields.skills = 'skill_required';
+      if (state.instructions.length > MAX_INSTRUCTIONS) fields.instructions = 'instructions_long';
+      break;
+    case 1: {
+      for (const draft of state.triggers) {
+        const problem = triggerError(draft, ctx.now);
+        if (problem) triggers[draft.key] = problem;
+      }
+      if (state.triggers.length > MAX_AGENT_TRIGGERS) fields.triggers = 'triggers_many';
+      else {
+        const built = state.triggers.map(triggerInputOf).filter((t) => t !== null);
+        const keys = built.map((t) => `${t.kind}:${canonical(t.config)}`);
+        if (new Set(keys).size !== keys.length) fields.triggers = 'triggers_same';
+      }
+      if (!state.allBrands && state.triggers.some((d) => d.kind === 'brand_added')) {
+        // When a brand is added fires for a brand no one picked yet (00482).
+        fields.brands = 'brand_added_all_brands';
+      } else if (!state.allBrands && state.brandIds.length === 0) {
+        fields.brands = ctx.setup.brands.length === 0 ? 'no_brands' : 'brand_required';
+      }
+      if (state.engines.length > 10) fields.engines = 'engines_many';
+      const tags = parseList(state.tagsText);
+      if (tags.length > 20 || tags.some((tag) => tag.length > 50)) fields.tags = 'tags_invalid';
+      const urls = parseList(state.urlsText);
+      if (urls.length > 20 || urls.some((url) => !httpUrl.safeParse(url).success)) {
+        fields.urls = 'urls_invalid';
+      }
+      if (Object.keys(fields).length === 0 && !agentScopeSchema.safeParse(scopeOf(state)).success) {
+        fields.brands = 'scope_invalid';
+      }
+      break;
+    }
+    case 2:
+      if (state.mode === 'full_auto' && ctx.setup.fullAuto !== 'open') {
+        fields.mode = ctx.setup.fullAuto === 'plan' ? 'full_auto_plan' : 'full_auto_off';
+      }
+      break;
+    case 3: {
+      const name = foldName(state.name);
+      if (!name) fields.name = 'name_required';
+      else if (name.length > MAX_NAME) fields.name = 'name_long';
+      if (!wholeIn(state.maxRun, 1, 50)) fields.maxRun = 'run_share';
+      if (ctx.setup.role === 'admin' && state.monthCapOn && !wholeIn(state.maxMonth, 1, 100)) {
+        fields.maxMonth = 'month_share';
+      }
+      if (
+        state.visibility === 'workspace' &&
+        ctx.setup.role !== 'admin' &&
+        ctx.setup.workspaceAgentsAdminsOnly &&
+        ctx.agent?.visibility !== 'workspace'
+      ) {
+        fields.visibility = 'workspace_admins_only';
+      }
+      break;
+    }
+  }
+  return { fields, triggers };
+}
+
+/**
+ * An AEO Operator's steps (AEO Operator plan §4.3): its schedule's triggers
+ * and one brand; then its name, a daily budget of 1–10%, its agents (one at
+ * least when picked) and at most 1–8 a day, and an Admin's monthly cap. Its
+ * skill and its approvals are fixed.
+ */
+function operatorStepProblems(
+  step: AgentFormStep,
+  state: AgentFormState,
+  operator: OperatorFormState,
+  ctx: FormContext,
+): StepProblems {
+  const fields: StepProblems['fields'] = {};
+  const triggers: StepProblems['triggers'] = {};
+  switch (step) {
+    case 1: {
+      for (const draft of state.triggers) {
+        const problem = triggerError(draft, ctx.now);
+        if (problem) triggers[draft.key] = problem;
+      }
+      if (state.triggers.length > MAX_AGENT_TRIGGERS) fields.triggers = 'triggers_many';
+      else {
+        const keys = builtTriggers(state).map((t) => `${t.kind}:${canonical(t.config)}`);
+        if (new Set(keys).size !== keys.length) fields.triggers = 'triggers_same';
+      }
+      if (ctx.setup.brands.length === 0) fields.brands = 'no_brands';
+      else if (state.allBrands || state.brandIds.length !== 1) fields.brands = 'operator_brand';
+      break;
+    }
+    case 3: {
+      const name = foldName(state.name);
+      if (!name) fields.name = 'name_required';
+      else if (name.length > MAX_NAME) fields.name = 'name_long';
+      const budget = [OPERATOR_DAILY_BUDGET_MIN, OPERATOR_DAILY_BUDGET_MAX].map((share) =>
+        Math.round(share * 100),
+      );
+      if (!wholeIn(state.maxRun, budget[0], budget[1])) fields.maxRun = 'operator_budget';
+      if (operator.allowed !== null && operator.allowed.length === 0) {
+        fields.operatorAgents = 'operator_agents';
+      }
+      if (!wholeIn(operator.maxRuns, OPERATOR_MAX_RUNS_MIN, OPERATOR_MAX_RUNS_MAX)) {
+        fields.maxRuns = 'operator_max_runs';
+      }
+      if (ctx.setup.role === 'admin' && state.monthCapOn && !wholeIn(state.maxMonth, 1, 100)) {
+        fields.maxMonth = 'month_share';
+      }
+      break;
+    }
+  }
+  return { fields, triggers };
+}
+
+export const hasProblems = (problems: StepProblems) =>
+  Object.keys(problems.fields).length > 0 || Object.keys(problems.triggers).length > 0;
+
+/** The first step from `from` up to `to` (not included) that isn't ready, or null. */
+export function firstStepWithProblems(
+  state: AgentFormState,
+  ctx: FormContext,
+  to: number = AGENT_FORM_STEPS.length,
+  from = 0,
+): AgentFormStep | null {
+  for (let step = from; step < to; step++) {
+    if (hasProblems(stepProblems(step as AgentFormStep, state, ctx))) return step as AgentFormStep;
+  }
+  return null;
+}
+
+// ─── What is sent ────────────────────────────────────────────────────────────
+
+function builtTriggers(state: AgentFormState) {
+  return state.triggers.map(triggerInputOf).filter((t) => t !== null);
+}
+
+/** A share from a percent as typed: "10" → 0.1. */
+const shareOf = (percent: string) => Math.round(Number(percent)) / 100;
+
+/**
+ * POST /api/chat/agents's body: a new draft. The monthly cap only an Admin
+ * sends (CHAT-27 item 23). A name the person didn't type goes as the
+ * skill's title (`autoTitle`) for the server to name by §O against every
+ * agent, the ones the person can't see included.
+ */
+export function createBody(
+  state: AgentFormState,
+  role: TeamRole,
+  autoTitle: string | null = null,
+): Record<string, unknown> {
+  const auto = !state.nameEdited && !!autoTitle;
+  if (state.operator) {
+    // An AEO Operator: private, its daily budget, one brand and its own settings; nothing else.
+    return {
+      name: auto ? autoTitle : foldName(state.name),
+      ...(auto ? { autoName: true } : {}),
+      visibility: 'private',
+      maxRunShare: shareOf(state.maxRun),
+      ...(role === 'admin'
+        ? { maxMonthShare: state.monthCapOn ? shareOf(state.maxMonth) : null }
+        : {}),
+      skills: [OPERATOR_SKILL],
+      instructions: null,
+      mode: state.mode,
+      connections: [],
+      model: state.model,
+      effort: state.effort,
+      scope: scopeOf(state),
+      notifyUserIds: state.notifyUserIds,
+      followupDays: state.followupDays,
+      triggers: builtTriggers(state),
+      operator: operatorInputOf(state.operator),
+    };
+  }
+  return {
+    name: auto ? autoTitle : foldName(state.name),
+    ...(auto ? { autoName: true } : {}),
+    visibility: state.visibility,
+    maxRunShare: shareOf(state.maxRun),
+    ...(role === 'admin'
+      ? { maxMonthShare: state.monthCapOn ? shareOf(state.maxMonth) : null }
+      : {}),
+    skills: state.skills,
+    instructions: state.instructions.trim() || null,
+    mode: state.mode,
+    connections: state.connections,
+    model: state.model,
+    effort: state.effort,
+    scope: scopeOf(state),
+    notifyUserIds: state.notifyUserIds,
+    followupDays: state.followupDays,
+    ...(state.canCall.length > 0 ? { canCall: state.canCall } : {}),
+    triggers: builtTriggers(state),
+  };
+}
+
+/** An AEO Operator's settings as the API takes them (agent-rules.ts operatorSettingsInput). */
+export function operatorInputOf(operator: OperatorFormState): {
+  allowed: string[] | null;
+  includeWorkspace: boolean;
+  maxRuns: number;
+} {
+  return {
+    allowed: operator.allowed,
+    includeWorkspace: operator.includeWorkspace,
+    maxRuns: Math.round(Number(operator.maxRuns)),
+  };
+}
+
+/**
+ * PATCH /{id}'s body: only what changed, with the version and the
+ * `updatedAt` the form opened (a save over someone else's, even one that
+ * made no new version, is refused). Null when nothing changed.
+ */
+export function patchBody(
+  state: AgentFormState,
+  agent: AgentDetail,
+  role: TeamRole,
+): Record<string, unknown> | null {
+  const settings = agent.settings;
+  if (!settings) return null;
+  const patch: Record<string, unknown> = {};
+  const name = foldName(state.name);
+  if (name !== agent.name) patch.name = name;
+  if (state.visibility !== agent.visibility) patch.visibility = state.visibility;
+  const run = shareOf(state.maxRun);
+  if (Math.round(run * 100) !== Math.round(agent.maxRunShare * 100)) patch.maxRunShare = run;
+  if (role === 'admin') {
+    const month = state.monthCapOn ? shareOf(state.maxMonth) : null;
+    const was = agent.maxMonthShare;
+    if ((month === null) !== (was === null) || (month !== null && was !== null && month !== was)) {
+      patch.maxMonthShare = month;
+    }
+  }
+  if (canonical(state.skills) !== canonical(settings.skills)) patch.skills = state.skills;
+  const instructions = state.instructions.trim() || null;
+  if (instructions !== (settings.instructions ?? null)) patch.instructions = instructions;
+  if (state.mode !== settings.mode) patch.mode = state.mode;
+  if (canonical(state.connections) !== canonical(settings.connections)) {
+    patch.connections = state.connections;
+  }
+  if (state.model !== settings.model) patch.model = state.model;
+  const scope = scopeOf(state);
+  if (scopeKey(scope) !== scopeKey(settings.scope)) patch.scope = scope;
+  if (canonical(state.canCall) !== canonical(settings.canCall ?? [])) patch.canCall = state.canCall;
+  const triggers = builtTriggers(state);
+  const was = agent.triggers.map((t) => ({ kind: t.kind, config: t.config, enabled: t.enabled }));
+  if (canonical(triggers) !== canonical(was)) patch.triggers = triggers;
+  if (state.operator) {
+    // An AEO Operator's settings: all of them when one changed (they make a new version).
+    const operator = operatorInputOf(state.operator);
+    const kept = settings.operator;
+    if (
+      !kept ||
+      canonical(operator) !==
+        canonical({
+          allowed: kept.allowed,
+          includeWorkspace: kept.includeWorkspace,
+          maxRuns: kept.maxRuns,
+        })
+    ) {
+      patch.operator = operator;
+    }
+  }
+  if (Object.keys(patch).length === 0) return null;
+  return { expectedVersion: agent.version, expectedUpdatedAt: agent.updatedAt, ...patch };
+}
+
+// ─── The server's refusals ───────────────────────────────────────────────────
+
+/**
+ * The step and field a refusal of the server belongs to: a name taken on
+ * the last step, a past one-off on the triggers, the plan's engines on the
+ * scope, Full auto on the modes, sharing and the monthly cap on the last
+ * step. `asked` names what a denial refused (chatAgents.asked). The rest
+ * (the plan's active agents, the AI limit, a save over another) is the
+ * last step's line.
+ */
+export function refusalPlace(
+  code: string | null,
+  asked: string | null,
+): { step: AgentFormStep; field: FormField } {
+  switch (code) {
+    case 'name_taken':
+    case 'name_taken_hidden':
+      return { step: 3, field: 'name' };
+    case 'schedule_past':
+    case 'schedule_too_far':
+      return { step: 1, field: 'triggers' };
+    case 'brand_added_scope':
+      return { step: 1, field: 'brands' };
+    case 'brand_not_found':
+    case 'topic_not_found':
+    case 'no_brand':
+    case 'demo_brand':
+    // An AEO Operator: one brand, and one Operator on a brand at a time.
+    case 'operator_scope':
+    case 'operator_taken':
+      return { step: 1, field: 'brands' };
+    case 'operator_budget':
+      return { step: 3, field: 'maxRun' };
+    case 'operator_visibility':
+      return { step: 3, field: 'visibility' };
+    // The box under the Approvals table (AUTONOMOUS-GO-LIVE §7.2).
+    case 'go_live_off':
+    case 'go_live_mode':
+      return { step: 2, field: 'form' };
+  }
+  switch (asked) {
+    case 'fullAuto':
+      return { step: 2, field: 'mode' };
+    case 'goLive':
+      return { step: 2, field: 'form' };
+    case 'engines':
+      return { step: 1, field: 'engines' };
+    case 'workspace':
+      return { step: 3, field: 'visibility' };
+    case 'monthCap':
+      return { step: 3, field: 'maxMonth' };
+  }
+  return { step: LAST_STEP, field: 'form' };
+}

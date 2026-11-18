@@ -17,14 +17,17 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { useBrandStore } from '@/stores/use-brand-store';
 import { getActionHistory } from '@/lib/actions/action-history';
 import { getActionScorecard } from '@/lib/actions/action-scorecard';
-import type { ScorecardRow } from '@/lib/action-center/scorecard';
+import { SCORECARD_BY, type ScorecardBy, type ScorecardRow } from '@/lib/action-center/scorecard';
 import { readUrlChoice, readUrlParam, writeUrlParams } from '@/lib/url-state';
-import { actionTexts } from '@/lib/action-center/display';
+import { actionKindName, actionTexts } from '@/lib/action-center/display';
+import { useChatPageContext } from '@/components/chat/panel/chat-panel-context';
+import { rangeChipLabel, type ChatPageFilter } from '@/lib/chat/page-context';
+import { viewRows, type ChatPageView } from '@/lib/chat/page-view';
 import {
   HISTORY_PAGE_SIZE,
   HISTORY_SORTS,
   HISTORY_STATUSES,
-  compareHistory,
+  filterHistory,
   summarize,
   type ActionHistoryItem,
   type HistorySort,
@@ -40,7 +43,9 @@ import { ActionCenterTabs } from '@/components/action-center/action-center-tabs'
 import { HistoryTable } from '@/components/action-center/history-table';
 import { HistoryDrawer } from '@/components/action-center/history-drawer';
 import { ScorecardTable } from '@/components/action-center/scorecard-table';
+import { HistoryViews } from '@/components/action-center/history-views';
 import { cn } from '@/lib/utils';
+import { actionCode } from '@/lib/action-center/action-ref';
 import { HeaderWithAiUsage } from '@/components/ai-usage/ai-usage-meter';
 
 const RANGE_DAYS = { '7d': 7, '30d': 30, '90d': 90, all: null } as const;
@@ -93,6 +98,8 @@ export default function ActionCenterHistoryPage() {
   const [page, setPage] = useState(1);
   const [selected, setSelected] = useState<ActionHistoryItem | null>(null);
   const [scorecard, setScorecard] = useState<ScorecardRow[] | null>(null);
+  // By kind of action, or by the play it was opened with (AC plan P-4): ?by=play.
+  const [scorecardBy, setScorecardBy] = useState<ScorecardBy>('kind');
   const [scorecardFailed, setScorecardFailed] = useState(false);
 
   // Filters, sort and search live in the URL (#896) so a refresh keeps them
@@ -109,6 +116,7 @@ export default function ActionCenterHistoryPage() {
     );
     setSource(readUrlChoice<SignalSource | 'all'>('source', ['all', ...SIGNAL_SOURCES], 'all'));
     setSort(readUrlChoice('sort', HISTORY_SORTS, 'newest'));
+    setScorecardBy(readUrlChoice('by', SCORECARD_BY, 'kind'));
     setSearch(readUrlParam('q'));
     setUrlRead(true);
   }, []);
@@ -119,8 +127,9 @@ export default function ActionCenterHistoryPage() {
     const timer = setTimeout(
       () =>
         writeUrlParams(
-          { view, range, status, type, priority, source, sort, q: search.trim() },
+          { view, range, status, type, priority, source, sort, by: scorecardBy, q: search.trim() },
           {
+            by: 'kind',
             view: 'actions',
             range: DEFAULT_RANGE[view],
             status: 'all',
@@ -133,7 +142,7 @@ export default function ActionCenterHistoryPage() {
       300,
     );
     return () => clearTimeout(timer);
-  }, [urlRead, view, range, status, type, priority, source, sort, search]);
+  }, [urlRead, view, range, status, type, priority, source, sort, scorecardBy, search]);
 
   const load = useCallback(async () => {
     if (!brandId) {
@@ -166,11 +175,11 @@ export default function ActionCenterHistoryPage() {
     try {
       const days = RANGE_DAYS[range];
       const from = days ? new Date(Date.now() - days * 86_400_000).toISOString() : undefined;
-      setScorecard(await getActionScorecard(brandId, { from }));
+      setScorecard(await getActionScorecard(brandId, { from, by: scorecardBy }));
     } catch {
       setScorecardFailed(true);
     }
-  }, [brandId, range]);
+  }, [brandId, range, scorecardBy]);
 
   useEffect(() => {
     if (urlRead && view === 'scorecard') void loadScorecard();
@@ -182,28 +191,19 @@ export default function ActionCenterHistoryPage() {
     setPage(1);
   }, [status, type, priority, source, search, sort, range]);
 
-  const filtered = useMemo(() => {
-    const needle = search.trim().toLowerCase();
-    const rows = (items ?? []).filter((item) => {
-      if (status !== 'all' && item.status !== status) return false;
-      if (type !== 'all' && item.type !== type) return false;
-      if (priority !== 'all' && item.priorityLevel !== priority) return false;
-      if (source !== 'all' && !item.sources.includes(source)) return false;
-      if (needle) {
+  const filtered = useMemo(
+    () =>
+      filterHistory(items ?? [], { status, type, priority, source, search }, sort, (item) => {
         // Titles are composed from i18n templates rather than stored, so the
         // search has to run against what the row actually renders.
         const texts = actionTexts(
           { kind: item.kind, payload: item.payload } as Parameters<typeof actionTexts>[0],
           tTexts,
         );
-        const haystack = `${texts.title} ${texts.description} AC-${item.actionNo}`.toLowerCase();
-        if (!haystack.includes(needle)) return false;
-      }
-      return true;
-    });
-
-    return rows.sort(compareHistory(sort));
-  }, [items, status, type, priority, source, search, sort, tTexts]);
+        return `${texts.title} ${texts.description} ${actionCode(item)}`;
+      }),
+    [items, status, type, priority, source, search, sort, tTexts],
+  );
 
   // The scorecard hides the filters, so its cards count the whole range.
   const summary = useMemo(
@@ -213,6 +213,73 @@ export default function ActionCenterHistoryPage() {
 
   const pageCount = Math.max(1, Math.ceil(filtered.length / HISTORY_PAGE_SIZE));
   const visible = filtered.slice((page - 1) * HISTORY_PAGE_SIZE, page * HISTORY_PAGE_SIZE);
+
+  // Chat's side panel sees the page (the owner's plan of 2026-11-16, step 9): its range, and on
+  // the list its filters, sort and search and once read the actions on this page by code, with
+  // how many match; on the Scorecard its rows by kind of action.
+  const tChatRange = useTranslations('chatPanel.range');
+  const onList = view === 'actions';
+  const chatFilters: ChatPageFilter[] = onList
+    ? [
+        ...(status !== 'all'
+          ? [{ key: 'status', label: t(`status.${status}`), value: status }]
+          : []),
+        // History's Type is the action's category, as get_action_history names it.
+        ...(type !== 'all' ? [{ key: 'category', label: tTypes(type), value: type }] : []),
+        ...(priority !== 'all'
+          ? [{ key: 'priority', label: tActions(`priority.levels.${priority}`), value: priority }]
+          : []),
+        ...(source !== 'all' ? [{ key: 'source', label: tSources(source), value: source }] : []),
+      ]
+    : [];
+  const chatView: ChatPageView = onList
+    ? {
+        tab: view,
+        // The page's Sort once it isn't the default (newest first, as the read lists).
+        ...(sort !== 'newest'
+          ? { sort: { key: sort, dir: sort === 'oldest' ? 'asc' : 'desc' } }
+          : {}),
+        ...(search.trim() ? { search: search.trim() } : {}),
+        ...(items && !isLoading
+          ? {
+              rows: viewRows(visible, (item) => ({
+                ref: actionCode(item),
+                label: actionTexts(
+                  { kind: item.kind, payload: item.payload } as Parameters<typeof actionTexts>[0],
+                  tTexts,
+                ).title,
+              })),
+              total: filtered.length,
+            }
+          : {}),
+      }
+    : {
+        tab: view,
+        // By kind of action, as get_action_scorecard reads it; by play it has no read.
+        ...(scorecard && scorecardBy === 'kind'
+          ? {
+              rows: viewRows(scorecard, (row) => ({
+                ref: row.kind,
+                label: actionKindName(row.kind, tTexts),
+              })),
+              total: scorecard.length,
+            }
+          : {}),
+      };
+  useChatPageContext(
+    brandId
+      ? {
+          pageName: t('title'),
+          dateRange: {
+            from: range,
+            to: null,
+            label: rangeChipLabel(range, {}, (key, values) => tChatRange(key, values)),
+          },
+          filters: chatFilters,
+          view: chatView,
+        }
+      : null,
+  );
 
   const hasActiveFilters =
     status !== 'all' || type !== 'all' || priority !== 'all' || source !== 'all' || search !== '';
@@ -251,6 +318,7 @@ export default function ActionCenterHistoryPage() {
     <div className="space-y-6">
       {header}
       <ActionCenterTabs />
+      <HistoryViews current={view} onPick={setView} />
 
       {isLoading ? (
         <div className="space-y-4">
@@ -311,24 +379,6 @@ export default function ActionCenterHistoryPage() {
 
           <div className="flex flex-wrap items-center gap-2">
             <div className="inline-flex overflow-hidden rounded-md border">
-              {VIEWS.map((option) => (
-                <button
-                  key={option}
-                  type="button"
-                  aria-pressed={view === option}
-                  onClick={() => setView(option)}
-                  className={cn(
-                    'px-3 py-1.5 text-xs font-medium transition-colors',
-                    view === option
-                      ? 'bg-primary text-primary-foreground'
-                      : 'bg-card text-foreground hover:bg-muted',
-                  )}
-                >
-                  {t(`view.${option}`)}
-                </button>
-              ))}
-            </div>
-            <div className="inline-flex overflow-hidden rounded-md border">
               {RANGE_PRESETS.map((preset) => (
                 <button
                   key={preset}
@@ -345,6 +395,30 @@ export default function ActionCenterHistoryPage() {
                 </button>
               ))}
             </div>
+            {view === 'scorecard' && (
+              <div
+                role="group"
+                aria-label={t('scorecard.by.label')}
+                className="inline-flex overflow-hidden rounded-md border"
+              >
+                {SCORECARD_BY.map((option) => (
+                  <button
+                    key={option}
+                    type="button"
+                    aria-pressed={scorecardBy === option}
+                    onClick={() => setScorecardBy(option)}
+                    className={cn(
+                      'px-3 py-1.5 text-xs font-medium transition-colors',
+                      scorecardBy === option
+                        ? 'bg-primary text-primary-foreground'
+                        : 'bg-card text-foreground hover:bg-muted',
+                    )}
+                  >
+                    {t(`scorecard.by.${option}`)}
+                  </button>
+                ))}
+              </div>
+            )}
             {view === 'actions' && (
               <>
                 <FilterSelect
@@ -418,7 +492,7 @@ export default function ActionCenterHistoryPage() {
                 </Button>
               </div>
             ) : scorecard ? (
-              <ScorecardTable rows={scorecard} />
+              <ScorecardTable rows={scorecard} by={scorecardBy} />
             ) : (
               <div className="space-y-2">
                 {[0, 1, 2, 3].map((i) => (

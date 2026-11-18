@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useTranslations } from 'next-intl';
 import { useSearchParams } from 'next/navigation';
 import { useRouter } from '@/i18n/navigation';
@@ -15,18 +15,26 @@ import { OAuthButtons } from '@/components/auth/oauth-buttons';
 import { OrDivider } from '@/components/auth/or-divider';
 import { siteConfig } from '@/config/site';
 import { track } from '@/lib/analytics';
+import { stripInviteParams } from '@/lib/analytics-privacy';
 import { cn } from '@/lib/utils';
 
 export function SignUpForm() {
   const t = useTranslations('auth');
   const router = useRouter();
   const searchParams = useSearchParams();
-  const invitedEmail = searchParams.get('email') ?? '';
-  const nextPath = searchParams.get('next');
+  // An invitation link's address and way back are read once: the link's token
+  // and the invited address then leave the address bar (history, replays).
+  const [invitedEmail] = useState(() => searchParams.get('email') ?? '');
+  const [nextPath] = useState(() => searchParams.get('next'));
   const [fullName, setFullName] = useState('');
   const [email, setEmail] = useState(invitedEmail);
   const [password, setPassword] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+
+  useEffect(() => {
+    const clean = stripInviteParams(window.location.href);
+    if (clean) window.history.replaceState(null, '', clean);
+  }, []);
 
   async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -63,8 +71,8 @@ export function SignUpForm() {
   }
 
   return (
-    <div className="space-y-6">
-      <form onSubmit={handleSubmit} className="space-y-5">
+    <div className="space-y-5">
+      <form onSubmit={handleSubmit} className="space-y-4">
         <div className="space-y-2">
           <Label htmlFor="fullName">{t('fullName')}</Label>
           <Input
@@ -81,7 +89,7 @@ export function SignUpForm() {
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="email">{t('workEmail')}</Label>
+          <Label htmlFor="email">{t('email')}</Label>
           <Input
             id="email"
             type="email"
@@ -90,9 +98,14 @@ export function SignUpForm() {
             onChange={(e) => setEmail(e.target.value)}
             required
             autoComplete="email"
+            aria-describedby="email-hint"
             disabled={isLoading || Boolean(invitedEmail)}
             className="h-11"
           />
+          {/* A suggestion only: any address can sign up. */}
+          <p id="email-hint" className="text-sm text-muted-foreground">
+            {t('workEmailSuggested')}
+          </p>
         </div>
 
         <div className="space-y-2">

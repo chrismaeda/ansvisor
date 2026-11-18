@@ -4,8 +4,13 @@
  * Opportunities are generated per prompt cluster: a group of prompts in one
  * topic that a single piece of content can answer (lib/prompt-clusters.js).
  * A cluster's figures are built from its member prompts, and the score keeps
- * its components so the detail page can say why it is what it is.
+ * its components so the detail page can say why it is what it is. Its scale
+ * and sum are the ones every screen's score shares (priority-core.js,
+ * learning D4).
  */
+
+import { INTENT_WEIGHTS, logScale, round, weightedScore } from './priority-core.js';
+import { DISMISSED_BLOCK_DAYS } from './opportunity-dedup.js';
 
 /**
  * Opportunities one generation run may produce. A short list that gets read
@@ -26,21 +31,10 @@ export const OPPORTUNITY_WINDOW_DAYS = 30;
  */
 const DEMAND_CEILING = 1_000_000;
 
-export const INTENT_WEIGHTS = {
-  comparison: 1.0,
-  'best-top': 0.95,
-  'vs-review': 0.9,
-  recommendation: 0.85,
-  'how-to': 0.75,
-  'problem-solving': 0.7,
-  'what-is': 0.6,
-  other: 0.5,
-};
-
 /** Score weights per component, out of 100. */
 export const SCORE_WEIGHTS = { demand: 40, visibilityGap: 30, competitorGap: 20, intent: 10 };
 
-const round1 = (n) => Math.round(n * 10) / 10;
+const round1 = (n) => round(n, 1);
 
 function mostFrequent(values, limit) {
   const counts = new Map();
@@ -94,14 +88,18 @@ export function clusterMetrics(promptIds, prompts) {
       tested.flatMap((m) => m.metrics.competitors || []),
       5,
     ),
-    representative: representative ? { id: representative.id, text: representative.text } : null,
+    // The question an opportunity is shown with, and its own volume: what the
+    // opportunity's volume reads as, where demand above adds up its members.
+    representative: representative
+      ? { id: representative.id, text: representative.text, volume: volume(representative) }
+      : null,
   };
 }
 
 /** Each score component on a 0–100 scale. */
 export function scoreComponents({ demand, visibility, competitorGap, intent }) {
   return {
-    demand: round1(Math.min(Math.log10(1 + demand) / Math.log10(1 + DEMAND_CEILING), 1) * 100),
+    demand: round1(logScale(demand, DEMAND_CEILING) * 100),
     visibilityGap: round1(100 - visibility),
     competitorGap: round1(Math.min(Math.max(competitorGap, 0), 100)),
     intent: round1((INTENT_WEIGHTS[intent] || INTENT_WEIGHTS.other) * 100),
@@ -110,25 +108,58 @@ export function scoreComponents({ demand, visibility, competitorGap, intent }) {
 
 /** The weighted total of the components, 0–100. */
 export function opportunityScore(components) {
-  const total = Object.entries(SCORE_WEIGHTS).reduce(
-    (s, [key, weight]) => s + (components[key] * weight) / 100,
-    0,
-  );
-  return Math.round(total * 100) / 100;
+  return round(weightedScore(components, SCORE_WEIGHTS, 100).total);
+}
+
+const DAY_MS = 86_400_000;
+
+/**
+ * Whether a dismissed opportunity was dismissed over DISMISSED_BLOCK_DAYS ago,
+ * going by its last change. Without a date it still counts as recent.
+ */
+export function dismissedLongAgo(row, now = Date.now()) {
+  if (row.status !== 'dismissed') return false;
+  const at = Date.parse(row.updated_at);
+  return Number.isFinite(at) && now - at >= DISMISSED_BLOCK_DAYS * DAY_MS;
 }
 
 /**
  * Clusters that already have an opportunity, as its own cluster or a merged
  * one. Any status counts: a cluster gets one opportunity, and a dismissed one
- * is not suggested again in other words.
+ * is not suggested again in other words — for DISMISSED_BLOCK_DAYS, as the
+ * dismiss dialog and the duplicate check (CONTENT-004) say. After that its
+ * need may be suggested again.
  */
-export function coveredClusterIds(rows) {
+export function coveredClusterIds(rows, now = Date.now()) {
   const ids = new Set();
   for (const r of rows || []) {
+    if (dismissedLongAgo(r, now)) continue;
     if (r.cluster_id) ids.add(r.cluster_id);
     for (const id of r.related_cluster_ids || []) ids.add(id);
   }
   return ids;
+}
+
+/**
+ * What a request could draw on (CONTENT-003), so the page can say why fewer
+ * came back than were asked for: the needs (clusters) in its focus, how many
+ * of them already have an opportunity, and how many have no tracked answers
+ * to write from yet. Read before the run's own duplicate checks add to
+ * `covered`; the run reports those separately.
+ *
+ * @param {{ id: string, metrics: { tested: number } }[]} candidates
+ * @param {{ covered: Set<string>, inFocus: (c: object) => boolean, requested: number, focus: string }} opts
+ */
+export function requestScope(candidates, { covered, inFocus, requested, focus }) {
+  const needs = candidates.filter(inFocus);
+  const isCovered = (c) => covered.has(c.id);
+  return {
+    focus,
+    requested,
+    needs: needs.length,
+    covered: needs.filter(isCovered).length,
+    noAnswers: needs.filter((c) => !isCovered(c) && !(c.metrics.tested > 0)).length,
+  };
 }
 
 /** Statuses that still stand for a need's content work. */

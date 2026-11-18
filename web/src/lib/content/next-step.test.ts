@@ -2,9 +2,12 @@ import { describe, expect, it } from 'vitest';
 import {
   liveSkips,
   nextStep,
+  raisedLength,
   rulesForNext,
   stepState,
+  stepsLeft,
   thirdPassOf,
+  thirdPassesToRead,
   thirdStepPasses,
   thirdStepTried,
   type NextStepState,
@@ -85,11 +88,11 @@ describe('nextStep', () => {
     });
     // Words in: the page moves on, and the skip has had its day.
     const written = { ...mine, empty: false };
-    expect(nextStep(written).step.id).toBe('length');
+    expect(nextStep(written).step.id).toBe('fixRules');
     expect(liveSkips(written)).toEqual({});
   });
 
-  it('rewrites a page far off its Length before fixing rules (mockup: Long imported page)', () => {
+  it('fixes rules, then rewrites a page far off its Length within them (editor test 2026-11-12)', () => {
     const s = state({
       method: 'optimize',
       hasBrief: false,
@@ -97,20 +100,66 @@ describe('nextStep', () => {
       openRules: rules(3),
     });
     expect(nextStep(s).step).toMatchObject({
-      id: 'length',
-      primary: 'rewritePage',
-      alternative: 'fixRules',
+      id: 'fixRules',
+      primary: 'fixRules',
+      alternative: 'rewritePage',
     });
     // An optimize draft starts here once its page is in.
     expect(ids(s)).toEqual([
       'plan:done',
       'import:done',
-      'length:now',
+      'fixRules:now',
       'proof:ahead',
       'check:ahead',
     ]);
-    // Rewrite page is the step's own button, and Fix open rules its other one: no line repeats them.
+    // Fix open rules is the step's own button, and Rewrite page its other one: no line repeats them.
     expect(nextStep(s).tips).toEqual([]);
+    expect(nextStep({ ...s, openRules: [] }).step).toMatchObject({
+      id: 'length',
+      primary: 'rewritePage',
+      alternative: null,
+    });
+  });
+
+  it('sets the page type, then fits the rules in the Length, before Fix, the rewrite and Before you publish', () => {
+    const s = state({
+      method: 'optimize',
+      noType: true,
+      conflict: { need: 1_420, max: 960 },
+      rewrite: { reason: 'length', count: 2_000, target: 800, percent: 150 },
+      openRules: ['faq'],
+    });
+    expect(nextStep(s).step).toMatchObject({ id: 'pageType', primary: 'setPageType' });
+    expect(ids(s)).toEqual([
+      'pageType:now',
+      'plan:ahead',
+      'import:ahead',
+      'conflict:ahead',
+      'proof:ahead',
+      'check:ahead',
+    ]);
+    // Each step skipped in turn: the order they come in.
+    const order: string[] = [];
+    for (let now = s, i = 0; i < 5; i++) {
+      const { step } = nextStep(now);
+      order.push(step.id);
+      now = { ...now, skipped: { ...now.skipped, [step.id]: stepState(step.id, now) } };
+    }
+    expect(order).toEqual(['pageType', 'conflict', 'fixRules', 'length', 'check']);
+    expect(nextStep({ ...s, noType: false }).step).toMatchObject({
+      id: 'conflict',
+      primary: 'raiseLength',
+      alternative: 'askFewer',
+    });
+    // What the rules need, rounded up to 50.
+    expect(raisedLength({ need: 1_420 })).toBe(1_450);
+  });
+
+  it('shows Fix open rules taken once nothing open is the agent’s, as the Rules tab says (F1)', () => {
+    const s = state({ method: 'optimize', openRules: [], yours: 4, openTotal: 4 });
+    expect(nextStep(s).step.id).toBe('check');
+    expect(ids(s)).toContain('fixRules:passed');
+    expect(ids({ ...s, yours: 0 })).toContain('fixRules:done');
   });
 
   it('offers Rewrite page beside Fix open rules where the Rules tab recommends it', () => {
@@ -141,15 +190,77 @@ describe('nextStep', () => {
       'proof:now',
       'check:ahead',
     ]);
-    expect(nextStep(low).tips).toEqual([{ id: 'lowTrust', action: 'showTodos' }]);
+    expect(nextStep(low).tips).toEqual([{ id: 'lowTrust', action: 'showTrust' }]);
+    // No to-do left, Trust still low: what raises it, not to-dos (editor test 2026-11-03).
     expect(
       nextStep(state({ quality: { trust: 54, trustLow: true, todos: [] } })).step.primary,
+    ).toBe('showTrust');
+    expect(
+      nextStep(
+        state({ quality: { trust: 54, trustLow: true, todos: [todo({ id: 'placeholders' })] } }),
+      ).step.primary,
     ).toBe('showTodos');
     expect(
       nextStep(
         state({ quality: { trust: 80, trustLow: false, todos: [todo({ action: 'addAuthor' })] } }),
       ).step.primary,
     ).toBe('addAuthor');
+  });
+
+  it('asks to review the agent’s suggestions while they wait, the path on the step they’re for (editor UX review 2026-11-03)', () => {
+    const fixing = state({ openRules: ['faq'], waiting: 3 });
+    expect(nextStep(fixing).step).toEqual({
+      id: 'review',
+      primary: 'review',
+      alternative: null,
+      skippable: false,
+    });
+    expect(ids(fixing)).toEqual([
+      'plan:done',
+      'write:done',
+      'fixRules:now',
+      'proof:ahead',
+      'check:ahead',
+    ]);
+    // No tip to run anything else meanwhile.
+    expect(nextStep({ ...fixing, quality: { trust: 40, trustLow: true, todos: [] } }).tips).toEqual(
+      [],
+    );
+    // Decided: the step is the page's again.
+    expect(nextStep({ ...fixing, waiting: 0 }).step.id).toBe('fixRules');
+    // A page marked ready has nothing to review from Next.
+    expect(nextStep({ ...fixing, open: false }).step.id).toBe('ready');
+  });
+
+  it('asks for sources first when the brief has nothing to build from (editor UX review 2026-11-03)', () => {
+    const none = state({ hasBrief: false, briefSources: false });
+    expect(nextStep(none).step).toMatchObject({ id: 'plan', primary: 'addSources' });
+    expect(nextStep({ ...none, briefSources: true }).step.primary).toBe('buildBrief');
+    // Not read yet: Build brief, as before.
+    expect(nextStep({ ...none, briefSources: null }).step.primary).toBe('buildBrief');
+  });
+
+  it('shows a step marked ready past as skipped, not done, and counts it left (editor UX review 2026-11-03)', () => {
+    const ready = state({
+      open: false,
+      openRules: ['faq'],
+      quality: { trust: 40, trustLow: true, todos: [todo({ id: 'placeholders' })] },
+    });
+    expect(nextStep(ready).step.id).toBe('ready');
+    expect(ids(ready)).toEqual([
+      'plan:done',
+      'write:done',
+      'fixRules:skipped',
+      'proof:skipped',
+      'check:done',
+    ]);
+    expect(stepsLeft(nextStep(ready).path)).toBe(2);
+    // The agent took Fix open rules: ticked, its rest still the person's, so left too.
+    const taken = { ...ready, thirdPasses: { fixRules: thirdPassOf(ready) } };
+    expect(ids(taken)[2]).toBe('fixRules:passed');
+    expect(stepsLeft(nextStep(taken).path)).toBe(2);
+    // Nothing open: every step done.
+    expect(stepsLeft(nextStep(state({ open: false })).path)).toBe(0);
   });
 
   it('checks before marking ready, and exports once ready', () => {
@@ -271,7 +382,8 @@ describe('the third step, once the agent took it (editor test 2026-10-26)', () =
   });
 
   it('passes each step only by its own run: a Fix never passes the Length step', () => {
-    expect(nextStep(long).step.id).toBe('length');
+    // Fix first, the rewrite within the rules after (editor test 2026-11-12).
+    expect(nextStep(long).step.id).toBe('fixRules');
     // Fix open rules taken: the Length step still calls for a rewrite.
     const fixed = { ...long, thirdPasses: { fixRules: thirdPassOf(long) } };
     expect(nextStep(fixed).step.id).toBe('length');
@@ -294,15 +406,16 @@ describe('the third step, once the agent took it (editor test 2026-10-26)', () =
     expect(nextStep({ ...fix, openRules: ['faq', 'h2Answer'], thirdPasses: passes }).step.id).toBe(
       'fixRules',
     );
-    // The Length drifted far off since: the Length step, and Fix open rules with it.
+    // The Length drifted far off since: Fix open rules again, and the Length step after it.
     const drifted = { ...long, thirdPasses: passes };
-    expect(nextStep(drifted).step.id).toBe('length');
+    expect(nextStep(drifted).step.id).toBe('fixRules');
     // A rewrite's pass holds while the Length reads the same, whatever the rules.
     const rewritten = { ...long, thirdPasses: { length: thirdPassOf(long) } };
     expect(nextStep({ ...rewritten, openRules: ['faq'] }).step.id).toBe('fixRules');
     expect(
       nextStep({
         ...rewritten,
+        openRules: [],
         rewrite: { reason: 'length', count: 9_000, target: 13_998, percent: 36 },
       }).step.id,
     ).toBe('length');
@@ -320,10 +433,59 @@ describe('the third step, once the agent took it (editor test 2026-10-26)', () =
     const within = { ...fix, thirdPasses: passes };
     expect(thirdStepPasses(within)).toEqual(new Set(['fixRules']));
     expect(nextStep(within).step.id).toBe('proof');
-    // Written far past it instead: the Length step, and Fix open rules with it.
+    // Written far past it instead: Fix open rules again, and the Length step after it.
     const over = { ...long, thirdPasses: passes };
     expect(thirdStepPasses(over)).toEqual(new Set());
-    expect(nextStep(over).step.id).toBe('length');
+    expect(nextStep(over).step.id).toBe('fixRules');
+  });
+
+  it("keeps a step passed through the agent's own later batch, and reads it again once decided (editor test 2026-11-03)", () => {
+    // Fix open rules taken with its batch b1: on to proof.
+    const taken = {
+      ...fix,
+      batch: 'b1',
+      thirdPasses: { fixRules: thirdPassOf({ ...fix, batch: 'b1' }) },
+    };
+    expect(taken.thirdPasses.fixRules.batch).toBe('b1');
+    expect(nextStep(taken).step.id).toBe('proof');
+    // A hand-off from Quality leaves b2; accepted, it opens a rule the Fix never saw.
+    const handedOff = { ...taken, batch: 'b2', openRules: ['faq', 'h2Answer'] };
+    // Its own change: the step holds while b2 waits and is read, never back to Fix.
+    expect(nextStep(handedOff).step.id).toBe('proof');
+    expect(thirdPassesToRead(handedOff.thirdPasses, { batch: 'b2', open: 2, busy: false })).toEqual(
+      [],
+    );
+    expect(thirdPassesToRead(handedOff.thirdPasses, { batch: 'b2', open: 0, busy: true })).toEqual(
+      [],
+    );
+    expect(thirdPassesToRead(handedOff.thirdPasses, { batch: 'b2', open: 0, busy: false })).toEqual(
+      ['fixRules'],
+    );
+    // Read again as the page reads then: the step stays passed.
+    const read = { ...handedOff, thirdPasses: { fixRules: thirdPassOf(handedOff) } };
+    expect(read.thirdPasses.fixRules).toEqual({
+      rules: ['faq', 'h2Answer'],
+      length: '',
+      batch: 'b2',
+    });
+    expect(thirdPassesToRead(read.thirdPasses, { batch: 'b2', open: 0, busy: false })).toEqual([]);
+    expect(nextStep(read).step.id).toBe('proof');
+    // The person's own edits after it still bring the step back.
+    expect(nextStep({ ...read, openRules: ['faq', 'h2Answer', 'summary'] }).step.id).toBe(
+      'fixRules',
+    );
+    // A pass kept before batches were noted is read again, as one with a batch since.
+    const kept = {
+      ...fix,
+      batch: 'b1',
+      thirdPasses: { fixRules: { rules: ['h2Answer'], length: '' } },
+    };
+    expect(nextStep({ ...kept, openRules: ['faq'] }).step.id).toBe('proof');
+    expect(thirdPassesToRead(kept.thirdPasses, { batch: 'b1', open: 0, busy: false })).toEqual([
+      'fixRules',
+    ]);
+    // No batch on the page at all: nothing to read again.
+    expect(thirdPassesToRead(kept.thirdPasses, { batch: null, open: 0, busy: false })).toEqual([]);
   });
 
   it('keeps the steps before it: an empty page is still written first', () => {
@@ -381,5 +543,7 @@ describe('rulesForNext', () => {
     ];
     expect(rulesForNext(statuses)).toEqual(['sentence']);
     expect(rulesForNext(statuses, new Set(['sentence']))).toEqual([]);
+    // One the agent tried and couldn't close is the person's too.
+    expect(rulesForNext(statuses, undefined, new Set(['sentence']))).toEqual([]);
   });
 });

@@ -4,6 +4,8 @@ import { NextIntlClientProvider } from 'next-intl';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import messages from '../../../messages/en.json';
 import { RoleProvider, type TeamRole } from '@/components/providers/role-provider';
+import { ChatPanelContext, type ChatPanelState } from '@/components/chat/panel/chat-panel-context';
+import { Button } from '@/components/ui/button';
 import type { AiUsage, UsageLimits } from '@/lib/billing/ai-usage';
 import { readAiUsage, readDraftAiUsage, readUsageLimits } from '@/lib/billing/ai-usage-client';
 
@@ -19,6 +21,7 @@ vi.mock('@/config/plans', async (importOriginal) => ({
 }));
 vi.mock('next/navigation', () => ({ usePathname: () => env.pathname }));
 vi.mock('@/i18n/navigation', () => ({
+  useRouter: () => ({ refresh: () => {} }),
   Link: ({
     href,
     className,
@@ -196,6 +199,25 @@ describe('AiUsageMeter', () => {
     );
   });
 
+  it('says Chat goes on only on the workspace’s own key once the new Chat is on', async () => {
+    vi.mocked(readAiUsage).mockResolvedValue(usage({ percentUsed: 100, chatMetered: true }));
+    await render();
+    await open();
+    expect(popup()!.textContent).toContain(
+      "Used up. AI features stop until Nov 20; Chat keeps working only where it runs on your workspace's own AI key.",
+    );
+    expect(popup()!.textContent).not.toContain('Agent Chat on your own AI key keeps working');
+
+    vi.mocked(readAiUsage).mockResolvedValue(
+      usage({ trial: true, percentUsed: 100, chatMetered: true }),
+    );
+    await remount();
+    await open();
+    expect(popup()!.textContent).toContain(
+      "Start your plan now for its full monthly AI usage; Chat keeps working only where it runs on your workspace's own AI key.",
+    );
+  });
+
   it('opens what used it, what isn’t counted, the other limits and where to get more', async () => {
     await render();
     await open();
@@ -247,6 +269,37 @@ describe('AiUsageMeter', () => {
     ]);
   });
 
+  it('names the top agent this period once one the member may see used some (CHAT-27 item 28)', async () => {
+    vi.mocked(readAiUsage).mockResolvedValue(
+      usage({
+        chatMetered: true,
+        byAgent: {
+          agents: [
+            { agentId: null, percent: 20 },
+            { agentId: 'a-1', percent: 12, name: 'Weekly report' },
+            { agentId: 'a-2', percent: 3, name: 'Rival brief' },
+          ],
+          chat: 1,
+        },
+      }),
+    );
+    await render();
+    await open();
+    expect(popup()!.textContent).toContain('Top agent this period: Weekly report · 12%');
+    expect(popup()!.textContent).not.toContain('Rival brief');
+    expect(popup()!.textContent).not.toMatch(/\$|USD/);
+
+    // No agent used any, or none the member may see: no line.
+    for (const agents of [[], [{ agentId: 'a-3', percent: 5 }]]) {
+      vi.mocked(readAiUsage).mockResolvedValue(
+        usage({ chatMetered: true, byAgent: { agents, chat: 1 } }),
+      );
+      await remount('analyst');
+      await open();
+      expect(popup()!.textContent).not.toContain('Top agent');
+    }
+  });
+
   it('closes when one of its links is followed', async () => {
     await render();
     await open();
@@ -273,16 +326,62 @@ describe('AiUsageMeter', () => {
     expect(popup()!.textContent).not.toContain('Get more AI usage');
   });
 
-  it('names the free trial, and says starting the plan gives more once it’s used up', async () => {
+  it('names the free trial with no share, and offers to start the plan once it’s used up', async () => {
+    vi.mocked(readAiUsage).mockResolvedValue(usage({ trial: true, percentUsed: 100 }));
+    await render();
+    // The trigger names the credit's state, not a share.
+    expect(trigger()!.textContent).toBe('AIUsed up');
+    expect(trigger()!.getAttribute('aria-label')).toBe("AI: the free trial's AI credit is used up");
+    await open();
+    const text = popup()!.textContent!;
+    expect(text).toContain('AI usage · Growth free trial');
+    expect(text).toContain('Trial AI credit used up');
+    expect(text).toContain('Shared by every seat · the trial ends Nov 20');
+    expect(text).toContain('Start your plan now for its full monthly AI usage;');
+    // No share anywhere: neither the whole nor each feature's.
+    expect(text).not.toContain('%');
+    expect(popup()!.querySelector('[role="progressbar"]')).toBeNull();
+    expect([...popup()!.querySelectorAll('button')].map((b) => b.textContent)).toContain(
+      'Start my plan now',
+    );
+    expect(links()[0]).toEqual(['Use your own key', '/dashboard/settings/ai-providers']);
+    expect(text).not.toContain('Get more AI usage');
+  });
+
+  it('opens Start my plan now’s dialog outside the popover, which closes', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => Response.json({ planId: 'growth', status: 'trialing', interval: 'month' })),
+    );
     vi.mocked(readAiUsage).mockResolvedValue(usage({ trial: true, percentUsed: 100 }));
     await render();
     await open();
-    expect(popup()!.textContent).toContain('AI usage this month · Growth free trial');
-    expect(popup()!.textContent).toContain(
-      "The free trial's AI usage is used up. Starting the plan gives its full monthly allowance;",
+    const start = [...popup()!.querySelectorAll('button')].find(
+      (b) => b.textContent === 'Start my plan now',
+    )!;
+    await act(async () => start.click());
+    await act(async () => {});
+    expect(popup()).toBeNull();
+    expect(document.querySelector('[role="dialog"]')!.textContent).toContain(
+      'Start your Growth plan now?',
     );
-    expect(links()[0]).toEqual(['Start your plan', '/dashboard/settings/billing']);
-    expect(popup()!.textContent).not.toContain('Get more AI usage');
+    vi.unstubAllGlobals();
+  });
+
+  it('says a trial credit is almost used from 80%, and asks other members for an admin', async () => {
+    vi.mocked(readAiUsage).mockResolvedValue(usage({ trial: true, percentUsed: 84 }));
+    await render('analyst');
+    expect(trigger()!.textContent).toBe('AIAlmost used');
+    await open();
+    expect(popup()!.textContent).toContain('Trial AI credit almost used');
+    expect(popup()!.textContent).toContain(
+      'To start the plan now, ask an admin of your workspace.',
+    );
+    expect(popup()!.querySelectorAll('button')).toHaveLength(0);
+
+    vi.mocked(readAiUsage).mockResolvedValue(usage({ trial: true, percentUsed: 12 }));
+    await remount();
+    expect(trigger()!.textContent).toBe('AITrial credit');
   });
 
   it('tells a member who isn’t an admin to ask one, instead of the admin’s links', async () => {
@@ -328,13 +427,25 @@ describe('AiUsageMeter in the Content Editor', () => {
   const page = () =>
     [...popup()!.querySelectorAll('p')].find((p) => p.textContent?.startsWith('This page'));
 
-  it('is the header’s button height, the percent alone narrower than 1280px, named on hover', async () => {
+  it('is a 16 px ring and "AI 21.4%" after Saved, with no bar or border, named on hover', async () => {
     await render('admin', <AiUsageMeter compact draftId="d1" />);
     expect(trigger()!.className).toContain('h-7');
-    const [label, bar] = trigger()!.querySelectorAll('span');
-    expect(label.className).toContain('hidden xl:inline');
-    expect(bar.className).toContain('hidden xl:block');
+    expect(trigger()!.className).toContain('border-transparent');
+    const ring = trigger()!.querySelector('svg')!;
+    expect(ring.getAttribute('class')).toContain('h-4 w-4');
+    expect(ring.querySelectorAll('circle')[1].getAttribute('stroke-dasharray')).toBe('21.4 100');
+    expect(trigger()!.textContent).toBe('AI21.4%');
+    expect(trigger()!.querySelector('.rounded-full.bg-muted')).toBeNull();
     expect(trigger()!.title).toBe('AI 21.4% used this month');
+  });
+
+  it('turns the ring and its words amber near the limit, as the bar', async () => {
+    vi.mocked(readAiUsage).mockResolvedValue(usage({ percentUsed: 85 }));
+    await render('admin', <AiUsageMeter compact draftId="d1" />);
+    expect(trigger()!.className).toContain('text-amber-700');
+    const share = trigger()!.querySelectorAll('circle')[1];
+    expect(share.getAttribute('class')).toContain('stroke-amber-500');
+    expect(trigger()!.title).toBe('AI 85% used this month, close to the limit');
   });
 
   it('adds the page’s share of the month, read on each opening', async () => {
@@ -382,6 +493,35 @@ describe('HeaderWithAiUsage', () => {
     expect(row.className).toContain('sm:flex-row');
   });
 
+  it('lines Ask Chat and the meter up with the page’s header buttons, at the top or the bottom', async () => {
+    const panel = { available: true, open: false, toggle: () => {} } as unknown as ChatPanelState;
+    const header = (align?: 'start' | 'end') => (
+      <ChatPanelContext.Provider value={panel}>
+        <HeaderWithAiUsage align={align}>
+          <h1>Reports</h1>
+          <Button>Generate Report</Button>
+        </HeaderWithAiUsage>
+      </ChatPanelContext.Provider>
+    );
+    // The h-* classes: the same one on all three, a default button's.
+    const heights = (el: Element) => el.className.split(/\s+/).filter((c) => /^h-/.test(c));
+    await render('admin', header());
+    const row = container.firstElementChild!;
+    const [page, meter, ask] = [...row.querySelectorAll('button')];
+    expect(page.textContent).toBe('Generate Report');
+    expect(meter.getAttribute('aria-label')).toBe('AI 21.4% used this month');
+    expect(ask.getAttribute('data-action')).toBe('panel.open');
+    expect(heights(page)).toEqual(['h-8']);
+    expect(heights(meter)).toEqual(['h-8']);
+    expect(heights(ask)).toEqual(['h-8']);
+    expect(row.className).toContain('sm:items-start');
+
+    // Beside a date range, whose label sits above its buttons.
+    await render('admin', header('end'));
+    expect(container.firstElementChild!.className).toContain('sm:items-end');
+    expect(container.firstElementChild!.className).not.toContain('sm:items-start');
+  });
+
   it('leaves room on the row for a drawer’s close button', async () => {
     await render(
       'admin',
@@ -403,6 +543,59 @@ describe('HeaderWithAiUsage', () => {
     );
     expect(container.children).toHaveLength(1);
     expect(container.textContent).not.toContain('of this month');
+  });
+
+  it('keeps the meter’s room with reserveMeter, while it reads, once it shows, and when it shows nothing', async () => {
+    const header = (
+      <HeaderWithAiUsage reserveMeter askChat={false}>
+        <h1>Prompts</h1>
+      </HeaderWithAiUsage>
+    );
+    const slot = () => container.querySelector<HTMLElement>('[data-ai-meter-slot]');
+    const fresh = async () => {
+      act(() => root.unmount());
+      root = createRoot(container);
+      await render('admin', header);
+    };
+
+    vi.mocked(readAiUsage).mockReturnValue(new Promise(() => {}));
+    await render('admin', header);
+    expect(slot()!.className).toContain('sm:min-w-[8.5rem]');
+    // A phone keeps the meter under the row, as without it.
+    expect(slot()!.className).toContain('contents');
+    expect(slot()!.querySelector('span[aria-hidden]')).not.toBeNull();
+
+    vi.mocked(readAiUsage).mockResolvedValue(usage());
+    await fresh();
+    expect(slot()!.contains(trigger())).toBe(true);
+
+    // Nothing to meter (no active plan): the room stays, empty.
+    vi.mocked(readAiUsage).mockResolvedValue(null);
+    await fresh();
+    expect(trigger()).toBeNull();
+    expect(slot()!.className).toContain('sm:min-w-[8.5rem]');
+  });
+
+  it('keeps no room without reserveMeter, or self-hosted', async () => {
+    vi.mocked(readAiUsage).mockResolvedValue(null);
+    await render(
+      'admin',
+      <HeaderWithAiUsage askChat={false}>
+        <h1>Mentions</h1>
+      </HeaderWithAiUsage>,
+    );
+    expect(container.querySelector('[data-ai-meter-slot]')).toBeNull();
+
+    env.cloud = false;
+    act(() => root.unmount());
+    root = createRoot(container);
+    await render(
+      'admin',
+      <HeaderWithAiUsage reserveMeter askChat={false}>
+        <h1>Mentions</h1>
+      </HeaderWithAiUsage>,
+    );
+    expect(container.querySelector('[data-ai-meter-slot]')).toBeNull();
   });
 
   it('follows the row with the banner from 80%', async () => {
@@ -454,7 +647,7 @@ describe('AiUsageProvider', () => {
     vi.mocked(readAiUsage).mockResolvedValue(usage({ trial: true, percentUsed: 84 }));
     await render();
     expect(toast.warning).toHaveBeenCalledExactlyOnceWith(
-      "You've used 84% of the free trial's AI usage. Starting the plan gives its full monthly allowance.",
+      'Your trial AI credit is almost used. Starting your plan now gives its full monthly AI usage.',
     );
     expect(localStorage.getItem('aeo:ai-usage-toast')).toBe(
       '2026-10-20T09:00:00.000Z:growth:trial',

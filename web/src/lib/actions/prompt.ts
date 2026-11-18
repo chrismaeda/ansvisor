@@ -1,16 +1,22 @@
 'use server';
 
 import { z } from 'zod';
+import { normalizeTags, planBulkTagChange } from '../prompt-tags';
 import { createClient } from '@/lib/supabase/server';
 import { revalidatePath } from 'next/cache';
 import type { PromptSet, Prompt, AIPlatform, PromptVolume } from '@/types';
-import { getOrgPlan } from '@/lib/guards/plan-guard';
+import { ORG_PLAN_COLUMNS, getOrgPlan, planFromOrgRow } from '@/lib/guards/plan-guard';
+import { dbClient } from '@/lib/supabase/scoped';
+import { effectivePlanForBrand } from '@/lib/demo/demo-brand';
 import {
   activationDelta,
   getOrgLocationUsage,
   locationLimitMessage,
+  placeNewPrompt,
   planBulkLocationChange,
   promptLocationCount,
+  promptsThatFit,
+  waitingPromptColumns,
 } from '@/lib/prompt-locations';
 import { ALL_MODELS, ALL_SCRAPERS, DEFAULT_PROMPT_RANGE_DAYS } from '@/config/prompt-options';
 import { PROMPT_DELETE_BATCH } from '@/lib/prompt-bulk-actions';
@@ -23,6 +29,10 @@ import {
 } from '@/lib/prompt-location-matrix';
 import type { Plan, PlanId } from '@/config/plans';
 import { getPromptVolumes, type VolumeQuota } from '@/lib/actions/volumes';
+import { getPromptTableViews, type PromptTableViews } from '@/lib/actions/prompt-table-views';
+import { readBrandImprovingActions } from '@/lib/improving-actions';
+import type { ImprovingAction } from '@/lib/improve-outcome';
+import { readUnansweredPromptIds } from '@/lib/prompts-without-answers';
 import {
   analyzeNewPrompts,
   getPromptVisibilitySummaries,
@@ -36,6 +46,17 @@ import {
   type PromptPositionCell,
 } from '@/lib/prompt-position-summary';
 import { assertWritable } from '@/lib/subscription-guard';
+import { isManager } from '@/lib/session-role';
+import { NO_TOPICS, NO_TOPICS_MESSAGE, brandHasTopics } from '@/lib/topics-required';
+import { captureForSessionUser } from '@/lib/posthog-server';
+import {
+  sourceDataRefused,
+  validPromptSourceData,
+  type PromptSourceData,
+} from '@/lib/prompt-suggestion-source';
+
+/** A prompt's text as two are compared: case and spacing aside (the natural key, CHAT-20 §11c). */
+const textKey = (text: string) => text.trim().toLowerCase().replace(/\s+/g, ' ');
 
 function filterByPlan(plan: Plan, platforms: string[], models: string[]) {
   const allowedScrapers = plan.limits.allowedScrapers
@@ -77,6 +98,7 @@ function mapPromptRow(row: Record<string, unknown>): Prompt {
     platforms: ((row.platforms as string[]) ?? []) as AIPlatform[],
     regions: (row.regions as string[]) ?? [],
     models: (row.models as string[]) ?? [],
+    tags: normalizeTags((row.tags as string[]) ?? []),
     isActive: row.is_active as boolean,
     workStatus: (row.work_status as Prompt['workStatus']) ?? null,
     targetUrlCount: Array.isArray(row.prompt_target_urls) ? row.prompt_target_urls.length : 0,
@@ -85,6 +107,8 @@ function mapPromptRow(row: Record<string, unknown>): Prompt {
           .length
       : 0,
     createdAt: row.created_at as string,
+    // Only a prompt waiting for a spot (00535) carries it.
+    ...(row.waiting_since ? { waitingSince: row.waiting_since as string } : {}),
   };
 }
 
@@ -174,7 +198,13 @@ interface SavePromptSetInput {
   }[];
 }
 
-export type SavePromptSetResult = { promptSet: PromptSet } | { error: string; code?: 'plan_limit' };
+export type SavePromptSetResult =
+  | {
+      promptSet: PromptSet;
+      /** How many were saved waiting for a spot; absent when none. */
+      waiting?: number;
+    }
+  | { error: string; code?: 'plan_limit' };
 
 /**
  * How many tracked locations a brand's save may total before hitting the
@@ -206,7 +236,7 @@ export async function getPromptCapacity(
  * message (#427).
  */
 export async function savePromptSet(input: SavePromptSetInput): Promise<SavePromptSetResult> {
-  await assertWritable({ onboarding: true });
+  await assertWritable({ onboarding: true, brandId: input.brandId });
   const supabase = await createClient();
 
   const { organizationId: orgId, region: brandRegion } = await getBrandContext(
@@ -226,9 +256,11 @@ export async function savePromptSet(input: SavePromptSetInput): Promise<SaveProm
   const otherLocations = usage.total - (usage.byBrand.get(input.brandId) ?? 0);
   const adding = input.prompts.filter((p) => p.isActive ?? true).length;
   const limitError = locationLimitMessage(plan, otherLocations, adding);
-  if (limitError) {
-    return { code: 'plan_limit', error: limitError };
-  }
+  // The active prompts past the limit are saved waiting for a spot, in the
+  // order given, instead of the whole save being refused.
+  const fitting = limitError
+    ? promptsThatFit(plan, otherLocations, new Array<number>(adding).fill(1))
+    : adding;
 
   // Delete existing prompt sets for this brand to avoid duplicates
   // (e.g. user navigated back during onboarding and re-submitted)
@@ -280,7 +312,10 @@ export async function savePromptSet(input: SavePromptSetInput): Promise<SaveProm
     );
 
     const rows = [];
+    let activeSeen = 0;
     for (const p of input.prompts) {
+      const active = p.isActive ?? true;
+      const waits = active && activeSeen++ >= fitting;
       const filtered = filterByPlan(plan, p.platforms, p.models ?? []);
       const platforms = stripShoppingWhenDisabled(filtered.platforms, shoppingEnabled);
       if (platforms.length === 0 && filtered.models.length === 0) {
@@ -294,7 +329,7 @@ export async function savePromptSet(input: SavePromptSetInput): Promise<SaveProm
         platforms,
         regions: [brandRegion],
         models: filtered.models,
-        is_active: p.isActive ?? true,
+        ...(waits ? waitingPromptColumns() : { is_active: active }),
       });
     }
 
@@ -309,7 +344,18 @@ export async function savePromptSet(input: SavePromptSetInput): Promise<SaveProm
 
   revalidatePath('/dashboard/brands');
 
-  return { promptSet: mapPromptSetRow(set as Record<string, unknown>, insertedPrompts) };
+  // The core-loop funnel's second step: one event per save, with how many.
+  if (insertedPrompts.length > 0) {
+    await captureForSessionUser(supabase, 'prompt_tracked', {
+      brand_id: input.brandId,
+      count: insertedPrompts.length,
+      source: 'prompt_set',
+    });
+  }
+
+  const promptSet = mapPromptSetRow(set as Record<string, unknown>, insertedPrompts);
+  const waiting = adding - fitting;
+  return waiting > 0 ? { promptSet, waiting } : { promptSet };
 }
 
 export async function updatePrompt(
@@ -319,6 +365,7 @@ export async function updatePrompt(
     category?: string;
     platforms?: string[];
     models?: string[];
+    tags?: string[];
   },
 ): Promise<Prompt> {
   await assertWritable();
@@ -327,6 +374,7 @@ export async function updatePrompt(
   const payload: Record<string, unknown> = {};
   if (updates.text !== undefined) payload.text = updates.text;
   if (updates.category !== undefined) payload.category = updates.category || null;
+  if (updates.tags !== undefined) payload.tags = normalizeTags(updates.tags);
 
   // Both the category and the platform/model branch need context from the
   // prompt's row (its brand, org and shopping pref) — one fetch serves them.
@@ -512,7 +560,9 @@ export async function bulkUpdatePromptLocations(
 
   const locations = [...new Set(locationsInput.map((r) => r.trim().toUpperCase()))].filter(Boolean);
   if (locations.length === 0) return { error: 'Select at least one location.' };
-  const unknown = locations.filter((r) => !isValidLocation(r));
+  // Only a location being added must be one the product can track: stopping
+  // takes off whatever the prompts hold, a code no list names any more too.
+  const unknown = action === 'add' ? locations.filter((r) => !isValidLocation(r)) : [];
   if (unknown.length > 0) {
     return {
       error: `Unknown location code${unknown.length === 1 ? '' : 's'}: ${unknown.join(', ')}`,
@@ -572,6 +622,82 @@ export async function bulkUpdatePromptLocations(
   };
 }
 
+export interface BulkTagSummary {
+  /** Prompts whose tags changed. */
+  updated: number;
+  /** Already had every added tag, or none of the removed ones. */
+  unchanged: number;
+  /** Skipped: adding would have taken them past 10 tags. */
+  blocked: number;
+}
+
+export type BulkUpdatePromptTagsResult = BulkTagSummary | { error: string };
+
+/**
+ * Add or remove one or more custom tags across a selection of prompts
+ * (#2378). Add/remove rather than "set every selected prompt to this list",
+ * as the bulk location change: a selection can hold prompts carrying
+ * different tags, and assigning one list to all of them would erase that
+ * without saying so. A prompt that would pass 10 tags is skipped and
+ * counted, never silently trimmed. RLS decides which selected prompts may be
+ * written (Admins and Managers); a selection that resolves to nothing is a
+ * stale page, not a request to write.
+ */
+export async function bulkUpdatePromptTags(
+  promptIds: string[],
+  action: 'add' | 'remove',
+  tagsInput: string[],
+): Promise<BulkUpdatePromptTagsResult> {
+  await assertWritable();
+  const supabase = await createClient();
+
+  const ids = [...new Set(promptIds)].filter(Boolean);
+  if (ids.length === 0) return { error: 'Select at least one prompt.' };
+
+  const tags = normalizeTags(tagsInput);
+  if (tags.length === 0) return { error: 'Enter at least one tag.' };
+
+  const rows: { id: string; tags: string[] }[] = [];
+  for (let i = 0; i < ids.length; i += BULK_LOCATION_READ_CHUNK) {
+    const { data, error } = await supabase
+      .from('prompts')
+      .select('id, tags')
+      .in('id', ids.slice(i, i + BULK_LOCATION_READ_CHUNK));
+    if (error) return { error: error.message };
+    for (const row of data ?? []) {
+      rows.push({ id: row.id as string, tags: (row.tags as string[] | null) ?? [] });
+    }
+  }
+
+  // RLS decides what came back.
+  if (rows.length === 0) return { error: 'None of the selected prompts are available.' };
+
+  const plan = planBulkTagChange(rows, action, tags);
+  if (plan.changes.length === 0) {
+    return { updated: 0, unchanged: plan.unchanged, blocked: plan.blocked };
+  }
+
+  let updated = 0;
+  for (const change of plan.changes) {
+    const { error } = await supabase
+      .from('prompts')
+      .update({ tags: change.tags })
+      .eq('id', change.promptId);
+    if (error) {
+      return {
+        error:
+          updated > 0
+            ? `${error.message} (${updated} prompt${updated === 1 ? '' : 's'} updated before this.)`
+            : error.message,
+      };
+    }
+    updated++;
+  }
+
+  revalidatePath('/dashboard/brands');
+  return { updated, unchanged: plan.unchanged, blocked: plan.blocked };
+}
+
 /**
  * Org-wide tracked-location usage against the plan cap, for the brand prompts
  * page to bound its location pickers before a save can fail. `maxPrompts` has
@@ -607,15 +733,41 @@ interface AddPromptInput {
   category?: string;
   platforms: string[];
   models?: string[];
+  /**
+   * Where it came from, for a prompt accepted from a catalog suggestion
+   * (prompts.source_data, 00525); kept only in its own shape.
+   */
+  sourceData?: PromptSourceData | null;
 }
 
-export type AddPromptToSetResult = { prompt: Prompt } | { error: string; code?: 'plan_limit' };
+/**
+ * Why a prompt wasn't added, when the person can do something about it: the
+ * plan's prompt locations are full, or the brand has no topic to put it under.
+ */
+export type PromptAddFailureCode = 'plan_limit' | typeof NO_TOPICS;
+
+export type AddPromptToSetResult =
+  | {
+      prompt: Prompt;
+      /**
+       * Saved waiting for a spot, not tracked: the plan's prompt locations
+       * were full. Absent when
+       * it is tracked.
+       */
+      waiting?: true;
+    }
+  | { error: string; code?: PromptAddFailureCode };
 
 /**
- * User-facing failures (plan limit, empty platform selection, DB errors) come
- * back as a VALUE: production masks every error thrown from a server action,
- * so a thrown PlanLimitError would reach users as the meaningless digest
- * message (#427).
+ * User-facing failures (plan limit, no topics, empty platform selection, DB
+ * errors) come back as a VALUE: production masks every error thrown from a
+ * server action, so a thrown PlanLimitError would reach users as the
+ * meaningless digest message (#427). Prompts are grouped under topics, so a
+ * brand without one gets `no_topics` and nothing is written.
+ *
+ * With the plan's prompt locations full, the prompt is kept waiting for a
+ * spot (inactive, waiting_since now; 00535) and the result says so with
+ * `waiting`; it doesn't start by itself when a spot frees up.
  */
 export async function addPromptToSet(input: AddPromptInput): Promise<AddPromptToSetResult> {
   await assertWritable();
@@ -629,6 +781,12 @@ export async function addPromptToSet(input: AddPromptInput): Promise<AddPromptTo
 
   if (!ps?.brand_id) return { error: 'Prompt set not found' };
 
+  // A topic found by name means the brand has topics; only without one is it asked.
+  const topicId = await resolveTopicId(supabase, ps.brand_id as string, input.category);
+  if (!topicId && !(await brandHasTopics(supabase, ps.brand_id as string))) {
+    return { error: NO_TOPICS_MESSAGE, code: NO_TOPICS };
+  }
+
   const { organizationId: orgId, region: brandRegion } = await getBrandContext(
     supabase,
     ps.brand_id as string,
@@ -636,16 +794,14 @@ export async function addPromptToSet(input: AddPromptInput): Promise<AddPromptTo
   const plan = await getOrgPlan(orgId);
 
   // A new prompt starts at exactly one location (the brand's region), so the
-  // change adds one to the org's tracked-location total (#691).
+  // change adds one to the org's tracked-location total (#691), counted
+  // across every brand of the organization.
   const usage = await getOrgLocationUsage(supabase, orgId);
-  const limitError = locationLimitMessage(plan, usage.total, 1);
-  if (limitError) return { error: limitError, code: 'plan_limit' };
+  const waiting = placeNewPrompt(plan, usage.total, 1) === 'wait';
   const filtered = filterByPlan(plan, input.platforms, input.models ?? []);
   if (filtered.platforms.length === 0 && filtered.models.length === 0) {
     return { error: 'At least one platform or model must be selected.' };
   }
-
-  const topicId = await resolveTopicId(supabase, ps.brand_id as string, input.category);
 
   // #155 — the brand's Shopping pref drives chatgpt-shopping BOTH ways: on
   // means every new prompt gets it appended automatically (the user doesn't
@@ -663,30 +819,49 @@ export async function addPromptToSet(input: AddPromptInput): Promise<AddPromptTo
     return { error: 'At least one platform or model must be selected.' };
   }
 
-  const { data, error } = await supabase
-    .from('prompts')
-    .insert({
-      prompt_set_id: input.promptSetId,
-      text: input.text,
-      category: input.category || null,
-      topic_id: topicId,
-      platforms,
-      regions: [brandRegion],
-      models: filtered.models,
-      is_active: true,
-    })
-    .select()
-    .single();
+  const row = {
+    prompt_set_id: input.promptSetId,
+    text: input.text,
+    category: input.category || null,
+    topic_id: topicId,
+    platforms,
+    regions: [brandRegion],
+    models: filtered.models,
+    // Waiting: inactive, so neither tracked nor counted (00535).
+    ...(waiting ? waitingPromptColumns() : { is_active: true }),
+  };
+  // Only a catalog suggestion's prompt names the column, so every other add
+  // works on a database without 00525 too.
+  const sourceData = validPromptSourceData(input.sourceData);
+  const insert = (withSource: boolean) =>
+    supabase
+      .from('prompts')
+      .insert(withSource && sourceData ? { ...row, source_data: sourceData } : row)
+      .select()
+      .single();
+  let { data, error } = await insert(true);
+  if (sourceData && sourceDataRefused(error)) {
+    console.warn('[prompts] source_data not kept:', error?.message);
+    ({ data, error } = await insert(false));
+  }
 
   if (error || !data) {
     return { error: error?.message ?? 'Failed to add prompt' };
   }
 
   revalidatePath('/dashboard/brands');
-  return { prompt: mapPromptRow(data as Record<string, unknown>) };
+  await captureForSessionUser(supabase, 'prompt_tracked', {
+    brand_id: ps.brand_id,
+    count: 1,
+    source: 'single',
+  });
+  const prompt = mapPromptRow(data as Record<string, unknown>);
+  return waiting ? { prompt, waiting: true } : { prompt };
 }
 
-export type AddPromptToBrandResult = { prompt: Prompt } | { error: string };
+export type AddPromptToBrandResult =
+  | { prompt: Prompt; waiting?: true }
+  | { error: string; code?: PromptAddFailureCode };
 
 /**
  * Add a single prompt to a brand from the main Prompts page (#460). Same
@@ -702,7 +877,7 @@ export async function addPromptToBrand(
   brandId: string,
   input: { text: string; category?: string; platforms: string[]; models?: string[] },
 ): Promise<AddPromptToBrandResult> {
-  await assertWritable();
+  await assertWritable({ brandId });
   const supabase = await createClient();
   const trimmed = input.text.trim();
   if (!trimmed) return { error: 'Prompt text is required.' };
@@ -739,10 +914,10 @@ export async function addPromptToBrand(
     platforms: input.platforms,
     models: input.models ?? [],
   });
-  if ('error' in result) return { error: result.error };
+  if ('error' in result) return { error: result.error, code: result.code };
 
   revalidatePath('/dashboard/prompts');
-  return { prompt: result.prompt };
+  return result.waiting ? { prompt: result.prompt, waiting: true } : { prompt: result.prompt };
 }
 
 export type SetPromptActiveResult = { prompt: Prompt } | { error: string; code?: 'plan_limit' };
@@ -793,6 +968,15 @@ async function resumeLimitError(
 }
 
 /**
+ * The write that pauses or resumes prompts. Resuming also ends any wait for
+ * a spot (00535): the database refuses an active prompt that is still
+ * waiting, and a waiting prompt is resumed like a paused one, metered first.
+ */
+function activeColumns(isActive: boolean) {
+  return isActive ? { is_active: true, waiting_since: null } : { is_active: false };
+}
+
+/**
  * Pause or resume one prompt — the only way a prompt's active state changes
  * after it is created. Pausing frees its locations on the plan (00128).
  * Resuming brings them all back (activationDelta), so it is measured like
@@ -820,7 +1004,7 @@ export async function setPromptActive(
 
   const { data, error } = await supabase
     .from('prompts')
-    .update({ is_active: isActive })
+    .update(activeColumns(isActive))
     .eq('id', id)
     .select()
     .single();
@@ -833,14 +1017,29 @@ export interface ImportPromptRow {
   idx: number;
   text: string;
   topic: string | null;
+  /**
+   * The topic by its id, when the caller has it (Chat, Generate by topic): never
+   * matched or made by name. Only one of this brand's topics; any other id counts as none.
+   */
+  topicId?: string;
   platforms: string[];
   models: string[];
   regions: string[];
 }
 
 export type ImportPromptsResult =
-  | { importedIdx: number[]; promptIds: string[]; analysisStarted: boolean }
-  | { error: string };
+  | {
+      /** Every row saved, tracked or waiting, with its id at the same place in promptIds. */
+      importedIdx: number[];
+      promptIds: string[];
+      /**
+       * The saved rows waiting for a spot (the plan's locations ran out);
+       * absent when none waits.
+       */
+      waitingIdx?: number[];
+      analysisStarted: boolean;
+    }
+  | { error: string; code?: typeof NO_TOPICS };
 
 /**
  * Bulk import (PROMPT-005). The rows are the preview's importable ones, in
@@ -849,16 +1048,25 @@ export type ImportPromptsResult =
  * database call that stops at the plan's tracked-location cap
  * (import_prompts, 00122). New topics are created first, without touching the
  * brand's existing ones. The imported prompts are submitted for their first
- * run in one request.
+ * run in one request. A brand with no topic yet gets `no_topics`.
+ *
+ * Past the limit, the rest are saved waiting for a spot (p_over_limit
+ * 'wait', 00535) and listed in `waitingIdx`; they aren't tracked, so they
+ * get no first run.
  */
 export async function importPrompts(
   brandId: string,
   rows: ImportPromptRow[],
 ): Promise<ImportPromptsResult> {
-  await assertWritable();
+  await assertWritable({ brandId });
   if (rows.length === 0) return { importedIdx: [], promptIds: [], analysisStarted: false };
   if (rows.length > 1000) return { error: 'Import at most 1,000 prompts at a time.' };
   const supabase = await createClient();
+  // Prompts are grouped under topics: a brand without one adds a topic first,
+  // even when the file names topics of its own.
+  if (!(await brandHasTopics(supabase, brandId))) {
+    return { error: NO_TOPICS_MESSAGE, code: NO_TOPICS };
+  }
 
   let promptSetId: string;
   {
@@ -893,9 +1101,13 @@ export async function importPrompts(
     supabase.from('topics').select('id, name').eq('brand_id', brandId),
   ]);
   const shopping = !!brandRow?.shopping_mode_enabled;
-  const keyOf = (t: string) => t.trim().toLowerCase().replace(/\s+/g, ' ');
+  const keyOf = textKey;
   const seen = new Set((existing ?? []).map((p) => keyOf(p.text as string)));
   const topicIds = new Map((topicRows ?? []).map((t) => [keyOf(t.name as string), t.id as string]));
+  // A topic by its id only when it is one of this brand's, under its name now
+  // (renamed since the caller read it). Any other id counts as none: the row
+  // goes by its name, as one without an id does.
+  const topicNames = new Map((topicRows ?? []).map((t) => [t.id as string, t.name as string]));
 
   const clean = rows.flatMap((r) => {
     const text = r.text.trim().replace(/\s+/g, ' ');
@@ -911,14 +1123,16 @@ export async function importPrompts(
       ? Array.from(new Set([...filtered.platforms, 'chatgpt-shopping']))
       : stripShoppingWhenDisabled(filtered.platforms, false);
     if (platforms.length === 0 && filtered.models.length === 0) return [];
-    return [{ ...r, text, regions, platforms, models: filtered.models }];
+    const topicId = r.topicId && topicNames.has(r.topicId) ? r.topicId : undefined;
+    const topic = topicId ? topicNames.get(topicId)! : r.topic;
+    return [{ ...r, text, regions, platforms, models: filtered.models, topic, topicId }];
   });
 
   // New topics, once each, alongside the brand's existing ones.
   const newTopics = [
     ...new Map(
       clean
-        .filter((r) => r.topic && !topicIds.has(keyOf(r.topic)))
+        .filter((r) => r.topic && !r.topicId && !topicIds.has(keyOf(r.topic)))
         .map((r) => [keyOf(r.topic!), r.topic!.trim().slice(0, 60)]),
     ).values(),
   ];
@@ -935,11 +1149,12 @@ export async function importPrompts(
     p_prompt_set_id: promptSetId,
     p_organization_id: orgId,
     p_max_locations: plan.limits.maxPrompts,
+    p_over_limit: 'wait',
     p_rows: clean.map((r) => ({
       idx: r.idx,
       text: r.text,
       category: r.topic?.trim() ?? '',
-      topic_id: r.topic ? (topicIds.get(keyOf(r.topic)) ?? '') : '',
+      topic_id: r.topicId ?? (r.topic ? (topicIds.get(keyOf(r.topic)) ?? '') : ''),
       platforms: r.platforms,
       models: r.models,
       regions: r.regions,
@@ -947,11 +1162,256 @@ export async function importPrompts(
   });
   if (error) return { error: error.message };
 
-  const imported = (inserted ?? []) as { idx: number; id: string }[];
+  const imported = (inserted ?? []) as { idx: number; id: string; waiting?: boolean | null }[];
   const promptIds = imported.map((r) => r.id);
-  const { started } = await analyzeNewPrompts(brandId, promptIds);
+  // Only the tracked ones get a first run: a waiting prompt isn't tracked.
+  const tracked = imported.filter((r) => !r.waiting).map((r) => r.id);
+  const { started } = await analyzeNewPrompts(brandId, tracked);
   revalidatePath('/dashboard/prompts');
-  return { importedIdx: imported.map((r) => r.idx), promptIds, analysisStarted: started };
+  const waitingIdx = imported.filter((r) => r.waiting).map((r) => r.idx);
+  return {
+    importedIdx: imported.map((r) => r.idx),
+    promptIds,
+    ...(waitingIdx.length > 0 && { waitingIdx }),
+    analysisStarted: started,
+  };
+}
+
+export type AddTopicPromptsResult =
+  | {
+      ok: true;
+      /** partial: some weren't added (CHAT-20 §11a), each with why. */
+      code: 'ok' | 'partial';
+      /** Tracked from now on. */
+      added: { id: string; text: string }[];
+      /**
+       * Saved waiting for a spot, not tracked: the plan's prompt locations
+       * ran out. The person picks which to track once a spot is free (Tracked Prompts).
+       * Absent when none waits.
+       */
+      waiting?: { id: string; text: string }[];
+      skipped: { text: string; reason: 'duplicate' | 'plan_limit' | 'invalid' }[];
+      analysisStarted: boolean;
+    }
+  | {
+      ok: false;
+      reason: 'forbidden_role' | 'not_found' | 'duplicate' | 'quota_exceeded' | 'failed';
+      message: string;
+    };
+
+/** The ids of a brand's prompt sets: a prompt names its set, the set its brand. */
+async function brandSetIds(
+  supabase: Awaited<ReturnType<typeof createClient>>,
+  brandId: string,
+): Promise<string[]> {
+  const { data, error } = await supabase.from('prompt_sets').select('id').eq('brand_id', brandId);
+  if (error) throw new Error(error.message);
+  return (data ?? []).map((row) => row.id as string);
+}
+
+/**
+ * Add prompts to one of a brand's topics: Chat's add_prompts (CHAT-20 §9
+ * row 20). Admins and Managers, checked here (isManager). The topic comes
+ * first: one of the brand's active topics, by its id (a new one is
+ * add_topic's). Each prompt is tracked as the brand's newest active prompt
+ * is (its platforms and models, else ChatGPT) at the brand's location,
+ * through importPrompts: the same checks, the same locked write that stops
+ * at the plan's locations, and the first run. A text the brand already
+ * tracks is skipped (the natural key, §11c). Errors come back as values (#427).
+ */
+export async function addTopicPrompts(
+  brandId: string,
+  topicId: string,
+  texts: string[],
+): Promise<AddTopicPromptsResult> {
+  try {
+    await assertWritable({ brandId });
+    return await addPromptsToTopic(brandId, topicId, texts);
+  } catch (err) {
+    console.error('Failed to add prompts from Chat:', err);
+    return { ok: false, reason: 'failed', message: 'The prompts couldn’t be added. Try again.' };
+  }
+}
+
+async function addPromptsToTopic(
+  brandId: string,
+  topicId: string,
+  texts: string[],
+): Promise<AddTopicPromptsResult> {
+  const supabase = await createClient();
+  if (!(await isManager(supabase))) {
+    return {
+      ok: false,
+      reason: 'forbidden_role',
+      message: 'Only an admin or a manager can add prompts.',
+    };
+  }
+  const { data: topic, error: topicError } = await supabase
+    .from('topics')
+    .select('id, name')
+    .eq('id', topicId)
+    .eq('brand_id', brandId)
+    .eq('is_active', true)
+    .maybeSingle();
+  if (topicError) return { ok: false, reason: 'failed', message: topicError.message };
+  if (!topic) {
+    return {
+      ok: false,
+      reason: 'not_found',
+      message: "That topic isn't one of this brand's topics. Add the topic first.",
+    };
+  }
+
+  const sets = await brandSetIds(supabase, brandId);
+  const [existingRead, latestRead] = sets.length
+    ? await Promise.all([
+        supabase.from('prompts').select('text').in('prompt_set_id', sets),
+        supabase
+          .from('prompts')
+          .select('platforms, models')
+          .in('prompt_set_id', sets)
+          .eq('is_active', true)
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle(),
+      ])
+    : [
+        { data: [], error: null },
+        { data: null, error: null },
+      ];
+  const readError = existingRead.error ?? latestRead.error;
+  if (readError) return { ok: false, reason: 'failed', message: readError.message };
+
+  const { organizationId, region } = await getBrandContext(supabase, brandId);
+  const latest = latestRead.data as { platforms?: unknown; models?: unknown } | null;
+  const platforms =
+    Array.isArray(latest?.platforms) && latest.platforms.length > 0
+      ? (latest.platforms as string[])
+      : ['chatgpt-web'];
+  const models = Array.isArray(latest?.models) ? (latest.models as string[]) : [];
+  const tracked = new Set(
+    ((existingRead.data ?? []) as { text: string }[]).map((p) => textKey(p.text)),
+  );
+  const rows: ImportPromptRow[] = [];
+  const skipped: Extract<AddTopicPromptsResult, { ok: true }>['skipped'] = [];
+  for (const raw of texts) {
+    const text = raw.trim().replace(/\s+/g, ' ');
+    if (!text || text.length > 500) skipped.push({ text: raw, reason: 'invalid' });
+    else if (tracked.has(textKey(text))) skipped.push({ text, reason: 'duplicate' });
+    else {
+      tracked.add(textKey(text));
+      rows.push({
+        idx: rows.length,
+        text,
+        // The topic by its id: a brand may have another, paused or not, of the same name.
+        topic: topic.name as string,
+        topicId: topic.id as string,
+        platforms,
+        models,
+        regions: [region],
+      });
+    }
+  }
+  if (rows.length === 0) {
+    return skipped.every((s) => s.reason === 'duplicate')
+      ? { ok: false, reason: 'duplicate', message: 'The brand already tracks these prompts.' }
+      : { ok: false, reason: 'failed', message: 'There was no prompt text to add.' };
+  }
+
+  const result = await importPrompts(brandId, rows);
+  if ('error' in result) return { ok: false, reason: 'failed', message: result.error };
+  const waitingIdx = new Set(result.waitingIdx ?? []);
+  const saved = result.importedIdx.map((idx, i) => ({
+    idx,
+    id: result.promptIds[i],
+    text: rows[idx].text,
+  }));
+  const added = saved.filter((p) => !waitingIdx.has(p.idx)).map(({ id, text }) => ({ id, text }));
+  const waiting = saved.filter((p) => waitingIdx.has(p.idx)).map(({ id, text }) => ({ id, text }));
+  const savedIdx = new Set(result.importedIdx);
+  // What the locked write left out: the plan's locations ran out.
+  for (const row of rows) {
+    if (!savedIdx.has(row.idx)) skipped.push({ text: row.text, reason: 'plan_limit' });
+  }
+  if (added.length === 0 && waiting.length === 0) {
+    const [plan, usage] = await Promise.all([
+      getOrgPlan(organizationId),
+      getOrgLocationUsage(supabase, organizationId),
+    ]);
+    return {
+      ok: false,
+      reason: 'quota_exceeded',
+      message:
+        locationLimitMessage(plan, usage.total, 1) ??
+        "Your plan's prompt locations are used up, so no prompt was added.",
+    };
+  }
+  return {
+    ok: true,
+    code: skipped.length > 0 ? 'partial' : 'ok',
+    added,
+    ...(waiting.length > 0 && { waiting }),
+    skipped,
+    analysisStarted: result.analysisStarted,
+  };
+}
+
+export type PauseBrandPromptsResult =
+  | { ok: true; paused: string[] }
+  | { ok: false; reason: 'forbidden_role' | 'not_found' | 'failed'; message: string };
+
+/**
+ * Pause some of a brand's prompts: Chat's pause_prompts (CHAT-20 §9 row 22,
+ * its "archive": a paused prompt stops being tracked, frees its locations
+ * and keeps its history). Admins and Managers, checked here. Only the
+ * brand's prompts among the ids that are active now, as the table's bulk
+ * Pause pauses them (pausing is never metered); the ones paused come back,
+ * and none paused is a refusal. Errors come back as values (#427).
+ */
+export async function pauseBrandPrompts(
+  brandId: string,
+  ids: string[],
+): Promise<PauseBrandPromptsResult> {
+  try {
+    await assertWritable({ brandId });
+    return await pauseSomePrompts(brandId, ids);
+  } catch (err) {
+    console.error('Failed to pause prompts from Chat:', err);
+    return { ok: false, reason: 'failed', message: 'The prompts couldn’t be paused. Try again.' };
+  }
+}
+
+async function pauseSomePrompts(brandId: string, ids: string[]): Promise<PauseBrandPromptsResult> {
+  const supabase = await createClient();
+  if (!(await isManager(supabase))) {
+    return {
+      ok: false,
+      reason: 'forbidden_role',
+      message: 'Only an admin or a manager can pause prompts.',
+    };
+  }
+  const sets = await brandSetIds(supabase, brandId);
+  if (sets.length === 0) {
+    return { ok: false, reason: 'not_found', message: "None of these prompts is this brand's." };
+  }
+  const { data, error } = await supabase
+    .from('prompts')
+    .update({ is_active: false })
+    .in('prompt_set_id', sets)
+    .in('id', ids)
+    .eq('is_active', true)
+    .select('id');
+  if (error) return { ok: false, reason: 'failed', message: error.message };
+  const paused = (data ?? []).map((row) => row.id as string);
+  if (paused.length === 0) {
+    return {
+      ok: false,
+      reason: 'not_found',
+      message: "None of these prompts is one of this brand's active prompts.",
+    };
+  }
+  revalidatePath('/dashboard/prompts');
+  return { ok: true, paused };
 }
 
 export async function deletePrompt(id: string): Promise<void> {
@@ -991,7 +1451,7 @@ export async function setPromptsActive(
 
   const { data, error } = await supabase
     .from('prompts')
-    .update({ is_active: isActive })
+    .update(activeColumns(isActive))
     .in('id', ids)
     .select('id');
   if (error) return { error: error.message };
@@ -1042,6 +1502,44 @@ export interface PromptsPageData {
   volumesDegraded: boolean;
   /** True when the visibility summaries failed/timed out — their columns read —. */
   visibilityDegraded: boolean;
+  /**
+   * The prompts with an Improve action still being tracked (PROMPT-008), by
+   * prompt id: the links under the Work chips, with the rows. Empty when
+   * unread: the rows look as they always did.
+   */
+  improving: Record<string, ImprovingAction>;
+  /**
+   * With `withoutAnswers`: the active prompts with no answers yet (Track
+   * now), null when unread; undefined when not asked for.
+   */
+  withoutAnswers?: string[] | null;
+  /**
+   * With `first`: the table's column views (PROMPT-015a), null when unread
+   * (today's columns). Undefined when not asked for.
+   */
+  tableViews?: PromptTableViews | null;
+}
+
+/** What the page asks of getPromptsPageData besides the rows. */
+export interface PromptsPageDataOptions {
+  days?: number;
+  from?: string;
+  to?: string;
+  region?: string;
+  /**
+   * The page's first read for the brand: the column views come with the
+   * rows, so the table opens with its own columns, and no read of them
+   * waits in Next's action queue before it.
+   */
+  first?: boolean;
+  /** The active prompts with no answers yet, for Track now (admins and managers). */
+  withoutAnswers?: boolean;
+  /**
+   * False: leave the volumes out (volumes: [], quota: null). Tracked
+   * Prompts reads them on its own, alongside, so the rows never wait for the
+   * volumes API, and a range change doesn't read them again.
+   */
+  volumes?: boolean;
 }
 
 /**
@@ -1056,10 +1554,18 @@ export interface PromptsPageData {
  * Volumes come from the aeo-server and are the least reliable dependency, so
  * their failure degrades to an empty list instead of blanking the prompt
  * table — the page's core content must never be hostage to the volumes API.
+ * The page says so (volumesDegraded) and reads them again on their own.
+ *
+ * The rest of the table's first view comes in the same Promise.all: the
+ * Improve links under the Work chips, and on request the prompts with no
+ * answers yet (Track now) and the column views. Each degrades to "unread"
+ * alone. The page sends this read through /api/prompts/read, so it isn't
+ * queued behind the menu's and the page's other server actions, and reads
+ * the volumes there too, beside it (`volumes: false`).
  */
 export async function getPromptsPageData(
   brandId: string,
-  opts?: { days?: number; from?: string; to?: string; region?: string },
+  opts?: PromptsPageDataOptions,
 ): Promise<PromptsPageData> {
   // Only the visibility summaries are window- and location-scoped. Prompt
   // sets are the roster itself, and volumes are keyword-level estimates with
@@ -1072,7 +1578,15 @@ export async function getPromptsPageData(
   };
   // The plan-limit numbers aren't here: the usage cards read them from
   // GET /api/prompts/usage, which reads counters instead of counting prompts.
-  const [promptSets, visibility, positionRows, volumesResult] = await Promise.all([
+  const [
+    promptSets,
+    visibility,
+    positionRows,
+    volumesResult,
+    improving,
+    withoutAnswers,
+    tableViews,
+  ] = await Promise.all([
     getPromptSets(brandId),
     // The visibility columns scan the window's answers too: a timeout shows —
     // in them, with a note, rather than blanking the table as if the brand
@@ -1096,13 +1610,38 @@ export async function getPromptsPageData(
       console.error('[prompts] position summaries fetch failed, rendering without them:', err);
       return noPositionRows();
     }),
-    getPromptVolumes(brandId).then(
-      (r) => ({ volumes: r.volumes, quota: r.quota ?? null, degraded: false }),
-      (err) => {
-        console.error('[prompts] volumes fetch failed, rendering without them:', err);
-        return { volumes: [] as PromptVolume[], quota: null, degraded: true };
-      },
-    ),
+    opts?.volumes === false
+      ? { volumes: [] as PromptVolume[], quota: null, degraded: false }
+      : getPromptVolumes(brandId).then(
+          (r) => ({ volumes: r.volumes, quota: r.quota ?? null, degraded: false }),
+          (err) => {
+            console.error('[prompts] volumes fetch failed, rendering without them:', err);
+            return { volumes: [] as PromptVolume[], quota: null, degraded: true };
+          },
+        ),
+    createClient()
+      .then((supabase) => readBrandImprovingActions(supabase, brandId))
+      .then(
+        (byPrompt) => Object.fromEntries(byPrompt) as Record<string, ImprovingAction>,
+        (err) => {
+          console.error('[prompts] Improve actions read failed, rendering without them:', err);
+          return {} as Record<string, ImprovingAction>;
+        },
+      ),
+    opts?.withoutAnswers
+      ? createClient()
+          .then((supabase) => readUnansweredPromptIds(supabase, brandId))
+          .catch((err: unknown) => {
+            console.error('[prompts] prompts without answers read failed:', err);
+            return null;
+          })
+      : undefined,
+    opts?.first
+      ? getPromptTableViews(brandId).catch((err: unknown) => {
+          console.error("[prompts] column views read failed, today's columns:", err);
+          return null;
+        })
+      : undefined,
   ]);
 
   const positions: Record<string, PromptPositionCell> = {};
@@ -1129,6 +1668,9 @@ export async function getPromptsPageData(
     quota: volumesResult.quota,
     volumesDegraded: volumesResult.degraded,
     visibilityDegraded: visibility.degraded,
+    improving,
+    ...(withoutAnswers !== undefined ? { withoutAnswers } : {}),
+    ...(tableViews !== undefined ? { tableViews } : {}),
   };
 }
 
@@ -1146,7 +1688,8 @@ function noPositionRows(): PositionRows {
 /**
  * Per-prompt, per-engine position sums for the Positions column: the window
  * on screen and the period of the same length just before it, for the trend.
- * Only engines the org's plan includes count, as in the Positions panel.
+ * Only engines the brand's plan includes count (the org's, Growth's on the
+ * demo brand), as in the Positions panel.
  */
 async function getPositionRows(
   brandId: string,
@@ -1163,18 +1706,29 @@ async function getPositionRows(
   return { included, current, previous };
 }
 
-/** The engines the org's plan includes, as the Positions panel counts them; null without a brand. */
+/**
+ * The engines the brand's plan includes (the org's, Growth's on the demo
+ * brand), as the Positions panel counts them; null without a brand.
+ */
 async function includedPositionPlatforms(
   brandId: string,
 ): Promise<{ id: string; label: string }[] | null> {
-  const supabase = await createClient();
-  const { data: brand } = await supabase
+  // dbClient: the member's session, or the service role the MCP's
+  // get_prompt_locations scopes it with (withDbClient), the brand checked.
+  const supabase = await dbClient();
+  const { data: brand, error } = await supabase
     .from('brands')
-    .select('organization_id')
+    .select(
+      `organization_id, is_demo, organizations!brands_organization_id_fkey(${ORG_PLAN_COLUMNS})`,
+    )
     .eq('id', brandId)
     .maybeSingle();
+  // The column then reads —: said here, so a broken read doesn't pass for no data.
+  if (error)
+    console.error('[prompts] brand plan read failed, positions without engines:', error.message);
   if (!brand?.organization_id) return null;
-  const plan = await getOrgPlan(brand.organization_id as string);
+  const org = Array.isArray(brand.organizations) ? brand.organizations[0] : brand.organizations;
+  const plan = effectivePlanForBrand(planFromOrgRow(org ?? null), brand.is_demo === true);
   return POSITION_PLATFORMS.filter((p) => platformAccess(plan, p.id).state === 'included').map(
     (p) => ({ id: p.id as string, label: p.label as string }),
   );
@@ -1252,7 +1806,7 @@ async function positionSums(
   window: { from: string; to?: string },
   region?: string,
 ): Promise<Map<string, PlatformPositionRow[]>> {
-  const supabase = await createClient();
+  const supabase = await dbClient();
   // One jsonb array (00153). A busy brand's 30 or 90 days come to thousands
   // of prompt × platform rows, past PostgREST's 1000-row cap, which dropped
   // the rest and left most prompts reading —; a single value isn't cut, so

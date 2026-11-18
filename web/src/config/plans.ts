@@ -17,13 +17,28 @@ export const FEATURES = [
   // underlying tool calls run against the user's own infrastructure.
   'ai_agent',
   // Shopping analytics — the Shopping dashboard page (cards from
-  // Perplexity / AI Mode / Copilot, your products vs competitors,
+  // ChatGPT Shopping / AI Mode, your products vs competitors,
   // merchant breakdown). Free / Starter get the headline KPI only;
   // Growth+ and self-host get the full set of tabs.
   'shopping_analytics',
   // Positions panel → Improve tab: AI-generated, platform-specific
   // suggestions to improve a prompt's position (PROMPT-003). Growth+.
   'prompt_improve',
+  // Slack (#2139): alerts, the Pulse and the daily suggestion in a brand's
+  // channel on every paid plan; approving an agent's step from Slack on
+  // Growth and up.
+  'slack_notifications',
+  'slack_approvals',
+  // CRM integrations, HubSpot first (#2140): AI-sourced contacts, deals and
+  // revenue, and pages to the CRM's CMS. Growth and above (owner, 2026-11-09);
+  // self-host gets it, with its own Composio keys.
+  'crm_integrations',
+  // Ads (ADS-01 §8, owner A2): reading it (opportunities, paid share of
+  // voice, connections, reports) is Growth and above; Starter and the free
+  // trial see what it adds, locked (DECISIONS J). Writing (building and
+  // changing campaigns) comes later, on its own feature. Ads itself is in
+  // development behind ADS_ENABLED (lib/ads/flag.ts).
+  'ads_read',
 ] as const;
 
 export type Feature = (typeof FEATURES)[number];
@@ -47,7 +62,7 @@ export interface PlanLimits {
    * Monthly USD budget for AI usage: Improve-tab model calls (Positions
    * panel, PROMPT-003), the Content Editor's AI and the Action Center's task
    * writing. Starter $5, Growth $25, Enterprise $50 (or more, set per
-   * customer), and $1 in the free trial (the server's rule); the billing cards
+   * customer), and $2 in the free trial (the server's rule); the billing cards
    * show them as multiples of Starter's. Enforced on the server from each
    * call's real token cost so it holds whichever model is configured.
    * -1 = unlimited (self-host).
@@ -94,6 +109,15 @@ export interface PlanLimits {
    * stops adding products past it.
    */
   maxCatalogProducts: number;
+  /**
+   * GB of Files a workspace keeps (CHAT-06 item 26, STORAGE-COSTS.md):
+   * Starter 5, Growth 25, Enterprise from the contract (1% of it at
+   * $0.05 a GB: $499 → 99 GB), set per customer via
+   * organizations.plan_overrides.maxStorageGb; storage packs add to it.
+   * The free trial keeps TRIAL_STORAGE_GB whatever its plan. -1 = no cap
+   * (self-host).
+   */
+  maxStorageGb: number;
   maxDailyOnDemand: number;
   onDemandCooldownMinutes: number;
   features: readonly Feature[];
@@ -121,6 +145,9 @@ export interface Plan {
   highlighted?: boolean;
 }
 
+/** GB of Files a workspace keeps in its free trial, whatever its plan (STORAGE-COSTS.md). */
+export const TRIAL_STORAGE_GB = 1;
+
 export const PLANS: Record<PlanId, Plan> = {
   self_hosted: {
     id: 'self_hosted',
@@ -143,6 +170,7 @@ export const PLANS: Record<PlanId, Plan> = {
       maxBotEventsPerMonth: -1,
       maxBotRawRecordsPerMonth: -1,
       maxCatalogProducts: -1,
+      maxStorageGb: -1,
       maxDailyOnDemand: -1,
       onDemandCooldownMinutes: 0,
       features: [
@@ -159,6 +187,15 @@ export const PLANS: Record<PlanId, Plan> = {
         'ai_agent',
         'shopping_analytics',
         'prompt_improve',
+        'white_label',
+        // Alerts, the Pulse and the daily suggestion in a brand's Slack channel (#2139): every paid plan.
+        'slack_notifications',
+        // Approving an agent's step from Slack (#2139): Growth and up.
+        'slack_approvals',
+        // HubSpot (#2140), with the server's own Composio keys.
+        'crm_integrations',
+        // Ads (ADS-01), reading: Growth and above.
+        'ads_read',
       ],
       // Self-host runs against the operator's own infrastructure / API
       // keys — no platform quota to enforce.
@@ -179,7 +216,7 @@ export const PLANS: Record<PlanId, Plan> = {
       maxBriefGenerations: 10,
       // The workspace's one AI budget, in tiers the billing cards show as
       // multiples of Starter's: $5 here (1x), Growth $25 (5x), Enterprise $50
-      // or more, set per customer (2026-10-27); the server gives the free trial $1.
+      // or more, set per customer (2026-10-27); the server gives the free trial $2.
       improveMonthlyBudgetUsd: 5,
       // 0.1% of the $49 price, spent rating suggestions' relevance (VIS-011).
       relevanceMonthlyBudgetUsd: 0.049,
@@ -189,9 +226,10 @@ export const PLANS: Record<PlanId, Plan> = {
       maxBotEventsPerMonth: 0,
       maxBotRawRecordsPerMonth: 0,
       maxCatalogProducts: 5_000,
+      maxStorageGb: 5,
       maxDailyOnDemand: 3,
       onDemandCooldownMinutes: 15,
-      allowedScrapers: ['chatgpt-web', 'copilot-web'],
+      allowedScrapers: ['chatgpt-web', 'gemini-web'],
       allowedModels: [],
       features: [
         'basic_insights',
@@ -211,6 +249,8 @@ export const PLANS: Record<PlanId, Plan> = {
         'ai_agent',
         // Improve, on Starter's AI budget (above).
         'prompt_improve',
+        // Alerts, the Pulse and the daily suggestion in a brand's Slack channel (#2139): every paid plan.
+        'slack_notifications',
       ],
     },
   },
@@ -223,7 +263,11 @@ export const PLANS: Record<PlanId, Plan> = {
     limits: {
       maxBrands: 4,
       maxPrompts: 200,
-      maxPlatforms: 8,
+      // The engines Growth tracks: ChatGPT, Gemini, Google AI Overviews,
+      // Google AI Mode and Microsoft Copilot (through Bing AI Mode since
+      // Perplexity went, 2026-11-06). ChatGPT Shopping feeds Product
+      // Visibility and isn't counted.
+      maxPlatforms: 5,
       maxTeamMembers: -1,
       maxDomainsPerBrand: 10,
       maxVolumeAnalyses: 10,
@@ -238,6 +282,7 @@ export const PLANS: Record<PlanId, Plan> = {
       maxBotEventsPerMonth: 2_000_000,
       maxBotRawRecordsPerMonth: 20_000_000,
       maxCatalogProducts: 50_000,
+      maxStorageGb: 25,
       maxDailyOnDemand: 10,
       onDemandCooldownMinutes: 5,
       // API-model tracking (Claude) is not part of Growth — scraper engines
@@ -254,9 +299,18 @@ export const PLANS: Record<PlanId, Plan> = {
         'content_optimization',
         'custom_reports',
         'api_access',
+        'white_label',
         'ai_agent',
         'shopping_analytics',
         'prompt_improve',
+        // Alerts, the Pulse and the daily suggestion in a brand's Slack channel (#2139): every paid plan.
+        'slack_notifications',
+        // Approving an agent's step from Slack (#2139): Growth and up.
+        'slack_approvals',
+        // HubSpot (#2140): Growth and above (owner, 2026-11-09).
+        'crm_integrations',
+        // Ads (ADS-01), reading: Growth and above (owner A2, 2026-11-06).
+        'ads_read',
       ],
     },
   },
@@ -268,7 +322,8 @@ export const PLANS: Record<PlanId, Plan> = {
     limits: {
       maxBrands: -1,
       maxPrompts: -1,
-      maxPlatforms: 8,
+      // Growth's five engines plus Claude, set per contract.
+      maxPlatforms: 6,
       maxTeamMembers: -1,
       maxDomainsPerBrand: -1,
       maxVolumeAnalyses: -1,
@@ -287,6 +342,7 @@ export const PLANS: Record<PlanId, Plan> = {
       maxBotEventsPerMonth: 20_000_000,
       maxBotRawRecordsPerMonth: 200_000_000,
       maxCatalogProducts: -1,
+      maxStorageGb: 99,
       maxDailyOnDemand: -1,
       onDemandCooldownMinutes: 0,
       // API-model tracking (Claude) is a per-customer opt-in on Enterprise:
@@ -311,6 +367,14 @@ export const PLANS: Record<PlanId, Plan> = {
         'ai_agent',
         'shopping_analytics',
         'prompt_improve',
+        // Alerts, the Pulse and the daily suggestion in a brand's Slack channel (#2139): every paid plan.
+        'slack_notifications',
+        // Approving an agent's step from Slack (#2139): Growth and up.
+        'slack_approvals',
+        // HubSpot (#2140): Growth and above (owner, 2026-11-09).
+        'crm_integrations',
+        // Ads (ADS-01), reading: Growth and above (owner A2, 2026-11-06).
+        'ads_read',
       ],
       // Enterprise — no platform quota; usage governed by contract.
     },
@@ -331,11 +395,39 @@ export const CUSTOM_PLAN_STARTING_PRICE = 499;
 export const PRICING_URL = 'https://www.ansvisor.com/pricing';
 
 /**
+ * The first-month offer with "Buy now": a Stripe promotion code taking
+ * `percentOff` off the first month of a monthly plan (no trial with it; a
+ * year up front has its own discount). One setting, so it can end without a
+ * code change: NEXT_PUBLIC_FIRST_MONTH_OFFER=off turns it off, and every
+ * plan button and line goes back to the plain price. The code itself lives
+ * in Stripe, where its coupon is ended too.
+ */
+export const FIRST_MONTH_OFFER = {
+  code: 'SAVE50',
+  percentOff: 50,
+  period: 'monthly',
+} as const;
+
+/** Whether the first-month offer is on (NEXT_PUBLIC_FIRST_MONTH_OFFER isn't `off`). */
+export function firstMonthOfferOn(): boolean {
+  return process.env.NEXT_PUBLIC_FIRST_MONTH_OFFER !== 'off';
+}
+
+/**
  * Self-hosted instances bypass all limits.
  * Cloud is determined by NEXT_PUBLIC_IS_CLOUD env var.
  */
 export function isCloud(): boolean {
   return process.env.NEXT_PUBLIC_IS_CLOUD === 'true';
+}
+
+/**
+ * A stored plan as a known one. A new sign-up's organization holds `free`
+ * (or nothing) until it picks a plan; the dashboard opens for it once it has
+ * the demo brand, and reads limits as Starter's until then.
+ */
+export function toPlanId(value: string | null | undefined): PlanId {
+  return value && value in PLANS ? (value as PlanId) : 'starter';
 }
 
 export function getPlan(planId: string | null | undefined): Plan {

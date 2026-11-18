@@ -23,7 +23,9 @@ import {
 } from './content-runs.js';
 import { citedPagesLength } from './content-cited-length.js';
 import { guardPeople, knownPeople, peopleEdits } from './content-people.js';
+import { sentenceSpans } from './content-research.js';
 import {
+  NUMBER_PLACEHOLDER,
   addedNumbers,
   knownNumbers,
   numberSources,
@@ -33,6 +35,7 @@ import {
   todayText,
 } from './content-sources.js';
 import { reserveAiBudget } from './plan-guard.js';
+import { objectOptions } from './structured-output.js';
 
 /**
  * The Content Editor's brief (CE-007, spec §10): Rebuild outline writes a
@@ -44,7 +47,11 @@ import { reserveAiBudget } from './plan-guard.js';
  * (spec §3).
  */
 
-/** The model, as the Improve tab's. */
+/**
+ * The Improve tab's model, which the Content Editor ran on before it had
+ * its own (contentReadModelId, contentWriteModelId), and still runs on
+ * without an Anthropic key.
+ */
 export function contentBriefModelId() {
   return (
     process.env.IMPROVE_SUGGESTION_MODEL ||
@@ -52,6 +59,44 @@ export function contentBriefModelId() {
     'google/gemini-3-flash-preview'
   );
 }
+
+/** The Content Editor's models with ANTHROPIC_API_KEY set: Haiku reads, Sonnet writes. */
+export const CONTENT_READ_CLAUDE = 'anthropic/claude-haiku-5-5';
+export const CONTENT_WRITE_CLAUDE = 'anthropic/claude-sonnet-5-5';
+
+/**
+ * The model the Content Editor reads and judges with: the brief (Rebuild
+ * outline) and Quality's reads (content-source-class.js). CONTENT_READ_MODEL,
+ * else Claude Haiku with an Anthropic key, else `fallback`, the model it ran
+ * on before: a server without the key runs as it did.
+ */
+export function contentReadModelId(fallback = contentBriefModelId) {
+  return (
+    process.env.CONTENT_READ_MODEL ||
+    (process.env.ANTHROPIC_API_KEY ? CONTENT_READ_CLAUDE : fallback())
+  );
+}
+
+/**
+ * The model the Content Agent writes with: whatever goes into the page (a
+ * page written or rewritten whole, the cut pass, its suggestions).
+ * CONTENT_WRITE_MODEL, else Claude Sonnet with an Anthropic key, else the
+ * model it ran on before.
+ */
+export function contentWriteModelId() {
+  return (
+    process.env.CONTENT_WRITE_MODEL ||
+    (process.env.ANTHROPIC_API_KEY ? CONTENT_WRITE_CLAUDE : contentBriefModelId())
+  );
+}
+
+/**
+ * The most a read's and a write's answer may take, sent to Claude only
+ * (structured-output.js): its thinking counts toward it. A whole page of
+ * BRIEF_LENGTH_MAX characters is about 17k tokens as HTML in JSON.
+ */
+export const CONTENT_READ_MAX_TOKENS = 16_000;
+export const CONTENT_WRITE_MAX_TOKENS = 32_000;
 
 /** How long the model may take: the dashboard waits for it. */
 const CALL_TIMEOUT_MS = 60_000;
@@ -94,6 +139,16 @@ export const rebuildSources = z.object({
     .number()
     .int()
     .transform((n) => Math.min(BRIEF_LENGTH_MAX, Math.max(BRIEF_LENGTH_MIN, n))),
+  /**
+   * A range the person set on the Length rule (editor test 2026-11-03):
+   * the page is written and cut to keep within it. One that doesn't read
+   * is dropped, and `length` alone stands.
+   */
+  lengthBand: z
+    .object({ min: z.number().int().positive(), max: z.number().int().positive() })
+    .refine((band) => band.min <= band.max)
+    .optional()
+    .catch(undefined),
 });
 
 /**
@@ -110,6 +165,28 @@ export const briefRules = z
  * draftBriefSchema): the model's output is cut to them, so a brief saved and
  * charged for is one the editor can show.
  */
+/**
+ * About how many characters an H2 section takes at its plainest: a short
+ * heading, an answer of two or three sentences and a few points.
+ */
+const SECTION_CHARS = 450;
+
+/**
+ * How many H2 sections, and key points in each, a page of this Length holds
+ * (editor UX review 2026-11-03, decision b: the Length is the person's last
+ * word, and the brief fits it): an 800-character page got an outline for
+ * twice that, and its first draft came to 1,573. At most the Length's top
+ * (a range's, or 20% over one number) over SECTION_CHARS, from 1 up to the
+ * limits the editor reads a brief with.
+ */
+export function briefFit(length, band = null) {
+  const most = band?.max ?? Math.round(length * 1.2);
+  return {
+    sections: Math.max(1, Math.min(BRIEF_LIMITS.sections, Math.floor(most / SECTION_CHARS))),
+    keyPoints: most < 1_500 ? 2 : most < 4_000 ? 3 : BRIEF_LIMITS.keyPoints,
+  };
+}
+
 export const BRIEF_LIMITS = {
   goal: 500,
   audience: 500,
@@ -343,9 +420,10 @@ const FORMAT_FOR_WRITER = {
  * A version 2 brief's plan as the Content Agent reads it (brief rules, 2026),
  * after the brief's goal, outline and keywords: the essentials at the top,
  * the angle, each section's answer, format and facts (one from Your input
- * by its name; one to check against a cited page, whose words the writer
- * doesn't see, or with none, a placeholder), the proof to gather (from Your
- * input only), the searches left to another page, freshness, the names as
+ * by its name; any other looked up, content-research.js, a cited page
+ * named when the brief has one, as the writer doesn't see its words), the
+ * proof to gather (from Your input only, else asked of the person), the
+ * searches left to another page, freshness, the names as
  * written and, unless `links` is false (a new page's writer has no links
  * rule), the links planned: never an allow list, the links rule decides.
  * '' with the brief rules off, or for an older brief.
@@ -366,8 +444,8 @@ export function briefForWriter(brief, { links: withLinks = true } = {}) {
           fact.source?.kind === 'input'
             ? `from Your input "${fact.source.label}"`
             : fact.source
-              ? `a placeholder: check it against ${fact.source.label}, whose words you don't see`
-              : 'a placeholder until a source is found';
+              ? `look it up with {{find: …}}: ${fact.source.label} may have it, but you don't see its words`
+              : 'look it up with {{find: …}}';
         parts.push(`give a fact on: ${fact.claim} (${fact.sourceType}, ${source})`);
       }
       return parts.length ? `${section.heading} — ${parts.join('; ')}` : null;
@@ -376,7 +454,7 @@ export function briefForWriter(brief, { links: withLinks = true } = {}) {
   if (plans.length) lines.push(`Section plans:\n${plans.map((plan) => `- ${plan}`).join('\n')}`);
   if (brief.proof?.length) {
     lines.push(
-      `Proof to gather (write it only from Your input; else a placeholder): ${brief.proof.map((p) => `${p.kind}: ${p.what}`).join('; ')}`,
+      `Proof to gather (write it only from Your input; else {{ask: …}}): ${brief.proof.map((p) => `${p.kind}: ${p.what}`).join('; ')}`,
     );
   }
   if (brief.leftOut?.length) {
@@ -430,9 +508,16 @@ const QUOTED_QUESTION = /["“„«»]([^"“”„«»\n]{1,300}\?)["”“»«
  * the brand's, charges the AI usage budget, asks the model, and saves the
  * brief on the draft. Throws with `.status` 404 for a draft outside the
  * brand, 422 with no sources to build from, PlanLimitError once the budget
- * is spent.
+ * is spent. `claimedAt` is the claim Write this holds on the draft while it
+ * builds the brief before the page (content-writer.js): a Stop lets go of it.
  */
-export async function rebuildDraftBrief({ draftId, brandId, sources, rules = [] }) {
+export async function rebuildDraftBrief({
+  draftId,
+  brandId,
+  sources,
+  rules = [],
+  claimedAt = null,
+}) {
   const { data: draft, error: draftError } = await supabaseAdmin
     .from('content_drafts')
     .select('id, brand_id, title, page_type, method, source_url')
@@ -508,6 +593,7 @@ export async function rebuildDraftBrief({ draftId, brandId, sources, rules = [] 
   const run = await startRun({
     draftId,
     kind: 'brief',
+    claimedAt,
     counts: {
       sources:
         prompts.length + sources.fanouts.length + sources.pages.length + sources.queries.length,
@@ -538,6 +624,18 @@ export async function rebuildDraftBrief({ draftId, brandId, sources, rules = [] 
   }
 }
 
+/**
+ * The cited pages' read as the brief keeps it: their length (CE-030), and
+ * what Site Audit's checks find on them (learning C2), when read.
+ */
+function citedOf(cited) {
+  if (!cited) return { citedLength: null };
+  return {
+    citedLength: { characters: cited.characters, pages: cited.pages },
+    ...(cited.features ? { citedFeatures: cited.features } : {}),
+  };
+}
+
 /** The rebuild itself, step by step: nothing is saved once it is stopped. */
 async function briefWithRun({
   draft,
@@ -551,7 +649,7 @@ async function briefWithRun({
   targets,
   run,
 }) {
-  const modelId = contentBriefModelId();
+  const modelId = contentReadModelId();
   // Held on the budget before the call, so calls at once can't pass it.
   const budget = await reserveAiBudget(brand.organization_id, {
     feature: 'content',
@@ -572,7 +670,7 @@ async function briefWithRun({
     generated = await runCall(run, budget, CALL_TIMEOUT_MS, (abortSignal) =>
       generateObject({
         model: resolveModel(modelId),
-        schema: briefSchema(),
+        ...objectOptions(modelId, briefSchema(), { maxOutputTokens: CONTENT_READ_MAX_TOKENS }),
         system: briefSystemPrompt(),
         prompt: buildBriefPrompt({
           brand,
@@ -611,7 +709,7 @@ async function briefWithRun({
       pages: sources.pages.length,
       queries: sources.queries.length,
     },
-    citedLength: await citedLength,
+    ...citedOf(await citedLength),
   };
   // Stopped meanwhile: the brief stays as it was.
   await stopIfStopped(run);
@@ -684,6 +782,8 @@ function shapeWhole(
   const byId = v2 ? new Map(briefNumbered(sources, inputs).map((n) => [n.id, n])) : null;
   // Version 2's numbers (S1…) belong in a fact's source only: taken out of the words.
   const words = v2 ? (text) => stripSourceIds(text, byId.size) : (text) => text;
+  // No more than the Length holds (briefFit), the first sections first.
+  const fit = briefFit(sources.length, sources.lengthBand);
   const outline = mapOutline(
     object.outline.map((section) => ({
       ...section,
@@ -692,7 +792,9 @@ function shapeWhole(
       ...(v2 ? sectionPlan(section, guard, byId, words) : {}),
     })),
     sources.fanouts,
-  );
+  )
+    .slice(0, fit.sections)
+    .map((section) => ({ ...section, keyPoints: section.keyPoints.slice(0, fit.keyPoints) }));
   return {
     goal: clip(guard.text(words(object.goal)), BRIEF_LIMITS.goal),
     audience: clip(guard.text(words(object.audience)), BRIEF_LIMITS.audience),
@@ -912,12 +1014,38 @@ export function briefNumbered(sources, inputs = []) {
 }
 
 /**
+ * A brief's words with no figure left for anyone to find (2026-10-30): the
+ * number guard's placeholder goes, in a heading on its own ("The best
+ * machines under $500"), else with its sentence. A fact the page needs is
+ * named in words ("how far forecasts drift, from a study"), and the
+ * Content Agent looks it up as it writes (content-research.js).
+ */
+export function withoutFigures(text, heading = false) {
+  const s = String(text ?? '');
+  if (!s.includes(NUMBER_PLACEHOLDER)) return s;
+  if (heading) {
+    return s
+      .split(NUMBER_PLACEHOLDER)
+      .join(' ')
+      .replace(/\s{2,}/g, ' ')
+      .replace(/\s+([,.;:!?])/g, '$1')
+      .trim();
+  }
+  return sentenceSpans(s)
+    .map(({ start, end }) => s.slice(start, end))
+    .filter((sentence) => !sentence.includes(NUMBER_PLACEHOLDER))
+    .join(' ');
+}
+
+/**
  * What a brief may say without a placeholder: the numbers (CE-033), names
  * and quotes (CE-044) of what it was built from — the brand, the page, the
  * prompts, searches, queries and headings kept, the length asked for — and
  * today's year. The writer reads a brief as something it was given, so a
  * figure or a person made up in one would pass the writer's own guard.
- * `text` and `heading` put each one added as a placeholder, as a written
+ * `text` and `heading` take each figure added out (withoutFigures: nobody
+ * is left a figure to find, the writer looks up what the brief names in
+ * words) and put each person or quote added as a placeholder, as a written
  * page's are, a question in quotes aside; `keeps` drops a keyword that adds
  * one, as a placeholder can't be searched for; `found` lists what a text
  * adds, read the same way (the brief eval's gate).
@@ -939,7 +1067,7 @@ export function briefGuard({ brand, draft, prompts, sources, rules, inputs, comp
   };
   const text = (words, heading = false) => {
     const numbered = placeholderNumbers(words ?? '', known);
-    return guardPeople(numbered, askedIn(numbered), { heading }).text;
+    return withoutFigures(guardPeople(numbered, askedIn(numbered), { heading }).text, heading);
   };
   return {
     text,
@@ -1075,6 +1203,16 @@ export function buildBriefPrompt({
       ? PAGE_TYPE_SECTION_FORMATS[draft.page_type]
       : null;
   const listed = v2 ? rules.filter((r) => r.name) : [];
+  const fit = briefFit(sources.length, sources.lengthBand);
+  // Version 1's words stay as its eval baseline recorded them (content-brief-eval):
+  // its answer is cut to fit all the same (shapeWhole).
+  const length =
+    v2 && sources.lengthBand
+      ? `between ${sources.lengthBand.min} and ${sources.lengthBand.max} characters, about ${sources.length}`
+      : `about ${sources.length} characters`;
+  const fitLine = v2
+    ? ` Fit the page to it: at most ${fit.sections} H2 ${fit.sections === 1 ? 'section' : 'sections'}, each with up to ${fit.keyPoints} key points. Leave out what doesn't fit rather than go past it.`
+    : '';
   return `Brand: ${brand?.name || 'Unknown'}
 Industry: ${brand?.industry || 'Not specified'}
 ${siteTypeLine(brand)}Description: ${brand?.description || 'N/A'}
@@ -1082,7 +1220,7 @@ ${siteTypeLine(brand)}Description: ${brand?.description || 'N/A'}
 Page: ${draft.title || 'Untitled'}
 Page type: ${pageTypeFormat(draft.page_type)}
 ${leans ? `Its sections lean to: ${leans}.\n` : ''}${draft.method === 'optimize' && draft.source_url ? `Existing page to improve: ${draft.source_url}` : 'A new page.'}
-Length: about ${sources.length} characters.
+Length: ${length}.${fitLine}
 ${listed.length ? `\nRules the page is written to:\n${list(listed.map((r) => (r.detail ? `${r.name}: ${r.detail}` : r.name)))}\n` : ''}
 Prompts the page must answer:
 ${list(prompts)}

@@ -1,0 +1,680 @@
+'use client';
+
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useTranslations } from 'next-intl';
+import { Link, usePathname } from '@/i18n/navigation';
+import { DotLegend } from '@/components/agentic/dot-legend';
+import { NewPill } from '@/components/agentic/new-pill';
+import { Skeleton } from '@/components/ui/skeleton';
+import { countChatSchedules } from '@/lib/actions/chat-schedules';
+import type { ChatListItem } from '@/lib/chat/conversations';
+import { AT_WORK_ROWS, chatMenuLists, type DayGroup } from '@/lib/chat/menu-groups';
+import { CHAT_SETTINGS_TABS } from '@/lib/chat/settings-tabs';
+import { cn } from '@/lib/utils';
+import { readAgentsSeen } from './agents/agents-seen';
+import { ConnectionsMenu } from './connections/connections-menu';
+import { useChatList, type ChatListStatus } from './chat-list-provider';
+import { ChatRowMenu } from './chat-menus';
+import { ChatRow } from './chat-row';
+import { useChatSearch } from './chat-search';
+import { MenuToggleIcon, shortcutLabel, useIsMac } from './chat-shortcuts';
+
+/** The menu's sections the person folded, remembered in this browser. */
+const SECTIONS_KEY = 'ansvisor.chatMenu.sections';
+type Section = 'menu' | 'settings' | 'atWork' | 'chats' | 'connections';
+
+/**
+ * As the menu opens: every section shown, but Connections' list (agentic
+ * plan §6: closed by default) and Settings' list, closed until opened.
+ */
+const FOLDED: Record<Section, boolean> = {
+  menu: false,
+  settings: true,
+  atWork: false,
+  chats: false,
+  connections: true,
+};
+
+/**
+ * Settings' pages in Chat, the Settings page's tabs (CHAT_SETTINGS_TABS):
+ * on one, Settings' list is open.
+ */
+const SETTINGS_PAGES: string[] = CHAT_SETTINGS_TABS.map((tab) => tab.href);
+
+function readFolded(): Record<Section, boolean> {
+  const none = FOLDED;
+  try {
+    const raw = JSON.parse(window.localStorage.getItem(SECTIONS_KEY) ?? '{}');
+    if (typeof raw !== 'object' || !raw) return none;
+    // Only today's sections: one since taken out (Governance) is dropped.
+    return {
+      ...none,
+      ...Object.fromEntries(Object.entries(raw).filter(([section]) => section in FOLDED)),
+    };
+  } catch {
+    return none;
+  }
+}
+
+function saveFolded(folded: Record<Section, boolean>) {
+  try {
+    window.localStorage.setItem(SECTIONS_KEY, JSON.stringify(folded));
+  } catch {
+    // Private windows and full storage: it is only folded for this visit.
+  }
+}
+
+/** The ▴ / ▾'s box: a section's FoldButton, and the arrow on Settings' row. */
+const FOLD_ARROW =
+  'flex size-[22px] items-center justify-center rounded-md text-[13px] text-foreground';
+
+/** The ▴ / ▾ at a section's right: hides or shows the section. */
+function FoldButton({
+  folded,
+  label,
+  controls,
+  action,
+  onClick,
+}: {
+  folded: boolean;
+  label: string;
+  controls: string;
+  action: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      data-action={action}
+      aria-label={label}
+      title={label}
+      aria-expanded={!folded}
+      aria-controls={controls}
+      onClick={onClick}
+      className={cn(
+        FOLD_ARROW,
+        'ml-auto outline-none hover:bg-sidebar-accent focus-visible:ring-[3px] focus-visible:ring-ring/50',
+      )}
+    >
+      {folded ? '▾' : '▴'}
+    </button>
+  );
+}
+
+/** A section's small uppercase title, with its count and controls. */
+function SectionHead({ children, className }: { children: ReactNode; className?: string }) {
+  return (
+    <div
+      className={cn(
+        'mx-2 mt-3 mb-1 flex items-center gap-1.5 text-[11px] tracking-[.4px] text-muted-foreground uppercase',
+        className,
+      )}
+    >
+      {children}
+    </div>
+  );
+}
+
+function Count({ value, title }: { value: number; title?: string }) {
+  return (
+    <span
+      title={title}
+      className="rounded-md bg-foreground/10 px-[5px] text-[10.5px] tracking-normal text-foreground/80 tabular-nums normal-case"
+    >
+      {value.toLocaleString('en-US')}
+    </span>
+  );
+}
+
+/** A menu row's look: 32px, its words at 8px. */
+const MENU_ROW =
+  'flex h-8 w-full items-center gap-2 rounded-lg px-2 text-[13px] leading-[18px] text-foreground/80 outline-none hover:bg-sidebar-accent focus-visible:ring-[3px] focus-visible:ring-ring/50';
+
+/**
+ * A menu item (Home, Inbox…): one 32px row; grey while it is the page shown.
+ * In a row's list (Settings'), 28px and indented as Connections' list.
+ */
+function MenuItem({
+  href,
+  action,
+  active,
+  onNavigate,
+  label,
+  sub = false,
+  children,
+}: {
+  href: string;
+  action: string;
+  active: boolean;
+  onNavigate?: () => void;
+  /** Its name for a screen reader when the visible words and counts don't say it all. */
+  label?: string;
+  /** In the list under a row (Settings'). */
+  sub?: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <Link
+      href={href}
+      data-action={action}
+      aria-label={label}
+      aria-current={active ? 'page' : undefined}
+      onClick={onNavigate}
+      className={cn(
+        MENU_ROW,
+        sub && 'h-7 pl-[23px] text-[12.5px] leading-[18px]',
+        active && 'bg-sidebar-accent font-medium text-foreground',
+      )}
+    >
+      {children}
+    </Link>
+  );
+}
+
+/**
+ * Settings in the menu (owner decision, 15 Nov 2026): a plain row that
+ * shows or hides its list, only the menu's ▾ / ▴ on its right, as
+ * Connections' row. Under it, General (Chat's Settings page), then what
+ * was Governance: Activity, What Chat can do and Tool policy, the Settings
+ * page's tabs, each marked while it is the page shown.
+ */
+function SettingsMenu({
+  open,
+  onToggle,
+  pathname,
+  onNavigate,
+}: {
+  open: boolean;
+  onToggle: () => void;
+  pathname: string;
+  onNavigate?: () => void;
+}) {
+  const t = useTranslations('chatShell.menu');
+  return (
+    <div>
+      <button
+        type="button"
+        data-action="chatMenu.toggleSettings"
+        title={t('toggleSettings')}
+        aria-expanded={open}
+        aria-controls="chat-menu-settings"
+        onClick={onToggle}
+        className={MENU_ROW}
+      >
+        {t('settings')}
+        <span aria-hidden className={cn(FOLD_ARROW, 'ml-auto')}>
+          {open ? '▴' : '▾'}
+        </span>
+      </button>
+      {open && (
+        <div id="chat-menu-settings" className="flex flex-col gap-0.5 pt-0.5 pb-1">
+          {CHAT_SETTINGS_TABS.map((tab) => (
+            <MenuItem
+              key={tab.id}
+              sub
+              href={tab.href}
+              action={tab.menuAction}
+              active={pathname === tab.href}
+              onNavigate={onNavigate}
+            >
+              {t(tab.id)}
+            </MenuItem>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function groupLabel(group: DayGroup, t: ReturnType<typeof useTranslations>, now: Date): string {
+  if (group.kind !== 'calendar') return t(`groups.${group.kind}`);
+  return group.month.toLocaleDateString('en-US', {
+    month: 'long',
+    ...(group.month.getFullYear() === now.getFullYear() ? {} : { year: 'numeric' }),
+  });
+}
+
+export interface ChatMenuViewProps {
+  status: ChatListStatus;
+  chats: ChatListItem[];
+  total: number;
+  /** The person's archived chats ("Archived · 2 ›"). */
+  archived?: number;
+  pathname: string;
+  /** Whether the menu is shown: its toggle says Hide or Show. */
+  open: boolean;
+  onToggle: () => void;
+  onNewChat: () => void;
+  onRetry: () => void;
+  /** After a link is followed: the drawer closes. */
+  onNavigate?: () => void;
+  /** Each row's ⋯ menu. */
+  rowActions?: (chat: ChatListItem) => ReactNode;
+  now?: Date;
+  /** The person's scheduled jobs that are on (W3-03): Scheduled's count. */
+  scheduled?: number;
+}
+
+/**
+ * The chat menu, top to bottom (CHAT-01 items 6, 9a; agentic update; mockup
+ * CHAT-mockup-v2.html, the menu on every #s-… screen): the toggle and
+ * "＋ New chat"; Menu (Home; Inbox, with its count and an amber dot while
+ * something needs the person; Agents, with "New" until it is first opened
+ * (governance mockup #cnav); Settings, a plain row whose list holds
+ * General (Chat's Settings page), Activity, What Chat can do and Tool
+ * policy (once Governance, the governance mockup's #cnav);
+ * Scheduled, with the person's jobs on; Files); Agents at work (needs you,
+ * running, unread results: three rows, See all, Show less, the dots'
+ * legend); Chats with its count, Search chats (typing lists the chats
+ * whose title or messages match, in place of the days; Ctrl K opens the
+ * palette under it), Pinned, then by day, and All chats and Archived at the
+ * end. Items whose pages aren't built yet stay out (Skills, Integrations). Sections fold, remembered in this
+ * browser; Settings' list folds with the same ▴ / ▾, closed until opened
+ * and open on one of its pages.
+ */
+export function ChatMenuView({
+  status,
+  chats,
+  total,
+  archived = 0,
+  pathname,
+  open,
+  onToggle,
+  onNewChat,
+  onRetry,
+  onNavigate,
+  rowActions,
+  now: nowProp,
+  scheduled = 0,
+}: ChatMenuViewProps) {
+  const t = useTranslations('chatShell.menu');
+  const tAttention = useTranslations('agentic.attention');
+  const isMac = useIsMac();
+  const [folded, setFolded] = useState<Record<Section, boolean>>(FOLDED);
+  // Settings' list folds as the sections do, with one difference: open on
+  // one of its pages, without remembering that, and otherwise as the person
+  // left it, closed at first.
+  const onSettingsPage = SETTINGS_PAGES.includes(pathname);
+  const [settingsForPage, setSettingsForPage] = useState(onSettingsPage);
+  const settingsOpen = settingsForPage || !folded.settings;
+  const [allRuns, setAllRuns] = useState(false);
+  const [query, setQuery] = useState('');
+  const found = useChatSearch(query);
+  const searching = query.trim() !== '';
+  // The "New" pill beside Agents, until it is first opened in this browser.
+  const [agentsNew, setAgentsNew] = useState(false);
+  useEffect(() => {
+    // Browser storage exists only after hydration.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setFolded(readFolded());
+    setAgentsNew(!readAgentsSeen());
+  }, []);
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (onSettingsPage) setSettingsForPage(true);
+  }, [onSettingsPage]);
+  const fold = (section: Section, to?: boolean) =>
+    setFolded((was) => {
+      const next = { ...was, [section]: to ?? !was[section] };
+      saveFolded(next);
+      return next;
+    });
+  const toggleSettings = () => {
+    setSettingsForPage(false);
+    fold('settings', settingsOpen);
+  };
+
+  // Read the clock again with every list read, so a menu left open past
+  // midnight moves Today's chats to Yesterday.
+  const { now, atWork, groups } = useMemo(() => {
+    const at = nowProp ?? new Date();
+    return { now: at, ...chatMenuLists(chats, at) };
+  }, [chats, nowProp]);
+  // The Inbox holds the person's own chats in Agents at work: its count, with
+  // an amber dot while any needs them.
+  const inboxRows = atWork.filter((chat) => chat.mine);
+  const needsYou = inboxRows.filter((chat) => chat.state === 'needsYou').length;
+  const inbox = inboxRows.length;
+  const inboxLabel = needsYou
+    ? t('inboxLabelNeedsYou', { count: inbox, needsYou })
+    : t('inboxLabel', { count: inbox });
+  const shownRuns = allRuns ? atWork : atWork.slice(0, AT_WORK_ROWS);
+  const row = (chat: ChatListItem) => (
+    <ChatRow
+      key={chat.id}
+      chat={chat}
+      active={pathname === `/dashboard/chat/${chat.id}`}
+      onOpen={onNavigate}
+      actions={rowActions?.(chat)}
+      now={now}
+    />
+  );
+
+  return (
+    <nav aria-label={t('label')} className="flex h-full min-h-0 flex-col gap-1 p-3 text-[13px]">
+      <div className="mb-2 flex items-center gap-1.5">
+        <button
+          type="button"
+          data-action="chatMenu.toggle"
+          aria-label={open ? t('hide') : t('show')}
+          title={t(open ? 'hideTip' : 'showTip', { keys: shortcutLabel('menu', isMac) })}
+          aria-expanded={open}
+          aria-controls="chat-menu"
+          onClick={onToggle}
+          className="flex size-7 shrink-0 items-center justify-center rounded-lg border bg-card text-muted-foreground outline-none transition-colors duration-150 hover:bg-sidebar-accent hover:text-foreground focus-visible:ring-[3px] focus-visible:ring-ring/50 motion-reduce:transition-none"
+        >
+          <MenuToggleIcon />
+        </button>
+        <button
+          type="button"
+          data-action="chat.new"
+          title={t('newChatTip', { keys: shortcutLabel('new', isMac) })}
+          onClick={onNewChat}
+          className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-[10px] border bg-card px-2.5 font-medium outline-none hover:bg-sidebar-accent focus-visible:ring-[3px] focus-visible:ring-ring/50"
+        >
+          <span aria-hidden>＋</span>
+          {t('newChat')}
+          <kbd className="ml-auto font-sans text-[11px] text-muted-foreground">
+            {shortcutLabel('new', isMac)}
+          </kbd>
+        </button>
+      </div>
+
+      <SectionHead className="mt-0">
+        {t('menu')}
+        {folded.menu && inbox > 0 && (
+          <Link
+            href="/dashboard/chat/inbox"
+            data-action="chatMenu.openInbox"
+            aria-label={inboxLabel}
+            title={inboxLabel}
+            onClick={onNavigate}
+            className="ml-auto inline-flex items-center gap-1 rounded-md bg-foreground/10 px-1.5 text-[10.5px] leading-4 tracking-normal text-foreground/80 normal-case outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50"
+          >
+            {needsYou > 0 && (
+              <span aria-hidden className="size-1.5 rounded-full bg-amber-600 dark:bg-amber-400" />
+            )}
+            {inbox}
+          </Link>
+        )}
+        <FoldButton
+          folded={folded.menu}
+          label={t('toggleMenu')}
+          controls="chat-menu-items"
+          action="chatMenu.toggleMenuSection"
+          onClick={() => fold('menu')}
+        />
+      </SectionHead>
+      {!folded.menu && (
+        <div id="chat-menu-items" className="flex flex-col gap-0.5">
+          <MenuItem
+            href="/dashboard/chat"
+            action="chatMenu.openHome"
+            active={pathname === '/dashboard/chat'}
+            onNavigate={onNavigate}
+          >
+            {t('home')}
+          </MenuItem>
+          <MenuItem
+            href="/dashboard/chat/inbox"
+            action="chatMenu.openInbox"
+            active={pathname === '/dashboard/chat/inbox'}
+            onNavigate={onNavigate}
+            label={inbox > 0 ? inboxLabel : undefined}
+          >
+            {t('inbox')}
+            {inbox > 0 && (
+              <span className="ml-auto inline-flex items-center gap-1.5">
+                {needsYou > 0 && (
+                  <span
+                    aria-hidden
+                    title={tAttention('needsYou', { count: needsYou })}
+                    className="size-[7px] rounded-full bg-amber-600 dark:bg-amber-400"
+                  />
+                )}
+                <span className="min-w-[22px] rounded-md bg-foreground/10 px-1.5 text-center text-[11px] leading-[18px] text-foreground/80 tabular-nums">
+                  {inbox}
+                </span>
+              </span>
+            )}
+          </MenuItem>
+          {/* Action Center › Agents, out of Chat: never the one open here (named so for screen readers). */}
+          <MenuItem
+            href="/dashboard/agents"
+            action="chatMenu.openAgents"
+            active={false}
+            onNavigate={onNavigate}
+            label={t('agentsLabel')}
+          >
+            {t('agentsShort')}
+            {agentsNew && <NewPill />}
+          </MenuItem>
+          <MenuItem
+            href="/dashboard/chat/skills"
+            action="chatMenu.openSkills"
+            active={pathname === '/dashboard/chat/skills'}
+            onNavigate={onNavigate}
+          >
+            {t('skills')}
+          </MenuItem>
+          {/* Connections right under Skills (agentic plan §6). */}
+          <ConnectionsMenu
+            open={!folded.connections}
+            onToggle={() => fold('connections')}
+            active={pathname === '/dashboard/chat/connections'}
+            onNavigate={onNavigate}
+          />
+          <SettingsMenu
+            open={settingsOpen}
+            onToggle={toggleSettings}
+            pathname={pathname}
+            onNavigate={onNavigate}
+          />
+          <MenuItem
+            href="/dashboard/chat/scheduled"
+            action="chatMenu.openScheduled"
+            active={pathname.startsWith('/dashboard/chat/scheduled')}
+            onNavigate={onNavigate}
+            label={scheduled ? t('scheduledLabel', { count: scheduled }) : undefined}
+          >
+            {t('scheduled')}
+            {scheduled > 0 && (
+              <span className="ml-auto min-w-[22px] rounded-md bg-foreground/10 px-1.5 text-center text-[11px] leading-[18px] text-foreground/80 tabular-nums">
+                {scheduled}
+              </span>
+            )}
+          </MenuItem>
+          <MenuItem
+            href="/dashboard/chat/files"
+            action="chatMenu.openFiles"
+            active={pathname === '/dashboard/chat/files'}
+            onNavigate={onNavigate}
+          >
+            {t('files')}
+          </MenuItem>
+        </div>
+      )}
+
+      {atWork.length > 0 && (
+        <>
+          <SectionHead>
+            {t('atWork')}
+            <Count value={atWork.length} />
+            <DotLegend dots="menu" className="ml-0.5" />
+            <FoldButton
+              folded={folded.atWork}
+              label={t('toggleAtWork')}
+              controls="chat-menu-at-work"
+              action="chatMenu.toggleAgentsAtWork"
+              onClick={() => fold('atWork')}
+            />
+          </SectionHead>
+          {!folded.atWork && (
+            <div id="chat-menu-at-work">
+              <div className={cn(allRuns && 'max-h-[260px] overflow-y-auto chat-scroll')}>
+                {shownRuns.map(row)}
+              </div>
+              {atWork.length > AT_WORK_ROWS && (
+                <button
+                  type="button"
+                  data-action={allRuns ? 'chatMenu.showLessRuns' : 'chatMenu.seeAllRuns'}
+                  aria-expanded={allRuns}
+                  aria-controls="chat-menu-at-work"
+                  onClick={() => setAllRuns((was) => !was)}
+                  className="block w-full rounded-lg py-[5px] pr-2 pl-[33px] text-left text-xs text-muted-foreground outline-none hover:bg-sidebar-accent hover:text-foreground focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                >
+                  {allRuns ? t('showLess') : t('seeAll', { count: atWork.length })}
+                </button>
+              )}
+            </div>
+          )}
+        </>
+      )}
+
+      <div className="chat-scroll -mx-1 min-h-0 flex-1 overflow-y-auto px-1">
+        <SectionHead>
+          {t('chats')}
+          {status === 'ready' && <Count value={total} />}
+          <FoldButton
+            folded={folded.chats}
+            label={t('toggleChats')}
+            controls="chat-menu-chats"
+            action="chatMenu.toggleChats"
+            onClick={() => fold('chats')}
+          />
+        </SectionHead>
+        {!folded.chats && (
+          <div id="chat-menu-chats">
+            {status === 'loading' && (
+              <div className="flex flex-col gap-2 px-2 py-1" aria-hidden>
+                {[0, 1, 2, 3].map((i) => (
+                  <Skeleton key={i} className="h-8 w-full" />
+                ))}
+              </div>
+            )}
+            {status === 'error' && (
+              <p className="px-2 py-1 text-xs text-muted-foreground">
+                {t('loadFailed')}{' '}
+                <button
+                  type="button"
+                  onClick={onRetry}
+                  className="underline underline-offset-2 hover:text-foreground"
+                >
+                  {t('retry')}
+                </button>
+              </p>
+            )}
+            {status === 'ready' && (
+              <input
+                id="chat-menu-search"
+                type="search"
+                data-action="chatMenu.searchChats"
+                aria-label={t('searchLabel')}
+                title={t('searchTip', { keys: shortcutLabel('search', isMac) })}
+                placeholder={t('searchPlaceholder', { keys: shortcutLabel('search', isMac) })}
+                autoComplete="off"
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Escape' && query) {
+                    event.stopPropagation();
+                    setQuery('');
+                  }
+                }}
+                className="mt-1.5 mb-1 block w-full rounded-lg border bg-background px-2.5 py-1.5 text-[12.5px] outline-none placeholder:text-muted-foreground focus:border-foreground/30 [&::-webkit-search-cancel-button]:hidden"
+              />
+            )}
+            {searching ? (
+              <div role="region" aria-label={t('searchResults')} aria-live="polite">
+                {found.chats.map(row)}
+                {found.status === 'ready' && found.chats.length === 0 && (
+                  <p className="px-2 py-1 text-xs text-muted-foreground">
+                    {t('noMatch')}{' '}
+                    <button
+                      type="button"
+                      data-action="emptyState.clearFilters"
+                      onClick={() => setQuery('')}
+                      className="underline underline-offset-2 hover:text-foreground"
+                    >
+                      {t('clearSearch')}
+                    </button>
+                  </p>
+                )}
+                {found.status === 'error' && (
+                  <p className="px-2 py-1 text-xs text-muted-foreground">{t('searchFailed')}</p>
+                )}
+              </div>
+            ) : (
+              <>
+                {status === 'ready' && groups.length === 0 && atWork.length === 0 && (
+                  <p className="px-2 py-1 text-xs text-muted-foreground">{t('empty')}</p>
+                )}
+                {groups.map((group) => (
+                  <div key={group.key}>
+                    <SectionHead>{groupLabel(group.group, t, now)}</SectionHead>
+                    {group.chats.map(row)}
+                  </div>
+                ))}
+              </>
+            )}
+            {status === 'ready' && (
+              <div className="mt-1">
+                <Link
+                  href="/dashboard/chat/all"
+                  data-action="chatMenu.openAllChats"
+                  onClick={onNavigate}
+                  className="block w-full rounded-lg p-2 text-[12.5px] text-muted-foreground outline-none hover:bg-sidebar-accent hover:text-foreground focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                >
+                  {t('allChats', { count: total })}
+                </Link>
+                <Link
+                  href="/dashboard/chat/all?tab=archived"
+                  data-action="chatMenu.openArchived"
+                  onClick={onNavigate}
+                  className="block w-full rounded-lg p-2 text-[12.5px] text-muted-foreground outline-none hover:bg-sidebar-accent hover:text-foreground focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                >
+                  {t('archivedLink', { count: archived })}
+                </Link>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </nav>
+  );
+}
+
+/** The chat menu with the person's chats from the shell's list. */
+export function ChatMenu(
+  props: Omit<
+    ChatMenuViewProps,
+    'status' | 'chats' | 'total' | 'archived' | 'pathname' | 'onRetry'
+  >,
+) {
+  const { status, chats, total, archived, refresh } = useChatList();
+  const pathname = usePathname();
+  // Scheduled's count: read again as the person moves between Chat's pages.
+  const [scheduled, setScheduled] = useState(0);
+  useEffect(() => {
+    let live = true;
+    void countChatSchedules()
+      .then((count) => live && setScheduled(count))
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [pathname]);
+  return (
+    <ChatMenuView
+      scheduled={scheduled}
+      rowActions={(chat) => <ChatRowMenu chat={chat} />}
+      {...props}
+      status={status}
+      chats={chats}
+      total={total}
+      archived={archived}
+      pathname={pathname}
+      onRetry={() => void refresh()}
+    />
+  );
+}

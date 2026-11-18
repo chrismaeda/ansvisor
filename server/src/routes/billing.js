@@ -4,17 +4,24 @@
  *
  * POST /api/billing/cancel-feedback — { reasons, message, choice } → kept and
  *                                     e-mailed to CANCEL_FEEDBACK_EMAILS, with
- *                                     replies going to the customer
+ *                                     replies going to the customer; then,
+ *                                     after the answer, an analysis of the
+ *                                     person's last 14 days in its thread
+ *                                     (lib/cancel-analysis)
  * GET  /api/billing/ai-usage        — this period's AI usage (getAiUsage), for
- *                                     the Billing page's meter
+ *                                     the Billing page's meter, with what
+ *                                     Write this typically takes
  * GET  /api/billing/ai-usage/draft/:draftId
  *                                   — a Content Editor page's share of it
  *                                     (getDraftAiUsage), for the editor meter
  */
 
+import { setImmediate } from 'timers';
 import { Router } from 'express';
 import { z } from 'zod';
 import supabaseAdmin from '../config/supabase.js';
+import { assertBrandAccess } from '../lib/access.js';
+import { aiEstimateCosts } from '../lib/ai-estimates.js';
 import { deliverEmail } from '../lib/email.js';
 import { PlanLimitError, getAiUsage, getDraftAiUsage, getOrgIdForUser } from '../lib/plan-guard.js';
 import {
@@ -25,6 +32,11 @@ import {
   cancelFeedbackSchema,
   feedbackRecipients,
 } from '../lib/cancel-feedback.js';
+import {
+  cancelAnalysisConfigured,
+  sendCancelAnalysis,
+  threadMessageId,
+} from '../lib/cancel-analysis/index.js';
 
 const router = Router();
 
@@ -44,7 +56,9 @@ router.get('/ai-usage', async (req, res) => {
         features: [],
       });
     }
-    return res.json(await getAiUsage(orgId));
+    // With what Write this and a draft's AI checks typically take, for the
+    // pages that say so (customer priorities item 9).
+    return res.json(await getAiUsage(orgId, { estimates: aiEstimateCosts() }));
   } catch (error) {
     // No active plan (a new workspace, past due, canceled): no allowance to meter.
     if (error instanceof PlanLimitError) {
@@ -66,8 +80,19 @@ router.get('/ai-usage/draft/:draftId', async (req, res) => {
     const orgId = await getOrgIdForUser(req.user.id);
     // As /ai-usage: without an org row there is no budget to share.
     if (!orgId) return res.json({ unlimited: true, percent: null });
+    // The page's share is its brand's: read only by someone who reaches it.
+    const { data: draft, error: draftError } = await supabaseAdmin
+      .from('content_drafts')
+      .select('brand_id')
+      .eq('id', draftId.data)
+      .maybeSingle();
+    if (draftError) throw new Error(draftError.message);
+    if (draft) await assertBrandAccess(draft.brand_id, req.user.id);
     return res.json(await getDraftAiUsage(orgId, draftId.data));
   } catch (error) {
+    if (error.status === 403 || error.status === 404) {
+      return res.status(error.status).json({ error: error.message, code: error.code });
+    }
     if (error instanceof PlanLimitError) {
       return res.status(error.statusCode).json({
         success: false,
@@ -146,16 +171,22 @@ router.post('/cancel-feedback', async (req, res) => {
       .single();
     if (error) throw new Error(error.message);
 
+    const recipients = feedbackRecipients();
+    // With PostHog set up, an analysis follows this e-mail in its thread
+    // (below): this one gets a Message-ID for it to answer.
+    const messageId =
+      recipients.length > 0 && cancelAnalysisConfigured() ? threadMessageId(row.id) : null;
     const { subject, html } = buildCancelFeedbackEmail({
       org,
       user: { name: profile.full_name, email: req.user.email, role: profile.role },
       feedback,
     });
     const emailStatus = await deliverEmail({
-      to: feedbackRecipients(),
+      to: recipients,
       subject,
       html,
       replyTo: req.user.email || undefined,
+      ...(messageId ? { headers: { 'Message-ID': messageId } } : {}),
     });
     if (emailStatus !== 'sent') {
       req.log.warn({ emailStatus, feedbackId: row.id }, '[billing] cancel feedback not e-mailed');
@@ -173,7 +204,25 @@ router.post('/cancel-feedback', async (req, res) => {
         .json({ error: "Your message didn't reach the team", code: 'not_sent' });
     }
 
-    return res.status(201).json({ ok: true });
+    res.status(201).json({ ok: true });
+    // The analysis, once the customer has their answer: it reads PostHog and
+    // asks the AI, which takes seconds. Only after an e-mail that may have
+    // gone out; whatever fails in it is logged there, never here.
+    if (messageId && emailStatus !== 'skipped' && emailStatus !== 'refused') {
+      const input = {
+        orgId,
+        userId: req.user.id,
+        plan: { plan: org.plan ?? null, status: org.subscription_status ?? null },
+        feedback,
+        subject,
+        messageId,
+        recipients,
+      };
+      setImmediate(() => {
+        sendCancelAnalysis(input).catch(() => {});
+      });
+    }
+    return undefined;
   } catch (error) {
     req.log.error({ err: error }, '[billing] cancel feedback failed');
     return res.status(500).json({ error: 'Could not send your message' });

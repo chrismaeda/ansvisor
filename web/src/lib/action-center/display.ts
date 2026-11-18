@@ -2,6 +2,7 @@ import type { ActionEvent, ActionItem } from '@/lib/actions/action-center';
 import { isActionKind } from '@/lib/action-center/registry';
 import { pagePath } from '@/lib/content/overlap';
 import { formatEstimateRange, guessedVolumeEstimate } from '@/lib/volume-estimate';
+import { refreshYears } from '@/lib/content/current-year';
 
 /**
  * Composes what an action row shows from `kind` + `payload`, mirroring the
@@ -52,6 +53,63 @@ export function actionKindName(kind: string, t: Translator): string {
  * definitions/_helpers.js). An action raised before the library existed has
  * neither, and gets its title without a count rather than "0 prompts".
  */
+/** A named target as a title quotes it: its first 80 characters. */
+const MAX_NAME = 80;
+
+/** Entities a title can name by their first target (en.json actionTexts.namedTargets). */
+const NAMEABLE = new Set(['prompts', 'competitors', 'topics']);
+
+/**
+ * The action's targets by name: its first, and how many more (“best decaf
+ * coffee beans” and 2 more prompts). Empty when its entity can't be named
+ * this way, its first target has no label, or it was removed (AC-009).
+ */
+export function namedTargets(payload: Record<string, unknown>, t: Translator): string {
+  const count = num(payload, 'targetCount');
+  const entity = str(payload, 'targetEntity');
+  if (count < 1 || !NAMEABLE.has(entity) || !Array.isArray(payload.targets)) return '';
+  const first = payload.targets[0] as unknown;
+  const target =
+    first && typeof first === 'object' ? (first as Record<string, unknown>) : { label: first };
+  const name = (str(target, 'label') || str(target, 'text')).trim();
+  const key = String(target.id ?? name);
+  const removed = Array.isArray(payload.removedKeys) && payload.removedKeys.includes(key);
+  if (!name || removed) return '';
+  return t(`namedTargets.${entity}`, {
+    name: name.length > MAX_NAME ? `${name.slice(0, MAX_NAME - 1).trimEnd()}…` : name,
+    more: count - 1,
+  });
+}
+
+/**
+ * Kinds whose title names its targets when it can, and the message that
+ * does: their titles read as well with a name as with a count.
+ */
+const NAMED_TITLES: Record<string, string> = {
+  close_competitor_gap: 'title',
+  expand_prompt_visibility: 'namedTitle',
+  protect_visibility: 'namedTitle',
+  recover_lost_mentions: 'namedTitle',
+  strengthen_emerging_content: 'namedTitle',
+};
+
+/**
+ * A content opportunity's why, from what it was sent with: the page it
+ * updates (or a new page) and the prompts it answers. Empty without prompts.
+ */
+function opportunityWhy(payload: Record<string, unknown>, t: Translator): string {
+  const prompts = namedTargets(payload, t);
+  if (!prompts) return '';
+  const pages = Array.isArray(payload.pages)
+    ? payload.pages.filter((page): page is string => typeof page === 'string' && page !== '')
+    : [];
+  const creates = payload.decision === 'create' || pages.length !== 1;
+  return t('content_opportunity.why', {
+    page: creates ? 'none' : pagePath(pages[0]) || pages[0],
+    prompts,
+  });
+}
+
 export function targetLabel(payload: Record<string, unknown>, t: Translator): string {
   const count = num(payload, 'targetCount');
   const entity = str(payload, 'targetEntity');
@@ -78,7 +136,11 @@ export function actionTexts(
   }
   // An action sent from a content opportunity is named after the work itself.
   if (action.kind === 'content_opportunity' && typeof p.title === 'string' && p.title) {
-    return { title: p.title, description: t(`${action.kind}.description`) };
+    // The opportunity's title as Content shows it, a past year read as this one.
+    return {
+      title: refreshYears(p.title),
+      description: opportunityWhy(p, t) || t(`${action.kind}.description`),
+    };
   }
   // A draft sent from the Content Editor (CE-015) is named after its page.
   if (action.kind === 'content_draft' && typeof p.title === 'string' && p.title) {
@@ -116,6 +178,46 @@ export function actionTexts(
           })
         : t('shopping_links.titleGeneric'),
       description: t('shopping_links.description', { count }),
+    };
+  }
+  // Setting up a ChatGPT Business Hub profile: worded for where claiming is
+  // open, or for the waitlist elsewhere, with ChatGPT's answers as evidence.
+  if (action.kind === 'business_hub_setup') {
+    const evidence = (p.evidence ?? {}) as Record<string, unknown>;
+    const answers = num(evidence, 'answers');
+    return {
+      title: t(
+        p.variant === 'waitlist' ? 'business_hub_setup.waitlistTitle' : 'business_hub_setup.title',
+      ),
+      description:
+        answers > 0
+          ? t('business_hub_setup.description', {
+              answers,
+              named: num(evidence, 'named'),
+              cited: num(evidence, 'cited'),
+            })
+          : t('business_hub_setup.descriptionGeneric'),
+    };
+  }
+  // The weekly reminder to enter the numbers names the last entry's days.
+  if (action.kind === 'business_hub_numbers') {
+    const end = str(p, 'lastEnd');
+    return {
+      title: t('business_hub_numbers.title'),
+      description: end
+        ? t('business_hub_numbers.description', {
+            days: num(p, 'lastDays') === 28 ? 28 : 7,
+            end,
+          })
+        : t('business_hub_numbers.descriptionGeneric'),
+    };
+  }
+  // A finding sent from Chat (CHAT-09 §E) carries the title and the finding
+  // the person approved.
+  if (action.kind === 'chat_finding' && typeof p.title === 'string' && p.title) {
+    return {
+      title: p.title,
+      description: typeof p.why === 'string' && p.why ? p.why : t(`${action.kind}.description`),
     };
   }
   // An Improve action carries its own title and "why", written from the
@@ -218,10 +320,52 @@ export function actionTexts(
     };
   }
   const targets = targetLabel(p, t);
+  // A store's topic whose category page is live optimizes that page (AC plan P-7).
+  if (optimizesCategoryPage(action.kind, p)) {
+    return {
+      title: targets
+        ? t(`${action.kind}.categoryTitle`, { targets })
+        : t(`${action.kind}.categoryTitleGeneric`),
+      description: t(`${action.kind}.categoryDescription`),
+    };
+  }
+  // A competitor's lead names the competitor, and the prompt it leads most on
+  // when its signals said (C01's leadPrompt); the prompt kinds their first prompt.
+  const named = NAMED_TITLES[action.kind] ? namedTargets(p, t) : '';
+  if (named) {
+    const lead = (p.leadPrompt ?? null) as { text?: unknown } | null;
+    const prompt = typeof lead?.text === 'string' ? lead.text.trim() : '';
+    const single = action.kind === 'close_competitor_gap' && num(p, 'targetCount') === 1;
+    return {
+      title:
+        single && prompt
+          ? t('close_competitor_gap.promptTitle', {
+              competitor: named,
+              prompt:
+                prompt.length > MAX_NAME ? `${prompt.slice(0, MAX_NAME - 1).trimEnd()}…` : prompt,
+            })
+          : t(`${action.kind}.${NAMED_TITLES[action.kind]}`, { targets: named }),
+      description: t(`${action.kind}.description`),
+    };
+  }
   return {
     title: targets ? t(`${action.kind}.title`, { targets }) : t(`${action.kind}.titleGeneric`),
     description: t(`${action.kind}.description`),
   };
+}
+
+/**
+ * Whether a topic action (G16) optimizes its topic's live category page
+ * (AC plan P-7): its play is the category page, not a new page.
+ */
+function optimizesCategoryPage(kind: string, payload: Record<string, unknown>): boolean {
+  const play = payload.play;
+  return (
+    kind === 'create_content_for_topics' &&
+    !!play &&
+    typeof play === 'object' &&
+    (play as { id?: unknown }).id === 'category_page'
+  );
 }
 
 /**
@@ -241,14 +385,24 @@ export function eventTaskText(
   return t(key);
 }
 
+/** Chat's History events about one task (CHAT-09 §D), named as a checked task is. */
+const CHAT_TASK_EVENTS = new Set([
+  'file_attached',
+  'file_detached',
+  'task_ready_for_review',
+  'task_review_withdrawn',
+]);
+
 /** A History entry as a sentence: what happened, to what, by which tool. */
 export function actionEventText(
   event: ActionEvent,
   t: Translator,
   tTasks: Translator & { has?: (key: string) => boolean },
 ): string {
-  return t(`drawer.events.${event.event}`, {
+  const text = t(`drawer.events.${event.event}`, {
     to: String(event.data.to ?? ''),
+    // A task added to the open opportunity on its question.
+    merged: event.data.merged === true ? 'yes' : 'no',
     count: Number(event.data.count ?? 0),
     // Tasks the writer left for review (AC-010).
     reviews: Number(event.data.reviews ?? 0),
@@ -256,11 +410,22 @@ export function actionEventText(
     // and the tool as it is recorded — the tool id is the audit fact, so it
     // is not translated.
     // A checked task is named once (`{task}{title}`): by its own title when it
-    // has one; lines written before the API sent only one carry both.
+    // has one; lines written before the API sent only one carry both. So is a
+    // task Chat attached a file to or set to Ready for review (CHAT-09 §D).
     task:
-      event.event === 'task_checked' && event.data.title
+      (event.event === 'task_checked' || CHAT_TASK_EVENTS.has(event.event)) && event.data.title
         ? ''
         : eventTaskText(event.data.task, tTasks),
+    // Where it came from: `chat` for what Chat did (CHAT-20 §10a).
+    source: String(event.data.source ?? ''),
+    // A finding Chat added, and a file it attached, in their own words.
+    finding: String(event.data.finding ?? ''),
+    file: String(event.data.file ?? ''),
+    // Who undid a Chat action (CHAT-20 §10b): named when they were.
+    by:
+      typeof event.data.by === 'string' && event.data.by
+        ? event.data.by
+        : t('drawer.eventParts.someone'),
     tool: String(event.data.tool ?? ''),
     improved: Number(event.data.improved ?? 0),
     measurable: Number(event.data.measurable ?? 0),
@@ -274,7 +439,25 @@ export function actionEventText(
     // (learning B1); none for one measured once before.
     day: Number(event.data.day ?? 0),
     final: event.data.final === true ? 'yes' : 'no',
+    // The Chat agent a run on the action was (CHAT-21 §F item 31), by its name
+    // then, and why it stopped; a deleted agent's line ends without a name.
+    agent: String(event.data.agent ?? ''),
+    named: event.data.agent ? 'yes' : 'no',
+    reason: String(event.data.stop_reason ?? ''),
   });
+  if (event.event !== 'evidence_attached') return text;
+  // A finding added from Chat says its note and where it was read, when it has them.
+  const parts = [text];
+  if (typeof event.data.note === 'string' && event.data.note.trim()) {
+    parts.push(t('drawer.eventParts.note', { note: event.data.note.trim() }));
+  }
+  const sources = Array.isArray(event.data.sources)
+    ? event.data.sources.filter((source): source is string => typeof source === 'string')
+    : [];
+  if (sources.length > 0) {
+    parts.push(t('drawer.eventParts.sources', { sources: sources.join(', ') }));
+  }
+  return parts.join(' · ');
 }
 
 /**
@@ -289,16 +472,22 @@ export function actionGoal(
   t: Translator,
   payload?: Record<string, unknown> | null,
 ): string {
-  // An Improve action names its own prompt and platforms (PROMPT-004).
-  if (kind === 'prompt_improve' && typeof payload?.goal === 'string' && payload.goal) {
+  // An Improve action names its own prompt and platforms (PROMPT-004); a
+  // finding sent from Chat its own goal, when it gave one (CHAT-09 §E).
+  if (
+    (kind === 'prompt_improve' || kind === 'chat_finding') &&
+    typeof payload?.goal === 'string' &&
+    payload.goal
+  ) {
     return payload.goal;
   }
+  if (optimizesCategoryPage(kind, payload ?? {})) return t(`${kind}.categoryGoal`);
   return isActionKind(kind) ? t(`${kind}.goal`) : t('unknown.goal');
 }
 
 /**
- * Kinds a person sends rather than a definition raises, and the catalog
- * check's (shopping_links): none rests on detection signals.
+ * Kinds a person sends rather than a definition raises, the catalog check's
+ * (shopping_links) and Business Hub's: none rests on detection signals.
  */
 const PERSON_SENT_KINDS: string[] = [
   'content_opportunity',
@@ -312,6 +501,9 @@ const PERSON_SENT_KINDS: string[] = [
   'shopping_product',
   'shopping_category',
   'shopping_links',
+  'chat_finding',
+  'business_hub_setup',
+  'business_hub_numbers',
 ];
 
 /** Compact evidence chips under the title: signal count plus the kind's own

@@ -185,9 +185,21 @@ export async function classifyIntentsByDecider(queries, decideFn) {
 }
 
 /**
+ * A fan-out sub-query as its intent is cached (fanout_query_intents, #333):
+ * whitespace collapsed, trimmed, lower-cased, at most 512 characters; empty
+ * when it isn't a string.
+ *
+ * @param {unknown} raw
+ * @returns {string}
+ */
+export function normalizeIntentQuery(raw) {
+  return typeof raw === 'string' ? raw.replace(/\s+/g, ' ').trim().toLowerCase().slice(0, 512) : '';
+}
+
+/**
  * Classifies the queries the cache doesn't hold yet. With
- * FANOUT_INTENTS_DECIDER set and OpenRouter configured, a decision model
- * answers them in batches; otherwise the chat model takes each, six at a time,
+ * FANOUT_INTENTS_DECIDER set and a decision provider configured, a decision
+ * model answers them in batches; otherwise the chat model takes each, six at a time,
  * as before. A query that fails stays out, and is asked again next time.
  *
  * @param {string[]} queries - normalized queries, each once

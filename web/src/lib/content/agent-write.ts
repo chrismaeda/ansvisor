@@ -2,8 +2,8 @@ import { useCallback } from 'react';
 import { useTranslations } from 'next-intl';
 import { getCitedPassages, getDraftSources, getMyRuleSets } from '@/lib/actions/content-drafts';
 import { rebuildSources, type RebuildSources } from './brief';
-import { MAX_PASSAGES } from './cited-passages';
-import { isPageType, type DraftMethod } from './drafts';
+import { pagePassages } from './cited-passages';
+import type { DraftMethod } from './drafts';
 import {
   NOT_FOR_AGENT,
   activeRules,
@@ -12,7 +12,9 @@ import {
   fanoutsToUse,
   readPage,
   ruleLength,
+  ruleLengthBand,
   ruleSet,
+  ruleSetType,
   type ActiveRule,
   type DraftRules,
   type RuleStatus,
@@ -40,6 +42,8 @@ export interface AgentWriteRequest {
   locked: string[];
   /** How many rules the editor counts ("met of total"): the run's "Reading N rules" says the same. */
   counted?: number;
+  /** Write this (customer priorities item 9): the brief built from the sources first, in the same run. */
+  buildBrief?: boolean;
 }
 
 /** The server's limit on rules (content-writer.js writeDraftInput). */
@@ -54,24 +58,36 @@ export type RuleDescriber = (
   status?: RuleStatus,
 ) => { name: string; detail: string };
 
+/**
+ * A rule in the Rules tab's words (contentEditor.editor.rules), as Fix open
+ * rules sends it: the editor's hook below, and Chat's Optimize here on the
+ * server (W4-12b part 2).
+ */
+export function describeRule(
+  t: (key: string) => string,
+  rule: ActiveRule,
+  status?: RuleStatus,
+): { name: string; detail: string } {
+  const fanouts = status ? fanoutsToUse(status) : null;
+  return {
+    name: t(`names.${rule.key}`),
+    detail: [
+      rule.current
+        ? `${t('agent.aim')}: ${rule.current}${rule.unit ? ` ${t(`units.${rule.unit}`)}` : ''}`
+        : null,
+      fanouts ? `${t('agent.fanouts')}: ${fanouts}` : null,
+    ]
+      .filter(Boolean)
+      .join(' · '),
+  };
+}
+
 /** Rules in the reader's words, as Fix open rules sends them. */
 export function useRuleDescriber(): RuleDescriber {
   const t = useTranslations('contentEditor.editor.rules');
   return useCallback(
-    (rule: ActiveRule, status?: RuleStatus) => {
-      const fanouts = status ? fanoutsToUse(status) : null;
-      return {
-        name: t(`names.${rule.key}`),
-        detail: [
-          rule.current
-            ? `${t('agent.aim')}: ${rule.current}${rule.unit ? ` ${t(`units.${rule.unit}`)}` : ''}`
-            : null,
-          fanouts ? `${t('agent.fanouts')}: ${fanouts}` : null,
-        ]
-          .filter(Boolean)
-          .join(' · '),
-      };
-    },
+    (rule: ActiveRule, status?: RuleStatus) =>
+      describeRule(t as unknown as (key: string) => string, rule, status),
     [t],
   );
 }
@@ -113,15 +129,6 @@ export function rulesForBrief(
   );
 }
 
-/** The page's headings and paragraphs, as the editor's passages. */
-function pagePassages(html: string): string[] {
-  const doc = new DOMParser().parseFromString(html, 'text/html');
-  return [...doc.querySelectorAll('h1, h2, h3, h4, h5, h6, p')]
-    .map((el) => (el.textContent ?? '').trim().slice(0, 5_000))
-    .filter(Boolean)
-    .slice(0, MAX_PASSAGES);
-}
-
 /**
  * The request for a draft. The rules in effect are read for it (the page
  * type's set with the workspace's My rules), unless the editor, which has
@@ -145,7 +152,7 @@ export async function agentWriteRequest(
   /** The locked passages' keys, as the editor holds them; read from the server otherwise. */
   locked?: string[],
 ): Promise<AgentWriteRequest> {
-  const setType = draft.rules.set ?? (isPageType(draft.pageType) ? draft.pageType : null);
+  const setType = ruleSetType(draft.rules, draft.pageType);
   const [read, mine, cited] = await Promise.all([
     getDraftSources(draft.id),
     // Without the workspace's rules, the page type's defaults still apply.
@@ -169,14 +176,25 @@ export async function agentWriteRequest(
   const textRules =
     inEffect?.textRules ?? effective.textRules.filter((rule) => rule.on).map((rule) => rule.text);
   const length = ruleLength(rules, setType);
+  // A range the person set is kept to, not only aimed at (editor test 2026-11-03).
+  const lengthBand = ruleLengthBand(rules);
   const sources = read
     ? rebuildSources(read.data, read.choices, {
         title: draft.title,
         sourceUrl: draft.sourceUrl,
         html: draft.bodyHtml,
         length,
+        lengthBand,
       })
-    : { promptIds: [], fanouts: [], pages: [], queries: [], headings: [], length };
+    : {
+        promptIds: [],
+        fanouts: [],
+        pages: [],
+        queries: [],
+        headings: [],
+        length,
+        ...(lengthBand ? { lengthBand } : {}),
+      };
   // The fan-out rules name the fan-outs the page doesn't use yet: an existing
   // page's own; a page the agent writes anew starts from none of them.
   const page = readPage(draft.method === 'optimize' ? (draft.bodyHtml ?? '') : '', 0);

@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import messages from '../../../messages/en.json';
+import { PAGE_TYPES } from './drafts';
 import { htmlBlockElement } from './html-allowlist';
 import { productBlockHtml } from './product-block';
 import type { ShoppingCheck, ShoppingLinkState } from './shopping-check';
+import { agentFixable } from './tried-rules';
 import {
   NO_DRAFT_RULES,
   NOT_FOR_AGENT,
@@ -18,11 +20,21 @@ import {
   draftRulesSchema,
   readPage,
   ruleLength,
+  ruleLengthBand,
+  lengthCapFor,
+  lengthSpan,
+  lengthRangeValue,
   wordsForLength,
   lengthWarns,
   lengthConflict,
   ruleSet,
+  ruleSetType,
   rulesMet,
+  rulesPageType,
+  rulesForPageType,
+  legacyPin,
+  notCheckedHere,
+  phrasesFound,
   type ActiveRule,
   type RuleContext,
   draftRulesFit,
@@ -211,6 +223,52 @@ describe('length and structure', () => {
       min: 2400,
       max: 3600,
     });
+  });
+
+  it('reads a Length range as set: met within it, aimed at its middle (editor test 2026-11-03)', () => {
+    const range = rule('length', 'feature_page', '4500-5500');
+    expect(checkRule(range, page('', 4500), ctx)).toEqual({ state: 'ok' });
+    expect(checkRule(range, page('', 5500), ctx)).toEqual({ state: 'ok' });
+    // Within the band around its middle (5,000 ± 20%), but not the range.
+    expect(checkRule(range, page('', 5900), ctx)).toEqual({
+      state: 'bad',
+      code: 'long',
+      count: 5900,
+      min: 4500,
+      max: 5500,
+    });
+    expect(checkRule(range, page('', 4200), ctx)).toMatchObject({ code: 'short', min: 4500 });
+    expect(ruleLength([range], 'feature_page')).toBe(5000);
+    expect(ruleLengthBand([range])).toEqual({ min: 4500, max: 5500 });
+    // One number: the agent aims at it, as before.
+    expect(ruleLengthBand([rule('length', 'feature_page', '3000')])).toBeUndefined();
+    expect(ruleLengthBand([{ ...range, on: false }])).toBeUndefined();
+  });
+
+  it('gives a Fix the page’s characters and the most its Length allows (editor UX review 2026-11-03)', () => {
+    const at = (value: string, on = true) => [
+      { rule: { ...rule('length', 'feature_page', value), on } },
+    ];
+    expect(lengthCapFor(at('800'), 2706.4)).toEqual({ count: 2706, max: 960 });
+    expect(lengthCapFor(at('4500-5500'), 4000)).toEqual({ count: 4000, max: 5500 });
+    // Off, or no Length to read: none.
+    expect(lengthCapFor(at('800', false), 2706)).toBeUndefined();
+    expect(lengthCapFor(at('0'), 2706)).toBeUndefined();
+    expect(lengthCapFor([], 2706)).toBeUndefined();
+  });
+
+  it('parses a Length as one number or a range, as typed', () => {
+    expect(lengthSpan('5000')).toEqual({ target: 5000, min: 4000, max: 6000 });
+    expect(lengthSpan('4500-5500')).toEqual({ target: 5000, min: 4500, max: 5500 });
+    expect(lengthSpan('4.500–5.500')).toEqual({ target: 5000, min: 4500, max: 5500 });
+    expect(lengthSpan('4,500 - 5,500')).toEqual({ target: 5000, min: 4500, max: 5500 });
+    // The larger first is read the right way round; one bound alone is a range of one.
+    expect(lengthSpan('5500-4500')).toEqual({ target: 5000, min: 4500, max: 5500 });
+    expect(lengthSpan('5000-5000')).toEqual({ target: 5000, min: 5000, max: 5000 });
+    for (const bad of ['', '0', 'many', '4500-', '-5500', '0-5000', '1-2-3']) {
+      expect(lengthSpan(bad)).toBeNull();
+    }
+    expect(lengthRangeValue(5500, 4500)).toBe('4500-5500');
   });
 
   it('wants one H1 per page, and leaves the agent out of it', () => {
@@ -402,6 +460,14 @@ describe('fan-outs and keywords', () => {
         'espresso machine reviews 2026',
       ],
     });
+  });
+
+  it('counts a fan-out H2 or FAQ question written in its own words', () => {
+    const measure = { ...ctx, fanouts: ['how to measure ai overviews'] };
+    const h2 = page('<h2>Measuring AI Overviews</h2>');
+    expect(checkRule(rule('fanoutH2'), h2, measure)).toEqual({ state: 'ok' });
+    const faq = page('<h2>FAQ</h2><h3>How do you measure AI Overviews?</h3><p>In GA4.</p>');
+    expect(checkRule(rule('fanoutFaq'), faq, measure)).toEqual({ state: 'ok' });
   });
 
   it('quotes the fan-outs still to use for the agent, as many as fit', () => {
@@ -658,6 +724,45 @@ describe('style', () => {
       count: 3,
     });
     expect(check('bannedWords', '<p>Seamlessly done.</p>')).toEqual({ state: 'ok' });
+  });
+
+  it('checks the brand’s banned phrases only when it has some, as Chat does', () => {
+    const keys = (bannedPhrases?: string[]) =>
+      ruleSet('guide', { bannedPhrases })
+        .filter((r) => r.group === 'style')
+        .map((r) => r.key);
+    expect(keys()).not.toContain('brandBanned');
+    expect(keys([])).not.toContain('brandBanned');
+    // On by default, after Banned words, and the person can turn it off.
+    expect(keys(['cheap']).slice(1, 3)).toEqual(['bannedWords', 'brandBanned']);
+    const [banned] = activeRules(ruleSet('guide', { bannedPhrases: ['x'] }), NO_DRAFT_RULES).filter(
+      (r) => r.key === 'brandBanned',
+    );
+    expect(banned).toMatchObject({ on: true, kind: 'switch', changed: false });
+    const off = activeRules(ruleSet('guide', { bannedPhrases: ['x'] }), {
+      overrides: { brandBanned: { on: false } },
+    }).find((r) => r.key === 'brandBanned');
+    expect(off?.on).toBe(false);
+
+    const read = (html: string, bannedPhrases?: string[]) =>
+      checkRule(banned, page(html), { ...ctx, bannedPhrases });
+    const phrases = ['cheap', 'Best Price', 'free'];
+    // Whole words in any case, across a line; each phrase once, as the brand wrote it.
+    expect(read('<h2>CHEAP flights</h2><p>The best\nprice, cheap.</p>', phrases)).toEqual({
+      state: 'bad',
+      code: 'found',
+      count: 2,
+      phrases: ['cheap', 'Best Price'],
+    });
+    expect(read('<p>Cheaper flights, freedom.</p>', phrases)).toEqual({ state: 'ok' });
+    expect(read('<p>Cheap.</p>')).toEqual({ state: 'ok' });
+    // Counted like the other rules.
+    const status = read('<p>Cheap.</p>', phrases);
+    expect(rulesMet([{ rule: banned, status }])).toEqual({ met: 0, total: 1 });
+    expect(phrasesFound(status)).toEqual(['cheap']);
+    expect(phrasesFound({ state: 'ok' })).toEqual([]);
+    // Content Agent's to fix (Fix open rules), as other open rules.
+    expect(agentFixable([{ rule: banned, status }]).fixable).toHaveLength(1);
   });
 
   it('leaves tone and language to AI', () => {
@@ -1001,6 +1106,120 @@ describe('lengthConflict', () => {
   });
 });
 
+describe('rules that follow the page, and rules it can’t meet', () => {
+  it('never gives a default set more sections and questions than its Length holds (G1)', () => {
+    for (const type of [null, ...PAGE_TYPES]) {
+      const open = activeRules(ruleSet(type, { shopping: true }), NO_DRAFT_RULES).map((r) => ({
+        rule: r,
+        status: { state: 'bad', code: 'missing' } as RuleStatus,
+      }));
+      expect([type, lengthConflict(open, 10)]).toEqual([type, null]);
+    }
+  });
+
+  it('follows the page type, unless a set was picked for the type the page has (A1)', () => {
+    // Picked for another type than the page has now (its type set or changed since): it falls back.
+    expect(ruleSetType({ set: 'product_page', setFor: 'blog_post' }, 'guide')).toBe('guide');
+    expect(ruleSetType({ set: 'product_page', setFor: 'blog_post' }, null)).toBeNull();
+    expect(rulesPageType({ set: 'product_page', setFor: 'blog_post' }, 'guide')).toBe('guide');
+    expect(ruleSetType({ set: 'product_page', setFor: 'blog_post' }, 'blog_post')).toBe(
+      'product_page',
+    );
+    // Its type rules aren't the page's: they're set apart, as #2389 sets them.
+    expect(rulesPageType({ set: 'product_page', setFor: 'blog_post' }, 'blog_post')).toBe(
+      'blog_post',
+    );
+    expect(ruleSetType({ set: null }, 'guide')).toBe('guide');
+    expect(ruleSetType({ set: null }, null)).toBeNull();
+  });
+
+  it('keeps a set picked before setFor, with its type rules, whatever the page type', () => {
+    const legacy = { set: 'product_page' as const };
+    expect(legacyPin(legacy)).toBe(true);
+    expect(legacyPin({ set: 'product_page', setFor: 'blog_post' })).toBe(false);
+    expect(legacyPin({ set: null })).toBe(false);
+    // With a page type, another or its own, and with none.
+    for (const pageType of ['blog_post', 'product_page', 'not_a_type', null]) {
+      expect([pageType, ruleSetType(legacy, pageType)]).toEqual([pageType, 'product_page']);
+      expect([pageType, rulesPageType(legacy, pageType)]).toEqual([pageType, 'product_page']);
+    }
+    // Its type rules are checked as they were, on a blog post and on a page with no type.
+    const table = '<table><tr><td>Weight</td><td>1.2 kg</td></tr></table>';
+    for (const pageType of ['blog_post', null]) {
+      const on = { ...ctx, pageType: rulesPageType(legacy, pageType) };
+      expect(checkRule(rule('specsTable', 'product_page'), page(table), on)).toEqual({
+        state: 'ok',
+      });
+      expect(checkRule(rule('specsTable', 'product_page'), page('<p>x</p>'), on)).not.toEqual({
+        state: 'info',
+        code: 'otherType',
+      });
+    }
+    // Its customised rules stay on it.
+    const choices = draftRulesSchema.parse({
+      set: 'product_page',
+      source: 'default',
+      overrides: { specsTable: { on: false } },
+    });
+    const kept = activeRules(ruleSet(ruleSetType(choices, 'blog_post')), choices);
+    expect(kept.find((r) => r.key === 'specsTable')?.on).toBe(false);
+  });
+
+  it('brings the type’s set when the person picks a page type: only the pin goes (the owner, 2026-11-14)', () => {
+    const custom = {
+      source: 'mine' as const,
+      overrides: { sentence: { on: false }, specsTable: { on: false } },
+      textRules: [{ id: 't1', text: 'Mention free shipping', on: true }],
+      importLength: 4_800,
+    };
+    // A set picked before setFor: it goes, whatever the type picked, its own too.
+    for (const type of ['blog_post', 'product_page'] as const) {
+      const next = rulesForPageType({ ...custom, set: 'product_page' }, type);
+      expect(next).toEqual({ ...custom, set: null });
+      expect(next).not.toHaveProperty('setFor');
+      expect(ruleSetType(next!, type)).toBe(type);
+      expect(rulesPageType(next!, type)).toBe(type);
+    }
+    // One picked for another type than the one picked now: it goes too (it already fell back).
+    const forBlog = { ...custom, set: 'feature_page' as const, setFor: 'blog_post' as const };
+    expect(rulesForPageType(forBlog, 'guide')).toEqual({ ...custom, set: null });
+    // Picked for this very type: the page keeps its type, the set stays.
+    expect(rulesForPageType(forBlog, 'blog_post')).toBeNull();
+    // No set pinned: nothing to save.
+    expect(rulesForPageType({ ...custom, set: null }, 'guide')).toBeNull();
+    // A value the new type's set also has keeps it.
+    const next = rulesForPageType({ ...custom, set: 'product_page' }, 'blog_post')!;
+    const kept = activeRules(ruleSet(ruleSetType(next, 'blog_post')), next);
+    expect(kept.find((r) => r.key === 'sentence')?.on).toBe(false);
+  });
+
+  it('sets apart another type’s rules and a product page with no specs, never counted (H)', () => {
+    const on = (key: string, html: string, pageType: RuleContext['pageType']) =>
+      checkRule(rule(key, 'product_page'), page(html), { ...ctx, pageType });
+    const table = '<table><tr><td>Weight</td><td>1.2 kg</td></tr></table>';
+    expect(on('specsTable', table, 'blog_post')).toEqual({ state: 'info', code: 'otherType' });
+    expect(on('feedMatch', '<p>x</p>', null)).toEqual({ state: 'info', code: 'otherType' });
+    expect(on('specsTable', table, 'product_page')).toEqual({ state: 'ok' });
+    expect(on('specsTable', '<p>A daypack.</p>', 'product_page')).toEqual({
+      state: 'info',
+      code: 'needsSpecs',
+    });
+    // Specs the page gives, not yet in a table: the agent sets them out.
+    const specs = '<ul><li>Weight: 1.2 kg</li><li>Volume: 28 l</li></ul>';
+    expect(on('specsTable', specs, 'product_page')).toEqual({ state: 'bad', code: 'missing' });
+    const codes = ['otherType', 'needsSpecs', 'needsFeed', 'noSizes', 'aiCheck', 'feedReading'];
+    expect(codes.map((code) => notCheckedHere({ state: 'info', code } as RuleStatus))).toEqual([
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+    ]);
+    expect(notCheckedHere({ state: 'bad', code: 'missing' })).toBe(false);
+  });
+});
+
 describe('rewriteAdvice', () => {
   const statuses = (
     length: number | null,
@@ -1057,6 +1276,7 @@ describe('rewriteAdvice', () => {
     expect(lengthOutOfReach(page, floor)).toEqual({
       count: 6_877,
       target: 4_000,
+      max: 4_800,
       kept: 3_799,
       why: 'floor',
       least: 5_100,
@@ -1128,7 +1348,9 @@ describe('rewriteAdvice', () => {
       suggested: 6_500,
     });
     // Never a Length past the page as it is.
-    expect(lengthOutOfReach(statuses(4_900, [], '4000'), run)?.suggested).toBe(5_000);
+    expect(lengthOutOfReach(statuses(4_900, [], '4000'), { ...run, floor: 5_100 })?.suggested).toBe(
+      5_000,
+    );
     // Rewritten with its cited passages too (it kept less): still missing says keeping them misses too…
     const citedToo = { ...run, last: { chars: 5_200, target: 4_000, kept: 0 } };
     expect(lengthOutOfReach(page, citedToo)).toMatchObject({ why: 'reached', least: 5_200 });
@@ -1140,6 +1362,23 @@ describe('rewriteAdvice', () => {
         last: { ...citedToo.last, chars: 4_500 },
       }),
     ).toMatchObject({ why: 'floor', least: 5_000 });
+  });
+
+  it('rewrites again from a page that took the last rewrite, missed or not (editor test 2026-11-03)', () => {
+    // A rewrite for 4,000 came to 5,468 and was accepted: the page is that long now.
+    const run = { kept: 3_125, floor: 4_300, last: { chars: 5_468, target: 4_000, kept: 3_125 } };
+    expect(lengthOutOfReach(statuses(5_468, [], '4000'), run)).toBeNull();
+    // A little edited since, or shorter: still rewritten from there.
+    expect(lengthOutOfReach(statuses(5_600, [], '4000'), run)).toBeNull();
+    expect(lengthOutOfReach(statuses(5_000, [], '4000'), run)).toBeNull();
+    // 30% off or more: a rewrite is recommended again.
+    expect(rewriteAdvice(statuses(5_468, [], '4000'), run)).toMatchObject({ reason: 'length' });
+    // From a page still well past what it came to (it was rejected): another won't get further.
+    expect(lengthOutOfReach(statuses(5_800, [], '4000'), run)).toMatchObject({ why: 'reached' });
+    // The estimate still holds a page whose kept blocks and headings are past the Length.
+    expect(lengthOutOfReach(statuses(5_468, [], '4000'), { ...run, floor: 5_100 })).toMatchObject({
+      why: 'floor',
+    });
   });
 
   it('names what a rewrite keeps as why it missed only when that alone puts the Length out of reach', () => {

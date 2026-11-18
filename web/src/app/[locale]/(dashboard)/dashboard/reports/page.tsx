@@ -1,14 +1,18 @@
 'use client';
 
 import { useState, useEffect, useCallback } from 'react';
-import { useRouter } from '@/i18n/navigation';
+import { Link, useRouter } from '@/i18n/navigation';
 import { useTranslations } from 'next-intl';
 import { toast } from 'sonner';
 import { useBrandStore } from '@/stores/use-brand-store';
 import { useUpgradeGate } from '@/components/providers/upgrade-gate';
+import { useFeatureGate } from '@/hooks/use-feature-gate';
 import { createReport, getReports, deleteReport, type ReportListItem } from '@/lib/actions/reports';
+import { useChatPageContext } from '@/components/chat/panel/chat-panel-context';
+import { viewRows } from '@/lib/chat/page-view';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Button } from '@/components/ui/button';
+import { Button, buttonVariants } from '@/components/ui/button';
+import { useChatAgentic } from '@/components/providers/chat-agentic-provider';
 import { Input } from '@/components/ui/input';
 import {
   Dialog,
@@ -27,7 +31,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import { Check, FileBarChart, Loader2, Plus, Trash2 } from 'lucide-react';
+import { Check, Crown, FileBarChart, Loader2, Plus, Trash2 } from 'lucide-react';
 import { formatDate } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import {
@@ -66,6 +70,7 @@ function getDateRange(preset: DatePreset, custom: { from: string; to: string }) 
 
 export default function ReportsPage() {
   const t = useTranslations('reports');
+  const chatAgentic = useChatAgentic();
   const tc = useTranslations('common');
   // A read-only workspace (plan not active): Generate report and Delete open
   // the upgrade dialog instead; reading and downloading reports stay open.
@@ -99,6 +104,10 @@ export default function ReportsPage() {
   const pickableSections = ALL_REPORT_SECTIONS.filter(
     (s) => s !== 'shoppingVisibility' || reportBrand?.shoppingModeEnabled,
   );
+  // HubSpot's AI-sourced pipeline (#2140) comes with the plan's
+  // crm_integrations: below it, shown off with the plan it needs.
+  const { canUse, requiredPlanFor } = useFeatureGate();
+  const lockedSection = (s: ReportSection) => s === 'aiPipeline' && !canUse('crm_integrations');
 
   const selectTemplate = (id: ReportTemplateId) => {
     setTemplate(id);
@@ -145,6 +154,25 @@ export default function ReportsPage() {
     load();
   }, [load]);
 
+  // Chat's side panel sees the page (the owner's plan of 2026-11-16, step 9): once read, the
+  // saved reports listed by id, each with its title and the days it covers, and how many.
+  useChatPageContext(
+    activeBrandId
+      ? {
+          pageName: t('title'),
+          view: loading
+            ? {}
+            : {
+                rows: viewRows(reports, (report) => ({
+                  ref: report.id,
+                  label: `${report.title} (${report.dateFrom.slice(0, 10)} – ${report.dateTo.slice(0, 10)})`,
+                })),
+                total: reports.length,
+              },
+        }
+      : null,
+  );
+
   const handleGenerate = async () => {
     const targetBrandId = reportBrandId ?? activeBrandId;
     if (!targetBrandId) return;
@@ -164,7 +192,7 @@ export default function ReportsPage() {
         dateTo,
         title: reportTitle || undefined,
         template,
-        sections: pickableSections.filter((s) => sections.has(s)),
+        sections: pickableSections.filter((s) => sections.has(s) && !lockedSection(s)),
       });
       toast.success(t('generated'));
       setDialogOpen(false);
@@ -194,15 +222,27 @@ export default function ReportsPage() {
   return (
     <div className="space-y-6">
       <HeaderWithAiUsage>
-        <div className="flex items-center justify-between">
+        <div className="flex items-start justify-between gap-4">
           <div>
             <h1 className="text-2xl font-bold tracking-tight">{t('title')}</h1>
             <p className="text-muted-foreground">{t('description')}</p>
           </div>
-          <Button className="gap-2" onClick={openDialog} disabled={!activeBrandId}>
-            <Plus className="h-4 w-4" />
-            {t('generateReport')}
-          </Button>
+          <div className="flex items-center gap-2">
+            {/* What Ansvisor did for you (CHAT-22 §2 item 5): kept only with the new Chat on. */}
+            {chatAgentic && (
+              <Link
+                href="/dashboard/reports/impact"
+                data-action="reports.openImpact"
+                className={buttonVariants({ variant: 'outline' })}
+              >
+                {t('impactLink')}
+              </Link>
+            )}
+            <Button className="gap-2" onClick={openDialog} disabled={!activeBrandId}>
+              <Plus className="h-4 w-4" />
+              {t('generateReport')}
+            </Button>
+          </div>
         </div>
       </HeaderWithAiUsage>
 
@@ -393,13 +433,14 @@ export default function ReportsPage() {
               <p className="text-sm font-medium">{t('sectionsLabel')}</p>
               <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3">
                 {pickableSections.map((s) => {
-                  const on = sections.has(s);
+                  const locked = lockedSection(s);
+                  const on = sections.has(s) && !locked;
                   return (
                     <button
                       key={s}
                       type="button"
                       onClick={() => toggleSection(s)}
-                      disabled={generating}
+                      disabled={generating || locked}
                       className={cn(
                         'flex items-center gap-2 rounded-md border px-2.5 py-1.5 text-left text-xs transition-colors',
                         on
@@ -418,6 +459,12 @@ export default function ReportsPage() {
                         {on && <Check className="h-2.5 w-2.5" />}
                       </span>
                       {t(`sections.${s}`)}
+                      {locked && (
+                        <span className="ml-auto inline-flex items-center gap-0.5 rounded border px-1 text-[10px] font-medium">
+                          <Crown aria-hidden className="h-2.5 w-2.5" />
+                          {requiredPlanFor('crm_integrations')}
+                        </span>
+                      )}
                     </button>
                   );
                 })}

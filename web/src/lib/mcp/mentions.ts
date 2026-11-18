@@ -1,5 +1,7 @@
 import { supabaseAdmin } from '@/lib/supabase/admin';
 import type { McpAuthContext } from '@/lib/mcp-auth';
+import { competitorTypesFor, mayUseBrand } from './data';
+import { competitorTypeLabel, matchesCompetitorType } from '@/lib/competitor-types';
 import { expandDateToEndOfDay } from '@/lib/dates';
 import { mentionExcerpt } from '@/lib/mention-match';
 import {
@@ -102,7 +104,11 @@ interface OwnedBrand {
   terms: string[];
 }
 
-/** The brand, when it belongs to the key's organization; null otherwise. */
+/**
+ * The brand, when it belongs to the key's organization and its owner may use
+ * it; null otherwise. The Mentions functions (00434) run with the service
+ * role here, which they don't check, so every read asks this first.
+ */
 async function ownedBrand(auth: McpAuthContext, brandId: string): Promise<OwnedBrand | null> {
   if (!auth.organizationId) return null;
   const { data } = await supabaseAdmin
@@ -111,7 +117,7 @@ async function ownedBrand(auth: McpAuthContext, brandId: string): Promise<OwnedB
     .eq('id', brandId)
     .eq('organization_id', auth.organizationId)
     .maybeSingle();
-  if (!data) return null;
+  if (!data || !(await mayUseBrand(auth, data.id))) return null;
   const row = data as { id: string; name: string; brand_domains?: { domain?: string }[] };
   return {
     id: row.id,
@@ -323,21 +329,25 @@ export interface MentionCompetitors {
     previousMentions: number;
     /** Against the window before, in percent; null with none before. */
     mentionsChangePct: number | null;
+    /** Its type as the Competitors page names it (00542); null for none. */
+    type: string | null;
   }>;
 }
 
 /**
  * The Overview's competitor framing (get_mention_competitors): how often AI
  * names each competitor in the brand's tracked responses, and how often in the
- * same response as the brand.
+ * same response as the brand. With `type`, only competitors of that type
+ * (matchesCompetitorType).
  */
 export async function getMentionCompetitorsFor(
   auth: McpAuthContext,
   params: MentionsFilterParams,
+  opts: { type?: string } = {},
 ): Promise<MentionCompetitors | null> {
   const brand = await ownedBrand(auth, params.brandId);
   if (!brand) return null;
-  const o = await readOverview(params);
+  const [o, types] = await Promise.all([readOverview(params), competitorTypesFor(auth, brand.id)]);
   if (!o) return null;
   const answers = o.current.answers;
   const share = (n: number) => round1(answers > 0 ? (n * 100) / answers : null);
@@ -349,7 +359,8 @@ export async function getMentionCompetitorsFor(
       shareOfResponses: share(o.current.mentions),
     },
     trackedResponses: answers,
-    competitors: [...o.competitors]
+    competitors: o.competitors
+      .filter((c) => matchesCompetitorType(types.get(c.competitorId), opts.type))
       .sort((a, b) => b.mentions - a.mentions)
       .map((c) => ({
         competitorId: c.competitorId,
@@ -359,6 +370,7 @@ export async function getMentionCompetitorsFor(
         sameResponseAsYou: c.coMentions,
         previousMentions: c.previousMentions,
         mentionsChangePct: whole(relativeChange(c.mentions, c.previousMentions)),
+        type: competitorTypeLabel(types.get(c.competitorId)),
       })),
   };
 }
@@ -370,6 +382,12 @@ export interface MentionListParams extends MentionsFilterParams {
   sort?: MentionSort;
   /** 1-based, 100 rows a page. */
   page?: number;
+  /**
+   * Chat's pages: answers before this page and how many it holds (at most
+   * MENTIONS_PAGE_SIZE), in place of `page`.
+   */
+  offset?: number;
+  limit?: number;
 }
 
 export interface MentionListItem {
@@ -439,13 +457,21 @@ export async function listMentionsFor(
   const brand = await ownedBrand(auth, params.brandId);
   if (!brand) return null;
   const page = Math.max(1, Math.floor(params.page ?? 1));
+  const pageSize = Math.min(
+    Math.max(Math.floor(params.limit ?? MENTIONS_PAGE_SIZE), 1),
+    MENTIONS_PAGE_SIZE,
+  );
+  const offset =
+    params.offset === undefined
+      ? (page - 1) * MENTIONS_PAGE_SIZE
+      : Math.max(0, Math.floor(params.offset));
   const { data, error } = await supabaseAdmin.rpc('mentions_list', {
     ...filterArgs(params),
     p_sentiment: params.sentiment,
     p_competitor_id: params.competitorId || undefined,
     p_sort: params.sort ?? 'newest',
-    p_limit: MENTIONS_PAGE_SIZE,
-    p_offset: (page - 1) * MENTIONS_PAGE_SIZE,
+    p_limit: pageSize,
+    p_offset: offset,
   });
   if (error) throw new Error(error.message);
   const list = parseMentionsList(data, (response) => mentionExcerpt(response, brand.terms));
@@ -454,7 +480,7 @@ export async function listMentionsFor(
     total: list.total,
     prompts: list.prompts,
     page,
-    pageSize: MENTIONS_PAGE_SIZE,
+    pageSize,
     mentions: list.rows.map(listItem),
   };
 }
@@ -570,6 +596,7 @@ export async function getMentionFor(
   if (answer.error) throw new Error(answer.error.message);
   const row = answer.data as unknown as ResultRow | null;
   if (!row || row.brands?.organization_id !== auth.organizationId) return null;
+  if (!(await mayUseBrand(auth, row.brand_id))) return null;
 
   return {
     id: row.id,
@@ -684,16 +711,18 @@ export async function overrideMentionSentimentFor(
   sentiment: MentionSentiment,
   note?: string,
 ): Promise<MentionOverrideResult> {
-  // An answer of another organization reads as missing, not as forbidden.
+  // An answer of another organization, or of a brand the owner may not use, reads as missing.
   if (!auth.organizationId) return { error: 'missing', message: 'Answer not found' };
   const { data: owned, error: ownedError } = await supabaseAdmin
     .from('prompt_results')
-    .select('id, brands!inner(organization_id)')
+    .select('id, brand_id, brands!inner(organization_id)')
     .eq('id', resultId)
     .eq('brands.organization_id', auth.organizationId)
     .maybeSingle();
   if (ownedError) throw new Error(ownedError.message);
-  if (!owned) return { error: 'missing', message: 'Answer not found' };
+  if (!owned || !(await mayUseBrand(auth, owned.brand_id))) {
+    return { error: 'missing', message: 'Answer not found' };
+  }
 
   const { data, error } = await supabaseAdmin.rpc('override_mention_sentiment', {
     p_result_id: resultId,

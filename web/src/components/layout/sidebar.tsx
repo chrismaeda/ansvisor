@@ -6,40 +6,53 @@ import { useEffect, useRef, useState } from 'react';
 import { useTranslations } from 'next-intl';
 import { useSearchParams } from 'next/navigation';
 import { usePathname, Link } from '@/i18n/navigation';
-import { getTrackedPromptCount } from '@/lib/actions/prompt';
 import { carriedParams, PROMPTS_BASE } from '@/lib/prompts-routes';
-import { dashboardNav } from '@/config/dashboard';
+import { dashboardNav, type NavGroup } from '@/config/dashboard';
+import { saveChatRailOpen } from '@/lib/actions/chat-prefs';
 import {
   activeChildHref,
+  CHAT_AGENTIC_HREF,
   childLinkHref,
+  dashboardNavBadge,
   getDashboardNavLabel,
   getDashboardNavGroupLabel,
+  isNavItemActive,
+  navItemHref,
   shouldShowDashboardNavItem,
+  visibleNavChildren,
 } from '@/lib/dashboard-navigation';
+import { brandVisibilityTabOf, isEcommerceBrand } from '@/lib/brand-visibility';
+import { BrandVisibilityTabLink } from '@/components/brand-visibility/tabs';
+import { useChatAgentic } from '@/components/providers/chat-agentic-provider';
+import { useAdsEnabled } from '@/components/providers/ads-provider';
 import { useSidebarStore } from '@/stores/use-sidebar-store';
+import { useChatRailStore } from '@/stores/use-chat-rail-store';
 import { useBrandStore } from '@/stores/use-brand-store';
 import { useFeatureGate } from '@/hooks/use-feature-gate';
 import { useAgentKeyStatus } from '@/hooks/use-agent-key-status';
 import { siteConfig } from '@/config/site';
 import { cn } from '@/lib/utils';
-import { formatNumber } from '@/lib/format';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Separator } from '@/components/ui/separator';
 import { BrandSwitcher } from '@/components/layout/brand-switcher';
 import { UserProfileNavItem } from '@/components/layout/user-profile-nav-item';
+import { NavIcon } from '@/components/layout/nav-icon';
 import { ThemeToggle } from '@/components/layout/theme-toggle';
+import { NewPill } from '@/components/agentic/new-pill';
 import { useHiddenMenuSections } from '@/components/providers/menu-access-provider';
+import { menuSectionOf } from '@/lib/menu-access';
+import { NEW_RESULTS_ITEM } from '@/lib/menu-dots';
 import {
-  ChevronDown,
-  ChevronsLeft,
-  ChevronsRight,
-  Crown,
-  ExternalLink,
-  Lock,
-  MessageSquareHeart,
-} from 'lucide-react';
+  FoldedGroupLabel,
+  ICON_DOT,
+  MenuDot,
+  NewResultsWords,
+  useDotLabel,
+  useMenuDots,
+} from '@/components/layout/menu-dots';
+import { ChevronDown, ChevronsLeft, ChevronsRight, Crown, Lock } from 'lucide-react';
 
 /** How long the pointer rests on the collapsed sidebar before it opens. */
 const PEEK_DELAY_MS = 150;
@@ -64,19 +77,32 @@ const NAV_VIEWPORT =
 const NAV_SCROLLBAR =
   'data-vertical:w-2 opacity-0 transition-opacity duration-300 data-hovering:opacity-100 data-scrolling:opacity-100 data-scrolling:duration-75 [&>[data-slot=scroll-area-thumb]]:bg-muted-foreground/25 [&>[data-slot=scroll-area-thumb]:hover]:bg-muted-foreground/45';
 
-/** The items that open a submenu (Prompts, Content). */
-const EXPANDABLE_HREFS = dashboardNav.flatMap((group) =>
-  group.items.filter((item) => item.children?.length).map((item) => item.href),
-);
+/** A menu's items that open a submenu (the Action Center, Prompts, Brand Visibility, Content). */
+function expandableItemsOf(nav: NavGroup[]) {
+  return nav.flatMap((group) => group.items.filter((item) => item.children?.length));
+}
+const EXPANDABLE_HREFS = expandableItemsOf(dashboardNav).map((item) => item.href);
 
 /**
  * Where a submenu's open/closed state is remembered, per item: Prompts keeps
  * its key from PROMPT-001 (ansvisor.sidebar.promptsOpen), Content gets
- * ansvisor.sidebar.contentOpen.
+ * ansvisor.sidebar.contentOpen, the Action Center
+ * ansvisor.sidebar.action-centerOpen.
  */
 function submenuKey(href: string) {
   return `ansvisor.sidebar.${href.split('/').pop()}Open`;
 }
+
+/**
+ * Where a titled group's open/closed state is remembered:
+ * ansvisor.sidebar.group.analyticsOpen, ansvisor.sidebar.group.executionOpen.
+ */
+function groupKey(title: string) {
+  return `ansvisor.sidebar.group.${title.toLowerCase()}Open`;
+}
+
+/** The titled groups (Analytics, Execution), which fold under their title. */
+const GROUP_TITLES = dashboardNav.flatMap((group) => (group.title ? [group.title] : []));
 
 /**
  * Arrow keys in the sidebar's links (PROMPT-001): up and down move between
@@ -120,7 +146,17 @@ function handleNavKeys(
 
 export function Sidebar() {
   const pathname = usePathname();
-  const { isCollapsed, toggleCollapse } = useSidebarStore();
+  const { isCollapsed: pinnedClosed, toggleCollapse } = useSidebarStore();
+  // On Chat's screens (the new Chat on) the sidebar is the rail unless the
+  // person expanded it with the logo, a choice kept on them for every device
+  // (CHAT-01 item 4f); elsewhere it keeps its own pinned state.
+  const chatAgentic = useChatAgentic();
+  const nav = dashboardNav;
+  const onChat =
+    chatAgentic && (pathname === CHAT_AGENTIC_HREF || pathname.startsWith(`${CHAT_AGENTIC_HREF}/`));
+  const railOpen = useChatRailStore((s) => s.open);
+  const setRailOpen = useChatRailStore((s) => s.setOpen);
+  const isCollapsed = onChat ? !railOpen : pinnedClosed;
   // A collapsed sidebar opens over the page while the pointer is on it
   // ("peeking") and while its brand menu is open, and closes again after.
   const [peeking, setPeeking] = useState(false);
@@ -135,34 +171,50 @@ export function Sidebar() {
   // always visible in it.
   const [openMenus, setOpenMenus] = useState<Record<string, boolean>>({});
   const isSubmenuOpen = (href: string) => openMenus[href] ?? true;
-  const underMenu = EXPANDABLE_HREFS.find((href) => pathname.startsWith(href)) ?? null;
-  const [trackedCount, setTrackedCount] = useState<number | null>(null);
-  const activeBrandId = useBrandStore((s) => s.activeBrandId);
+  // Brand Visibility's tabs keep their own routes (Mentions, Citations), so
+  // an item is under the page shown when one of its entries is.
+  const underMenu =
+    expandableItemsOf(nav).find((item) => isNavItemActive(item, pathname))?.href ?? null;
+  // Each titled group (Analytics, Execution) folds under its title the same
+  // way: remembered per browser, open until closed, and open whenever one of
+  // its pages is showing.
+  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
+  const isGroupOpen = (title: string) => openGroups[title] ?? true;
+  const underGroup =
+    nav.find((group) => group.title && group.items.some((item) => isNavItemActive(item, pathname)))
+      ?.title ?? null;
   const t = useTranslations('nav');
   const { canUse, requiredPlanFor, isCloud } = useFeatureGate();
   // Probe once per session whether the org has a provider key for Chat.
-  // Returns 'configured' immediately on self-host (no network call).
-  const agentKeyStatus = useAgentKeyStatus(isCloud);
-  const agentKeyMissing = isCloud && agentKeyStatus === 'missing';
+  // Returns 'configured' immediately on self-host and with the new Chat on
+  // (no network call): that one runs on the plan's AI limit.
+  const agentKeyStatus = useAgentKeyStatus(isCloud && !chatAgentic);
+  const agentKeyMissing = isCloud && !chatAgentic && agentKeyStatus === 'missing';
+  const chatSetUp = agentKeyMissing ? t('chatSetUp') : null;
   // Brand-scoped gates follow the active brand, not the org. Selecting the
   // derived brand keeps this reactive: switching brands via BrandSwitcher or
   // toggling the flag in Brand Settings flips the gate without a route change.
   const activeBrand = useBrandStore((s) => s.brands.find((b) => b.id === s.activeBrandId) ?? null);
-  // Map from a NavItem.requiresBrandPref key to the active brand's value.
-  // Sidebar hides the item entirely when this returns false — see #155/#170
-  // for why Shopping uses this on top of the existing plan-feature gate.
-  const brandPrefs = { shoppingModeEnabled: !!activeBrand?.shoppingModeEnabled };
+  // Map from a requiresBrandPref key to the active brand's value. The
+  // sidebar hides the entry entirely when it is false — Visibility's
+  // Products shows for brands that sell online (#155/#170, 2026-11-06).
+  const brandPrefs = { ecommerce: isEcommerceBrand(activeBrand) };
+  const childGates = { brandPrefs, canUse, chatAgentic };
   // The items the viewer sees, and the groups that keep one: a group whose
-  // sections are all off their menu goes, title and all.
+  // sections are all off their menu goes, title and all. Ads only with Ads on.
   const hiddenSections = useHiddenMenuSections();
-  const visibleNav = dashboardNav
+  const ads = useAdsEnabled();
+  const visibleNav = nav
     .map((group) => ({
       ...group,
       items: group.items.filter((item) =>
-        shouldShowDashboardNavItem(item, brandPrefs, hiddenSections),
+        shouldShowDashboardNavItem(item, brandPrefs, hiddenSections, chatAgentic, canUse, ads),
       ),
     }))
     .filter((group) => group.items.length > 0);
+  // The menu's dots and the Action Center's count.
+  const dots = useMenuDots(nav, compact);
+  const dotLabel = useDotLabel();
   const { resolvedTheme } = useTheme();
   const [mounted, setMounted] = useState(false);
   // Hydration guard: SSR can't know the resolved theme, so we render the
@@ -206,6 +258,16 @@ export function Sidebar() {
     }
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setOpenMenus((prev) => ({ ...stored, ...prev }));
+    const storedGroups: Record<string, boolean> = {};
+    for (const title of GROUP_TITLES) {
+      try {
+        const value = localStorage.getItem(groupKey(title));
+        if (value !== null) storedGroups[title] = value === '1';
+      } catch {
+        // Storage can be unavailable (private mode); the default stands.
+      }
+    }
+    setOpenGroups((prev) => ({ ...storedGroups, ...prev }));
   }, []);
 
   useEffect(() => {
@@ -213,25 +275,24 @@ export function Sidebar() {
     if (underMenu) setOpenMenus((prev) => ({ ...prev, [underMenu]: true }));
   }, [underMenu]);
 
-  // The count beside Tracked Prompts, refreshed on brand switch and on every
-  // page change so adding or deleting prompts shows up. Not read while
-  // Prompts is off the viewer's menu.
-  const promptsOnMenu = !hiddenSections.has('prompts');
   useEffect(() => {
-    if (!activeBrandId || !promptsOnMenu) return;
-    let cancelled = false;
-    getTrackedPromptCount(activeBrandId)
-      .then((n) => !cancelled && setTrackedCount(n))
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, [activeBrandId, pathname, promptsOnMenu]);
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (underGroup) setOpenGroups((prev) => ({ ...prev, [underGroup]: true }));
+  }, [underGroup]);
 
   const setSubmenuOpen = (href: string, open: boolean) => {
     setOpenMenus((prev) => ({ ...prev, [href]: open }));
     try {
       localStorage.setItem(submenuKey(href), open ? '1' : '0');
+    } catch {
+      // Not remembered this time; nothing else depends on it.
+    }
+  };
+
+  const setGroupOpen = (title: string, open: boolean) => {
+    setOpenGroups((prev) => ({ ...prev, [title]: open }));
+    try {
+      localStorage.setItem(groupKey(title), open ? '1' : '0');
     } catch {
       // Not remembered this time; nothing else depends on it.
     }
@@ -275,7 +336,12 @@ export function Sidebar() {
     // Collapsing takes effect at once, even with the pointer still on it.
     clearTimeout(peekTimer.current);
     setPeeking(false);
-    toggleCollapse();
+    if (onChat) {
+      setRailOpen(!railOpen);
+      void saveChatRailOpen(!railOpen);
+    } else {
+      toggleCollapse();
+    }
   }
 
   return (
@@ -297,6 +363,8 @@ export function Sidebar() {
           if (!asideRef.current?.contains(e.relatedTarget as Node | null)) setPeeking(false);
         }}
         onKeyDown={(e) => handleNavKeys(e, setSubmenuOpen)}
+        // Icons alone: an icon's motion waits until the menu has opened (globals.css).
+        data-icons-only={compact || undefined}
         className={cn(
           'absolute inset-y-0 left-0 z-40 flex flex-col border-r bg-sidebar transition-[width] duration-200',
           compact ? 'w-16' : 'w-60',
@@ -309,20 +377,49 @@ export function Sidebar() {
             compact && 'justify-center px-0',
           )}
         >
-          <Link
-            href="/dashboard"
-            className={cn('flex items-center gap-2 overflow-hidden', !compact && 'min-w-0 flex-1')}
-          >
-            <Image
-              src={logoSrc}
-              alt={siteConfig.name}
-              width={24}
-              height={24}
-              className="h-6 w-6 shrink-0"
-              priority
-            />
-            {!compact && <span className="truncate font-semibold">{siteConfig.name}</span>}
-          </Link>
+          {onChat ? (
+            // On Chat's screens the logo expands the rail, and collapses it again (CHAT-23 rail.toggle).
+            <button
+              type="button"
+              data-action="rail.toggle"
+              onClick={handleToggleCollapse}
+              aria-expanded={!isCollapsed}
+              aria-label={isCollapsed ? t('expandRail') : t('collapseRail')}
+              title={t('railTip')}
+              className={cn(
+                'flex items-center gap-2 overflow-hidden rounded-md outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50',
+                !compact && 'min-w-0 flex-1',
+              )}
+            >
+              <Image
+                src={logoSrc}
+                alt=""
+                width={24}
+                height={24}
+                className="h-6 w-6 shrink-0"
+                priority
+              />
+              {!compact && <span className="truncate font-semibold">{siteConfig.name}</span>}
+            </button>
+          ) : (
+            <Link
+              href="/dashboard"
+              className={cn(
+                'flex items-center gap-2 overflow-hidden',
+                !compact && 'min-w-0 flex-1',
+              )}
+            >
+              <Image
+                src={logoSrc}
+                alt={siteConfig.name}
+                width={24}
+                height={24}
+                className="h-6 w-6 shrink-0"
+                priority
+              />
+              {!compact && <span className="truncate font-semibold">{siteConfig.name}</span>}
+            </Link>
+          )}
           {/* Too narrow beside the logo when collapsed; it shows while the
               sidebar is open over the page. */}
           {!compact && <ThemeToggle className="shrink-0" />}
@@ -349,10 +446,31 @@ export function Sidebar() {
         >
           {visibleNav.map((group, i) => (
             <div key={i} className="mb-4">
+              {/* A titled group folds under its title, the chevron on the
+                right. Icons alone (compact) have no titles to fold, so they
+                show every item. */}
               {group.title && !compact && (
-                <p className="mb-1 px-2 text-xs font-medium uppercase tracking-wider text-muted-foreground">
-                  {getDashboardNavGroupLabel(group.title, t)}
-                </p>
+                <button
+                  type="button"
+                  aria-expanded={isGroupOpen(group.title)}
+                  aria-controls={isGroupOpen(group.title) ? `nav-group-${i}` : undefined}
+                  data-nav-group={group.title}
+                  onClick={() => setGroupOpen(group.title!, !isGroupOpen(group.title!))}
+                  className="mb-1 flex w-full items-center justify-between rounded-md px-2 text-xs font-medium uppercase tracking-wider text-muted-foreground outline-none hover:text-foreground focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                >
+                  {/* Folded, its items' dot beside it. */}
+                  <FoldedGroupLabel
+                    label={getDashboardNavGroupLabel(group.title, t)}
+                    dot={isGroupOpen(group.title) ? null : dots.groupDot(group)}
+                  />
+                  <ChevronDown
+                    aria-hidden
+                    className={cn(
+                      'h-3.5 w-3.5 shrink-0 transition-transform',
+                      !isGroupOpen(group.title) && '-rotate-90',
+                    )}
+                  />
+                </button>
               )}
               {/* A group with no title has no header to set it apart, so it
                 carries a rule instead — without one its items read as the tail
@@ -360,184 +478,245 @@ export function Sidebar() {
                 precedes it. */}
               {!group.title && i > 0 && <Separator className="mb-2" />}
               {group.title && compact && i > 0 && <Separator className="my-2" />}
-              <nav className="space-y-0.5">
-                {group.items.map((item) => {
-                  const isActive =
-                    item.href === '/dashboard'
-                      ? pathname === '/dashboard'
-                      : pathname.startsWith(item.href);
-                  const label = getDashboardNavLabel(item.title, t);
+              {(!group.title || compact || isGroupOpen(group.title)) && (
+                <nav id={`nav-group-${i}`} className="space-y-0.5">
+                  {group.items.map((item) => {
+                    const href = navItemHref(item, chatAgentic);
+                    const isActive = isNavItemActive(item, pathname, href);
+                    const label = getDashboardNavLabel(item.title, t);
+                    // The entries this person's menu shows (menu access).
+                    const children = visibleNavChildren(item, hiddenSections, childGates);
 
-                  // Dynamic badge override: show "Set up" on the Agent item
-                  // when the org has no provider key for Chat (cloud only).
-                  const effectiveBadge =
-                    item.href === '/dashboard/agent' && agentKeyMissing ? 'Set up' : item.badge;
+                    // Chat's own badge: "Set up" when the org has no provider key for
+                    // it (cloud only, never with the new Chat on).
+                    const effectiveBadge = dashboardNavBadge(item, { chatAgentic, chatSetUp });
 
-                  const isLocked =
-                    isCloud && item.requiredFeature != null && !canUse(item.requiredFeature);
+                    const isLocked =
+                      isCloud && item.requiredFeature != null && !canUse(item.requiredFeature);
+                    // Its dot (a locked item has none): its own, or its submenu's strongest.
+                    const dot = dots.itemDot(item);
 
-                  if (isLocked) {
-                    return (
-                      <span
-                        key={item.href}
-                        className={cn(
-                          'flex cursor-not-allowed items-center gap-3 rounded-md px-2 py-1.5 text-[13px] font-medium text-muted-foreground/50',
-                          compact && 'justify-center',
-                        )}
-                        title={
-                          compact
-                            ? `${label} (${requiredPlanFor(item.requiredFeature!)})`
-                            : undefined
-                        }
-                      >
-                        <item.icon className="h-4 w-4 shrink-0" />
-                        {!compact && (
-                          <>
-                            <span className="flex-1 truncate">{label}</span>
-                            <Badge
-                              variant="outline"
-                              className="ml-auto h-5 shrink-0 gap-0.5 px-1.5 text-[10px] font-normal"
-                            >
-                              <Crown className="h-2.5 w-2.5" />
-                              {requiredPlanFor(item.requiredFeature!)}
-                            </Badge>
-                          </>
-                        )}
-                        {compact && (
-                          <Lock className="absolute right-1 top-1 h-2.5 w-2.5 text-muted-foreground/40" />
-                        )}
-                      </span>
-                    );
-                  }
-
-                  if (item.children?.length && !compact) {
-                    // Expandable item (PROMPT-001): the row toggles the
-                    // submenu, whose links are the item's views.
-                    const carry =
-                      underPrompts && item.href === PROMPTS_BASE
-                        ? carriedParams(searchParams.toString())
-                        : '';
-                    const submenuId = `submenu-${item.href.replace(/\W+/g, '-')}`;
-                    const submenuOpen = isSubmenuOpen(item.href);
-                    const currentChild = activeChildHref(item.children, pathname);
-                    return (
-                      <div key={item.href}>
-                        <button
-                          type="button"
-                          data-nav-item="parent"
-                          data-submenu={item.href}
-                          aria-expanded={submenuOpen}
-                          aria-controls={submenuId}
-                          onClick={() => setSubmenuOpen(item.href, !submenuOpen)}
+                    if (isLocked) {
+                      return (
+                        <span
+                          key={item.href}
                           className={cn(
-                            'flex w-full items-center gap-3 rounded-md px-2 py-1.5 text-left text-[13px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
-                            isActive
-                              ? 'text-primary'
-                              : 'text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
+                            'flex cursor-not-allowed items-center gap-3 rounded-md px-2 py-1.5 text-[13px] font-medium text-muted-foreground/50',
+                            compact && 'justify-center',
                           )}
+                          title={
+                            compact
+                              ? `${label} (${requiredPlanFor(item.requiredFeature!)})`
+                              : undefined
+                          }
                         >
                           <item.icon className="h-4 w-4 shrink-0" />
-                          <span className="flex-1 truncate">{label}</span>
-                          {effectiveBadge && (
-                            <Badge
-                              variant="secondary"
-                              className="h-5 shrink-0 px-1.5 text-[10px] font-normal"
-                            >
-                              {effectiveBadge}
-                            </Badge>
+                          {!compact && (
+                            <>
+                              <span className="flex-1 truncate">{label}</span>
+                              <Badge
+                                variant="outline"
+                                className="ml-auto h-5 shrink-0 gap-0.5 px-1.5 text-[10px] font-normal"
+                              >
+                                <Crown className="h-2.5 w-2.5" />
+                                {requiredPlanFor(item.requiredFeature!)}
+                              </Badge>
+                            </>
                           )}
-                          <ChevronDown
-                            className={cn(
-                              'h-3.5 w-3.5 shrink-0 transition-transform',
-                              !submenuOpen && '-rotate-90',
-                            )}
-                          />
-                        </button>
-                        {submenuOpen && (
-                          <ul id={submenuId} className="mt-0.5 ml-[18px] space-y-0.5 border-l pl-2">
-                            {item.children.map((child) => {
-                              const childActive = child.href === currentChild;
-                              return (
-                                <li key={child.href}>
-                                  <Link
-                                    href={`${childLinkHref(child, pathname)}${carry}`}
-                                    data-nav-item="child"
-                                    aria-current={childActive ? 'page' : undefined}
-                                    className={cn(
-                                      'flex items-center gap-2 rounded-md px-2 py-1 text-[13px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
-                                      childActive
-                                        ? 'bg-primary/10 font-medium text-primary'
-                                        : 'text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
-                                    )}
-                                  >
-                                    <span className="flex-1 truncate">
-                                      {getDashboardNavLabel(child.title, t)}
-                                    </span>
-                                    {child.badge && (
-                                      <Badge
-                                        variant="secondary"
-                                        className="h-4 shrink-0 px-1.5 text-[10px] font-normal"
-                                      >
-                                        {child.badge}
-                                      </Badge>
-                                    )}
-                                    {child.href.endsWith('/tracked') && trackedCount !== null && (
-                                      <span className="text-[11px] tabular-nums text-muted-foreground">
-                                        {formatNumber(trackedCount)}
-                                      </span>
-                                    )}
-                                  </Link>
-                                </li>
-                              );
-                            })}
-                          </ul>
-                        )}
-                      </div>
-                    );
-                  }
+                          {compact && (
+                            <Lock className="absolute right-1 top-1 h-2.5 w-2.5 text-muted-foreground/40" />
+                          )}
+                        </span>
+                      );
+                    }
 
-                  return (
-                    <Link
-                      key={item.href}
-                      href={item.href}
-                      data-nav-item="link"
-                      aria-current={isActive ? 'page' : undefined}
-                    >
-                      <span
-                        className={cn(
-                          'flex items-center gap-3 rounded-md px-2 py-1.5 text-[13px] font-medium transition-colors',
-                          isActive
-                            ? 'bg-primary/10 text-primary'
-                            : 'text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
-                          compact && 'justify-center',
-                        )}
-                        title={
-                          compact
-                            ? effectiveBadge
-                              ? `${label} (${effectiveBadge})`
-                              : label
-                            : undefined
-                        }
-                      >
-                        <item.icon className="h-4 w-4 shrink-0" />
-                        {!compact && (
-                          <>
-                            <span className="flex-1 truncate">{label}</span>
+                    if (children.length > 0 && !compact) {
+                      // Expandable item (PROMPT-001): the row toggles the
+                      // submenu, whose links are the item's views.
+                      const carry =
+                        underPrompts && item.href === PROMPTS_BASE
+                          ? carriedParams(searchParams.toString())
+                          : '';
+                      const submenuId = `submenu-${item.href.replace(/\W+/g, '-')}`;
+                      const submenuOpen = isSubmenuOpen(item.href);
+                      const currentChild = activeChildHref(children, pathname);
+                      // Closed, its icon carries its entries' dot. Visibility
+                      // says "New results" in words too, its dot by its name
+                      // while open.
+                      const words = dot?.colour === 'green' && item.href === NEW_RESULTS_ITEM;
+                      const iconDot = submenuOpen ? null : dot;
+                      const nameDot = submenuOpen && words ? dot : null;
+                      return (
+                        <div key={item.href}>
+                          <button
+                            type="button"
+                            data-nav-item="parent"
+                            data-submenu={item.href}
+                            aria-expanded={submenuOpen}
+                            aria-controls={submenuId}
+                            onClick={() => setSubmenuOpen(item.href, !submenuOpen)}
+                            className={cn(
+                              'flex w-full items-center gap-3 rounded-md px-2 py-1.5 text-left text-[13px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
+                              isActive
+                                ? 'text-primary'
+                                : 'text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
+                              iconDot && 'relative',
+                            )}
+                          >
+                            <NavIcon icon={item.icon} />
+                            <span className={nameDot ? 'truncate' : 'flex-1 truncate'}>
+                              {label}
+                            </span>
+                            {nameDot && <MenuDot dot={nameDot} className="mr-auto" />}
+                            {iconDot && (
+                              <MenuDot dot={iconDot} className={cn(ICON_DOT, 'left-5')} />
+                            )}
+                            {words && <NewResultsWords />}
                             {effectiveBadge && (
                               <Badge
                                 variant="secondary"
-                                className="ml-auto h-5 shrink-0 px-1.5 text-[10px] font-normal"
+                                className="h-5 shrink-0 px-1.5 text-[10px] font-normal"
                               >
                                 {effectiveBadge}
                               </Badge>
                             )}
-                          </>
-                        )}
-                      </span>
-                    </Link>
-                  );
-                })}
-              </nav>
+                            <ChevronDown
+                              className={cn(
+                                'h-3.5 w-3.5 shrink-0 transition-transform',
+                                !submenuOpen && '-rotate-90',
+                              )}
+                            />
+                          </button>
+                          {submenuOpen && (
+                            <ul
+                              id={submenuId}
+                              className="mt-0.5 ml-[18px] space-y-0.5 border-l pl-2"
+                            >
+                              {children.map((child) => {
+                                const childActive = child.href === currentChild;
+                                const childDot = dots.dotOf(child.href);
+                                const childName = (
+                                  <>
+                                    <span className={childDot ? 'truncate' : 'flex-1 truncate'}>
+                                      {getDashboardNavLabel(child.title, t)}
+                                    </span>
+                                    {childDot && <MenuDot dot={childDot} className="mr-auto" />}
+                                  </>
+                                );
+                                const onDotClick = childDot
+                                  ? () => dots.clicked(childDot, false)
+                                  : undefined;
+                                const childClass = cn(
+                                  'flex items-center gap-2 rounded-md px-2 py-1 text-[13px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
+                                  childActive
+                                    ? 'bg-primary/10 font-medium text-primary'
+                                    : 'text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
+                                );
+                                // Brand Visibility's tabs keep the date range,
+                                // engine, country and topic, as its tab bar does.
+                                const tab = brandVisibilityTabOf(child.href);
+                                if (tab) {
+                                  return (
+                                    <li key={child.href}>
+                                      <BrandVisibilityTabLink
+                                        tab={tab}
+                                        data-nav-item="child"
+                                        aria-current={childActive ? 'page' : undefined}
+                                        className={childClass}
+                                        onClick={onDotClick}
+                                      >
+                                        {childName}
+                                      </BrandVisibilityTabLink>
+                                    </li>
+                                  );
+                                }
+                                return (
+                                  <li key={child.href}>
+                                    <Link
+                                      href={`${childLinkHref(child, pathname)}${carry}`}
+                                      data-nav-item="child"
+                                      aria-current={childActive ? 'page' : undefined}
+                                      className={childClass}
+                                      onClick={onDotClick}
+                                    >
+                                      {childName}
+                                      {child.badge && (
+                                        <Badge
+                                          variant="secondary"
+                                          className="h-4 shrink-0 px-1.5 text-[10px] font-normal"
+                                        >
+                                          {child.badge}
+                                        </Badge>
+                                      )}
+                                    </Link>
+                                  </li>
+                                );
+                              })}
+                            </ul>
+                          )}
+                        </div>
+                      );
+                    }
+
+                    const ownSection = menuSectionOf(item.href);
+                    const linkHref =
+                      children.length > 0 && ownSection && hiddenSections.has(ownSection)
+                        ? children[0].href
+                        : href;
+                    // Icons only, the item's name says its dot ("Visibility, New results").
+                    const iconName = compact && dot ? dotLabel(dot, label) : undefined;
+                    return (
+                      <Link
+                        key={item.href}
+                        href={linkHref}
+                        data-nav-item="link"
+                        aria-current={isActive ? 'page' : undefined}
+                        aria-label={iconName}
+                        onClick={dot ? () => dots.clicked(dot, compact) : undefined}
+                      >
+                        <span
+                          className={cn(
+                            'flex items-center gap-3 rounded-md px-2 py-1.5 text-[13px] font-medium transition-colors',
+                            isActive
+                              ? 'bg-primary/10 text-primary'
+                              : 'text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
+                            compact && 'justify-center',
+                            iconName && 'relative',
+                          )}
+                          title={
+                            iconName ??
+                            (compact
+                              ? effectiveBadge
+                                ? `${label} (${effectiveBadge})`
+                                : label
+                              : undefined)
+                          }
+                        >
+                          <NavIcon icon={item.icon} />
+                          {iconName && dot && (
+                            <MenuDot dot={dot} className={cn(ICON_DOT, 'left-7')} />
+                          )}
+                          {!compact && (
+                            <>
+                              <span className={dot ? 'truncate' : 'flex-1 truncate'}>{label}</span>
+                              {dot && <MenuDot dot={dot} className="mr-auto" />}
+                              {effectiveBadge && (
+                                <Badge
+                                  variant="secondary"
+                                  className="ml-auto h-5 shrink-0 px-1.5 text-[10px] font-normal"
+                                >
+                                  {effectiveBadge}
+                                </Badge>
+                              )}
+                              {item.newPill && <NewPill className="ml-auto" />}
+                            </>
+                          )}
+                        </span>
+                      </Link>
+                    );
+                  })}
+                </nav>
+              )}
             </div>
           ))}
         </ScrollArea>
@@ -555,24 +734,6 @@ export function Sidebar() {
               </Link>
             </p>
           )}
-          <a
-            href={siteConfig.links.feedback}
-            target="_blank"
-            rel="noopener noreferrer"
-            title={compact ? t('feedback') : undefined}
-            className={cn(
-              'flex items-center gap-3 rounded-md px-2 py-1.5 text-[13px] font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
-              compact && 'justify-center',
-            )}
-          >
-            <MessageSquareHeart className="h-4 w-4 shrink-0" />
-            {!compact && (
-              <>
-                <span className="flex-1 truncate">{t('feedback')}</span>
-                <ExternalLink className="h-3 w-3 shrink-0 opacity-60" />
-              </>
-            )}
-          </a>
           <Button
             variant="ghost"
             onClick={handleToggleCollapse}
@@ -593,7 +754,7 @@ export function Sidebar() {
         </div>
 
         <div className="border-t p-2">
-          <UserProfileNavItem collapsed={compact} />
+          <UserProfileNavItem collapsed={compact} shortcut />
         </div>
       </aside>
     </>

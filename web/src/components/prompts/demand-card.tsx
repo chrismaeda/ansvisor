@@ -12,6 +12,9 @@ import { Skeleton } from '@/components/ui/skeleton';
 import KpiSparkline from '@/components/action-center/kpi-sparkline';
 import { useIntegrationConnect } from '@/hooks/use-integration-connect';
 import { trackDemandQuestion } from '@/lib/actions/prompt-demand-signals';
+import { isNoTopics } from '@/lib/topics-required';
+import { useTopicFirstDialog } from '@/components/prompts/topic-first';
+import { useWaitingForSpotToast } from '@/components/prompts/waiting-for-spot';
 import { formatCompactNumber, formatDate, formatNumber } from '@/lib/format';
 import {
   DEMAND_SIGNALS,
@@ -274,6 +277,9 @@ function PaaCard({
   const t = useTranslations('promptDemand');
   const [tracking, setTracking] = useState<string | null>(null);
   const [tracked, setTracked] = useState<Set<string>>(new Set());
+  // A brand with no topic yet: Track asks for one first.
+  const topicFirst = useTopicFirstDialog();
+  const showWaiting = useWaitingForSpotToast();
   const paa = demand.paa;
 
   const track = async (question: string) => {
@@ -287,9 +293,16 @@ function PaaCard({
     setTracking(null);
     if (outcome.promptIds.length > 0 || outcome.alreadyTracked) {
       setTracked((prev) => new Set(prev).add(question));
-      toast.success(
-        t(outcome.alreadyTracked ? 'paa.alreadyTrackedToast' : 'paa.trackedToast', { question }),
-      );
+      const waiting = ('waitingIds' in outcome && outcome.waitingIds?.length) || 0;
+      if (!showWaiting('demand', 0, waiting)) {
+        toast.success(
+          t(outcome.alreadyTracked ? 'paa.alreadyTrackedToast' : 'paa.trackedToast', { question }),
+        );
+      }
+      return;
+    }
+    if (isNoTopics(outcome)) {
+      topicFirst.show();
       return;
     }
     toast.error(
@@ -338,6 +351,7 @@ function PaaCard({
       ) : (
         <PaidState demand={demand} signal="paa" />
       )}
+      {topicFirst.dialog}
     </SignalCard>
   );
 }

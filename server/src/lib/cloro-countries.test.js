@@ -7,7 +7,7 @@ vi.mock('../config/supabase.js', () => ({ default: {} }));
 
 import { fakeDb } from './catalog/__fixtures__/fake-db.js';
 import { logger } from './logger.js';
-import { CITY_SCRAPERS, COUNTRY_ONLY_SCRAPERS } from './locations.js';
+import { CITY_SCRAPERS } from './locations.js';
 import {
   CLORO_COUNTRY_MODELS,
   countryCodesIn,
@@ -141,7 +141,7 @@ describe('refreshCloroCountries', () => {
       db: fake.db,
       apiKey: 'k',
       now: day1,
-      fetchImpl: answer({ chatgpt: ['US', 'GB', 'CZ'], copilot: ['US', 'BR'] }),
+      fetchImpl: answer({ chatgpt: ['US', 'GB', 'CZ'], gemini: ['US', 'BR'] }),
     });
     const day2 = new Date('2026-10-28T06:00:00Z');
     const outcome = await refreshCloroCountries({
@@ -149,15 +149,15 @@ describe('refreshCloroCountries', () => {
       apiKey: 'k',
       now: day2,
       fetchImpl: answer({
-        // CZ dropped from ChatGPT; Copilot's read fails and keeps yesterday's.
+        // CZ dropped from ChatGPT; Gemini's read fails and keeps yesterday's.
         chatgpt: ['US', 'GB'],
-        copilot: new Error('timeout'),
+        gemini: new Error('timeout'),
       }),
     });
-    expect(outcome).toMatchObject({ chatgpt: 2, copilot: 'kept' });
+    expect(outcome).toMatchObject({ chatgpt: 2, gemini: 'kept' });
     const supported = await loadSupportedCountries({ db: fake.db });
     expect([...supported.get('chatgpt')].sort()).toEqual(['GB', 'US']);
-    expect([...supported.get('copilot')].sort()).toEqual(['BR', 'US']);
+    expect([...supported.get('gemini')].sort()).toEqual(['BR', 'US']);
   });
 
   it('reads nothing without the provider key', async () => {
@@ -171,32 +171,34 @@ describe('refreshCloroCountries', () => {
 
 describe('supportsCountry and supportedLocations', () => {
   const supported = new Map([
-    ['copilot', new Set(['US', 'TR'])],
+    ['gemini', new Set(['US', 'TR'])],
     ['aimode', new Set(['US', 'TR', 'KE'])],
   ]);
 
   it('asks an engine only where it answers from', () => {
-    expect(supportsCountry(supported, 'copilot-web', 'KE')).toBe(false);
-    expect(supportsCountry(supported, 'copilot-web', 'TR')).toBe(true);
+    expect(supportsCountry(supported, 'gemini-web', 'KE')).toBe(false);
+    expect(supportsCountry(supported, 'gemini-web', 'TR')).toBe(true);
   });
 
   it('restricts nothing it has no list for', () => {
     // No list read for ChatGPT, the API models aren't the provider's, an untargeted run.
     expect(supportsCountry(supported, 'chatgpt-web', 'KE')).toBe(true);
     expect(supportsCountry(supported, 'gpt-5', 'KE')).toBe(true);
-    expect(supportsCountry(supported, 'copilot-web', null)).toBe(true);
-    expect(supportsCountry(new Map(), 'copilot-web', 'KE')).toBe(true);
+    expect(supportsCountry(supported, 'gemini-web', null)).toBe(true);
+    expect(supportsCountry(new Map(), 'gemini-web', 'KE')).toBe(true);
   });
 
   it('skips a country an engine does not support, cities and states included', () => {
     const codes = ['US', 'KE', 'TR~ISTANBUL', 'US-CA'];
-    expect(supportedLocations(codes, 'copilot-web', supported)).toEqual(['US', 'US-CA']);
+    expect(supportedLocations(codes, 'gemini-web', supported)).toEqual(['US', 'US-CA']);
+    // Google's engines ask from the state too.
     expect(supportedLocations(codes, 'google-aimode', supported)).toEqual([
       'US',
       'KE',
       'TR~ISTANBUL',
+      'US-CA',
     ]);
-    expect(supportedLocations([], 'copilot-web', supported)).toEqual([null]);
+    expect(supportedLocations([], 'gemini-web', supported)).toEqual([null]);
   });
 });
 
@@ -216,7 +218,7 @@ describe('the provider models on both sides (PROMPT-015e)', () => {
   it('names every model the API reads a list for, and no other', () => {
     const labels = web.match(/ENGINE_LABELS[^=]*=\s*\{([^}]*)\}/);
     expect(labels).not.toBeNull();
-    const named = [...labels[1].matchAll(/^\s*'?([a-z]+)'?:/gm)].map((m) => m[1]);
+    const named = [...labels[1].matchAll(/^\s*'?([a-z_]+)'?:/gm)].map((m) => m[1]);
     expect(named.sort()).toEqual([...models].sort());
   });
 
@@ -224,18 +226,13 @@ describe('the provider models on both sides (PROMPT-015e)', () => {
     const mapped = web.match(/PLATFORM_MODELS[^=]*=\s*\{([^}]*)\}/);
     expect(mapped).not.toBeNull();
     const pairs = Object.fromEntries(
-      [...mapped[1].matchAll(/'([a-z-]+)':\s*'([a-z]+)'/g)].map((m) => [m[1], m[2]]),
+      [...mapped[1].matchAll(/'([a-z-]+)':\s*'([a-z_]+)'/g)].map((m) => [m[1], m[2]]),
     );
     expect(pairs).toEqual(CLORO_COUNTRY_MODELS);
   });
 
-  it('leaves a US state to the models of the engines the API runs country-wide', () => {
-    const countryOnly = web.match(/COUNTRY_ONLY_MODELS[^=]*=\s*new Set\(\[([^\]]*)\]\)/);
-    expect(countryOnly).not.toBeNull();
-    const webModels = [...countryOnly[1].matchAll(/'([^']+)'/g)].map((m) => m[1]);
-    expect(webModels.sort()).toEqual(
-      [...new Set([...COUNTRY_ONLY_SCRAPERS].map((id) => CLORO_COUNTRY_MODELS[id]))].sort(),
-    );
+  it('leaves a US state to every model, as the API runs a state on every engine', () => {
+    expect(web).not.toMatch(/COUNTRY_ONLY_MODELS/);
   });
 
   it("takes a city on the models of the API's city engines", () => {

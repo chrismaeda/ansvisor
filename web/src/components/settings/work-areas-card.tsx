@@ -15,25 +15,30 @@ import {
   MENU_SECTIONS,
   WORK_AREA_IDS,
   hiddenWithWorkAreas,
-  menuSectionOf,
+  menuSectionEntries,
   type WorkAreaId,
 } from '@/lib/menu-access';
+import { useMenuSections } from '@/components/providers/menu-access-provider';
 import { getMyMenu, setMyWorkAreas, type MyMenu } from '@/lib/actions/menu-access';
 
-/** The menu's sections with their icons and nav titles, in its order. */
-const SECTIONS = dashboardNav
-  .flatMap((group) => group.items)
-  .flatMap((item) => {
-    const section = menuSectionOf(item.href);
-    return section ? [{ section, title: item.title, icon: item.icon }] : [];
-  });
+/** The menu's sections with their icons and nav titles, in its order: Agents under the Action Center. */
+const SECTIONS = menuSectionEntries(dashboardNav.flatMap((group) => group.items));
 
 /**
  * The menu with other work areas: what the admin takes off stays off, and the
- * areas narrow the rest (as for anyone, admins included).
+ * areas narrow the rest (as for anyone, admins included), of the menu's
+ * sections the workspace has.
  */
-export function menuWithWorkAreas(menu: MyMenu, workAreas: WorkAreaId[]): MyMenu {
-  return { ...menu, workAreas, hidden: hiddenWithWorkAreas(menu.hiddenByAdmin, workAreas) };
+export function menuWithWorkAreas(
+  menu: MyMenu,
+  workAreas: WorkAreaId[],
+  sections: readonly string[] = MENU_SECTIONS,
+): MyMenu {
+  return {
+    ...menu,
+    workAreas,
+    hidden: hiddenWithWorkAreas(menu.hiddenByAdmin, workAreas, sections),
+  };
 }
 
 /**
@@ -45,6 +50,9 @@ export function WorkAreasCard() {
   const t = useTranslations('settings.menuAccess');
   const tNav = useTranslations('nav');
   const { canAdmin } = useUserRole();
+  // Agents only with the new Chat on.
+  const sections = useMenuSections();
+  const shown = SECTIONS.filter((s) => sections.includes(s.section));
   const [menu, setMenu] = useState<MyMenu | null>(null);
   const [failed, setFailed] = useState(false);
 
@@ -68,7 +76,7 @@ export function WorkAreasCard() {
   // meanwhile stays, which putting back the state before it wouldn't.
   const save = async (workAreas: WorkAreaId[]) => {
     if (!menu) return;
-    setMenu(menuWithWorkAreas(menu, workAreas));
+    setMenu(menuWithWorkAreas(menu, workAreas, sections));
     try {
       await setMyWorkAreas(workAreas);
     } catch {
@@ -136,14 +144,14 @@ export function WorkAreasCard() {
                 {t('yourMenu')}
                 <span className="text-xs font-normal text-muted-foreground">
                   {t('sectionCount', {
-                    count: MENU_SECTIONS.length - menu.hidden.length,
-                    total: MENU_SECTIONS.length,
+                    count: sections.length - menu.hidden.length,
+                    total: sections.length,
                   })}
                 </span>
               </p>
               {/* Two columns once a section and why it's off fit side by side. */}
               <ul className="grid grid-cols-1 gap-x-6 gap-y-1.5 @lg:grid-cols-2">
-                {SECTIONS.map(({ section, title, icon: Icon }) => {
+                {shown.map(({ section, title, icon: Icon }) => {
                   const off = menu.hidden.includes(section);
                   const byAdmin = menu.hiddenByAdmin.includes(section);
                   return (

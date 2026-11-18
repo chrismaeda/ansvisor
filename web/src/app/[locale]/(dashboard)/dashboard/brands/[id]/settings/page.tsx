@@ -43,9 +43,17 @@ import {
   Plus,
   Save,
   ShoppingBag,
+  Tag,
   Trash2,
 } from 'lucide-react';
 import { Checkbox } from '@/components/ui/checkbox';
+import {
+  CompetitorTypeBadge,
+  CompetitorTypePicker,
+  SetCompetitorTypeDialog,
+  competitorTypeIsValid,
+} from '@/components/competitors/competitor-type';
+import { competitorTypeOptions } from '@/lib/competitor-types';
 import { useUserRole } from '@/hooks/use-user-role';
 import { useFeatureGate } from '@/hooks/use-feature-gate';
 import { useUpgradeGate } from '@/components/providers/upgrade-gate';
@@ -61,7 +69,11 @@ import { getPublicApiBaseUrl } from '@/config/api';
 import { SITE_TYPES, guessSiteType, isSiteType, type SiteType } from '@/lib/content/page-types';
 import { qualityPhase } from '@/lib/content/quality';
 import { BrandFactsTab } from './_brand-facts-tab';
+import { ContentRulesCard } from './_content-rules-card';
 import { ConversionsCard } from './_conversions-card';
+import { ClientLogoCard } from './_client-logo-card';
+import { PeopleTab } from './_people-tab';
+import { IntegrationsTab } from './_integrations-tab';
 import { trackingSnippetTag } from '@/lib/conversion-tracking';
 
 interface PageProps {
@@ -70,7 +82,16 @@ interface PageProps {
   searchParams?: Promise<{ tab?: string }>;
 }
 
-const TABS = ['general', 'domains', 'tracking', 'competitors', 'facts', 'danger'];
+const TABS = [
+  'general',
+  'domains',
+  'tracking',
+  'competitors',
+  'facts',
+  'integrations',
+  'people',
+  'danger',
+];
 /** No search params: one promise for every render, as use() needs. */
 const NO_SEARCH: Promise<{ tab?: string }> = Promise.resolve({});
 
@@ -109,6 +130,8 @@ export default function BrandSettingsPage({ params, searchParams }: PageProps) {
           <TabsTrigger value="tracking">Tracking</TabsTrigger>
           <TabsTrigger value="competitors">Competitors</TabsTrigger>
           {factsOn && <TabsTrigger value="facts">{t('settings.facts.tab')}</TabsTrigger>}
+          <TabsTrigger value="integrations">{t('settings.integrations.tab')}</TabsTrigger>
+          <TabsTrigger value="people">{t('settings.people.tab')}</TabsTrigger>
           <TabsTrigger
             value="danger"
             className="text-destructive data-[state=active]:text-destructive"
@@ -119,10 +142,12 @@ export default function BrandSettingsPage({ params, searchParams }: PageProps) {
 
         <TabsContent value="general" className="space-y-6">
           <GeneralTab brand={brand} onUpdate={(updated) => updateBrandStore(brand.id, updated)} />
+          <ClientLogoCard brand={brand} />
           <ShoppingModeCard
             brand={brand}
             onUpdate={(updated) => updateBrandStore(brand.id, updated)}
           />
+          <ContentRulesCard brandId={brand.id} />
           <PauseBrandCard
             brand={brand}
             onUpdate={(updated) => updateBrandStore(brand.id, updated)}
@@ -150,6 +175,14 @@ export default function BrandSettingsPage({ params, searchParams }: PageProps) {
             <BrandFactsTab brandId={brand.id} />
           </TabsContent>
         )}
+
+        <TabsContent value="integrations">
+          <IntegrationsTab brand={brand} />
+        </TabsContent>
+
+        <TabsContent value="people">
+          <PeopleTab brandId={brand.id} />
+        </TabsContent>
 
         <TabsContent value="danger">
           <DangerTab
@@ -314,6 +347,10 @@ function GeneralTab({
             <p className="text-xs text-muted-foreground">
               {t('settings.siteTypeHint')}
               {siteType === null && ` ${t('settings.siteTypeGuessed')}`}
+              {siteType !== null &&
+                siteType === brand.siteType &&
+                brand.siteTypeSource === 'auto' &&
+                ` ${t('settings.siteTypeDetected')}`}
             </p>
           </div>
 
@@ -754,6 +791,12 @@ function CompetitorsTab({ brandId }: { brandId: string }) {
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [newName, setNewName] = useState('');
   const [newDomain, setNewDomain] = useState('');
+  // Competitor types (00542): the new one's, and the one whose type is being set.
+  const tType = useTranslations('competitors.type');
+  const [newType, setNewType] = useState<string | null>(null);
+  const [newTypeKey, setNewTypeKey] = useState(0);
+  const [typeFor, setTypeFor] = useState<Competitor | null>(null);
+  const typeOptions = competitorTypeOptions(competitors);
 
   const load = useCallback(
     async (isCancelled?: () => boolean) => {
@@ -781,16 +824,19 @@ function CompetitorsTab({ brandId }: { brandId: string }) {
   }, [load]);
 
   const handleAdd = async () => {
-    if (!newName.trim()) return;
+    if (!newName.trim() || !competitorTypeIsValid(newType)) return;
     setIsAdding(true);
     try {
       const added = await addCompetitor(brandId, {
         name: newName.trim(),
         domain: newDomain.trim(),
+        type: newType?.trim() || null,
       });
       setCompetitors((prev) => [...prev, added]);
       setNewName('');
       setNewDomain('');
+      setNewType(null);
+      setNewTypeKey((k) => k + 1);
       toast.success(`${added.name} added`);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to add competitor');
@@ -850,8 +896,25 @@ function CompetitorsTab({ brandId }: { brandId: string }) {
                       )}
                       <div className="flex-1 overflow-hidden">
                         <p className="truncate text-sm font-medium">{c.name}</p>
-                        {c.domain && <p className="text-xs text-muted-foreground">{c.domain}</p>}
+                        <div className="flex min-w-0 items-center gap-1.5">
+                          {c.domain && (
+                            <p className="truncate text-xs text-muted-foreground">{c.domain}</p>
+                          )}
+                          <CompetitorTypeBadge type={c.type} className="shrink-0" />
+                        </div>
                       </div>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-7 w-7 shrink-0 text-muted-foreground"
+                        onClick={guard(() => setTypeFor(c), {
+                          action: tActions('setCompetitorTypes'),
+                        })}
+                        aria-label={tType('setFor', { name: c.name })}
+                        title={tType('setFor', { name: c.name })}
+                      >
+                        <Tag className="h-3.5 w-3.5" />
+                      </Button>
                       <Dialog
                         open={deletingId === c.id}
                         onOpenChange={(open) => !open && setDeletingId(null)}
@@ -902,25 +965,38 @@ function CompetitorsTab({ brandId }: { brandId: string }) {
 
               <div className="space-y-2">
                 <Label className="text-sm font-medium">Add Competitor</Label>
-                <div className="flex gap-2">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-start">
                   <Input
                     placeholder="Competitor name"
                     value={newName}
                     onChange={(e) => setNewName(e.target.value)}
                     onKeyDown={(e) => e.key === 'Enter' && newName.trim() && submitAdd()}
-                    className="flex-1"
+                    className="sm:flex-1"
                   />
                   <Input
                     placeholder="domain.com"
                     value={newDomain}
                     onChange={(e) => setNewDomain(e.target.value)}
                     onKeyDown={(e) => e.key === 'Enter' && newName.trim() && submitAdd()}
-                    className="w-40"
+                    className="sm:w-40"
                   />
+                  <div className="sm:w-48">
+                    <Label htmlFor="new-competitor-type" className="sr-only">
+                      {tType('label')}
+                    </Label>
+                    <CompetitorTypePicker
+                      key={newTypeKey}
+                      id="new-competitor-type"
+                      value={newType}
+                      options={typeOptions}
+                      onChange={setNewType}
+                      disabled={isAdding}
+                    />
+                  </div>
                   <Button
                     variant="outline"
                     onClick={submitAdd}
-                    disabled={isAdding || !newName.trim()}
+                    disabled={isAdding || !newName.trim() || !competitorTypeIsValid(newType)}
                     className="gap-1.5 shrink-0"
                   >
                     {isAdding ? (
@@ -938,6 +1014,17 @@ function CompetitorsTab({ brandId }: { brandId: string }) {
         {!canManage && (
           <p className="text-xs text-muted-foreground">{t('settings.managersOnlyEdit')}</p>
         )}
+        <SetCompetitorTypeDialog
+          brandId={brandId}
+          competitor={typeFor}
+          options={typeOptions}
+          onOpenChange={(open) => {
+            if (!open) setTypeFor(null);
+          }}
+          onSaved={(changed) =>
+            setCompetitors((prev) => prev.map((c) => changed.find((n) => n.id === c.id) ?? c))
+          }
+        />
       </CardContent>
     </Card>
   );
@@ -1091,7 +1178,9 @@ function DangerTab({
   const [confirmValue, setConfirmValue] = useState('');
   const [isDeleting, setIsDeleting] = useState(false);
   // Delete stays open on a read-only workspace (plan not active): it only
-  // removes what the person gave us (Ansvisor, 2026-10-27).
+  // removes what the person gave us (Ansvisor, 2026-10-27). The demo brand
+  // is never deleted, only hidden from the brand menu.
+  const demo = brand.isDemo === true;
 
   const canDelete = confirmValue === brand.name;
 
@@ -1120,20 +1209,26 @@ function DangerTab({
       </CardHeader>
       <CardContent className="space-y-4">
         {/* Only an admin deletes a brand (the server's rule). */}
-        <fieldset disabled={!canAdmin} className="min-w-0 space-y-4">
-          <div className="space-y-2">
-            <Label className="text-sm">
-              {t('settings.confirmDelete')} <span className="font-semibold">{brand.name}</span>
-            </Label>
-            <Input
-              placeholder={t('settings.deleteConfirmPlaceholder')}
-              value={confirmValue}
-              onChange={(e) => setConfirmValue(e.target.value)}
-            />
-          </div>
+        <fieldset disabled={!canAdmin || demo} className="min-w-0 space-y-4">
+          {demo ? (
+            <p data-slot="demo-cant-delete" className="text-sm text-muted-foreground">
+              {t('settings.demoCantDelete')}
+            </p>
+          ) : (
+            <div className="space-y-2">
+              <Label className="text-sm">
+                {t('settings.confirmDelete')} <span className="font-semibold">{brand.name}</span>
+              </Label>
+              <Input
+                placeholder={t('settings.deleteConfirmPlaceholder')}
+                value={confirmValue}
+                onChange={(e) => setConfirmValue(e.target.value)}
+              />
+            </div>
+          )}
           <Button
             variant="destructive"
-            disabled={!canDelete || isDeleting}
+            disabled={demo || !canDelete || isDeleting}
             onClick={handleDelete}
             className="gap-2"
           >
@@ -1145,7 +1240,7 @@ function DangerTab({
             {t('settings.deleteButton')}
           </Button>
         </fieldset>
-        {!canAdmin && (
+        {!canAdmin && !demo && (
           <p className="text-xs text-muted-foreground">{t('settings.adminsOnlyDelete')}</p>
         )}
       </CardContent>

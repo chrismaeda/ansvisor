@@ -3,19 +3,24 @@ import { stripe } from '@/lib/stripe';
 import { supabaseAdmin } from '@/lib/supabase/admin';
 import { alignPromptsToPlanForOrg } from '@/lib/plan-engines';
 import { periodEndIso } from '@/lib/billing/period-end';
-import { API_BASE_URL } from '@/config/api';
-import { DASHBOARD_HOME } from '@/config/home';
+import { startFirstTrackingRun } from '@/lib/billing/first-run';
+import { hideDemoBrandAfterPurchase } from '@/lib/demo/hide-after-purchase';
+import { readMyHome } from '@/lib/my-home';
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const sessionId = searchParams.get('session_id');
   const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
 
+  // Without a checkout to read, /dashboard opens the person's start page.
   if (!sessionId) {
-    return NextResponse.redirect(`${appUrl}${DASHBOARD_HOME}`);
+    return NextResponse.redirect(`${appUrl}/dashboard`);
   }
 
   let trackingJobId: string | null = null;
+  // Where the person lands once the plan is written: their home (readMyHome),
+  // else /dashboard picks it.
+  let landing = '/dashboard';
 
   try {
     // Retrieve and validate the Stripe checkout session
@@ -58,6 +63,10 @@ export async function GET(req: NextRequest) {
           console.error('[stripe/success] DB update error:', updateError);
         } else {
           console.log('[stripe/success] DB updated for org:', orgId);
+          // The buyer, on the workspace they just paid for: their home by their
+          // menu (Tracked Prompts, or Action Center › Today when Prompts is off
+          // it: config/home.ts), or setup after purchase first.
+          landing = await readMyHome();
 
           // Align onboarding-created prompts to the just-confirmed plan's
           // engine set. Onboarding saves prompts at step 4 with the default
@@ -74,69 +83,20 @@ export async function GET(req: NextRequest) {
             console.error('[stripe/success] Plan-engine alignment threw:', alignErr);
           }
 
-          // Find first brand and trigger tracking via aeo-server
-          const { data: brand } = await supabaseAdmin
-            .from('brands')
-            .select('id')
-            .eq('organization_id', orgId)
-            .order('created_at', { ascending: true })
-            .limit(1)
-            .single();
+          // A plan bought: the demo brand steps aside before the dashboard
+          // opens, whether or not the webhook came first, so the person lands
+          // on their own brand (the layout lists no hidden brand, and the
+          // brand kept from before falls back to the first one listed).
+          await hideDemoBrandAfterPurchase(orgId, subscription?.status, 'stripe/success');
 
-          if (brand) {
-            const serverUrl = API_BASE_URL;
-            const cronSecret = process.env.CRON_SECRET;
-
-            if (cronSecret) {
-              try {
-                const trackingRes = await fetch(`${serverUrl}/api/internal/trigger-tracking`, {
-                  method: 'POST',
-                  headers: {
-                    'Content-Type': 'application/json',
-                    Authorization: `Bearer ${cronSecret}`,
-                  },
-                  body: JSON.stringify({ brandId: brand.id }),
-                });
-
-                if (trackingRes.ok) {
-                  const result = await trackingRes.json();
-                  trackingJobId = result.jobId;
-                  console.log(
-                    '[stripe/success] Tracking triggered for brand:',
-                    brand.id,
-                    'jobId:',
-                    trackingJobId,
-                  );
-                } else {
-                  console.error('[stripe/success] Tracking trigger failed:', trackingRes.status);
-                }
-              } catch (fetchErr) {
-                console.error('[stripe/success] Failed to call trigger-tracking:', fetchErr);
-              }
-
-              try {
-                const volumesRes = await fetch(`${serverUrl}/api/internal/analyze-volumes`, {
-                  method: 'POST',
-                  headers: {
-                    'Content-Type': 'application/json',
-                    Authorization: `Bearer ${cronSecret}`,
-                  },
-                  body: JSON.stringify({ brandId: brand.id }),
-                });
-
-                if (volumesRes.ok) {
-                  console.log('[stripe/success] Volume analysis triggered for brand:', brand.id);
-                } else {
-                  console.error(
-                    '[stripe/success] Volume analysis trigger failed:',
-                    volumesRes.status,
-                  );
-                }
-              } catch (fetchErr) {
-                console.error('[stripe/success] Failed to call volume analysis:', fetchErr);
-              }
-            }
-          }
+          // The first run, or the one the webhook already started for this
+          // checkout: its id goes to the dashboard either way.
+          trackingJobId = await startFirstTrackingRun({
+            orgId,
+            subscriptionStatus: subscription?.status,
+            purchaseStarted: session.created,
+            ctx: 'stripe/success',
+          });
         }
       }
     }
@@ -146,7 +106,7 @@ export async function GET(req: NextRequest) {
 
   // The first tracking run's id rides along: TrackingJobHandoff keeps it for
   // Visibility's progress bar.
-  const redirectUrl = new URL(`${appUrl}${DASHBOARD_HOME}`);
+  const redirectUrl = new URL(`${appUrl}${landing}`);
   if (trackingJobId) {
     redirectUrl.searchParams.set('jobId', trackingJobId);
   }

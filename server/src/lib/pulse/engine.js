@@ -1,9 +1,13 @@
 import supabaseAdmin from '../../config/supabase.js';
 import { logger } from '../logger.js';
 import { isCloud, isSubscriptionActive } from '../../config/plans.js';
+import { brandOutsiders, brandReaders } from '../access.js';
 import { dispatchBrandWebhook } from '../webhook-dispatch.js';
 import { computePulseMetrics } from './metrics.js';
 import { renderPulseEmail, sendPulseEmail } from './email.js';
+import { skipsAsNotNotable } from './send-rules.js';
+import { deliverToSlack } from '../slack/deliver.js';
+import { pulseMessage } from '../slack/blocks/pulse.js';
 
 /**
  * Daily Pulse orchestration (#540).
@@ -11,8 +15,9 @@ import { renderPulseEmail, sendPulseEmail } from './email.js';
  * generatePulseForBrand runs after a brand's daily tracking job finishes.
  * It decides eligibility, computes the digest, records it in sent_pulses
  * (which doubles as the "already sent today" dedup and the 7-day warning
- * cooldown log), then delivers: email via Resend on cloud, and the
- * `daily_pulse.created` webhook event everywhere.
+ * cooldown log), then delivers: email via Resend on cloud, the
+ * `daily_pulse.created` webhook event everywhere, and the brand's Slack
+ * channel where it picked one (#2139, lib/slack/deliver.js).
  *
  * Everything is best-effort — a pulse failure must never fail the
  * tracking job that triggered it.
@@ -39,22 +44,36 @@ export function appUrl() {
   }
 }
 
-/** Recipient emails: explicit list from settings, else every org member.
- *  The AI Traffic weekly digest (AT-013) sends to the same people. */
-export async function resolveRecipients(organizationId, settings) {
-  if (settings?.recipients?.length) return settings.recipients;
-
-  const { data: members } = await supabaseAdmin
-    .from('profiles')
-    .select('id')
-    .eq('organization_id', organizationId);
-
+/** The sign-in e-mail of each of `ids` that has one. */
+async function emailsOf(ids) {
   const emails = [];
-  for (const member of members ?? []) {
-    const { data: authUser } = await supabaseAdmin.auth.admin.getUserById(member.id);
+  for (const id of ids) {
+    const { data: authUser } = await supabaseAdmin.auth.admin.getUserById(id);
     if (authUser?.user?.email) emails.push(authUser.user.email);
   }
   return emails;
+}
+
+const sameAddress = (address) => String(address).trim().toLowerCase();
+
+/**
+ * Recipient emails (brand access, spec §5.4): the explicit list from
+ * settings, as an Admin or Manager set it, less the members who can't see
+ * the brand, so a list made before someone was narrowed doesn't mail them
+ * its numbers; an address that is no member's (a client, team@) stays.
+ * Else every member who can see the brand: with All brands, every member.
+ * The AI Traffic weekly digest (AT-013) sends to the same people.
+ */
+export async function resolveRecipients(organizationId, settings, brandId) {
+  if (settings?.recipients?.length) {
+    const outsiders = await brandOutsiders(organizationId, brandId);
+    if (outsiders.length === 0) return settings.recipients;
+    const hidden = new Set((await emailsOf(outsiders)).map(sameAddress));
+    return settings.recipients.filter((address) => !hidden.has(sameAddress(address)));
+  }
+
+  const readers = await brandReaders(organizationId, [brandId]);
+  return emailsOf([...readers.keys()]);
 }
 
 // In webhook mode the tracking job can "complete" while Cloro is still
@@ -150,10 +169,12 @@ export async function generatePulseForBrand(brandId, { pulseDate: pulseDateOverr
 
     const { data: brand } = await supabaseAdmin
       .from('brands')
-      .select('id, name, organization_id, is_active')
+      .select('id, name, organization_id, is_active, is_demo')
       .eq('id', brandId)
       .single();
     if (!brand?.is_active) return { skipped: 'brand_inactive' };
+    // A demo brand (00380) is sample data: nobody is mailed about it.
+    if (brand.is_demo) return { skipped: 'demo_brand' };
 
     // Hard requirement: never generate for orgs without an active or
     // trialing subscription (self-host always passes — isSubscriptionActive
@@ -172,7 +193,7 @@ export async function generatePulseForBrand(brandId, { pulseDate: pulseDateOverr
       .select('frequency, recipients')
       .eq('brand_id', brandId)
       .maybeSingle();
-    const frequency = settings?.frequency ?? 'daily';
+    const frequency = settings?.frequency ?? 'notable';
 
     if (frequency === 'off') return { skipped: 'off' };
     if (frequency === 'weekly' && now.getUTCDay() !== WEEKLY_SEND_UTC_DAY) {
@@ -230,9 +251,25 @@ export async function generatePulseForBrand(brandId, { pulseDate: pulseDateOverr
     const cooldown = await recentWarningKeys(brandId, now);
     metrics.warnings = metrics.warnings.filter((w) => !cooldown.has(w.key));
 
-    if (frequency === 'notable' && !metrics.highlights.length && !metrics.warnings.length) {
+    // "Only when notable" still sends a brand's first pulse. A failed read
+    // counts as "not first", so a hiccup can't turn into an extra mail.
+    let isFirstPulse = false;
+    if (frequency === 'notable') {
+      const { count, error: countError } = await supabaseAdmin
+        .from('sent_pulses')
+        .select('id', { count: 'exact', head: true })
+        .eq('brand_id', brandId);
+      isFirstPulse = !countError && count === 0;
+    }
+    if (skipsAsNotNotable({ frequency, isFirstPulse, metrics })) {
       return { skipped: 'nothing_notable' };
     }
+
+    // Read before the claim: a read that fails (a brief 503) then leaves no
+    // claim, and the catch-up sweep sends the pulse later, webhook included.
+    const recipients = isCloud()
+      ? await resolveRecipients(brand.organization_id, settings, brand.id)
+      : [];
 
     // Record first — the unique (brand_id, pulse_date) constraint makes
     // this the race-safe claim on "today's pulse".
@@ -262,7 +299,6 @@ export async function generatePulseForBrand(brandId, { pulseDate: pulseDateOverr
     let emailSent = false;
     let recipientCount = 0;
     if (isCloud()) {
-      const recipients = await resolveRecipients(brand.organization_id, settings);
       recipientCount = recipients.length;
       if (recipients.length) {
         const { subject, html } = renderPulseEmail({
@@ -299,11 +335,39 @@ export async function generatePulseForBrand(brandId, { pulseDate: pulseDateOverr
       })
       .eq('id', pulseRow.id);
 
+    // Slack leg — cloud and self-host alike (#2139): the brand's channel, when
+    // it picked one and has the Pulse on there. Never throws; recorded apart
+    // from the legs above, so a database without 00515 still records them.
+    const slack = await deliverToSlack({
+      brand,
+      kind: 'pulse',
+      dedupeKey: `pulse:${pulseDate}`,
+      message: () => pulseMessage({ brandName: brand.name, metrics, insightsUrl, settingsUrl }),
+    });
+    const slackSent = slack.status === 'sent';
+    if (slackSent) {
+      const { error: slackError } = await supabaseAdmin
+        .from('sent_pulses')
+        .update({ slack_sent: true })
+        .eq('id', pulseRow.id);
+      if (slackError) {
+        logger.warn({ brandId, code: slackError.code ?? null }, 'pulse slack_sent not recorded');
+      }
+    }
+
     logger.info(
-      { brandId, pulseDate, frequency, emailSent, recipientCount, webhooksSent: sent },
+      {
+        brandId,
+        pulseDate,
+        frequency,
+        emailSent,
+        recipientCount,
+        webhooksSent: sent,
+        slack: slack.status === 'skipped' ? `skipped:${slack.reason}` : slack.status,
+      },
       'daily pulse generated',
     );
-    return { generated: true, emailSent, webhooksSent: sent };
+    return { generated: true, emailSent, webhooksSent: sent, slackSent };
   } catch (err) {
     logger.error({ err, brandId }, 'daily pulse generation failed');
     return { error: true };

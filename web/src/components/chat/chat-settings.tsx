@@ -1,0 +1,436 @@
+'use client';
+
+import { useState, type ReactNode } from 'react';
+import { useTranslations } from 'next-intl';
+import { toast } from 'sonner';
+import { Button } from '@/components/ui/button';
+import { Link, useRouter } from '@/i18n/navigation';
+import { saveChatFocus, saveChatGeneralSettings, saveDefaultHome } from '@/lib/actions/chat-prefs';
+import { track } from '@/lib/analytics';
+import { FOCUS_AREAS, type FocusArea, type HomeView } from '@/lib/chat/focus';
+import type {
+  AnswerLanguage,
+  ChatGeneralAccess,
+  ChatGeneralSettings,
+  GeneralPatch,
+  NotifyChannel,
+} from '@/lib/chat/general-settings';
+import { PAGE_OPENS } from '@/lib/chat/page-open';
+import type { ChatMode } from '@/lib/chat/precedence';
+import { RANGE_PRESETS, customDays, isRangePreset, rangeWords } from '@/lib/chat/range';
+import { CHAT_POLICY_HREF } from '@/lib/chat/settings-tabs';
+import { cn } from '@/lib/utils';
+import { useFocusLabel } from './focus-picker';
+import { CustomRangeFields, useRangeT } from './range/range-picker';
+import { useChatRange } from './range/use-chat-range';
+import { useChatTour } from './tour/chat-tour';
+
+/**
+ * Chat's Settings (CHAT-01 owner update 2026-10-26; CHAT-23
+ * `chatSettings.*`; mockup #s-settings), General: the person's own
+ * preferences. Each pick is kept at once on the person (every device); one
+ * that can't be kept goes back and says so. Default mode is for the roles
+ * that change things; Full auto says why it's locked. Your focus (CHAT-24
+ * §3 item 2) is for everyone: it only changes what Chat suggests. Product
+ * tour takes the tour again, where Chat opens on pages (00486). The title
+ * and the tabs around it are the Settings frame's (ChatSettingsFrame).
+ */
+
+const MODES: ChatMode[] = ['ask_first', 'auto', 'full_auto'];
+const CHANNELS: NotifyChannel[] = ['inbox_email', 'inbox', 'inbox_slack'];
+/** general-settings.ts ANSWER_LANGUAGES, in the order the list shows them. */
+const LANGUAGES: AnswerLanguage[] = ['en', 'tr', 'de', 'fr', 'es', 'it', 'pt', 'nl'];
+
+const SELECT =
+  'h-7 rounded-lg border bg-background px-2 text-[12.5px] text-foreground outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50';
+
+/** One setting (mockup `.srow2`): its name and a muted line, the control on the right. */
+function Row({ label, note, children }: { label: string; note: string; children: ReactNode }) {
+  return (
+    <div className="flex items-center gap-3 border-t py-3 text-[13px]">
+      <div className="min-w-0 flex-1">
+        {label}
+        <span className="block text-xs text-muted-foreground">{note}</span>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+/** A switch (mockup `.sw`): 30×18, dark when on. */
+function Switch({
+  checked,
+  label,
+  action,
+  onChange,
+}: {
+  checked: boolean;
+  label: string;
+  action: string;
+  onChange: (next: boolean) => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      data-action={action}
+      onClick={() => onChange(!checked)}
+      className={cn(
+        'relative h-[18px] w-[30px] shrink-0 rounded-full outline-none transition-colors focus-visible:ring-[3px] focus-visible:ring-ring/50 motion-reduce:transition-none',
+        checked ? 'bg-foreground' : 'bg-muted-foreground/40',
+      )}
+    >
+      <span
+        aria-hidden
+        className={cn(
+          'absolute top-0.5 size-3.5 rounded-full bg-background transition-[left] duration-200 motion-reduce:transition-none',
+          checked ? 'left-[14px]' : 'left-0.5',
+        )}
+      />
+    </button>
+  );
+}
+
+/**
+ * Date range (owner request 2026-11-11): the period Chat reads when a
+ * message names none, the same as the line under the message box. Ask me
+ * clears it, so Chat asks before the next analysis; Custom opens two days.
+ * Hidden when it can't be read.
+ */
+function RangeRow() {
+  const t = useTranslations('chatRange');
+  const say = useRangeT();
+  const { range, available, save } = useChatRange();
+  const [customOpen, setCustomOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  if (!available) return null;
+  const custom = range ? customDays(range) : null;
+  const keep = async (next: Parameters<typeof save>[0]) => {
+    setBusy(true);
+    const kept = await save(next);
+    setBusy(false);
+    if (kept) setCustomOpen(false);
+  };
+  return (
+    <>
+      <Row label={t('settingLabel')} note={t('settingNote')}>
+        <select
+          data-action="chatSettings.dateRange"
+          aria-label={t('settingLabel')}
+          value={customOpen || custom ? 'custom' : (range ?? '')}
+          disabled={busy}
+          onChange={(event) => {
+            const value = event.target.value;
+            if (value === 'custom') setCustomOpen(true);
+            else void keep(isRangePreset(value) ? value : null);
+          }}
+          className={SELECT}
+        >
+          <option value="">{t('settingAsk')}</option>
+          {RANGE_PRESETS.map((preset) => (
+            <option key={preset} value={preset}>
+              {rangeWords(preset, say)}
+            </option>
+          ))}
+          <option value="custom">
+            {range && custom ? rangeWords(range, say) : t('customButton')}
+          </option>
+        </select>
+      </Row>
+      {customOpen && (
+        <CustomRangeFields
+          initial={custom}
+          busy={busy}
+          action="chatSettings.dateRangeDates"
+          onUse={(picked) => void keep(picked)}
+          className="justify-end pb-3"
+        />
+      )}
+    </>
+  );
+}
+
+export function ChatSettings({
+  initial,
+  access,
+  focus: savedFocus,
+  view: savedView,
+}: {
+  initial: ChatGeneralSettings;
+  access: ChatGeneralAccess;
+  /** What Chat focuses on for the person, in the order picked. */
+  focus: FocusArea[];
+  /** Home's view (00485): Default, or tailored to the focus. */
+  view: HomeView;
+}) {
+  const t = useTranslations('chatShell.settings');
+  const tf = useTranslations('chatShell.focus');
+  const tour = useChatTour();
+  const focusLabel = useFocusLabel();
+  const router = useRouter();
+  const [settings, setSettings] = useState(initial);
+  const [focus, setFocus] = useState(savedFocus);
+  const [view, setView] = useState(savedView);
+  // The areas Home is tailored to: none on the Default view, whose focus is only kept.
+  const shown = view === 'focus' ? focus : [];
+
+  /** Shows the pick at once and keeps it; a refusal puts the old value back. */
+  const change = async (patch: GeneralPatch) => {
+    const before = settings;
+    setSettings((was) => ({ ...was, ...patch }));
+    const saved = await saveChatGeneralSettings(patch).catch(() => ({ ok: false as const }));
+    if (!saved.ok) {
+      setSettings(before);
+      toast.error(t('failed'));
+    } else if (patch.panelOnPages !== undefined) {
+      // The dashboard's layout reads it: Ask Chat and Ctrl J follow on every page.
+      router.refresh();
+    }
+  };
+
+  /**
+   * Turns an area on (after the ones shown) or off; the last one off is the
+   * Default view. One that isn't kept goes back.
+   */
+  const changeFocus = async (area: FocusArea, on: boolean) => {
+    const before = { focus, view };
+    const next = on ? [...shown.filter((a) => a !== area), area] : shown.filter((a) => a !== area);
+    setFocus(next);
+    setView(next.length ? 'focus' : 'default');
+    const saved = await saveChatFocus(next).catch(() => ({ ok: false as const }));
+    if (!saved.ok) {
+      setFocus(before.focus);
+      setView(before.view);
+      toast.error(t('failed'));
+      return;
+    }
+    track('chat_focus_saved', { areas: next, count: next.length, source: 'settings' });
+    toast(next.length ? t('focus.saved', { label: focusLabel(next) }) : t('focus.cleared'));
+  };
+
+  /** The Default view: the focus is kept, for the picker to tick next time. */
+  const chooseDefault = async () => {
+    if (view === 'default') return;
+    setView('default');
+    const saved = await saveDefaultHome().catch(() => ({ ok: false as const }));
+    if (!saved.ok) {
+      setView('focus');
+      toast.error(t('failed'));
+      return;
+    }
+    track('chat_focus_saved', { areas: [], count: 0, source: 'settings' });
+    toast(t('focus.cleared'));
+  };
+
+  const lockTip =
+    access.fullAutoLock === 'plan'
+      ? t('fullAutoPlan')
+      : access.fullAutoLock === 'admin'
+        ? t('fullAutoAdmin')
+        : undefined;
+
+  return (
+    <section className="max-w-[680px]">
+      <h2 className="mb-1 text-base font-semibold">{t('general.title')}</h2>
+      <p className="mb-3.5 text-[13px] text-muted-foreground">
+        {t.rich('general.intro', {
+          policy: (chunks) => (
+            <Link
+              href={CHAT_POLICY_HREF}
+              data-action="policy.open"
+              className="underline underline-offset-2 hover:text-foreground"
+            >
+              {chunks}
+            </Link>
+          ),
+        })}
+      </p>
+
+      {access.modes && (
+        <Row label={t('defaultMode.label')} note={t('defaultMode.note')}>
+          <span
+            role="radiogroup"
+            aria-label={t('defaultMode.label')}
+            className="inline-flex shrink-0 rounded-[9px] border bg-muted/60 p-0.5"
+          >
+            {MODES.map((mode) => {
+              const locked = mode === 'full_auto' && !!access.fullAutoLock;
+              const on = settings.defaultMode === mode;
+              return (
+                <button
+                  key={mode}
+                  type="button"
+                  role="radio"
+                  aria-checked={on}
+                  aria-disabled={locked || undefined}
+                  data-action="chatSettings.defaultMode"
+                  title={locked ? lockTip : undefined}
+                  onClick={() => {
+                    if (!locked && !on) void change({ defaultMode: mode });
+                  }}
+                  className={cn(
+                    'inline-flex items-center rounded-[7px] px-[9px] py-[3px] text-xs whitespace-nowrap text-muted-foreground outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50',
+                    on &&
+                      'bg-background font-medium text-foreground shadow-[0_1px_2px_rgba(0,0,0,.08)]',
+                    locked && 'cursor-not-allowed text-muted-foreground/60',
+                  )}
+                >
+                  {t(`defaultMode.${mode}`)}
+                </button>
+              );
+            })}
+          </span>
+        </Row>
+      )}
+
+      <Row label={t('focus.label')} note={t('focus.note')}>
+        <span
+          role="group"
+          aria-label={t('focus.label')}
+          className="grid shrink-0 grid-cols-2 gap-x-4 gap-y-1.5 text-[13px]"
+        >
+          <label className="col-span-2 flex items-center gap-[7px] whitespace-nowrap">
+            <input
+              type="checkbox"
+              data-action="chatSettings.focusDefault"
+              checked={view === 'default'}
+              onChange={() => void chooseDefault()}
+              className="accent-foreground"
+            />
+            {tf('default.name')}
+          </label>
+          {FOCUS_AREAS.map((area) => (
+            <label key={area} className="flex items-center gap-[7px] whitespace-nowrap">
+              <input
+                type="checkbox"
+                data-action="chatSettings.focus"
+                value={area}
+                checked={shown.includes(area)}
+                onChange={(event) => void changeFocus(area, event.target.checked)}
+                className="accent-foreground"
+              />
+              {tf(`areas.${area}.name`)}
+            </label>
+          ))}
+        </span>
+      </Row>
+
+      <Row label={t('language.label')} note={t('language.note')}>
+        <select
+          data-action="chatSettings.answerLanguage"
+          aria-label={t('language.label')}
+          value={settings.answerLanguage ?? ''}
+          onChange={(event) =>
+            void change({
+              answerLanguage: (event.target.value || null) as AnswerLanguage | null,
+            })
+          }
+          className={SELECT}
+        >
+          <option value="">{t('language.same')}</option>
+          {LANGUAGES.map((language) => (
+            <option key={language} value={language}>
+              {t(`language.${language}`)}
+            </option>
+          ))}
+        </select>
+      </Row>
+
+      <RangeRow />
+
+      <Row label={t('notify.label')} note={t('notify.note')}>
+        <select
+          data-action="chatSettings.notifyChannel"
+          aria-label={t('notify.label')}
+          value={settings.notifyVia}
+          onChange={(event) => void change({ notifyVia: event.target.value as NotifyChannel })}
+          className={SELECT}
+        >
+          {CHANNELS.map((channel) => (
+            <option
+              key={channel}
+              value={channel}
+              disabled={channel === 'inbox_slack' && !access.slack}
+            >
+              {channel === 'inbox_slack' && !access.slack
+                ? t('notify.slackSoon')
+                : t(`notify.${channel}`)}
+            </option>
+          ))}
+        </select>
+      </Row>
+
+      <Row label={t('thought.label')} note={t('thought.note')}>
+        <Switch
+          checked={settings.showThought}
+          label={t('thought.label')}
+          action="chatSettings.toggleThinking"
+          onChange={(next) => void change({ showThought: next })}
+        />
+      </Row>
+
+      <Row label={t('everyPage.label')} note={t('everyPage.note')}>
+        <Switch
+          checked={settings.panelOnPages}
+          label={t('everyPage.label')}
+          action="chatSettings.toggleAskChatEverywhere"
+          onChange={(next) => void change({ panelOnPages: next })}
+        />
+      </Row>
+
+      {/* The product tour again, from its first topic: it runs in the side panel. */}
+      {tour?.available && settings.panelOnPages && (
+        <Row label={t('tour.label')} note={t('tour.note')}>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            data-action="chatSettings.takeTour"
+            disabled={tour.busy}
+            onClick={() => {
+              track('chat_tour_restarted');
+              void tour.show('visibility', 'everything');
+            }}
+            className="shrink-0"
+          >
+            {t('tour.take')}
+          </Button>
+        </Row>
+      )}
+
+      {/* Where a page Chat writes opens (CHAT-25 §3, W4-11; Open here, W4-15b). */}
+      <Row label={t('pageOpen.label')} note={t('pageOpen.note')}>
+        <span
+          role="radiogroup"
+          aria-label={t('pageOpen.label')}
+          className="inline-flex shrink-0 rounded-[9px] border bg-muted/60 p-0.5"
+        >
+          {PAGE_OPENS.map((where) => {
+            const on = settings.pageOpen === where;
+            return (
+              <button
+                key={where}
+                type="button"
+                role="radio"
+                aria-checked={on}
+                data-action="chatSettings.pageOpen"
+                onClick={() => {
+                  if (!on) void change({ pageOpen: where });
+                }}
+                className={cn(
+                  'inline-flex items-center rounded-[7px] px-[9px] py-[3px] text-xs whitespace-nowrap text-muted-foreground outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50',
+                  on &&
+                    'bg-background font-medium text-foreground shadow-[0_1px_2px_rgba(0,0,0,.08)]',
+                )}
+              >
+                {t(`pageOpen.${where}`)}
+              </button>
+            );
+          })}
+        </span>
+      </Row>
+    </section>
+  );
+}

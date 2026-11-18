@@ -1,5 +1,6 @@
 import type { ActionItem } from '@/lib/actions/action-center';
 import { OPEN_ACTION_STATUSES } from '@/lib/action-center/registry';
+import { levelOf } from '@/lib/priority-core';
 
 /**
  * An action's priority as the app shows it (AC-006): the 0–100 score and its
@@ -13,12 +14,20 @@ export type PriorityLevel = (typeof PRIORITY_LEVELS)[number];
 
 const CHANGES = ['lost', 'dropped', 'slipping', 'gap', 'issue', 'opportunity', 'gain'] as const;
 type PriorityChange = (typeof CHANGES)[number];
+/** Changes that are a standing state rather than an event: said without "N days ago". */
+const STATES = new Set<PriorityChange>(['gap', 'opportunity']);
 
 /** The facts the server stored with the score (`actions.priority_reason`). */
 export interface PriorityReason {
   /** The worst finding's change; null when nothing open supports the action. */
   change: PriorityChange | null;
   subject: { entity: string | null; count: number | null };
+  /**
+   * A topic gap sent from Visibility (VIS-010): the rival's lead in
+   * Visibility points and its name, as the action was sent. Null for every
+   * other action, and from a scorer before it.
+   */
+  competitorGap?: { points: number; competitor: string } | null;
   /** Measured demand; null when nothing measures it. */
   demand: 'high' | 'medium' | 'low' | null;
   /**
@@ -39,7 +48,76 @@ export interface PriorityReason {
    * results with a verdict, how many improved, and the points that moved
    * its score. Null with no history, or from a scorer before it.
    */
-  pastSuccess?: { improved: number; results: number; points: number } | null;
+  pastSuccess?: {
+    improved: number;
+    results: number;
+    points: number;
+    /** Read from its play's track (AC plan P-4): the play's id; absent, its kind's. */
+    play?: string;
+  } | null;
+  /** How sure the score is of what it rests on; null from a scorer before it was kept. */
+  confidence?: PriorityConfidence | null;
+}
+
+export type ConfidenceLevel = 'low' | 'medium' | 'high';
+
+/**
+ * The score's confidence factor as the server weighs it (priority.js
+ * `confidenceOf`): 0.3 for one kind of finding from one source, 0.2 more for
+ * each further kind and each further source; an action a person sent carries
+ * its own. Read as a level and why, never as the bare number.
+ */
+export interface PriorityConfidence {
+  level: ConfidenceLevel;
+  /** The 0–1 factor the score used. */
+  score: number;
+  /** Kinds of finding and data sources behind it; none for an action a person sent. */
+  kinds: number;
+  sources: number;
+}
+
+/** A 0–1 confidence's level: High from 0.7, Medium from 0.5, else Low. */
+export function confidenceLevelOf(score: number): ConfidenceLevel {
+  return score >= 0.7 ? 'high' : score >= 0.5 ? 'medium' : 'low';
+}
+
+function confidenceOf(r: Record<string, unknown>): PriorityConfidence | null {
+  const factors = (r.factors && typeof r.factors === 'object' ? r.factors : {}) as Record<
+    string,
+    unknown
+  >;
+  const score = factors.confidence;
+  if (typeof score !== 'number' || !Number.isFinite(score)) return null;
+  const count = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+  return {
+    level: confidenceLevelOf(score),
+    score,
+    kinds: count(r.kinds),
+    sources: count(r.sources),
+  };
+}
+
+/**
+ * Why the confidence is what it is, in English, for the MCP server: "one kind
+ * of finding from one source".
+ */
+export function confidenceNote(confidence: PriorityConfidence): string {
+  const count = (n: number, one: string, many: string) => (n === 1 ? `one ${one}` : `${n} ${many}`);
+  if (confidence.kinds === 0) {
+    return 'rated from what the action was sent with, not from detected findings';
+  }
+  const kinds = count(confidence.kinds, 'kind of finding', 'kinds of finding');
+  return confidence.sources > 0
+    ? `${kinds} from ${count(confidence.sources, 'source', 'sources')}`
+    : kinds;
+}
+
+/** Days New with no one's event before an action is stale: the server's staleAfterDays (config/action-engine.js). */
+export const STALE_AFTER_DAYS = 30;
+
+/** Stale (00432): New for a month with no one's event. Only a New action reads as stale. */
+export function isStale(action: { status: string; staleAt?: string | null }): boolean {
+  return action.status === 'new' && Boolean(action.staleAt);
 }
 
 /** How many actions the Top Actions card names (spec: at most five). */
@@ -49,12 +127,12 @@ export function isPriorityLevel(value: unknown): value is PriorityLevel {
   return (PRIORITY_LEVELS as readonly unknown[]).includes(value);
 }
 
-/** A score's level, as the server assigns it: critical 90+, high 75+, medium 50+. */
+/** The server's level cut-offs (config/action-engine.js `priority`): critical 90+, high 75+, medium 50+. */
+const LEVEL_CUTOFFS = { critical: 90, high: 75, medium: 50 };
+
+/** A score's level, as the server assigns it. */
 export function priorityLevelOf(score: number): PriorityLevel {
-  if (score >= 90) return 'critical';
-  if (score >= 75) return 'high';
-  if (score >= 50) return 'medium';
-  return 'low';
+  return levelOf(score, LEVEL_CUTOFFS);
 }
 
 /** The stored level, or the score's when the stored one is missing or unknown. */
@@ -94,6 +172,7 @@ export function parsePriorityReason(
       entity: typeof subject.entity === 'string' ? subject.entity : null,
       count: num(subject.count),
     },
+    competitorGap: competitorGapOf(r.competitorGap),
     demand: r.demand === 'high' || r.demand === 'medium' || r.demand === 'low' ? r.demand : null,
     realDemand: r.realDemand === 'high' || r.realDemand === 'medium' ? r.realDemand : null,
     commercial: r.commercial === true,
@@ -101,7 +180,17 @@ export function parsePriorityReason(
     days: daysSince(num(r.days), scoredAt, now),
     sources: num(r.sources) ?? 0,
     pastSuccess: pastSuccessOf(r.pastSuccess),
+    confidence: confidenceOf(r),
   };
+}
+
+function competitorGapOf(value: unknown): PriorityReason['competitorGap'] {
+  if (!value || typeof value !== 'object') return null;
+  const g = value as Record<string, unknown>;
+  const competitor = typeof g.competitor === 'string' ? g.competitor.trim() : '';
+  return typeof g.points === 'number' && Number.isFinite(g.points) && g.points > 0 && competitor
+    ? { points: g.points, competitor }
+    : null;
 }
 
 function pastSuccessOf(value: unknown): PriorityReason['pastSuccess'] {
@@ -111,7 +200,12 @@ function pastSuccessOf(value: unknown): PriorityReason['pastSuccess'] {
     typeof v === 'number' && Number.isFinite(v) ? v : null,
   );
   if (improved === null || results === null || points === null || results < 1) return null;
-  return { improved, results, points };
+  return {
+    improved,
+    results,
+    points,
+    ...(typeof p.play === 'string' && p.play ? { play: p.play } : {}),
+  };
 }
 
 function daysSince(days: number | null, scoredAt: string | null | undefined, now: Date) {
@@ -175,10 +269,21 @@ const SUBJECTS = new Set([
 ]);
 
 /**
+ * The English article a number takes, as it is said: "an" before 8, 11, 18
+ * and the eighties ("an 8.5-pt gap"), "a" before the rest. A select in the
+ * copy, so another language's words can leave it aside.
+ */
+function articleBefore(number: string): 'an' | 'a' {
+  return /^(8\d?|11|18)(\.|$)/.test(number) ? 'an' : 'a';
+}
+
+/**
  * "Why this priority?": what changed, on what, how recently, and what makes
  * it matter — from the action's own facts, in the reader's language
  * (actionsPage.priority.reason). "Lost ground on 7 high-demand prompts
  * 2 days ago — measured demand High, commercial intent, previously visible."
+ * A topic gap sent from Visibility names its gap and rival: "A 23.4-pt gap
+ * with Northbound Roasters on 12 prompts — commercial intent."
  */
 export function priorityReasonText(reason: PriorityReason, t: Translator): string {
   const { entity, count } = reason.subject;
@@ -187,18 +292,28 @@ export function priorityReasonText(reason: PriorityReason, t: Translator): strin
   const inSubject =
     Boolean(adjective) && entity !== null && DEMANDED.has(entity) && count !== null && count > 0;
   const known = entity !== null && SUBJECTS.has(entity) && count !== null && count > 0;
-  const what = !reason.change
+  const gap = reason.change ? reason.competitorGap : null;
+  const key = gap ? 'competitorGap' : reason.change;
+  // One decimal, as the action's title states the gap.
+  const points = gap ? gap.points.toFixed(1) : '';
+  const named: Record<string, string> = gap
+    ? { points, competitor: gap.competitor, article: articleBefore(points) }
+    : {};
+  const what = !key
     ? t('reason.change.none')
     : known
-      ? t(`reason.change.${reason.change}`, {
+      ? t(`reason.change.${key}`, {
+          ...named,
           subject: t(`reason.subject.${entity}`, {
             count,
             demand: inSubject ? `${adjective} ` : '',
           }),
         })
-      : t(`reason.alone.${reason.change}`);
+      : t(`reason.alone.${key}`, named);
+  // When it happened, for a change that happened: a gap or room to grow is a
+  // standing state, and "Room to grow on 3 prompts 1 day ago" reads as noise.
   const when =
-    reason.change && reason.days !== null
+    reason.change && !STATES.has(reason.change) && reason.days !== null
       ? reason.days === 0
         ? t('reason.when.today')
         : t('reason.when.days', { days: reason.days })
@@ -222,6 +337,7 @@ export function priorityReasonText(reason: PriorityReason, t: Translator): strin
       t(past.points > 0 ? 'reason.pastSuccess.worked' : 'reason.pastSuccess.rarely', {
         improved: past.improved,
         results: past.results,
+        by: past.play ? 'play' : 'kind',
       }),
     );
   }
@@ -234,4 +350,15 @@ export function priorityReasonText(reason: PriorityReason, t: Translator): strin
     });
   }
   return t('reason.sentence.end', { text });
+}
+
+/** "Low confidence — one kind of finding from one source." */
+export function priorityConfidenceText(confidence: PriorityConfidence, t: Translator): string {
+  return t('reason.confidence.line', {
+    level: t(`reason.confidence.${confidence.level}`),
+    why:
+      confidence.kinds > 0
+        ? t('reason.confidence.found', { kinds: confidence.kinds, sources: confidence.sources })
+        : t('reason.confidence.sent'),
+  });
 }

@@ -2,6 +2,7 @@
 
 import { createClient } from '@/lib/supabase/server';
 import { revalidatePath } from 'next/cache';
+import { after } from 'next/server';
 import { getOrgPlan } from '@/lib/guards/plan-guard';
 import { isWithinLimit } from '@/config/plans';
 import { slugify } from '@/lib/slug';
@@ -11,6 +12,7 @@ import { MAX_PINNED_COMPETITORS } from '@/lib/insights-trend';
 import { isSiteType, type SiteType } from '@/lib/content/page-types';
 import { isConversionsConsent, type ConversionsConsent } from '@/lib/conversion-tracking';
 import { assertWritable } from '@/lib/subscription-guard';
+import { countPlanBrands } from '@/lib/plan-brand-count';
 
 function mapDomainRow(d: Record<string, unknown>): BrandDomain {
   return {
@@ -37,9 +39,15 @@ function mapBrandRow(brand: Record<string, unknown>, domains: Record<string, unk
     trackingCode: (brand.tracking_code as string | null) ?? undefined,
     shoppingModeEnabled: !!brand.shopping_mode_enabled,
     siteType: (brand.site_type as string | null) ?? undefined,
+    siteTypeSource:
+      brand.site_type_source === 'auto' || brand.site_type_source === 'manual'
+        ? brand.site_type_source
+        : undefined,
     conversionsEnabled: brand.conversions_enabled === true,
     conversionsConsent: brand.conversions_consent === 'always' ? 'always' : 'wait',
     isActive: brand.is_active === undefined ? true : !!brand.is_active,
+    isDemo: brand.is_demo === true,
+    demoHiddenAt: (brand.demo_hidden_at as string | null | undefined) ?? null,
     domains: domains.map(mapDomainRow),
     createdAt: brand.created_at as string,
     updatedAt: brand.updated_at as string,
@@ -94,6 +102,23 @@ interface CreateBrandInput {
 export type CreateBrandResult = { brand: Brand } | { error: string; code: 'plan_limit' };
 
 /**
+ * Fires the agents' When a brand is added triggers for a new brand once the
+ * answer has gone (00482; agent-triggers.ts fireBrandAdded): the page
+ * doesn't wait for them. Their runs wait queued and start on the agents'
+ * minute tick. Best effort: a failure is logged, and the brand stays.
+ */
+function fireBrandAddedLater(brandId: string) {
+  after(async () => {
+    try {
+      const { fireBrandAdded } = await import('@/lib/chat/agent-triggers');
+      await fireBrandAdded(brandId, new Date(), null);
+    } catch (err) {
+      console.error('[brand] the brand-added triggers failed', err);
+    }
+  });
+}
+
+/**
  * The plan limit comes back as a VALUE: production masks every error thrown
  * from a server action, so a thrown PlanLimitError reached users as the
  * meaningless digest message (same as #427 for prompts).
@@ -102,13 +127,12 @@ export async function createBrand(input: CreateBrandInput): Promise<CreateBrandR
   await assertWritable({ onboarding: true });
   const supabase = await createClient();
 
-  const { count } = await supabase
-    .from('brands')
-    .select('id', { count: 'exact', head: true })
-    .eq('organization_id', input.organizationId);
+  // Every brand of the organization, whatever this person sees (00390); the
+  // demo brand (00380) never counts against the plan.
+  const count = await countPlanBrands(supabase, input.organizationId);
 
   const plan = await getOrgPlan(input.organizationId);
-  if (!isWithinLimit(plan, 'maxBrands', count ?? 0)) {
+  if (!isWithinLimit(plan, 'maxBrands', count)) {
     const max = plan.limits.maxBrands;
     return {
       code: 'plan_limit',
@@ -118,22 +142,32 @@ export async function createBrand(input: CreateBrandInput): Promise<CreateBrandR
 
   const slug = slugify(input.name) || `brand-${Date.now()}`;
 
+  // The id is chosen here and the row is read back after the insert, never
+  // with `insert … returning`: that checks the select policy before the row
+  // is stored, and a Selected-brands person (00388/00389) only sees the brand
+  // once the creator grant, which runs after the insert, has shared it.
+  const brandId = crypto.randomUUID();
+  const { error: insertError } = await supabase.from('brands').insert({
+    id: brandId,
+    organization_id: input.organizationId,
+    name: input.name.trim(),
+    slug,
+    logo_url: input.logoUrl || null,
+    industry: input.industry || null,
+    description: input.description || null,
+    region: input.region || 'US',
+    // State only makes sense for US brands; drop it silently otherwise so
+    // a stale value from a region switch can't leak into the row.
+    state: (input.region || 'US') === 'US' ? input.state || null : null,
+    language: input.language || 'en',
+  });
+
+  if (insertError) throw new Error(insertError.message);
+
   const { data: brand, error } = await supabase
     .from('brands')
-    .insert({
-      organization_id: input.organizationId,
-      name: input.name.trim(),
-      slug,
-      logo_url: input.logoUrl || null,
-      industry: input.industry || null,
-      description: input.description || null,
-      region: input.region || 'US',
-      // State only makes sense for US brands; drop it silently otherwise so
-      // a stale value from a region switch can't leak into the row.
-      state: (input.region || 'US') === 'US' ? input.state || null : null,
-      language: input.language || 'en',
-    })
-    .select()
+    .select('*')
+    .eq('id', brandId)
     .single();
 
   if (error || !brand) throw new Error(error?.message ?? 'Failed to create brand');
@@ -157,6 +191,7 @@ export async function createBrand(input: CreateBrandInput): Promise<CreateBrandR
     insertedDomains = (domains as Record<string, unknown>[]) ?? [];
   }
 
+  fireBrandAddedLater(brandId);
   revalidatePath('/dashboard/brands');
   return { brand: mapBrandRow(brand as Record<string, unknown>, insertedDomains) };
 }
@@ -177,7 +212,7 @@ interface UpdateBrandInput {
 }
 
 export async function updateBrand(id: string, updates: UpdateBrandInput): Promise<Brand> {
-  await assertWritable();
+  await assertWritable({ brandId: id });
   const supabase = await createClient();
 
   const payload: Record<string, unknown> = {};
@@ -275,7 +310,7 @@ export async function setBrandShoppingMode(
   brandId: string,
   enabled: boolean,
 ): Promise<{ promptsUpdated: number }> {
-  await assertWritable();
+  await assertWritable({ brandId });
   return applyShoppingMode(await createClient(), brandId, enabled);
 }
 
@@ -353,25 +388,58 @@ async function applyShoppingMode(
   return { promptsUpdated };
 }
 
+/** Postgres' code for a column that doesn't exist (here: 00379 not applied). */
+const UNDEFINED_COLUMN = '42703';
+
 /**
  * Setup found the brand sells products online (competitor research's
- * isEcommerce): its industry becomes E-commerce & Retail when it has none,
- * and Shopping mode goes on, so Product Visibility shows in the menu. A
- * brand already in Shopping mode is left as it is.
+ * isEcommerce): its site type becomes e-commerce, as a detection, unless a
+ * person chose one (00379); its industry becomes E-commerce & Retail when it
+ * has none; and Shopping mode goes on, so Product Visibility shows in the
+ * menu. A brand already in Shopping mode keeps its industry and mode.
+ * `siteType` is the type written, null when it was left as it was.
  */
 export async function markBrandAsEcommerce(
   brandId: string,
-): Promise<{ industry: string | null; promptsUpdated: number }> {
-  await assertWritable({ onboarding: true });
+): Promise<{ industry: string | null; promptsUpdated: number; siteType: SiteType | null }> {
+  await assertWritable({ onboarding: true, brandId });
   const supabase = await createClient();
-  const { data: brand, error } = await supabase
+  const read = await supabase
     .from('brands')
-    .select('industry, shopping_mode_enabled')
+    .select('industry, shopping_mode_enabled, site_type, site_type_source')
     .eq('id', brandId)
     .single();
+  // 00379 not applied yet (a deploy ahead of its migration): Shopping mode
+  // still goes on; the site type is left for detection once it is.
+  const typeKnown = read.error?.code !== UNDEFINED_COLUMN;
+  const { data: brand, error } = typeKnown
+    ? read
+    : await supabase
+        .from('brands')
+        .select('industry, shopping_mode_enabled, site_type')
+        .eq('id', brandId)
+        .single();
   if (error || !brand) throw new Error(error?.message ?? 'Brand not found');
 
-  if (brand.shopping_mode_enabled) return { industry: brand.industry ?? null, promptsUpdated: 0 };
+  let siteType: SiteType | null = null;
+  const source = 'site_type_source' in brand ? brand.site_type_source : null;
+  if (typeKnown && source !== 'manual' && brand.site_type !== 'ecommerce') {
+    // Stamped as a detection, so the trigger keeps it auto.
+    const { data: typed, error: typeErr } = await supabase
+      .from('brands')
+      .update({ site_type: 'ecommerce', site_type_detected_at: new Date().toISOString() })
+      .eq('id', brandId)
+      .select('id');
+    if (typeErr && typeErr.code !== UNDEFINED_COLUMN) throw new Error(typeErr.message);
+    if (!typeErr && (!typed || typed.length === 0)) {
+      throw new Error('Brand not found or you do not have permission to update it.');
+    }
+    if (!typeErr) siteType = 'ecommerce';
+  }
+
+  if (brand.shopping_mode_enabled) {
+    return { industry: brand.industry ?? null, promptsUpdated: 0, siteType };
+  }
 
   let industry: string | null = brand.industry ?? null;
   if (!industry) {
@@ -388,7 +456,7 @@ export async function markBrandAsEcommerce(
     industry = ecommerce;
   }
   const { promptsUpdated } = await applyShoppingMode(supabase, brandId, true);
-  return { industry, promptsUpdated };
+  return { industry, promptsUpdated, siteType };
 }
 
 /**
@@ -404,7 +472,7 @@ export async function markBrandAsEcommerce(
  * brand via their org membership.
  */
 export async function setBrandActive(brandId: string, isActive: boolean): Promise<void> {
-  await assertWritable();
+  await assertWritable({ brandId });
   const supabase = await createClient();
 
   // Return the updated row so a no-op (invalid id, or RLS silently denying the
@@ -435,7 +503,7 @@ export async function setPinnedCompetitors(
   brandId: string,
   competitorIds: string[],
 ): Promise<string[]> {
-  await assertWritable();
+  await assertWritable({ brandId });
   if (!Array.isArray(competitorIds) || competitorIds.some((id) => typeof id !== 'string')) {
     throw new Error('Pinned competitors must be a list of competitor ids.');
   }

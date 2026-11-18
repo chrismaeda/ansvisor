@@ -1,38 +1,42 @@
 'use client';
 
-import { useId } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { useFormatter, useTranslations } from 'next-intl';
 import { Check } from 'lucide-react';
 import { Link } from '@/i18n/navigation';
 import { Button, buttonVariants } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
-import { normalizeDomain } from '@/lib/citations/classify';
 import type { ContentAuthor } from '@/lib/content/authors';
 import { isPageType } from '@/lib/content/drafts';
+import type { SiteType } from '@/lib/content/page-types';
 import { BAND_CLASSES, qualityBand } from '@/lib/content/quality';
 import type { QualityProfile } from '@/lib/content/quality-profiles';
 import {
   authorProfile,
-  FRESH_MONTHS,
-  trustGain,
   type EeatCheckId,
   type Score,
   type ClaimMark,
-  type TrustCheckId,
   type TrustRead,
 } from '@/lib/content/quality-checks';
 import type { QualityTodo } from '@/lib/content/quality-todos';
 import type { AiCheck } from '@/lib/content/page-read';
-import {
-  readabilityGain,
-  SECTION_WORDS,
-  type Readability,
-  type ReadabilityCheck,
-} from '@/lib/content/readability';
+import type { Readability } from '@/lib/content/readability';
 import { SITE_TRUST_PATH, siteTrustMissing, type SiteTrust } from '@/lib/content/site-trust';
 import { CATALOG_SETTINGS_PATH } from '@/lib/content/feed-match';
 import { cn } from '@/lib/utils';
+import {
+  readabilitySuggestions,
+  trustSuggestions,
+  type QualityT,
+  type Suggestion,
+  type TrustSuggestion,
+} from '@/lib/content/quality-suggestions';
 import { MANAGE_AUTHORS_PATH } from './_author-menu';
+
+// The suggestions' words live with Quality, so Chat's check_draft_rules says them too.
+export { trustSuggestions };
+export type { Suggestion, TrustSuggestion };
+type T = QualityT;
 
 /** The intro's sentences its to-do quotes, at most (CE-054). */
 const INTRO_QUOTED = 3;
@@ -85,7 +89,7 @@ export interface QualityRead {
   /** Where the brand's facts are approved: Brand settings › Brand facts (CE-047). */
   brandFactsPath?: string | null;
   /** The brand's business type: a proof to-do's wording follows it (CE-049). */
-  siteType?: 'b2b' | 'ecommerce' | 'b2c';
+  siteType?: SiteType;
   /** The page read (proof, CE-049; AI checks, CE-050) waits: the AI budget is spent, or its reads for the day made. */
   pagePaused?: boolean;
   pageLimited?: boolean;
@@ -118,28 +122,6 @@ export interface HandOff {
   todos: number;
 }
 
-export interface Suggestion {
-  key: string;
-  // E-E-A-T's are the person's to-dos.
-  score: Exclude<ScoreName, 'eeat'>;
-  gain: number;
-  line: string;
-  detail: string;
-  /** The passage Show goes to, if any. */
-  show: string | null;
-  /** The source Keep keeps (CE-046): the person trusts it all the same. */
-  keep?: string;
-  /** The claim whose words Add source selects to link, and whose sentence Remove takes out (CE-045). */
-  claim?: ClaimMark;
-  /** Read by AI, not by rules alone: it says so (spec §3, "AI check"). */
-  ai?: boolean;
-  /**
-   * Hand off leaves it to the person (CE-051): it asks the other way to what
-   * the agent is told for its check (sentences too short, a page too simple).
-   */
-  handOff?: false;
-}
-
 /**
  * Instructions › Quality (Quality spec §3, CE-039): the three scores read
  * from the draft and its author, each labelled an Ansvisor estimate, then
@@ -149,6 +131,7 @@ export interface Suggestion {
  */
 export function QualityTab({
   quality,
+  focusRequest = null,
   onShow,
   onShowPlaceholder,
   onPickAuthor,
@@ -167,6 +150,11 @@ export function QualityTab({
   onChangeType,
 }: {
   quality: QualityRead;
+  /**
+   * A part to show, from the Next step basket: scrolled into view and
+   * marked a moment, Quality open already or not (editor test 2026-11-03).
+   */
+  focusRequest?: { to: QualityFocus; n: number } | null;
   /** Opens the header's page type menu: the checks and weights follow the type (CE-052). */
   onChangeType?: () => void;
   /** Scrolls the draft to a passage and marks it. */
@@ -217,14 +205,24 @@ export function QualityTab({
   // Every live check has its points: none to raise, none of the person's left
   // (a page too short to read says so instead).
   const allDone = suggestions.length === 0 && todosLeft === 0 && readability?.score !== null;
+  const shown = useFocusRequest(focusRequest, todosLeft > 0, suggestions.length > 0);
 
   return (
     <div className="space-y-4 text-sm">
-      <section aria-label={t('scores')} className="space-y-2">
+      <section
+        ref={shown.ref('scores')}
+        tabIndex={-1}
+        aria-label={t('scores')}
+        className={cn('space-y-2', shown.mark('scores'))}
+      >
         <div className="grid grid-cols-3 gap-2">
           {scores.map(({ name, score, empty }) => (
             <div key={name} className="min-w-0 rounded-xl border bg-card px-2.5 py-2">
               <p className="truncate text-xs text-muted-foreground">{t(`names.${name}`)}</p>
+              {/* What it measures, in plain words (editor UX review 2026-11-03). */}
+              <p className="text-[11px] leading-tight text-muted-foreground">
+                {t(`about.${name}`)}
+              </p>
               {score === null ? (
                 <p className="mt-0.5 text-xs text-muted-foreground">{empty}</p>
               ) : (
@@ -243,6 +241,7 @@ export function QualityTab({
             </div>
           ))}
         </div>
+        <p className="text-xs text-muted-foreground">{t('bandsLegend')}</p>
         <p className="text-xs text-muted-foreground">{t('estimate')}</p>
         {weightsFor && (
           <p className="text-xs text-muted-foreground">
@@ -292,7 +291,12 @@ export function QualityTab({
       {handOff && <HandOffCard handOff={handOff} />}
 
       {todos.length > 0 && (
-        <section aria-label={t('todos.title')} className="space-y-2">
+        <section
+          ref={shown.ref('todos')}
+          tabIndex={-1}
+          aria-label={t('todos.title')}
+          className={cn('space-y-2', shown.mark('todos'))}
+        >
           <h4 className="text-xs text-muted-foreground">
             <span className="font-medium">{t('todos.title')}</span>{' '}
             {t('todos.left', { count: todosLeft })}
@@ -321,7 +325,12 @@ export function QualityTab({
       )}
 
       {(suggestions.length > 0 || allDone) && (
-        <section aria-label={t('suggestionsLabel')} className="space-y-2">
+        <section
+          ref={shown.ref('trust')}
+          tabIndex={-1}
+          aria-label={t('suggestionsLabel')}
+          className={cn('space-y-2', shown.mark('trust'))}
+        >
           <h4 className="text-xs font-medium text-muted-foreground">{t('suggestionsLabel')}</h4>
           {allDone ? (
             <p className="text-xs text-muted-foreground">{t('nothingToRaise')}</p>
@@ -330,7 +339,9 @@ export function QualityTab({
               {suggestions.map((s) => (
                 <li key={s.key} className="flex items-start gap-2.5 rounded-xl border px-3 py-2.5">
                   <span className="mt-0.5 shrink-0 rounded-md bg-emerald-50 px-1.5 text-[11px] font-medium text-emerald-700 tabular-nums dark:bg-emerald-950 dark:text-emerald-300">
-                    {t('gain', { gain: s.gain, score: t(`names.${s.score}`) })}
+                    <span title={t('gainLong', { gain: s.gain, score: t(`names.${s.score}`) })}>
+                      {t('gain', { gain: s.gain, score: t(`names.${s.score}`) })}
+                    </span>
                   </span>
                   <div className="min-w-0 flex-1">
                     <p className="font-medium [overflow-wrap:anywhere]">
@@ -436,6 +447,74 @@ export function QualityTab({
       )}
     </div>
   );
+}
+
+/** Quality's parts the Next step basket shows: its to-dos, or what raises Trust. */
+export type QualityFocus = 'todos' | 'trust';
+type FocusPart = QualityFocus | 'scores';
+
+/**
+ * Brings a part of the side panel to the top of the panel's own scroll
+ * (`data-panel-scroll`), leaving the page where it is: scrollIntoView moves
+ * every scroll it sits in, and at 1024×768 took the header with Next and
+ * Mark ready out of sight (editor UX review 2026-11-03). Outside the panel,
+ * as near as it needs.
+ */
+export function scrollInPanel(el: HTMLElement) {
+  const box = el.closest<HTMLElement>('[data-panel-scroll]');
+  if (!box) {
+    el.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
+    return;
+  }
+  const top = box.scrollTop + el.getBoundingClientRect().top - box.getBoundingClientRect().top;
+  box.scrollTo?.({ top: Math.max(0, top - 8), behavior: 'smooth' });
+}
+
+/** How long a part shown from the basket stays marked. */
+const FOCUS_MARK_MS = 1600;
+
+/**
+ * The part a request names, scrolled into view, focused and marked a moment
+ * (once per request): its to-dos with one open, else what raises the
+ * scores, else the scores themselves.
+ */
+function useFocusRequest(
+  request: { to: QualityFocus; n: number } | null,
+  hasTodos: boolean,
+  hasSuggestions: boolean,
+) {
+  const parts = useRef<Partial<Record<FocusPart, HTMLElement | null>>>({});
+  const handled = useRef<number | null>(null);
+  const [marked, setMarked] = useState<FocusPart | null>(null);
+  useEffect(() => {
+    if (!request || handled.current === request.n) return;
+    handled.current = request.n;
+    const order: FocusPart[] =
+      request.to === 'todos' ? ['todos', 'trust', 'scores'] : ['trust', 'todos', 'scores'];
+    const part = order.find(
+      (p) => (p === 'scores' || (p === 'todos' ? hasTodos : hasSuggestions)) && parts.current[p],
+    );
+    const el = part ? parts.current[part] : null;
+    if (!part || !el) return;
+    scrollInPanel(el);
+    el.focus({ preventScroll: true });
+    setMarked(part);
+    const timer = setTimeout(() => setMarked(null), FOCUS_MARK_MS);
+    return () => clearTimeout(timer);
+    // Only a new request shows a part.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [request?.n]);
+  return {
+    ref: (part: FocusPart) => (el: HTMLElement | null) => {
+      parts.current[part] = el;
+    },
+    mark: (part: FocusPart) =>
+      cn(
+        'rounded-xl outline-none transition-shadow duration-500',
+        marked === part &&
+          'ring-2 ring-amber-300 ring-offset-2 ring-offset-background dark:ring-amber-700',
+      ),
+  };
 }
 
 /** A to-do's words: its title, the nudge's "Next for you" phrase and its detail line. */
@@ -710,7 +789,9 @@ function TodoRow({
             <>
               {' · '}
               <span className="font-medium whitespace-nowrap text-emerald-700 tabular-nums dark:text-emerald-300">
-                {t('gain', { gain: todo.gain, score: t(`names.${todo.score}`) })}
+                <span title={t('gainLong', { gain: todo.gain, score: t(`names.${todo.score}`) })}>
+                  {t('gain', { gain: todo.gain, score: t(`names.${todo.score}`) })}
+                </span>
               </span>
             </>
           )}
@@ -829,29 +910,6 @@ function TodoRow({
   );
 }
 
-type T = ReturnType<typeof useTranslations<'contentEditor.editor.quality'>>;
-
-function readabilitySuggestions(t: T, readability: Readability | null): Suggestion[] {
-  if (!readability || readability.score === null) return [];
-  return readability.checks.map(
-    (check): Suggestion => ({
-      key: `readability:${check.id}`,
-      score: 'readability',
-      gain: readabilityGain(readability, check.id),
-      line: line(t, check),
-      detail: detail(t, check),
-      show: check.at || null,
-      ...(check.ai ? { ai: true } : {}),
-      ...(againstHandOff(check) ? { handOff: false as const } : {}),
-    }),
-  );
-}
-
-/** Asks for longer sentences or a harder read: the hand-off's checks say shorter and easier. */
-const againstHandOff = (check: ReadabilityCheck) =>
-  (check.id === 'avgSentence' && check.count < 0) ||
-  (check.id === 'readingLevel' && !!check.band && check.count > 0);
-
 /**
  * What would raise the scores, the biggest gain first: Readability's and
  * Trust's suggestions with a gain (E-E-A-T's are the person's to-dos). Hand
@@ -905,233 +963,6 @@ function HandOffCard({ handOff }: { handOff: HandOff }) {
       )}
     </section>
   );
-}
-
-/** A Trust suggestion: its check, and how many it names (Before you publish's warning). */
-export type TrustSuggestion = Suggestion & { check: TrustCheckId; count: number };
-
-/**
- * Trust's: figures without a source, sources past FRESH_MONTHS, links that
- * don't answer, each with Show on the first one in the page. A broken link
- * is listed before Trust is scored too, its gain out of the Phase 1 points.
- * Phase 2 (CE-046): weak or competitors' sources, Show and Keep on the first,
- * and no primary source among them. Phase 2 (CE-047): a price, trial or
- * founding year that differs from the brand's approved facts, listed before
- * Trust is scored too, as a broken link is.
- */
-export function trustSuggestions(
-  t: T,
-  trust: TrustRead | null,
-  covered: ReadonlySet<string> = new Set(),
-  /**
-   * Phase 2 (CE-050): the page read's balance and disclosure, each with the
-   * passage Show goes to (where the page puts the brand forward), and the
-   * brand's name for their lines.
-   */
-  page: { balanced: AiCheck | null; disclosure: AiCheck | null; brand: string } | null = null,
-): TrustSuggestion[] {
-  if (!trust) return [];
-  const out: TrustSuggestion[] = [];
-  // A sentence a proof to-do asks the person to prove isn't the agent's to
-  // source as well (CE-049).
-  const unsourced = trust.unsourced.filter((sentence) => !covered.has(sentence));
-  if (unsourced.length) {
-    // Phase 2 (CE-045): claims the model read count with the figures, so
-    // the line says claims; Add source and Remove act on the page's first.
-    const claims = trust.aiClaims > 0;
-    const first = unsourced[0];
-    out.push({
-      key: 'trust:claimsSourced',
-      check: 'claimsSourced',
-      score: 'trust',
-      // Each sentence's share: the covered ones' is their to-dos'.
-      gain: Math.round(
-        (trustGain(trust, ['claimsSourced']) * unsourced.length) / trust.unsourced.length,
-      ),
-      line: t(claims ? 'checks.claimsSourced.lineClaims' : 'checks.claimsSourced.line', {
-        count: unsourced.length,
-      }),
-      count: unsourced.length,
-      detail: t(claims ? 'checks.claimsSourced.detailClaims' : 'checks.claimsSourced.detail'),
-      show: first,
-      ai: claims,
-      claim: trust.marks.find((mark) => mark.sentence === first),
-    });
-  }
-  if (trust.mismatches.length) {
-    const [first] = trust.mismatches;
-    out.push({
-      key: 'trust:brandFacts',
-      check: 'brandFacts',
-      score: 'trust',
-      gain: trustGain(trust, ['brandFacts']),
-      line: t('checks.brandFacts.line', {
-        kind: first.kind,
-        page: first.page,
-        source: first.source,
-        fact: first.fact,
-      }),
-      count: trust.mismatches.length,
-      detail: t('checks.brandFacts.detail', { count: trust.mismatches.length }),
-      show: first.sentence,
-    });
-  }
-  // Phase 3 (CE-053): the person checks which is right, the page or the
-  // feed: Hand off leaves it (it isn't one of its keys).
-  const feed = trust.feed ?? [];
-  if (feed.length) {
-    const [first] = feed;
-    out.push({
-      key: 'trust:feedMatch',
-      check: 'feedMatch',
-      score: 'trust',
-      gain: trustGain(trust, ['feedMatch']),
-      line: t('checks.feedMatch.line', {
-        kind: first.kind,
-        page: first.page,
-        feed: first.feed,
-      }),
-      count: feed.length,
-      detail: t('checks.feedMatch.detail', { count: feed.length }),
-      show: first.sentence || null,
-    });
-  }
-  if (trust.stale.length) {
-    out.push({
-      key: 'trust:freshSources',
-      check: 'freshSources',
-      score: 'trust',
-      gain: trustGain(trust, ['freshSources']),
-      count: trust.stale.length,
-      line: t('checks.freshSources.line', {
-        count: trust.stale.length,
-        total: trust.dated,
-        months: FRESH_MONTHS,
-      }),
-      detail: t('checks.freshSources.detail'),
-      show: trust.stale[0].text,
-    });
-  }
-  // Only once Trust is scored: their gain out of the Phase 1 points would be made up.
-  if (trust.weak.length && trust.score !== null) {
-    const [first] = trust.weak;
-    out.push({
-      key: 'trust:noWeakSources',
-      check: 'noWeakSources',
-      score: 'trust',
-      gain: trustGain(trust, ['noWeakSources']),
-      line: t('checks.noWeakSources.line', { count: trust.weak.length }),
-      count: trust.weak.length,
-      detail: t('checks.noWeakSources.detail', {
-        host: normalizeDomain(first.url),
-        kind: first.kind,
-      }),
-      show: first.text,
-      keep: first.url,
-      ai: trust.weak.some((w) => w.ai),
-    });
-  }
-  const primary = trust.checks.find((c) => c.id === 'primarySources');
-  if (primary && primary.points < primary.max && trust.score !== null) {
-    out.push({
-      key: 'trust:primarySources',
-      check: 'primarySources',
-      score: 'trust',
-      gain: trustGain(trust, ['primarySources']),
-      line: t('checks.primarySources.line'),
-      count: 1,
-      detail: t('checks.primarySources.detail'),
-      show: null,
-    });
-  }
-  // The page read's (CE-050), once Trust is scored, as the sources' kinds.
-  for (const id of ['disclosure', 'balanced'] as const) {
-    const read = page?.[id];
-    if (!read || read.found || trust.score === null) continue;
-    out.push({
-      key: `trust:${id}`,
-      check: id,
-      score: 'trust',
-      gain: trustGain(trust, [id]),
-      // Before the brand's name is read: "your brand".
-      line: t(`checks.${id}.line`, { brand: page!.brand || t('yourBrand') }),
-      count: 1,
-      detail: t(`checks.${id}.detail`, { brand: page!.brand || t('yourBrand') }),
-      show: read.show,
-      ai: true,
-    });
-  }
-  if (trust.broken.length) {
-    out.push({
-      key: 'trust:noBrokenLinks',
-      check: 'noBrokenLinks',
-      score: 'trust',
-      gain: trustGain(trust, ['noBrokenLinks']),
-      line: t('checks.noBrokenLinks.line', { count: trust.broken.length }),
-      count: trust.broken.length,
-      detail: t('checks.noBrokenLinks.detail', {
-        count: trust.broken.length,
-        url: trust.broken[0].url,
-      }),
-      show: trust.broken[0].text,
-    });
-  }
-  return out;
-}
-
-/** A Readability check's one line: what the draft does now. */
-function line(t: T, check: ReadabilityCheck): string {
-  switch (check.id) {
-    case 'avgSentence':
-      return t('checks.avgSentence.line', { words: check.value });
-    case 'longSentences':
-      return t('checks.longSentences.line', { count: check.count });
-    case 'readingLevel':
-      return check.formula
-        ? t('checks.readingLevel.line', {
-            score: check.value,
-            formula: t(`formulas.${check.formula}`),
-          })
-        : t('checks.readingLevel.lineLength');
-    case 'answerFirst':
-      return t('checks.answerFirst.line');
-    case 'shortParagraphs':
-      return t('checks.shortParagraphs.line', { count: check.count });
-    case 'headingSpacing':
-      return t('checks.headingSpacing.line', { count: check.count, words: SECTION_WORDS });
-    case 'passiveJargon':
-      return t('checks.passiveJargon.line', { passive: check.count, jargon: check.value });
-    case 'typeRules':
-      return t('checks.typeRules.line', {
-        count: check.count,
-        names: (check.rules ?? []).map((r) => r.name).join(', '),
-      });
-  }
-}
-
-/** Its detail line: what to do. */
-function detail(t: T, check: ReadabilityCheck): string {
-  if (check.id === 'avgSentence' && check.count < 0) return t('checks.avgSentence.detailShort');
-  if (check.id === 'readingLevel') {
-    // English reads by its band (as Site Audit does): over it, the page reads too simple.
-    if (check.band) {
-      return check.count > 0
-        ? t('checks.readingLevel.detailSimple', check.band)
-        : t('checks.readingLevel.detailBand', check.band);
-    }
-    return check.formula
-      ? t('checks.readingLevel.detail', { target: check.target ?? 60 })
-      : t('checks.readingLevel.detailLength');
-  }
-  // Each rule with its aim and how the page reads now: what Hand off sends the agent too.
-  if (check.id === 'typeRules') {
-    return t('checks.typeRules.detail', {
-      rules: (check.rules ?? [])
-        .map((r) => (r.detail ? `${r.name} (${r.detail})` : r.name))
-        .join('; '),
-    });
-  }
-  return t(`checks.${check.id}.detail`);
 }
 
 /** The sentences the open proof to-dos ask the person to prove (CE-049), and its customer cases'. */

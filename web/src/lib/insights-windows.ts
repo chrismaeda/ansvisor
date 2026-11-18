@@ -39,6 +39,98 @@ export function dailyWindow(opts?: WindowedOpts): DayWindow | null {
 
 export const DAY_MS = 86_400_000;
 
+/**
+ * The whole UTC days a date range covers, for the daily rollups; null when a
+ * bound falls inside a day, which only the raw rows can answer. A bare
+ * 'YYYY-MM-DD' is that day. A lower bound at 00:00 UTC starts its day. An
+ * upper bound at 23:59:59 UTC or later ends its day, and one at 00:00 UTC
+ * the day before (it adds only answers of that one instant). A timestamp
+ * without a zone is UTC, as the database reads it. An absent bound is open;
+ * one that isn't a date or a time, null.
+ */
+export function wholeDayWindow(dateFrom?: string | null, dateTo?: string | null): DayWindow | null {
+  const from = wholeDayBound(dateFrom, 'from');
+  const to = wholeDayBound(dateTo, 'to');
+  if (from === null || to === null) return null;
+  return { ...(from ? { dayFrom: from } : {}), ...(to ? { dayTo: to } : {}) };
+}
+
+const BARE_DAY = /^\d{4}-\d{2}-\d{2}$/;
+const HAS_ZONE = /(?:Z|[+-]\d{2}(?::?\d{2})?)$/i;
+
+/** A bound's whole day: '' when absent, null when it falls inside a day or can't be read. */
+function wholeDayBound(value: string | null | undefined, side: 'from' | 'to'): string | null {
+  const text = value?.trim();
+  if (!text) return '';
+  if (BARE_DAY.test(text)) return Number.isNaN(Date.parse(text)) ? null : text;
+  const at = Date.parse(HAS_ZONE.test(text) ? text : `${text}Z`);
+  if (Number.isNaN(at)) return null;
+  const intoDay = ((at % DAY_MS) + DAY_MS) % DAY_MS;
+  const day = new Date(at - intoDay).toISOString().slice(0, 10);
+  if (intoDay === 0) return side === 'from' ? day : addDays(day, -1);
+  return side === 'to' && intoDay >= DAY_MS - 1000 ? day : null;
+}
+
+/**
+ * The whole UTC days a date range touches, for the daily rollups: a bound
+ * inside a day widens the window to that whole day (a lower one to the day's
+ * start, an upper one to its end), so the days cover every answer asked
+ * for. A range of whole days gives wholeDayWindow's days. Null when a bound
+ * isn't a date or a time.
+ */
+export function coveringDayWindow(
+  dateFrom?: string | null,
+  dateTo?: string | null,
+): DayWindow | null {
+  const from = coveringDayBound(dateFrom, 'from');
+  const to = coveringDayBound(dateTo, 'to');
+  if (from === null || to === null) return null;
+  return { ...(from ? { dayFrom: from } : {}), ...(to ? { dayTo: to } : {}) };
+}
+
+/** A bound's whole day, widened: '' when absent, null when it can't be read. */
+function coveringDayBound(value: string | null | undefined, side: 'from' | 'to'): string | null {
+  const whole = wholeDayBound(value, side);
+  if (whole !== null) return whole;
+  const at = boundAt(value, side);
+  return typeof at === 'number' ? new Date(at).toISOString().slice(0, 10) : null;
+}
+
+/**
+ * A bound's instant: a bare 'YYYY-MM-DD' at its day's first instant (a lower
+ * bound) or last millisecond (an upper one, as expandDateToEndOfDay reads
+ * it); a timestamp without a zone is UTC. Undefined when absent, null when
+ * it isn't a date or a time.
+ */
+function boundAt(value: string | null | undefined, side: 'from' | 'to'): number | null | undefined {
+  const text = value?.trim();
+  if (!text) return undefined;
+  if (BARE_DAY.test(text)) {
+    const start = Date.parse(`${text}T00:00:00Z`);
+    if (Number.isNaN(start)) return null;
+    return side === 'from' ? start : start + DAY_MS - 1;
+  }
+  const at = Date.parse(HAS_ZONE.test(text) ? text : `${text}Z`);
+  return Number.isNaN(at) ? null : at;
+}
+
+/**
+ * How long a date range holds answers for, in ms: from its lower bound to
+ * its upper one or `now`, whichever comes first (no answer is later than
+ * now), at least 0. Null when its lower bound is open or a bound can't be
+ * read. What a read over the raw rows costs follows it.
+ */
+export function answeredSpanMs(
+  dateFrom?: string | null,
+  dateTo?: string | null,
+  now: number = Date.now(),
+): number | null {
+  const from = boundAt(dateFrom, 'from');
+  const to = boundAt(dateTo, 'to');
+  if (typeof from !== 'number' || to === null) return null;
+  return Math.max(0, Math.min(to ?? now, now) - from);
+}
+
 export function utcToday(): string {
   return new Date().toISOString().slice(0, 10);
 }

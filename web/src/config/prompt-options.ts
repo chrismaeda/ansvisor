@@ -176,7 +176,6 @@ export const SCRAPER_GROUPS = [
       { id: 'google-aimode', label: 'Google AI Mode', platform: 'google-ai-mode' },
       { id: 'copilot-web', label: 'Microsoft Copilot', platform: 'copilot' },
       { id: 'grok-web', label: 'Grok', platform: 'grok' },
-      { id: 'perplexity-web', label: 'Perplexity', platform: 'perplexity' },
       { id: 'gemini-web', label: 'Google Gemini', platform: 'gemini' },
     ],
   },

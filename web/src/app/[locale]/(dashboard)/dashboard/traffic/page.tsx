@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { getPlatformFilterItems } from './_charts';
-import { getPlatformName, platformTableRows } from '@/lib/traffic-platforms';
+import { getPlatformName, movedPlatformOf, platformTableRows } from '@/lib/traffic-platforms';
 import dynamic from 'next/dynamic';
 import { Skeleton } from '@/components/ui/skeleton';
 const ReferralTrendChart = dynamic(() => import('./_charts').then((m) => m.ReferralTrendChart), {
@@ -19,6 +19,10 @@ const PlatformBreakdownChart = dynamic(
 );
 import { useTranslations } from 'next-intl';
 import { useBrandStore } from '@/stores/use-brand-store';
+import { AskAboutThis } from '@/components/chat/panel/ask-about-this';
+import { useChatPageContext } from '@/components/chat/panel/chat-panel-context';
+import { trafficChatView } from './_chat-view';
+import { rangeChipLabel } from '@/lib/chat/page-context';
 import type { Brand } from '@/types';
 import {
   type TrafficSources,
@@ -34,17 +38,19 @@ import {
 } from '@/components/filters/date-range-filter';
 import { PagesCard } from './_pages-card';
 import { ConversionsSection } from './_conversions';
+import { AiPipelineSection } from './_ai-pipeline';
 import { TrafficKpis } from './_kpis';
 import { VisitListSourceNote } from './_visit-list-note';
 import { EngagedCell, KeyEventsCell, PlatformValueNote } from './_platform-value';
 import { ExportMenu, TableExport, useTrafficExport } from './_export';
 import { SourcesStrip } from './_sources-strip';
+import { useFirstSnippetCheck } from './_use-first-snippet-check';
 import { SnippetBanner, SnippetDialog } from './_snippet-code';
 import { GoogleTrendView } from './_google-trend';
 import { GoogleSection } from './_google-section';
 import { BotsReportSection } from './_bots-report';
 import { NeedsTag } from './_source-gate';
-import { googleSourceStatus, snippetDetected } from '@/lib/traffic-sources';
+import { googleSourceStatus, snippetStateOf } from '@/lib/traffic-sources';
 import { useUserRole } from '@/hooks/use-user-role';
 import { useLatestRequest } from '@/hooks/use-latest-request';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -419,6 +425,8 @@ function TrafficPageContent({ brand }: { brand: Brand }) {
   const tCommon = useTranslations('common');
   const tVisits = useTranslations('traffic.visits');
   const tTrend = useTranslations('traffic.trend');
+  const tChat = useTranslations('chatPanel.suggest');
+  const tChatRange = useTranslations('chatPanel.range');
   // The page opens on the member's last range, or the last 24 hours (AT-017,
   // spec §3.01). This only renders in the browser, once the brand has loaded,
   // so the stored choice is read before the first load rather than after it.
@@ -588,6 +596,13 @@ function TrafficPageContent({ brand }: { brand: Brand }) {
   }, [loadLogs]);
 
   const primaryDomain = brand.domains.find((d) => d.isPrimary)?.domain ?? brand.domains[0]?.domain;
+  // A brand never checked for the snippet is checked once as the page opens.
+  const snippetChecking = useFirstSnippetCheck({
+    brandId: brand.id,
+    sources,
+    domain: primaryDomain,
+    onChecked: () => void loadSources(),
+  });
 
   // A new range shows only a spinner until the page and every section have
   // its data, rather than one range's numbers beside another's.
@@ -619,6 +634,9 @@ function TrafficPageContent({ brand }: { brand: Brand }) {
     ? googleSourceStatus(sources.gsc) === 'connected'
     : sourcesFailed || null;
 
+  // Where the tracking snippet stands (00433); null while the sources load or couldn't be read.
+  const snippet = sources ? snippetStateOf(sources) : null;
+
   const isEmpty = totalVisits === 0 && logs.length === 0;
   const hasAnyData = summary?.hasAnyData ?? false;
   const trulyEmpty = isEmpty && !hasAnyData;
@@ -642,6 +660,16 @@ function TrafficPageContent({ brand }: { brand: Brand }) {
       onConnected={() => void loadSources()}
       pagesActions={<TableExport exporter={exporter} section="convertingPages" />}
       answersActions={<TableExport exporter={exporter} section="buyerAnswers" />}
+    />
+  );
+
+  // HubSpot's AI-sourced contacts, deals and revenue (#2140), after the conversions.
+  const pipelineSection = (
+    <AiPipelineSection
+      brandId={brand.id}
+      brandName={brand.name}
+      dateWindow={dateWindow}
+      rangeLabel={rangeSubLabel}
     />
   );
 
@@ -693,10 +721,48 @@ function TrafficPageContent({ brand }: { brand: Brand }) {
     />
   );
 
+  // Chat's side panel sees the page (W1-08): its range and platform, the
+  // platform whose visits moved most, and the two tables to ask about.
+  const movedPlatform = movedPlatformOf(summary);
+  useChatPageContext({
+    dateRange: {
+      from: datePreset === 'custom' ? customFrom : datePreset,
+      to: datePreset === 'custom' ? customTo : null,
+      label: rangeChipLabel(datePreset, { from: customFrom, to: customTo }, (key, values) =>
+        tChatRange(key, values),
+      ),
+    },
+    filters: [
+      {
+        key: 'platform',
+        label: filters.platform ? getPlatformName(filters.platform) : tCommon('allPlatforms'),
+        value: filters.platform,
+      },
+    ],
+    suggestions: [
+      ...(movedPlatform
+        ? [
+            tChat(movedPlatform.change < 0 ? 'trafficDrop' : 'trafficRise', {
+              platform: movedPlatform.name,
+            }),
+          ]
+        : []),
+      tChat('trafficPages'),
+      tChat('actions'),
+    ],
+    referenceables: [
+      { type: 'table', id: 'traffic-platforms', label: t('chat.platformsTable') },
+      { type: 'table', id: 'traffic-pages', label: t('chat.pagesTable') },
+    ],
+    // And what else it shows (the owner's plan, item 8): the visit list's search, and once
+    // read, its visits on screen with how many match.
+    view: trafficChatView(filters.search, isLoadingLogs ? null : { logs, total: logsTotal }),
+  });
+
   return (
     <div className="space-y-6">
-      {/* Header */}
-      <HeaderWithAiUsage>
+      {/* Header: the meter and Ask Chat at its bottom, beside the range's buttons. */}
+      <HeaderWithAiUsage align="end">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <h1 className="text-2xl font-bold tracking-tight">AI Traffic Analytics</h1>
@@ -735,6 +801,7 @@ function TrafficPageContent({ brand }: { brand: Brand }) {
               brandId={brand.id}
               sources={sources}
               domain={primaryDomain}
+              snippetChecking={snippetChecking}
               hasTrackingCode={Boolean(brand.trackingCode)}
               canConnect={canManage}
               onShowCode={() => setCodeOpen(true)}
@@ -743,13 +810,28 @@ function TrafficPageContent({ brand }: { brand: Brand }) {
               onBotsChanged={() => setBotsRevision((n) => n + 1)}
             />
           )}
-          {/* The code stays open only while the snippet sends nothing (F3). */}
-          {(sourcesFailed || (sources && !snippetDetected(sources.snippetLastVisitAt))) && (
-            <SnippetBanner trackingCode={brand.trackingCode} conversions={conversions} />
+          {/* The code stays open only while the snippet isn't seen on the site (F3, 00433). */}
+          {(sourcesFailed || snippet === 'not_detected') && (
+            <SnippetBanner
+              trackingCode={brand.trackingCode}
+              conversions={conversions}
+              check={
+                sources
+                  ? {
+                      brandId: brand.id,
+                      domain: primaryDomain,
+                      checkedAt: sources.snippetCheckedAt,
+                      busy: snippetChecking,
+                      onFound: () => void loadSources(),
+                    }
+                  : undefined
+              }
+            />
           )}
           <SnippetDialog
             trackingCode={brand.trackingCode}
             conversions={conversions}
+            domain={primaryDomain}
             open={codeOpen}
             onOpenChange={setCodeOpen}
           />
@@ -760,7 +842,9 @@ function TrafficPageContent({ brand }: { brand: Brand }) {
                 <Globe className="h-10 w-10 mx-auto text-muted-foreground/50" />
                 <h3 className="text-lg font-semibold mt-4">{t('noDataTitle')}</h3>
                 <p className="text-sm text-muted-foreground mt-1 max-w-md mx-auto">
-                  {brand.trackingCode ? t('noVisitsDescription') : t('noDataDescriptionNoSnippet')}
+                  {snippet === 'not_detected'
+                    ? t('noDataDescriptionNoSnippet')
+                    : t('noVisitsDescription')}
                 </p>
               </CardContent>
             </Card>
@@ -843,7 +927,16 @@ function TrafficPageContent({ brand }: { brand: Brand }) {
                 <Card>
                   <CardHeader className="pb-2">
                     <div className="flex items-center justify-between gap-2">
-                      <CardTitle className="text-sm font-medium">Referrals by Platform</CardTitle>
+                      <div className="flex items-center gap-1">
+                        <CardTitle className="text-sm font-medium">Referrals by Platform</CardTitle>
+                        <AskAboutThis
+                          reference={{
+                            type: 'table',
+                            id: 'traffic-platforms',
+                            label: t('chat.platformsTable'),
+                          }}
+                        />
+                      </div>
                       <TableExport exporter={exporter} section="platforms" />
                     </div>
                   </CardHeader>
@@ -921,7 +1014,16 @@ function TrafficPageContent({ brand }: { brand: Brand }) {
                 <Card>
                   <CardHeader className="pb-2">
                     <div className="flex items-center justify-between gap-2">
-                      <CardTitle className="text-sm font-medium">Top Landing Pages</CardTitle>
+                      <div className="flex items-center gap-1">
+                        <CardTitle className="text-sm font-medium">Top Landing Pages</CardTitle>
+                        <AskAboutThis
+                          reference={{
+                            type: 'table',
+                            id: 'traffic-pages',
+                            label: t('chat.pagesTable'),
+                          }}
+                        />
+                      </div>
                       <TableExport exporter={exporter} section="pages" />
                     </div>
                   </CardHeader>
@@ -974,6 +1076,7 @@ function TrafficPageContent({ brand }: { brand: Brand }) {
               that has none (or some again) keeps these sections and their
               data rather than mounting them anew and reading it again. */}
           {conversionsSection}
+          {pipelineSection}
           {pagesCard}
           {googleSection}
           {botsSection}

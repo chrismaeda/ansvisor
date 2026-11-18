@@ -27,6 +27,13 @@ vi.mock('@/lib/actions/prompt-suggestions', () => ({
 }));
 const toast = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }));
 vi.mock('sonner', () => ({ toast }));
+// Adding a topic is for admins and managers.
+vi.mock('@/hooks/use-user-role', () => ({ useUserRole: () => ({ canManage: true }) }));
+vi.mock('@/i18n/navigation', () => ({
+  Link: ({ href, children }: { href: string; children: React.ReactNode }) => (
+    <a href={href}>{children}</a>
+  ),
+}));
 
 const { UntrackedQueriesCard } = await import('./_untracked-queries');
 
@@ -124,6 +131,23 @@ describe('UntrackedQueriesCard', () => {
     expect(onTracked).toHaveBeenCalledTimes(1);
   });
 
+  it('asks for a topic first on a brand without one, with a way to the Topics tab', async () => {
+    trackPagePrompts.mockResolvedValue({
+      promptIds: [],
+      error: 'Add a topic first: prompts are grouped under topics.',
+      code: 'no_topics',
+    });
+    await render();
+    await act(async () => button('Track')!.click());
+    expect(document.body.textContent).toContain('Add a topic first');
+    const link = [...document.body.querySelectorAll('a')].find(
+      (a) => a.textContent === 'Add a topic',
+    );
+    expect(link?.getAttribute('href')).toBe('/dashboard/prompts/topics?new=1');
+    expect(toast.error).not.toHaveBeenCalled();
+    expect(onTracked).not.toHaveBeenCalled();
+  });
+
   it('tracks nothing on a read-only workspace: Track opens the upgrade dialog', async () => {
     openUpgrade.mockReset();
     await render(true, true);
@@ -132,34 +156,22 @@ describe('UntrackedQueriesCard', () => {
     expect(trackPagePrompts).not.toHaveBeenCalled();
   });
 
-  it('tracks as many as the slots allow, and says when the plan ran out', async () => {
-    getLocationQuota.mockResolvedValue({ maxPrompts: 50, used: 48 });
-    trackPagePrompts.mockResolvedValue({ promptIds: ['n1'], error: 'limit', code: 'plan_limit' });
+  it('tracks them all past the slots left: the rest wait for a spot', async () => {
+    getLocationQuota.mockResolvedValue({ maxPrompts: 50, used: 50 });
     await render();
-    const all = button('Track all (2)');
+    const all = button('Track all (3)');
     expect(all).toBeTruthy();
+    expect(all!.disabled).toBe(false);
     await act(async () => all!.click());
     expect(trackPagePrompts).toHaveBeenCalledWith('b1', null, [
       { text: 'cold brew ratio', topic: '' },
       { text: 'how to descale an espresso machine', topic: '' },
+      { text: 'oat milk latte', topic: '' },
     ]);
-    expect(toast.error).toHaveBeenCalledWith(
-      "1 query needs another prompt slot: your plan's are used up.",
-    );
   });
 
-  it('turns tracking off without slots or for members', async () => {
-    getLocationQuota.mockResolvedValue({ maxPrompts: 50, used: 50 });
-    await render();
-    expect(button('Track')!.disabled).toBe(true);
-    expect(button('Track all (0)')!.disabled).toBe(true);
-    expect(button('Track')!.parentElement!.getAttribute('title')).toBe(
-      'No prompt slots left on your plan',
-    );
-
+  it('turns tracking off for members', async () => {
     getLocationQuota.mockResolvedValue({ maxPrompts: -1, used: 3 });
-    act(() => root.unmount());
-    root = createRoot(container);
     await render(false);
     expect(button('Track')!.disabled).toBe(true);
     expect(button('Track all (3)')!.parentElement!.getAttribute('title')).toBe(

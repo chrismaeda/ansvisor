@@ -116,4 +116,58 @@ describe('renderPulseEmail', () => {
     expect(html).toContain('color:#059669;">▲ 0</div>');
     expect(html).not.toContain('color:#dc2626;">▼ 0</div>');
   });
+
+  // The page is Visibility (Brand Visibility until 2026-11-06); its Overview keeps /dashboard/insights.
+  it('names the page it opens Visibility', () => {
+    const { html } = renderPulseEmail({
+      brandName: 'Acme',
+      metrics,
+      insightsUrl: 'https://app.example.com/dashboard/insights',
+      settingsUrl: 'https://example.com/settings',
+    });
+
+    expect(html).toContain('href="https://app.example.com/dashboard/insights"');
+    expect(html).toContain('>Open Visibility</a>');
+    expect(html).not.toContain('Open Insights');
+    expect(html).not.toContain('Brand Visibility');
+  });
+});
+
+describe('campaign tags', () => {
+  const links = {
+    insightsUrl: 'https://app.example.com/dashboard/insights',
+    settingsUrl: 'https://app.example.com/dashboard/settings?tab=notifications',
+  };
+
+  it('tags links into the app and keeps the existing query', async () => {
+    const { tagAppLink } = await import('./email.js');
+    const tagged = new URL(tagAppLink(links.settingsUrl, 'https://app.example.com'));
+    expect(tagged.searchParams.get('tab')).toBe('notifications');
+    expect(tagged.searchParams.get('utm_source')).toBe('pulse');
+    expect(tagged.searchParams.get('utm_medium')).toBe('email');
+    expect(tagged.searchParams.get('utm_campaign')).toBe('daily_pulse');
+  });
+
+  it('leaves other domains alone', async () => {
+    const { tagAppLink } = await import('./email.js');
+    const other = 'https://example.org/page?x=1';
+    expect(tagAppLink(other, 'https://app.example.com')).toBe(other);
+  });
+
+  it('tags the buttons in the email but not cited URLs', () => {
+    process.env.PUBLIC_APP_URL = 'https://app.example.com';
+    const { html } = renderPulseEmail({
+      brandName: 'Acme',
+      metrics: {
+        ...metrics,
+        highlights: [{ type: 'first_citation', url: 'https://cited.example.org/a' }],
+      },
+      ...links,
+    });
+    expect(html).toContain(
+      'insights?utm_source=pulse&amp;utm_medium=email&amp;utm_campaign=daily_pulse',
+    );
+    expect(html).toContain('tab=notifications&amp;utm_source=pulse');
+    expect(html).toContain('href="https://cited.example.org/a"');
+  });
 });

@@ -12,14 +12,14 @@ The Public Metrics API is a read-only, versioned REST surface under `/api/v1/*` 
 
 ## Authentication
 
-Every request needs an Ansvisor API key in the `Authorization` header. Create one under **Settings → API Keys** in the dashboard — the plaintext key (prefix `ans_`) is shown exactly once at creation time.
+Every request needs an Ansvisor API key in the `Authorization` header. Create one under **Settings → MCP & API Keys** in the dashboard — the plaintext key (prefix `ans_`) is shown exactly once at creation time.
 
 ```bash
 curl "https://app.ansvisor.com/api/v1/brands" \
   -H "Authorization: Bearer ans_..."
 ```
 
-Keys are scoped to the user who created them and resolve to that user's organization: every endpoint only returns data for brands the organization owns. Revoking a key (Settings → API Keys) takes effect immediately.
+Keys are scoped to the user who created them and resolve to that user's organization: every endpoint only returns data for brands the organization owns. Revoking a key (Settings → MCP & API Keys) takes effect immediately.
 
 `GET /api/v1/whoami` echoes the resolved identity — useful as a connection test. It also says the key's user's role, their work areas and whether they may choose who sees which menu sections:
 
@@ -110,7 +110,7 @@ The domains and URLs AI engines cite around the brand: totals, a source-type bre
 GET /api/v1/ai-traffic?brand_id=<uuid>&date_from=2026-06-01&date_to=2026-06-30
 ```
 
-Visits referred by AI platforms, collected by the tracking pixel: `total_visits`, `platform_breakdown`, `top_pages` (top 10 paths) and `country_breakdown`.
+Visits referred by AI platforms, collected by the tracking pixel: `tracking`, `total_visits`, `platform_breakdown`, `top_pages` (top 10 paths) and `country_breakdown`. `tracking` says whether the tracking snippet is installed: `not_detected` (not seen on the brand's site, so a `total_visits` of 0 means nothing is measured yet), `installed_quiet` (installed, no AI visit in the last 7 days) or `active`.
 
 ### Prompt performance
 
@@ -127,6 +127,8 @@ GET /api/v1/shopping-cards?brand_id=<uuid>&role=own&limit=50
 ```
 
 Normalized shopping-card rows (product title, brand, price, merchant, rating, position) captured from AI shopping surfaces. `role` filters to `own`, `competitor` or `other` matches; cursor-paginated via `limit` (default 50, max 200) and the returned `next_cursor`.
+
+Shopping analytics comes with the Growth plan and above. On Starter the endpoint answers `403` with `{ "error": "plan_limit", "message": "…" }`.
 
 ## Using it from Looker Studio
 

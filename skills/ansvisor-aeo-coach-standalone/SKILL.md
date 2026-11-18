@@ -42,7 +42,7 @@ Activate this skill when the user asks anything in the shape of:
 You need two things from the user, in this order:
 
 1. **API key** — a token starting with `ans_`. Tell them to grab one
-   from their Ansvisor dashboard: **Settings → API Keys → New key**. The
+   from their Ansvisor dashboard: **Settings → MCP & API Keys → New key**. The
    token is shown once at creation. If they don't have an Ansvisor
    account yet, point them at <https://www.ansvisor.com>.
 2. **Base URL** — defaults to `https://app.ansvisor.com`. Only ask if
@@ -136,18 +136,18 @@ mirrors the MCP tool of the same purpose and returns the same data.
 | `GET /visibility-trend` | `brand_id`, `granularity` (`day`/`week`), dates, `model`, `region`, `topic_id` | buckets over time, with an average competitor score |
 | `GET /competitor-comparison` | `brand_id`, dates, `model`, `region`, `topic_id` | per-entry `visibility_rate_pct`, mentions, citations, share of voice, split per model and platform |
 | `GET /citations` | `brand_id`, dates, `model`, `region`, `topic_id`, `limit`, `source_filter` (`all`/`owned`/`competitor`/`external`) | source-type breakdown, top domains and URLs |
-| `GET /ai-traffic` | `brand_id`, dates | AI-referred visits per platform, landing pages, countries |
+| `GET /ai-traffic` | `brand_id`, dates | AI-referred visits per platform, landing pages, countries, and `tracking`: `not_detected` (the tracking snippet isn't seen on the brand's site, so 0 visits means nothing is measured yet: say so and point to installing it on the AI Traffic page), `installed_quiet` (installed, no AI visit in the last 7 days) or `active` |
 
 **Mentions & sentiment**
 
-These take the Mentions page's filters: `brand_id`, `date_from` /
+These take the filters of Visibility's Mentions tab: `brand_id`, `date_from` /
 `date_to` (the last 30 days when left out), `platform` (e.g.
 `gemini-web`), `region`, `topic_id` and `search` over the prompts'
 text. They read the stored answers; no LLM is called.
 
 | Endpoint | Query / body | Returns |
 | --- | --- | --- |
-| `GET /mentions/summary` | the filters | the Overview: `current` and `previous` (times named, mentions, mention rate, prompts with mentions, average position, `sentiment` with `net` and `lowSample`), `changes` with their `basis`, `headline` (the platform that moved net sentiment most, competitors named beside the brand), `platforms[]`, `daily[]` |
+| `GET /mentions/summary` | the filters | the Mentions tab's Summary view: `current` and `previous` (times named, mentions, mention rate, prompts with mentions, average position, `sentiment` with `net` and `lowSample`), `changes` with their `basis`, `headline` (the platform that moved net sentiment most, competitors named beside the brand), `platforms[]`, `daily[]` |
 | `GET /mentions` | the filters, `sentiment`, `competitor_id` (`none` = no competitor), `sort` (`newest`/`oldest`/`co_mentions`/`negative`), `page` | `{ total, prompts, page, pageSize, mentions: [...] }`: 100 a page, each with sentiment, position, competitors in the same response and an `excerpt` |
 | `GET /mentions/{id}` | — | one response in full: text, citations, competitors named, sentiment, latest correction |
 | `GET /mentions/competitors` | the filters | each competitor's mentions, share of responses, change, and `sameResponseAsYou` |
@@ -162,7 +162,7 @@ text. They read the stored answers; no LLM is called.
 | `GET /prompts` | `brand_id`, `topic_id`, `is_active`, `limit` (default 100, max 500) | `{ prompts: [...] }` |
 | `GET /prompt-performance` | `brand_id`, dates, `topic_id`, `sort_by` (`visibility`/`mentions`/`citations`/`appearances`), `order`, `limit`, `model`, `region` | per-prompt visibility, mentions, citations, competitor score |
 | `GET /prompt-volumes` | `brand_id`, `limit` | `{ volumes: [...] }` — Google volumes, `est_ai_volume` with its range (`est_ai_volume_low` / `_high`) and `volume_confidence`, competition |
-| `GET /prompt-usage` | `brand_id` | `{ plan: { key, name, locationLimit, cta }, brand: { active, paused, total }, account: { activePrompts, brands, locationsUsed }, updatedAt }` — the plan's prompt allowance, as on the Tracked Prompts usage cards. The limit counts prompt **locations** account-wide (one slot per location of each active prompt; paused prompts use none, and resuming one needs free slots like adding one); `locationLimit: null` = unlimited |
+| `GET /prompt-usage` | `brand_id` | `{ plan: { key, name, locationLimit, cta, ended? }, brand: { active, paused, total }, account: { activePrompts, brands, locationsUsed }, updatedAt }` — the plan's prompt allowance, as on the Tracked Prompts usage cards. The limit counts prompt **locations** account-wide (one slot per location of each active prompt; paused prompts use none, and resuming one needs free slots like adding one); `locationLimit: null` = unlimited. With `plan.ended: true` the plan has ended (`plan` is the one it was on, `cta` is `choose_plan`): 0 slots are left until a plan is chosen |
 | `GET /topic-suggestions` | `brand_id` | `{ suggestions: [...] }` pending topic ideas |
 | `POST /topic-suggestions/{id}/accept` *(write)* | — | creates one topic |
 | `POST /topic-suggestions/{id}/dismiss` *(write)* | — | hides the suggestion |
@@ -178,7 +178,7 @@ text. They read the stored answers; no LLM is called.
 | `GET /site-audits/quota` | — | `{ used, limit, remaining }` (`-1` = unlimited) |
 | `GET /site-audits` | `brand_id` | recent audits |
 | `GET /site-audits/{id}` | — | one audit: scores, signals, fixes |
-| `POST /site-audits` *(write, uses a credit)* | `{ brand_id, url }` | a `running` audit; poll `GET /site-audits/{id}` (~30s) |
+| `POST /site-audits` *(write, uses a credit)* | `{ brand_id, url, force? }` | a `running` audit; poll `GET /site-audits/{id}` (~30s). A page with an audit already running returns that audit (`alreadyRunning: true`) and uses no credit. A page audited in the last 10 minutes answers 200 with `status: "recently_audited"` and that audit's `id`, starting nothing: read it, or ask the user and send `force: true` to audit it again (uses a credit) |
 
 **Shopping**
 
@@ -194,7 +194,7 @@ text. They read the stored answers; no LLM is called.
 | `GET /actions` | `brand_id`, `status`, `category`, `limit`, `sort` (`priority` default, or `updated`) | `{ actions: [...] }` open work, highest priority first: `priority` (`score` 0–100, `level`, `reason`; null until scored), impact, status, task progress |
 | `GET /actions/{id}` | `format`: `json` (default), `markdown` or `csv` | one action: priority, payload, signals, tasks (`mode`, `permission`, `details` with `where`, `why`, `how`, `done_when`, `type`, `effort`, `role`, `sent_to_content`, `sent_to_webhook`), events. `markdown` returns the dashboard's **Copy Data** text, `csv` its **Export CSV** file — read both as text (see below) |
 | `GET /signals` | `brand_id`, `status`, `kind`, `limit` | `{ signals: [...] }` detected changes, each with `where`, `change` (labelled figures with unit and period — prefer them over the raw values), `evidence` and `used_by_actions` |
-| `GET /action-history` | `brand_id`, `limit` | `{ actions: [...] }` closed, with `outcome` and `results` |
+| `GET /action-history` | `brand_id`, `limit` | `{ actions: [...] }` closed, with `outcome`, `results`, `reading_day` (7, 14 or 30: the day after closing of the latest reading; null before the first) and `final` (true once day 30 is read; until then the outcome is a reading so far) |
 | `PATCH /action-tasks/{id}/status` *(write)* | `{ status, skip_reason }`: `in_progress`, `completed`, `skipped` (reason required), `failed` | the updated task |
 | `POST /prompts/{id}/improve-action` *(write)* | `{ range: { preset, from, to, region }, idempotency_key, suggestions: [...] }` — see workflow 8 | `{ actionId, actionNo, created, taskCount }` |
 
@@ -398,8 +398,12 @@ or any "do I have gaps" question:
    (self-hosted, or an Enterprise account whose limit isn't set yet):
    skip the check. Otherwise, if none are left (or fewer than you'd
    suggest), say so: pausing low-value prompts frees their slots, and
-   `plan.cta` names the next step (`upgrade_growth`, `upgrade` or
-   `contact`).
+   `plan.cta` names the next step (`upgrade_growth`, `upgrade`,
+   `contact`, or `choose_plan` when `plan.ended` is true: the plan has
+   ended, and nothing can be added until an admin chooses a plan in
+   **Settings → Billing**).
+7. A prompt always sits under a topic: a brand with no topics can't add
+   prompts in Ansvisor, so suggest adding a topic first.
 
 ### 6. Prompt deep-dive
 
@@ -476,9 +480,11 @@ work:
 2. For each closed action, report the `outcome` and the before/after
    from `results` in one line. `pending_measurement` means the
    after-window is still open — say when to check back, don't judge
-   early.
+   early. Until `final` is true, say it is a reading so far ("day 14 of
+   30: improved so far") and that the final reading comes on day 30.
 3. Summarise: how many improved, how many didn't move, and what the
-   improved ones had in common.
+   improved ones had in common. Count readings so far apart from final
+   results.
 
 ### 10. Mentions & sentiment ("how is AI talking about us?")
 
@@ -550,6 +556,9 @@ When the user asks how AI describes the brand, why sentiment moved
   give its range and say so.
 - **Don't claim a citation count is good or bad in isolation.** It
   only matters relative to mentions (see scoring reference).
+- **Don't read 0 AI visits as no AI traffic.** When `GET /ai-traffic`
+  says `tracking: "not_detected"`, nothing is measured yet: say the
+  tracking snippet isn't installed instead.
 - **Don't call a write endpoint to "check" something.** Read
   endpoints exist for every write; use them.
 - **Don't log or repeat the API key.** If a code block needs to show
@@ -562,7 +571,7 @@ When the user asks how AI describes the brand, why sentiment moved
 ## Error handling
 
 - `401 Invalid API key` → ask the user to regenerate from Settings →
-  API Keys.
+  MCP & API Keys.
 - `403` on a sentiment correction → the key's user isn't an admin or
   manager of the brand's organization. Say so; don't retry.
 - `404 ... not found` → the id doesn't belong to the authenticated
@@ -573,6 +582,11 @@ When the user asks how AI describes the brand, why sentiment moved
   read-only: `GET` endpoints still work, writes are refused. Tell the
   user their plan has ended and that an admin can choose a plan (or
   update the payment method) in **Settings → Billing**. Don't retry.
+- `402` with `"code": "plan_required"` (and `"required_plan": "growth"`)
+  → the workspace is on Starter or in its free trial: `GET` endpoints
+  work, writes need the Growth plan or above. Tell the user this needs
+  Growth and that an admin can upgrade in **Settings → Billing**. Don't
+  retry.
 - `500` with a message (e.g. a plan limit, "Generate suggestions for
   this range first") → relay the message as is.
 - Network timeout → retry once. If it still fails, surface it and stop.

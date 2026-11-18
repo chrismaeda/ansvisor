@@ -1,4 +1,5 @@
 import { sendEmail } from '../email.js';
+import { platformLabel, signed } from './format.js';
 
 /**
  * Daily Pulse email rendering + delivery via the Resend HTTP API (#540).
@@ -9,22 +10,6 @@ import { sendEmail } from '../email.js';
  * environments never crash the tracking pipeline.
  */
 
-// Display names for platform slugs used in email copy. Keep in sync with
-// PLATFORM_LABELS in web/src/config/platform-labels.ts.
-const PLATFORM_LABELS = {
-  'chatgpt-web': 'ChatGPT',
-  'google-aio': 'Google AI Overviews',
-  'google-aimode': 'Google AI Mode',
-  'copilot-web': 'Microsoft Copilot',
-  'grok-web': 'Grok',
-  'perplexity-web': 'Perplexity',
-  'gemini-web': 'Google Gemini',
-};
-
-function platformLabel(slug) {
-  return PLATFORM_LABELS[slug] ?? slug;
-}
-
 function escapeHtml(value) {
   return String(value ?? '')
     .replace(/&/g, '&amp;')
@@ -33,10 +18,25 @@ function escapeHtml(value) {
     .replace(/"/g, '&quot;');
 }
 
-function signed(n, suffix = '') {
-  const v = Math.round(n * 10) / 10;
-  if (v > 0) return `+${v}${suffix}`;
-  return `${v}${suffix}`;
+const CAMPAIGN_TAGS = { utm_source: 'pulse', utm_medium: 'email', utm_campaign: 'daily_pulse' };
+
+/**
+ * Campaign tags for PostHog on links into the app. Only the app's own origin
+ * is tagged (never a cited third-party URL), and an existing query string is
+ * kept.
+ */
+export function tagAppLink(
+  link,
+  appOrigin = process.env.PUBLIC_APP_URL || 'http://localhost:3000',
+) {
+  try {
+    const url = new URL(link);
+    if (url.origin !== new URL(appOrigin).origin) return link;
+    for (const [key, value] of Object.entries(CAMPAIGN_TAGS)) url.searchParams.set(key, value);
+    return url.toString();
+  } catch {
+    return link;
+  }
 }
 
 function kpiCell(label, value, change) {
@@ -163,12 +163,12 @@ export function renderPulseEmail({ brandName, metrics, insightsUrl, settingsUrl 
   }
 
   <div style="margin:28px 0;">
-    <a href="${escapeHtml(insightsUrl)}" style="background:#111827;color:#ffffff;text-decoration:none;padding:10px 18px;border-radius:8px;font-size:14px;display:inline-block;">Open Insights</a>
+    <a href="${escapeHtml(tagAppLink(insightsUrl))}" style="background:#111827;color:#ffffff;text-decoration:none;padding:10px 18px;border-radius:8px;font-size:14px;display:inline-block;">Open Visibility</a>
   </div>
 
   <p style="font-size:12px;color:#9ca3af;border-top:1px solid #e5e7eb;padding-top:16px;">
     You're receiving this because Daily Pulse is enabled for ${escapeHtml(brandName)}.
-    <a href="${escapeHtml(settingsUrl)}" style="color:#6b7280;">Manage notification settings</a>
+    <a href="${escapeHtml(tagAppLink(settingsUrl))}" style="color:#6b7280;">Manage notification settings</a>
   </p>
 </div>`;
 

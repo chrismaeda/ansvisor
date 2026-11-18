@@ -1,11 +1,15 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import express from 'express';
 import {
+  apiLimiter,
   apiLimiterKey,
   botIngestKey,
+  businessHubTopicsLimiter,
   catalogCategoryLimiter,
   catalogLimiter,
   cmsLimiter,
+  cmsStatusLimiter,
+  isInternalChatBudgetCall,
   isJourneyBeacon,
   journeyEventKey,
   shoppingPathLimiter,
@@ -173,6 +177,34 @@ describe('rate-limiter – catalog buckets', () => {
   });
 });
 
+describe('rate-limiter – CMS buckets', () => {
+  it("keeps the Library's publish checks apart from connecting a CMS", async () => {
+    const app = express();
+    app.post('/webflow-status', cmsStatusLimiter, (_req, res) => res.json({}));
+    app.post('/cms', cmsLimiter, (_req, res) => res.json({}));
+    const server = await new Promise((resolve) => {
+      const listening = app.listen(0, '127.0.0.1', () => resolve(listening));
+    });
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const statuses = async (path, n) => {
+      const out = [];
+      for (let i = 0; i < n; i += 1)
+        out.push((await fetch(base + path, { method: 'POST' })).status);
+      return out;
+    };
+    try {
+      // Opening the Library 45 times (4 checks each) uses up its own 180…
+      const checks = await statuses('/webflow-status', 181);
+      expect(new Set(checks.slice(0, 180))).toEqual(new Set([200]));
+      expect(checks.at(-1)).toBe(429);
+      // …and connecting a CMS still goes through (its bucket is the module's: a few here).
+      expect(new Set(await statuses('/cms', 5))).toEqual(new Set([200]));
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+});
+
 describe('rate-limiter – shopping path builds', () => {
   it("gives a draft's shopping path builds a bucket of their own: 30 a quarter-hour", async () => {
     const app = express();
@@ -194,6 +226,127 @@ describe('rate-limiter – shopping path builds', () => {
       expect(builds.at(-1)).toBe(429);
       // The other buckets keep theirs.
       expect(await statuses('/cms', 1)).toEqual([200]);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+});
+
+describe('rate-limiter – prompts from Business Hub topics', () => {
+  it("gives each brand 10 an hour, whoever asks, and doesn't count a refusal", async () => {
+    const app = express();
+    app.post('/suggestions/:brandId/business-hub', businessHubTopicsLimiter, (req, res) =>
+      res.status(req.query.refuse ? 403 : req.query.fail ? 500 : 200).json({}),
+    );
+    const server = await new Promise((resolve) => {
+      const listening = app.listen(0, '127.0.0.1', () => resolve(listening));
+    });
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const statuses = async (brand, n, query = '') => {
+      const out = [];
+      for (let i = 0; i < n; i += 1) {
+        const res = await fetch(`${base}/suggestions/${brand}/business-hub${query}`, {
+          method: 'POST',
+        });
+        out.push(res.status);
+      }
+      return out;
+    };
+    try {
+      // Refusals first: none of them is counted.
+      expect(new Set(await statuses('b1', 12, '?refuse=1'))).toEqual(new Set([403]));
+      // A failed generation is: its model calls ran.
+      expect(await statuses('b1', 1, '?fail=1')).toEqual([500]);
+      const runs = await statuses('b1', 10);
+      expect(new Set(runs.slice(0, 9))).toEqual(new Set([200]));
+      expect(runs.at(-1)).toBe(429);
+      // Another brand keeps its own.
+      expect(await statuses('b2', 1)).toEqual([200]);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+});
+
+describe('rate-limiter – the Chat engine’s budget calls', () => {
+  beforeEach(() => vi.stubEnv('CRON_SECRET', 'chat-secret'));
+  afterEach(() => vi.unstubAllEnvs());
+
+  const req = (path, authorization) => ({
+    baseUrl: '/api',
+    path,
+    headers: authorization ? { authorization } : {},
+  });
+
+  it('exempts only the budget path, and only with the internal secret', () => {
+    expect(
+      isInternalChatBudgetCall(req('/internal/chat/budget/reserve', 'Bearer chat-secret')),
+    ).toBe(true);
+    expect(
+      isInternalChatBudgetCall(req('/internal/chat/budget/charge', 'Bearer chat-secret')),
+    ).toBe(true);
+    // Chat's page reads (fetch_page) come the same way.
+    expect(isInternalChatBudgetCall(req('/internal/chat/pages/open', 'Bearer chat-secret'))).toBe(
+      true,
+    );
+    expect(isInternalChatBudgetCall(req('/internal/chat/pages/open'))).toBe(false);
+    // And the model menu's reads (W4-01).
+    expect(isInternalChatBudgetCall(req('/internal/chat/models', 'Bearer chat-secret'))).toBe(true);
+    expect(isInternalChatBudgetCall(req('/internal/chat/models'))).toBe(false);
+    expect(
+      isInternalChatBudgetCall(req('/internal/chat/quality/reads', 'Bearer chat-secret')),
+    ).toBe(true);
+    expect(isInternalChatBudgetCall(req('/internal/chat/quality/reads'))).toBe(false);
+    // Without it, with another, or with the secret on any other path: counted.
+    expect(isInternalChatBudgetCall(req('/internal/chat/budget/reserve'))).toBe(false);
+    expect(isInternalChatBudgetCall(req('/internal/chat/budget/reserve', 'Bearer nope'))).toBe(
+      false,
+    );
+    expect(isInternalChatBudgetCall(req('/internal/chat/budget/reserve', 'chat-secret'))).toBe(
+      false,
+    );
+    expect(isInternalChatBudgetCall(req('/internal/ai-usage', 'Bearer chat-secret'))).toBe(false);
+    expect(isInternalChatBudgetCall(req('/internal/chat/budgetx', 'Bearer chat-secret'))).toBe(
+      false,
+    );
+    // No secret configured: nothing is exempt.
+    vi.stubEnv('CRON_SECRET', '');
+    expect(isInternalChatBudgetCall(req('/internal/chat/budget/reserve', 'Bearer '))).toBe(false);
+  });
+
+  it('never stops the secret’s budget calls, and still limits everything else from that address', async () => {
+    const app = express();
+    app.use('/api', apiLimiter);
+    app.post('/api/internal/chat/budget/reserve', (_req, res) => res.json({}));
+    app.get('/api/internal/ai-usage', (_req, res) => res.json({}));
+    const server = await new Promise((resolve) => {
+      const listening = app.listen(0, '127.0.0.1', () => resolve(listening));
+    });
+    const base = `http://127.0.0.1:${server.address().port}/api`;
+    const call = (method, path, secret) =>
+      fetch(base + path, {
+        method,
+        headers: secret ? { Authorization: `Bearer ${secret}` } : {},
+      }).then((r) => r.status);
+    try {
+      // Past the address's 250 a quarter-hour: none counted, none stopped.
+      const budget = [];
+      for (let i = 0; i < 260; i += 1) {
+        budget.push(await call('POST', '/internal/chat/budget/reserve', 'chat-secret'));
+      }
+      expect(new Set(budget)).toEqual(new Set([200]));
+
+      // The same address without the secret still gets its 250…
+      const plain = [];
+      for (let i = 0; i < 250; i += 1) plain.push(await call('GET', '/internal/ai-usage'));
+      expect(new Set(plain)).toEqual(new Set([200]));
+      // …then is stopped, on the budget path without the secret, with a wrong
+      // one, and on another internal path with the right one.
+      expect(await call('POST', '/internal/chat/budget/reserve')).toBe(429);
+      expect(await call('POST', '/internal/chat/budget/reserve', 'nope')).toBe(429);
+      expect(await call('GET', '/internal/ai-usage', 'chat-secret')).toBe(429);
+      // The secret's budget calls go on.
+      expect(await call('POST', '/internal/chat/budget/reserve', 'chat-secret')).toBe(200);
     } finally {
       await new Promise((resolve) => server.close(resolve));
     }

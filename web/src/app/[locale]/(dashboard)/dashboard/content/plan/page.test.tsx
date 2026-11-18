@@ -7,6 +7,11 @@ import type { PlanOpportunity, PlanPage } from '@/lib/content/plan';
 import { UpgradeDialogContext } from '@/components/providers/upgrade-gate';
 import ContentPlanPage from './page';
 
+const { chatPage } = vi.hoisted(() => ({ chatPage: vi.fn() }));
+vi.mock('@/components/chat/panel/chat-panel-context', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  useChatPageContext: chatPage,
+}));
 const getContentPlan = vi.fn();
 const getContentPlanInsights = vi.fn();
 const setPlanRowPriority = vi.fn();
@@ -19,9 +24,9 @@ vi.mock('@/lib/actions/content-plan', () => ({
   hidePlanRow: (...args: unknown[]) => hidePlanRow(...args),
   showPlanRow: (...args: unknown[]) => showPlanRow(...args),
 }));
-const listMembers = vi.fn();
+const listBrandMembers = vi.fn();
 vi.mock('@/lib/actions/team', () => ({
-  listMembers: (...args: unknown[]) => listMembers(...args),
+  listBrandMembers: (...args: unknown[]) => listBrandMembers(...args),
 }));
 // Assigning a draft's task is _assign-dialog's; here, which rows open it.
 vi.mock('./_assign-dialog', () => ({
@@ -181,7 +186,7 @@ beforeEach(() => {
   setPlanRowPriority.mockReset().mockResolvedValue(undefined);
   hidePlanRow.mockReset().mockResolvedValue(undefined);
   showPlanRow.mockReset().mockResolvedValue(undefined);
-  listMembers.mockReset().mockResolvedValue([]);
+  listBrandMembers.mockReset().mockResolvedValue([]);
   toast.mockReset();
   toast.error.mockReset();
   role.canManage = true;
@@ -732,7 +737,9 @@ describe('a Plan row’s menu', () => {
     expect(container.querySelectorAll('tbody tr')[2].textContent).toContain('Ada Lovelace');
 
     await clickItem('Coffee subscriptions', 'Assign to…');
-    expect(listMembers).toHaveBeenCalledTimes(1);
+    // The people who can see this brand (BRAND-ACCESS).
+    expect(listBrandMembers).toHaveBeenCalledTimes(1);
+    expect(listBrandMembers).toHaveBeenCalledWith('brand-1');
     expect(dialog.props).toMatchObject({
       open: true,
       preset: {
@@ -865,5 +872,45 @@ describe('the Content plan on a read-only workspace (plan not active)', () => {
       true,
     );
     expect(openUpgrade).not.toHaveBeenCalled();
+  });
+});
+
+describe("what Chat's side panel sees (the owner's plan, step 9)", () => {
+  const sent = () => chatPage.mock.lastCall![0];
+
+  it('sends its period and once read its rows by opportunity id, else by page address', async () => {
+    window.history.replaceState(null, '', '/dashboard/content/plan?days=7');
+    await renderPage();
+    expect(sent()).toMatchObject({
+      pageName: 'Content plan',
+      dateRange: { from: '7d', to: null, label: 'Last 7 days' },
+      filters: [],
+    });
+    const refs = sent().view.rows.map((row: { ref: string }) => row.ref);
+    expect(refs).toHaveLength(3);
+    expect(refs).toEqual(
+      expect.arrayContaining([
+        'o1',
+        'https://acme.example/guides/coffee-subscriptions',
+        'https://acme.example/guides/espresso',
+      ]),
+    );
+    expect(sent().view.total).toBe(3);
+  });
+
+  it('sends the card picked as a filter, and only its rows', async () => {
+    await renderPage();
+    await act(async () => button('Protect').click());
+    expect(sent().filters).toEqual([{ key: 'card', label: 'Protect', value: 'protect' }]);
+    expect(sent().view).toEqual({
+      rows: [{ ref: 'https://acme.example/guides/espresso', label: expect.any(String) }],
+      total: 1,
+    });
+  });
+
+  it('sends no rows while it reads', async () => {
+    getContentPlan.mockReturnValue(new Promise(() => {}));
+    await renderPage();
+    expect(sent().view).toEqual({});
   });
 });

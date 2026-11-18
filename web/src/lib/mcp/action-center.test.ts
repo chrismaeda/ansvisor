@@ -65,6 +65,8 @@ const auth: McpAuthContext = {
   email: null,
   organizationId: 'org-1',
   apiKeyId: 'key-1',
+  brandAccess: 'all',
+  role: 'admin',
 };
 
 const writes = () => ops.filter((o) => o.op !== 'select');

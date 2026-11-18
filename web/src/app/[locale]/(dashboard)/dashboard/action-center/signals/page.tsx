@@ -55,10 +55,15 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { cn } from '@/lib/utils';
 import { toCsv } from '@/lib/csv';
 import { readUrlChoice, readUrlParam, writeUrlParams } from '@/lib/url-state';
+import { exportFileName } from '@/lib/white-label/export-name';
 import type { KpiTrendPoint } from '@/lib/actions/kpis';
 import { signalChangeTone, signedPercent, type SignalMetric } from '@/lib/signals/metrics';
+import { matchesSignalCode, signalCode } from '@/lib/signals/signal-code';
 import { HeaderWithAiUsage } from '@/components/ai-usage/ai-usage-meter';
 import { useUpgradeGate } from '@/components/providers/upgrade-gate';
+import { useChatPageContext } from '@/components/chat/panel/chat-panel-context';
+import { rangeChipLabel, type ChatPageFilter } from '@/lib/chat/page-context';
+import { viewRows } from '@/lib/chat/page-view';
 
 const SIGNAL_EXPORT_HEADERS = [
   'title',
@@ -248,7 +253,8 @@ function SignalsContent({ brand }: { brand: Brand }) {
       if (status !== 'all' && signal.status !== status) return false;
       if (source !== 'all' && !signal.source.includes(source)) return false;
       if (platform !== 'all' && !isOnPlatform(signal.where.platforms, platform)) return false;
-      if (needle) {
+      // "S-12", "s12" or "12" finds the signal by its code (00534).
+      if (needle && !matchesSignalCode(signal, needle)) {
         const texts = signalTexts(signal, tTexts);
         const affected = signalAffected(signal, t);
         const where = [
@@ -275,7 +281,7 @@ function SignalsContent({ brand }: { brand: Brand }) {
     [signals, platform],
   );
 
-  const handleExportCsv = useCallback(() => {
+  const handleExportCsv = useCallback(async () => {
     if (visible.length === 0) return;
 
     const rows = visible.map((signal) => ({
@@ -298,7 +304,7 @@ function SignalsContent({ brand }: { brand: Brand }) {
     const slug = brand.slug ?? 'brand';
 
     link.href = url;
-    link.download = `ansvisor_${slug}_signals_${date}.csv`;
+    link.download = await exportFileName(`${slug}_signals_${date}.csv`);
     link.click();
 
     URL.revokeObjectURL(url);
@@ -307,6 +313,42 @@ function SignalsContent({ brand }: { brand: Brand }) {
   // The list shows copies of one finding as one row, and the counts follow.
   const groups = useMemo(() => groupSignals(visible), [visible]);
   const allGroups = useMemo(() => groupSignals(signals ?? []), [signals]);
+
+  // Chat's side panel sees the page (the owner's plan of 2026-11-16, step 9): its window, its
+  // filters, and once read, the signals on screen by the code each row shows, with how many.
+  const tChatRange = useTranslations('chatPanel.range');
+  const chatFilters: ChatPageFilter[] = [
+    ...(category !== 'all'
+      ? [{ key: 'category', label: tCategories(category), value: category }]
+      : []),
+    ...(impact !== 'all' ? [{ key: 'impact', label: t(`impact.${impact}`), value: impact }] : []),
+    ...(status !== 'all' ? [{ key: 'status', label: t(`status.${status}`), value: status }] : []),
+    ...(source !== 'all' ? [{ key: 'source', label: t(`sources.${source}`), value: source }] : []),
+    ...(platform !== 'all'
+      ? [{ key: 'platform', label: getAIProviderDisplayName(platform), value: platform }]
+      : []),
+  ];
+  useChatPageContext({
+    pageName: t('title'),
+    dateRange: {
+      from: datePreset,
+      to: null,
+      label: rangeChipLabel(datePreset, {}, (key, values) => tChatRange(key, values)),
+    },
+    filters: chatFilters,
+    view: {
+      ...(search.trim() ? { search: search.trim() } : {}),
+      ...(signals && !isLoading
+        ? {
+            rows: viewRows(groups, ({ signals: [lead] }) => ({
+              ref: signalCode(lead) ?? lead.id,
+              label: signalTexts(lead, tTexts).title,
+            })),
+            total: groups.length,
+          }
+        : {}),
+    },
+  });
 
   const categoryCounts = useMemo(() => {
     const counts = new Map<SignalCategory, number>();

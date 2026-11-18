@@ -19,6 +19,7 @@ import expandTopicVisibility from './definitions/g05-expand-topic-visibility.js'
 import createContentForTopics from './definitions/g16-create-content-for-topics.js';
 import { resolveBrandSources } from './sources.js';
 import { planTasks } from './tasks/plan.js';
+import { brandNoOf } from './action-code.js';
 
 export const TOPIC_OPPORTUNITY_ACTION_KIND = 'topic_opportunity';
 
@@ -66,7 +67,7 @@ export async function sendTopicOpportunityToActionCenter(topic, { suggestionIds,
   const openAction = async () => {
     const { data } = await supabaseAdmin
       .from('actions')
-      .select('id, action_no')
+      .select('id, action_no, brand_no')
       .eq('brand_id', brandId)
       .eq('dedup_key', dedupKey)
       .in('status', ACTIVE)
@@ -74,7 +75,13 @@ export async function sendTopicOpportunityToActionCenter(topic, { suggestionIds,
     return data;
   };
   const open = await openAction();
-  if (open) return { actionId: open.id, actionNo: Number(open.action_no), created: false };
+  if (open)
+    return {
+      actionId: open.id,
+      actionNo: Number(open.action_no),
+      ...brandNoOf(open),
+      created: false,
+    };
 
   // The card's rule, kept here too: in this topic and relevant. Tracked
   // ('added') counts: Track takes the topic off the card, and its toast
@@ -142,23 +149,30 @@ export async function sendTopicOpportunityToActionCenter(topic, { suggestionIds,
       baseline: { demand, trackedPrompts: tracked.length },
       dedup_key: dedupKey,
     })
-    .select('id, action_no')
+    .select('id, action_no, brand_no')
     .single();
   if (error) {
     // Two sends at once: the other one opened it (the open-action dedup index, 00084).
     if (error.code === '23505') {
       const winner = await openAction();
       if (winner) {
-        return { actionId: winner.id, actionNo: Number(winner.action_no), created: false };
+        return {
+          actionId: winner.id,
+          actionNo: Number(winner.action_no),
+          ...brandNoOf(winner),
+          created: false,
+        };
       }
     }
     throw new Error(error.message);
   }
 
   const sources = await resolveBrandSources(brandId);
+  // An untracked topic's work is a new page: G16's create branch (its
+  // optimize branch is a store's category page, AC plan P-7).
   const plan = planTasks(
     { id: TOPIC_OPPORTUNITY_ACTION_KIND, tasks: definition.tasks },
-    { sources, payload },
+    { sources, payload: { ...payload, contentExists: false } },
   );
   const { error: tasksErr } = await supabaseAdmin.from('action_tasks').insert(
     plan.map((item) => ({
@@ -169,6 +183,7 @@ export async function sendTopicOpportunityToActionCenter(topic, { suggestionIds,
       mode: item.mode,
       permission: item.permission,
       depends_on: item.dependsOn,
+      title: item.title,
       title_params: item.titleParams,
       details: item.details,
       status: 'todo',
@@ -189,5 +204,10 @@ export async function sendTopicOpportunityToActionCenter(topic, { suggestionIds,
     },
   });
 
-  return { actionId: action.id, actionNo: Number(action.action_no), created: true };
+  return {
+    actionId: action.id,
+    actionNo: Number(action.action_no),
+    ...brandNoOf(action),
+    created: true,
+  };
 }

@@ -5,6 +5,7 @@ import { useTranslations } from 'next-intl';
 import { useRouter } from '@/i18n/navigation';
 import { createClient } from '@/lib/supabase/client';
 import { createBrand, markBrandAsEcommerce, updateBrand } from '@/lib/actions/brand';
+import { TopicAccordion } from '@/components/onboarding/topic-accordion';
 import { EcommerceNote } from '@/components/onboarding/ecommerce-note';
 import { syncDomains } from '@/lib/actions/brand-domain';
 import { createTopics } from '@/lib/actions/topic';
@@ -15,7 +16,16 @@ import { triggerTrackingCheck } from '@/lib/actions/tracking';
 import { bootstrapBrandVolumes } from '@/lib/actions/volumes';
 import { usePlanContext } from '@/components/providers/plan-provider';
 import { useUpgradeGate } from '@/components/providers/upgrade-gate';
+import { trackSavedWaiting } from '@/components/prompts/waiting-for-spot';
+import {
+  defaultPickCount,
+  pickedCount,
+  promptRoom,
+  withDefaultPicks,
+  type TopicPromptPicks,
+} from '@/lib/onboarding-prompt-picks';
 import { getFaviconUrl } from '@/lib/favicon';
+import { frictionFlow } from '@/lib/friction-events';
 import { useBrandStore } from '@/stores/use-brand-store';
 import {
   REGIONS,
@@ -26,7 +36,7 @@ import {
   LANGUAGE_ITEMS,
 } from '@/config/prompt-options';
 import { ALL_MODELS, ALL_SCRAPERS } from '@/config/prompt-options';
-import { getPlan, type PlanId } from '@/config/plans';
+import { getPlan, toPlanId, type PlanId } from '@/config/plans';
 import type { Brand } from '@/types';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -39,33 +49,16 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu';
 import { toast } from 'sonner';
-import {
-  ArrowLeft,
-  Check,
-  ChevronDown,
-  ChevronRight,
-  Globe,
-  Loader2,
-  MoreHorizontal,
-  Plus,
-  Sparkles,
-  X,
-} from 'lucide-react';
+import { ArrowLeft, Check, Globe, Loader2, Plus, Sparkles, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import {
   BRAND_SETUP_LIMITS,
+  detectSiteType,
   suggestTopics,
   generatePromptsFromTopics,
   suggestCompetitors,
 } from '@/lib/ai-brand-setup';
-import { DASHBOARD_HOME } from '@/config/home';
 
 // ── Step indicator ─────────────────────────────────────────────────────────────
 
@@ -104,132 +97,30 @@ function BrandHeader({ name, domain }: { name: string; domain: string }) {
   );
 }
 
-// ── Topic Prompt Accordion ─────────────────────────────────────────────────────
-
-interface TopicPromptsData {
-  topic: string;
-  prompts: string[];
-}
-
-function TopicAccordion({
-  data,
-  defaultOpen = false,
-  onRemoveTopic,
-  onAddPrompt,
-  onRemovePrompt,
-}: {
-  data: TopicPromptsData;
-  defaultOpen?: boolean;
-  onRemoveTopic: () => void;
-  onAddPrompt: (prompt: string) => void;
-  onRemovePrompt: (index: number) => void;
-}) {
-  const [open, setOpen] = useState(defaultOpen);
-  const [newPrompt, setNewPrompt] = useState('');
-
-  const handleAdd = () => {
-    const trimmed = newPrompt.trim();
-    if (trimmed.length >= 10) {
-      onAddPrompt(trimmed);
-      setNewPrompt('');
-    }
-  };
-
-  return (
-    <div className="border-b last:border-b-0">
-      <div className="flex items-center gap-3 py-3 px-1">
-        <button
-          onClick={() => setOpen(!open)}
-          className="flex items-center gap-2 flex-1 text-left text-sm"
-        >
-          {open ? (
-            <ChevronDown className="h-4 w-4 text-muted-foreground shrink-0" />
-          ) : (
-            <ChevronRight className="h-4 w-4 text-muted-foreground shrink-0" />
-          )}
-          <span className="font-medium">{data.topic}</span>
-          <span className="text-xs text-muted-foreground">{data.prompts.length} prompts</span>
-        </button>
-        <DropdownMenu>
-          <DropdownMenuTrigger className="p-1 rounded hover:bg-muted text-muted-foreground">
-            <MoreHorizontal className="h-4 w-4" />
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end">
-            <DropdownMenuItem
-              className="text-destructive focus:text-destructive"
-              onClick={onRemoveTopic}
-            >
-              Remove topic
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </div>
-      {open && (
-        <div className="pl-7 pb-3 space-y-1.5">
-          {data.prompts.map((p, idx) => (
-            <div
-              key={idx}
-              className="flex items-center gap-2 group rounded-md border bg-muted/30 px-3 py-2"
-            >
-              <span className="text-sm flex-1">{p}</span>
-              <button
-                onClick={() => onRemovePrompt(idx)}
-                className="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-destructive transition-opacity"
-              >
-                <X className="h-3.5 w-3.5" />
-              </button>
-            </div>
-          ))}
-          <div className="flex items-center gap-2 mt-2">
-            <Input
-              placeholder="Enter new prompt..."
-              value={newPrompt}
-              onChange={(e) => setNewPrompt(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
-              className="text-sm h-9"
-            />
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={handleAdd}
-              disabled={newPrompt.trim().length < 10}
-              className="h-9 px-2"
-            >
-              <Check className="h-4 w-4" />
-            </Button>
-            <Button size="sm" variant="ghost" onClick={() => setNewPrompt('')} className="h-9 px-2">
-              <X className="h-4 w-4" />
-            </Button>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-// The state picker's own "no state" choice, ahead of the states themselves.
-const STATE_ITEMS = [{ value: 'nationwide', label: 'Nationwide (no state)' }, ...US_STATE_ITEMS];
-
+// Keys under brands.new, resolved when the loading effect runs.
 const TOPIC_LOADING_MESSAGES = [
-  'Researching topics for your brand...',
-  'Analyzing your industry landscape...',
-  'Identifying key themes and trends...',
-  'Finding what your audience cares about...',
-  'Evaluating competitive topics...',
-  'Almost there, finalizing suggestions...',
-];
+  'loading.topics.researching',
+  'loading.topics.industry',
+  'loading.topics.themes',
+  'loading.topics.audience',
+  'loading.topics.competitive',
+  'loading.topics.almost',
+] as const;
 
 const COMPETITOR_LOADING_MESSAGES = [
-  'Searching for competitors...',
-  'Analyzing your market...',
-  'Identifying key players...',
-  'Verifying company details...',
-  'Finalizing recommendations...',
-];
+  'loading.competitors.searching',
+  'loading.competitors.market',
+  'loading.competitors.players',
+  'loading.competitors.verifying',
+  'loading.competitors.finalizing',
+] as const;
 
 const TOTAL_STEPS = 5;
+
+/** brand_add: from this page's first step to Finish. */
+const BRAND_ADD = frictionFlow('brand_add');
 
 // ── Main page ──────────────────────────────────────────────────────────────────
 
@@ -240,9 +131,16 @@ export default function NewBrandPage() {
   // directly: the brand isn't created, the upgrade dialog opens instead.
   const { guard } = useUpgradeGate();
   const tActions = useTranslations('readOnly.actions');
+  // Prompts past the plan's limit are saved waiting for a spot, not held back.
+  const tWaiting = useTranslations('prompts.waiting');
+  const t = useTranslations('brands.new');
+  const tPrompts = useTranslations('onboarding.prompts');
+  // The state picker's own "no state" choice, ahead of the states themselves.
+  const stateItems = [{ value: 'nationwide', label: t('step2.nationwide') }, ...US_STATE_ITEMS];
 
   const [step, setStep] = useState(1);
   const [isLoading, setIsLoading] = useState(false);
+  useEffect(() => BRAND_ADD.started(), []);
 
   // Step 1
   const [brandName, setBrandName] = useState('');
@@ -272,19 +170,19 @@ export default function NewBrandPage() {
       topicMsgIdx.current = 0;
       return;
     }
-    setTopicLoadingMsg(TOPIC_LOADING_MESSAGES[0]);
+    setTopicLoadingMsg(t(TOPIC_LOADING_MESSAGES[0]));
     topicMsgIdx.current = 0;
 
     const interval = setInterval(() => {
       topicMsgIdx.current = (topicMsgIdx.current + 1) % TOPIC_LOADING_MESSAGES.length;
-      setTopicLoadingMsg(TOPIC_LOADING_MESSAGES[topicMsgIdx.current]);
+      setTopicLoadingMsg(t(TOPIC_LOADING_MESSAGES[topicMsgIdx.current]));
     }, 2500);
 
     return () => clearInterval(interval);
-  }, [loadingTopics]);
+  }, [loadingTopics, t]);
 
   // Step 4
-  const [topicPrompts, setTopicPrompts] = useState<TopicPromptsData[]>([]);
+  const [topicPrompts, setTopicPrompts] = useState<TopicPromptPicks[]>([]);
   const [loadingPrompts, setLoadingPrompts] = useState(false);
   const [promptCapacity, setPromptCapacity] = useState<{
     maxPrompts: number;
@@ -326,17 +224,17 @@ export default function NewBrandPage() {
       competitorMsgIdx.current = 0;
       return;
     }
-    setCompetitorLoadingMsg(COMPETITOR_LOADING_MESSAGES[0]);
+    setCompetitorLoadingMsg(t(COMPETITOR_LOADING_MESSAGES[0]));
     competitorMsgIdx.current = 0;
 
     const interval = setInterval(() => {
       competitorMsgIdx.current =
         (competitorMsgIdx.current + 1) % COMPETITOR_LOADING_MESSAGES.length;
-      setCompetitorLoadingMsg(COMPETITOR_LOADING_MESSAGES[competitorMsgIdx.current]);
+      setCompetitorLoadingMsg(t(COMPETITOR_LOADING_MESSAGES[competitorMsgIdx.current]));
     }, 2500);
 
     return () => clearInterval(interval);
-  }, [loadingCompetitors]);
+  }, [loadingCompetitors, t]);
 
   // Auto-fetch competitor suggestions when arriving at step 5 with none loaded
   useEffect(() => {
@@ -379,7 +277,7 @@ export default function NewBrandPage() {
             .select('plan')
             .eq('id', profile.organization_id)
             .single();
-          if (org?.plan) setCurrentPlanId(org.plan as PlanId);
+          if (org?.plan) setCurrentPlanId(toPlanId(org.plan));
         }
       } catch {
         // Non-critical
@@ -428,7 +326,7 @@ export default function NewBrandPage() {
         const {
           data: { user },
         } = await supabase.auth.getUser();
-        if (!user) throw new Error('Not authenticated');
+        if (!user) throw new Error(t('errors.notAuthenticated'));
 
         const { data: profile } = await supabase
           .from('profiles')
@@ -436,7 +334,7 @@ export default function NewBrandPage() {
           .eq('id', user.id)
           .single();
 
-        if (!profile?.organization_id) throw new Error('No organization found');
+        if (!profile?.organization_id) throw new Error(t('errors.noOrganization'));
 
         const result = await createBrand({
           organizationId: profile.organization_id,
@@ -448,6 +346,7 @@ export default function NewBrandPage() {
           domains: domain ? [{ domain, isPrimary: true }] : [],
         });
         if ('error' in result) {
+          BRAND_ADD.failed(result.code);
           toast.error(result.error);
           return;
         }
@@ -456,6 +355,7 @@ export default function NewBrandPage() {
         setCreatedBrand(brand);
         addBrand(brand);
         setActiveBrand(brand.id);
+        void detectBrandType(brand.id);
       }
 
       setStep(3);
@@ -464,7 +364,8 @@ export default function NewBrandPage() {
         fetchTopicSuggestions();
       }
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to save brand');
+      BRAND_ADD.failed();
+      toast.error(err instanceof Error ? err.message : t('errors.saveBrand'));
     } finally {
       setIsLoading(false);
     }
@@ -531,20 +432,25 @@ export default function NewBrandPage() {
       const topicNames = Array.from(selectedTopics);
       await createTopics(createdBrand.id, topicNames);
 
-      const { topicPrompts: generated } = await generatePromptsFromTopics(
-        {
-          brandName: brandName.trim(),
-          description: description.trim(),
-          website: domain,
-          language,
-        },
-        topicNames,
-      );
-      setTopicPrompts(generated);
+      const [{ topicPrompts: generated }, capacity] = await Promise.all([
+        generatePromptsFromTopics(
+          {
+            brandName: brandName.trim(),
+            description: description.trim(),
+            website: domain,
+            language,
+          },
+          topicNames,
+        ),
+        getPromptCapacity(createdBrand.id).catch(() => null),
+      ]);
+      if (capacity) setPromptCapacity(capacity);
+      setTopicPrompts(withDefaultPicks(generated, defaultPickCount(promptRoom(capacity))));
       setStep(4);
     } catch (err) {
       console.error('Prompt generation error:', err);
-      toast.error('Failed to generate prompts from topics');
+      BRAND_ADD.failed();
+      toast.error(t('errors.generatePrompts'));
     } finally {
       setLoadingPrompts(false);
     }
@@ -558,17 +464,19 @@ export default function NewBrandPage() {
     setSaveError(null);
     try {
       const allPrompts = topicPrompts.flatMap((tp) =>
-        tp.prompts.map((text) => ({
-          text,
-          category: tp.topic,
-          platforms: activeScrapers.map((s) => s.id),
-          models: activeModels.map((m) => m.id),
-          isActive: true,
-        })),
+        tp.prompts
+          .filter((p) => p.picked)
+          .map(({ text }) => ({
+            text,
+            category: tp.topic,
+            platforms: activeScrapers.map((s) => s.id),
+            models: activeModels.map((m) => m.id),
+            isActive: true,
+          })),
       );
 
       if (allPrompts.length === 0) {
-        setSaveError('Add at least one prompt before continuing.');
+        setSaveError(t('errors.noPrompts'));
         setIsLoading(false);
         return;
       }
@@ -579,20 +487,19 @@ export default function NewBrandPage() {
         prompts: allPrompts,
       });
       if ('error' in result) {
+        BRAND_ADD.failed(result.code);
         // No technical toasts on this step: actionable failures (plan limit)
         // show verbatim inline, anything else gets a friendly retry message.
-        setSaveError(
-          result.code === 'plan_limit'
-            ? result.error
-            : "We couldn't save your prompts — please try again.",
-        );
+        setSaveError(result.code === 'plan_limit' ? result.error : t('errors.savePrompts'));
         return;
       }
+      trackSavedWaiting('new_brand', result.waiting ?? 0);
 
       setStep(5);
       fetchCompetitorSuggestions();
     } catch {
-      setSaveError("We couldn't save your prompts — please try again.");
+      BRAND_ADD.failed();
+      setSaveError(t('errors.savePrompts'));
     } finally {
       setIsLoading(false);
     }
@@ -622,14 +529,36 @@ export default function NewBrandPage() {
     }
   };
 
+  // The brand's kind of site, from its home page (Step 0): in the
+  // background, best effort; the app goes on guessing when it can't tell.
+  const detectBrandType = async (brandId: string) => {
+    try {
+      const { siteType, industry } = await detectSiteType(brandId);
+      if (!siteType) return;
+      const updates = {
+        siteType,
+        siteTypeSource: 'auto' as const,
+        ...(industry ? { industry } : {}),
+      };
+      setCreatedBrand((b) => (b?.id === brandId ? { ...b, ...updates } : b));
+      updateBrandInStore(brandId, updates);
+    } catch (err) {
+      console.error('Site type detection error:', err);
+    }
+  };
+
   // The research found an online store: Shopping mode goes on, so Product
   // Visibility shows in the menu. Best effort: it can be turned on in the
   // brand's settings too.
   const turnOnProductVisibility = async () => {
     if (!createdBrand || createdBrand.shoppingModeEnabled) return;
     try {
-      const { industry } = await markBrandAsEcommerce(createdBrand.id);
-      const updates = { industry: industry ?? undefined, shoppingModeEnabled: true };
+      const { industry, siteType } = await markBrandAsEcommerce(createdBrand.id);
+      const updates = {
+        industry: industry ?? undefined,
+        shoppingModeEnabled: true,
+        ...(siteType ? { siteType, siteTypeSource: 'auto' as const } : {}),
+      };
       setCreatedBrand({ ...createdBrand, ...updates });
       updateBrandInStore(createdBrand.id, updates);
       setEcommerceDetected(true);
@@ -655,7 +584,7 @@ export default function NewBrandPage() {
       competitorDomain,
     );
     if (list === suggestedCompetitors) return;
-    if (duplicate) toast.info(`${duplicate.name} is already in the list`);
+    if (duplicate) toast.info(t('toasts.duplicateCompetitor', { name: duplicate.name }));
     setSuggestedCompetitors(list);
     setCompetitorName('');
     setCompetitorDomain('');
@@ -712,10 +641,13 @@ export default function NewBrandPage() {
       // in flight would be cancelled by the navigation below.
       await bootstrapBrandVolumes(createdBrand.id);
 
-      toast.success('Brand setup complete! Tracking is starting.');
-      router.push(DASHBOARD_HOME);
+      BRAND_ADD.completed();
+      toast.success(t('toasts.setupComplete'));
+      // The person's start page, Prompts › Tracked Prompts (config/home.ts).
+      router.push('/dashboard');
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to save competitors');
+      BRAND_ADD.failed();
+      toast.error(err instanceof Error ? err.message : t('errors.saveCompetitors'));
       setSavingCompetitors(false);
     }
   };
@@ -728,28 +660,35 @@ export default function NewBrandPage() {
 
   const addPromptToTopic = (topicIndex: number, prompt: string) => {
     setTopicPrompts((prev) =>
-      prev.map((tp, i) => (i === topicIndex ? { ...tp, prompts: [...tp.prompts, prompt] } : tp)),
+      prev.map((tp, i) =>
+        i === topicIndex ? { ...tp, prompts: [...tp.prompts, { text: prompt, picked: true }] } : tp,
+      ),
     );
   };
 
-  const removePromptFromTopic = (topicIndex: number, promptIndex: number) => {
+  const togglePrompt = (topicIndex: number, promptIndex: number) => {
     setTopicPrompts((prev) =>
       prev.map((tp, i) =>
         i === topicIndex
-          ? { ...tp, prompts: tp.prompts.filter((_, pi) => pi !== promptIndex) }
+          ? {
+              ...tp,
+              prompts: tp.prompts.map((p, pi) =>
+                pi === promptIndex ? { ...p, picked: !p.picked } : p,
+              ),
+            }
           : tp,
       ),
     );
   };
 
-  const totalPrompts = topicPrompts.reduce((sum, tp) => sum + tp.prompts.length, 0);
+  // The prompts offered, and the ticked ones: only those are saved and count
+  // toward the plan.
+  const offeredPrompts = topicPrompts.reduce((sum, tp) => sum + tp.prompts.length, 0);
+  const totalPrompts = pickedCount(topicPrompts);
   // Prompts this brand may save before hitting the org's plan cap (null =
   // unknown or unlimited); over that, Continue is disabled with an inline hint.
-  const promptLimit =
-    promptCapacity && promptCapacity.maxPrompts !== -1
-      ? Math.max(0, promptCapacity.maxPrompts - promptCapacity.used)
-      : null;
-  const excessPrompts = promptLimit !== null ? Math.max(0, totalPrompts - promptLimit) : 0;
+  const promptLimit = promptRoom(promptCapacity);
+  const overPrompts = promptLimit !== null ? Math.max(0, totalPrompts - promptLimit) : 0;
 
   // ── Step 1: Brand Info ──
 
@@ -761,18 +700,16 @@ export default function NewBrandPage() {
             <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-primary text-primary-foreground">
               <Globe className="h-6 w-6" />
             </div>
-            <h1 className="text-2xl font-bold tracking-tight">Add a new brand</h1>
-            <p className="text-sm text-muted-foreground">
-              See how AI platforms talk about your brand. Fill in the basics to get started.
-            </p>
+            <h1 className="text-2xl font-bold tracking-tight">{t('step1.title')}</h1>
+            <p className="text-sm text-muted-foreground">{t('step1.subtitle')}</p>
           </div>
 
           <div className="space-y-4">
             <div className="space-y-2">
-              <Label htmlFor="brandName">Brand name</Label>
+              <Label htmlFor="brandName">{t('step1.brandName')}</Label>
               <Input
                 id="brandName"
-                placeholder="e.g. Acme Corp"
+                placeholder={t('step1.brandNamePlaceholder')}
                 value={brandName}
                 onChange={(e) => setBrandName(e.target.value)}
                 autoFocus
@@ -780,14 +717,14 @@ export default function NewBrandPage() {
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="website">Website</Label>
+              <Label htmlFor="website">{t('step1.website')}</Label>
               <div className="flex">
                 <span className="inline-flex items-center rounded-l-md border border-r-0 bg-muted px-3 text-sm text-muted-foreground">
-                  https://
+                  {t('step1.protocol')}
                 </span>
                 <Input
                   id="website"
-                  placeholder="example.com"
+                  placeholder={t('step1.websitePlaceholder')}
                   value={website}
                   onChange={(e) => setWebsite(e.target.value)}
                   className="rounded-l-none"
@@ -797,18 +734,20 @@ export default function NewBrandPage() {
 
             <div className="space-y-2">
               <Label htmlFor="description">
-                Describe your brand <span className="text-muted-foreground">(optional)</span>
+                {t.rich('step1.describe', {
+                  optional: (chunks) => <span className="text-muted-foreground">{chunks}</span>,
+                })}
               </Label>
               <Textarea
                 id="description"
-                placeholder="A brief description helps us generate better suggestions."
+                placeholder={t('step1.descriptionPlaceholder')}
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
                 rows={3}
               />
               <ul className="text-xs text-muted-foreground space-y-1 list-disc ml-4">
-                <li>What industry are you in?</li>
-                <li>Who is your target audience?</li>
+                <li>{t('step1.hintIndustry')}</li>
+                <li>{t('step1.hintAudience')}</li>
               </ul>
             </div>
 
@@ -817,7 +756,7 @@ export default function NewBrandPage() {
               disabled={!brandName.trim() || !website.trim()}
               onClick={() => setStep(2)}
             >
-              Continue
+              {t('continue')}
             </Button>
           </div>
         </div>
@@ -836,16 +775,13 @@ export default function NewBrandPage() {
           <BrandHeader name={brandName} domain={domain} />
 
           <div>
-            <h1 className="text-2xl font-bold tracking-tight">Select your target market</h1>
-            <p className="text-sm text-muted-foreground mt-1">
-              Pick the region and language your audience uses. This helps us deliver more accurate
-              AI visibility data.
-            </p>
+            <h1 className="text-2xl font-bold tracking-tight">{t('step2.title')}</h1>
+            <p className="text-sm text-muted-foreground mt-1">{t('step2.subtitle')}</p>
           </div>
 
           <div className="space-y-4">
             <div className="space-y-2">
-              <Label>Region</Label>
+              <Label>{t('step2.region')}</Label>
               <Select
                 items={REGION_ITEMS}
                 value={region}
@@ -870,9 +806,9 @@ export default function NewBrandPage() {
 
             {region === 'US' && (
               <div className="space-y-2">
-                <Label>State (optional)</Label>
+                <Label>{t('step2.state')}</Label>
                 <Select
-                  items={STATE_ITEMS}
+                  items={stateItems}
                   value={usState || 'nationwide'}
                   onValueChange={(v) => setUsState(!v || v === 'nationwide' ? '' : v)}
                 >
@@ -880,7 +816,7 @@ export default function NewBrandPage() {
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="nationwide">Nationwide (no state)</SelectItem>
+                    <SelectItem value="nationwide">{t('step2.nationwide')}</SelectItem>
                     {US_STATES.map((s) => (
                       <SelectItem key={s.code} value={s.code}>
                         {s.label}
@@ -888,14 +824,12 @@ export default function NewBrandPage() {
                     ))}
                   </SelectContent>
                 </Select>
-                <p className="text-xs text-muted-foreground">
-                  Localizes AI answers to this state. Leave empty for nationwide results.
-                </p>
+                <p className="text-xs text-muted-foreground">{t('step2.stateHint')}</p>
               </div>
             )}
 
             <div className="space-y-2">
-              <Label>Language</Label>
+              <Label>{t('step2.language')}</Label>
               <Select
                 items={LANGUAGE_ITEMS}
                 value={language}
@@ -922,10 +856,10 @@ export default function NewBrandPage() {
               {isLoading ? (
                 <>
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Setting up...
+                  {t('step2.settingUp')}
                 </>
               ) : (
-                'Continue'
+                t('continue')
               )}
             </Button>
           </div>
@@ -937,7 +871,7 @@ export default function NewBrandPage() {
             className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
           >
             <ArrowLeft className="h-3.5 w-3.5" />
-            Back
+            {t('back')}
           </button>
           <StepDots current={2} total={TOTAL_STEPS} />
           <div className="w-12" />
@@ -957,9 +891,9 @@ export default function NewBrandPage() {
           <div className="grid grid-cols-1 gap-10 lg:grid-cols-5">
             <div className="lg:col-span-3 space-y-6">
               <div>
-                <h1 className="text-2xl font-bold tracking-tight">Choose topics to monitor</h1>
+                <h1 className="text-2xl font-bold tracking-tight">{t('step3.title')}</h1>
                 <div className="flex items-center gap-2 mt-3">
-                  <span className="text-sm text-muted-foreground">Select up to 10 topics</span>
+                  <span className="text-sm text-muted-foreground">{t('step3.selectUpTo')}</span>
                   <div className="flex-1 h-1.5 rounded-full bg-muted overflow-hidden">
                     <div
                       className="h-full bg-primary rounded-full transition-all"
@@ -982,11 +916,9 @@ export default function NewBrandPage() {
                 <div className="space-y-2">
                   {topicSuggestError && (
                     <div className="flex items-center justify-between gap-3 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm">
-                      <span>
-                        Couldn&apos;t fetch topic suggestions right now — add your own above.
-                      </span>
+                      <span>{t('step3.suggestError')}</span>
                       <Button variant="outline" size="sm" onClick={fetchTopicSuggestions}>
-                        Try again
+                        {t('tryAgain')}
                       </Button>
                     </div>
                   )}
@@ -1020,7 +952,7 @@ export default function NewBrandPage() {
 
                   <div className="flex items-center gap-2 pt-2">
                     <Input
-                      placeholder="Add custom topic..."
+                      placeholder={t('step3.customPlaceholder')}
                       maxLength={BRAND_SETUP_LIMITS.topic}
                       value={customTopic}
                       onChange={(e) => setCustomTopic(e.target.value)}
@@ -1047,46 +979,37 @@ export default function NewBrandPage() {
                 {loadingPrompts ? (
                   <>
                     <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    Generating prompts...
+                    {t('step3.generating')}
                   </>
                 ) : (
-                  'Looks good'
+                  t('step3.looksGood')
                 )}
               </Button>
             </div>
 
             <div className="lg:col-span-2">
               <div className="rounded-xl border bg-card p-5 sticky top-10">
-                <h3 className="text-sm font-semibold mb-4">Topic Selection Tips</h3>
+                <h3 className="text-sm font-semibold mb-4">{t('step3.tipsTitle')}</h3>
                 <div className="space-y-4">
                   <div className="flex gap-3">
                     <Check className="h-4 w-4 text-foreground shrink-0 mt-0.5" />
                     <div>
-                      <p className="text-sm font-medium">5 prompts are created per topic</p>
-                      <p className="text-xs text-muted-foreground mt-0.5">
-                        You can select up to 10 topics for a total of 50 prompts. More can be added
-                        anytime from the dashboard.
-                      </p>
+                      <p className="text-sm font-medium">{t('step3.tip1Title')}</p>
+                      <p className="text-xs text-muted-foreground mt-0.5">{t('step3.tip1Body')}</p>
                     </div>
                   </div>
                   <div className="flex gap-3">
                     <Check className="h-4 w-4 text-foreground shrink-0 mt-0.5" />
                     <div>
-                      <p className="text-sm font-medium">Think like your customers</p>
-                      <p className="text-xs text-muted-foreground mt-0.5">
-                        Use terms your audience would search for when looking for products or
-                        services like yours.
-                      </p>
+                      <p className="text-sm font-medium">{t('step3.tip2Title')}</p>
+                      <p className="text-xs text-muted-foreground mt-0.5">{t('step3.tip2Body')}</p>
                     </div>
                   </div>
                   <div className="flex gap-3">
                     <Check className="h-4 w-4 text-foreground shrink-0 mt-0.5" />
                     <div>
-                      <p className="text-sm font-medium">Keep it short</p>
-                      <p className="text-xs text-muted-foreground mt-0.5">
-                        Topics should be concise — we&apos;ll turn them into detailed prompts in the
-                        next step.
-                      </p>
+                      <p className="text-sm font-medium">{t('step3.tip3Title')}</p>
+                      <p className="text-xs text-muted-foreground mt-0.5">{t('step3.tip3Body')}</p>
                     </div>
                   </div>
                 </div>
@@ -1101,7 +1024,7 @@ export default function NewBrandPage() {
             className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
           >
             <ArrowLeft className="h-3.5 w-3.5" />
-            Back
+            {t('back')}
           </button>
           <StepDots current={3} total={TOTAL_STEPS} />
           <div className="w-12" />
@@ -1119,34 +1042,32 @@ export default function NewBrandPage() {
           <BrandHeader name={brandName} domain={domain} />
 
           <div className="mb-6">
-            <h1 className="text-2xl font-bold tracking-tight">Review your prompts</h1>
-            <p className="text-sm text-muted-foreground mt-1">
-              These prompts will be sent to AI platforms daily. Feel free to edit, add, or remove
-              any before starting.
-            </p>
+            <h1 className="text-2xl font-bold tracking-tight">{tPrompts('title')}</h1>
+            <p className="text-sm text-muted-foreground mt-1">{tPrompts('intro')}</p>
           </div>
 
-          {excessPrompts > 0 && (
+          {overPrompts > 0 && (
             <div className="mb-4 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm">
-              Your plan includes up to {promptLimit} prompts for this brand — remove {excessPrompts}{' '}
-              to continue.
+              {tWaiting('brandNote', { room: promptLimit ?? 0, count: overPrompts })}
             </div>
           )}
 
-          {saveError && excessPrompts === 0 && (
+          {saveError && (
             <div className="mb-4 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm">
               {saveError}
             </div>
           )}
 
           <div className="mb-4">
-            <p className="text-sm font-medium">Your Prompt List</p>
-            <p className="text-xs text-muted-foreground">{totalPrompts} prompts total</p>
+            <p className="text-sm font-medium">{t('step4.listTitle')}</p>
+            <p data-slot="prompt-count" className="text-xs text-muted-foreground">
+              {tPrompts('count', { picked: totalPrompts, total: offeredPrompts })}
+            </p>
           </div>
 
           <div className="rounded-lg border">
             <div className="flex items-center gap-4 px-4 py-2.5 border-b bg-muted/50 text-xs font-medium text-muted-foreground">
-              <span className="flex-1">Topic</span>
+              <span className="flex-1">{t('step4.topicColumn')}</span>
             </div>
             {topicPrompts.map((tp, idx) => (
               <TopicAccordion
@@ -1155,12 +1076,12 @@ export default function NewBrandPage() {
                 defaultOpen={idx === 0}
                 onRemoveTopic={() => removeTopic(idx)}
                 onAddPrompt={(p) => addPromptToTopic(idx, p)}
-                onRemovePrompt={(pi) => removePromptFromTopic(idx, pi)}
+                onTogglePrompt={(pi) => togglePrompt(idx, pi)}
               />
             ))}
             {topicPrompts.length === 0 && (
               <div className="py-8 text-center text-sm text-muted-foreground">
-                No prompts generated yet.
+                {t('step4.noPrompts')}
               </div>
             )}
           </div>
@@ -1168,15 +1089,15 @@ export default function NewBrandPage() {
           <Button
             className="mt-6 w-full"
             onClick={handleSavePromptsAndContinue}
-            disabled={isLoading || totalPrompts === 0 || excessPrompts > 0}
+            disabled={isLoading || totalPrompts === 0}
           >
             {isLoading ? (
               <>
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                Saving prompts...
+                {t('step4.saving')}
               </>
             ) : (
-              'Continue'
+              t('continue')
             )}
           </Button>
         </div>
@@ -1187,7 +1108,7 @@ export default function NewBrandPage() {
             className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
           >
             <ArrowLeft className="h-3.5 w-3.5" />
-            Back
+            {t('back')}
           </button>
           <StepDots current={4} total={TOTAL_STEPS} />
           <div className="w-12" />
@@ -1207,10 +1128,8 @@ export default function NewBrandPage() {
           <BrandHeader name={brandName} domain={domain} />
 
           <div className="mb-6">
-            <h1 className="text-2xl font-bold tracking-tight">Add your competitors</h1>
-            <p className="text-sm text-muted-foreground mt-1">
-              We&apos;ll track how often competitors appear alongside your brand in AI responses.
-            </p>
+            <h1 className="text-2xl font-bold tracking-tight">{t('step5.title')}</h1>
+            <p className="text-sm text-muted-foreground mt-1">{t('step5.subtitle')}</p>
           </div>
 
           {ecommerceDetected && <EcommerceNote brandName={brandName.trim()} />}
@@ -1218,17 +1137,17 @@ export default function NewBrandPage() {
           {/* First, and outside the loading state: people arrive knowing their
               rivals and should not have to wait for, or scroll past, ours. */}
           <div className="mb-6 space-y-2">
-            <p className="text-sm text-muted-foreground">Know your competitors? Add them here.</p>
+            <p className="text-sm text-muted-foreground">{t('step5.manualPrompt')}</p>
             <div className="flex items-center gap-2">
               <Input
-                placeholder="Company name"
+                placeholder={t('step5.namePlaceholder')}
                 value={competitorName}
                 onChange={(e) => setCompetitorName(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && addManualCompetitor()}
                 className="text-sm"
               />
               <Input
-                placeholder="domain.com"
+                placeholder={t('step5.domainPlaceholder')}
                 value={competitorDomain}
                 onChange={(e) => setCompetitorDomain(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && addManualCompetitor()}
@@ -1256,18 +1175,16 @@ export default function NewBrandPage() {
             <div className="space-y-4">
               {competitorSuggestError && (
                 <div className="flex items-center justify-between gap-3 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm">
-                  <span>
-                    Couldn&apos;t fetch competitor suggestions right now — add them manually above.
-                  </span>
+                  <span>{t('step5.suggestError')}</span>
                   <Button variant="outline" size="sm" onClick={fetchCompetitorSuggestions}>
-                    Try again
+                    {t('tryAgain')}
                   </Button>
                 </div>
               )}
               {suggestedCompetitors.length > 0 && (
                 <div className="space-y-2">
                   <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-                    Competitors to track
+                    {t('step5.toTrack')}
                   </p>
                   {suggestedCompetitors.map((c, idx) => (
                     <div
@@ -1325,12 +1242,12 @@ export default function NewBrandPage() {
                 {savingCompetitors ? (
                   <>
                     <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    Finishing setup...
+                    {t('step5.finishing')}
                   </>
                 ) : selectedCompetitorCount > 0 ? (
-                  `Start tracking with ${selectedCompetitorCount} competitor${selectedCompetitorCount !== 1 ? 's' : ''}`
+                  t('step5.start', { count: selectedCompetitorCount })
                 ) : (
-                  'Skip & start tracking'
+                  t('step5.skip')
                 )}
               </Button>
             </div>
@@ -1343,7 +1260,7 @@ export default function NewBrandPage() {
             className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
           >
             <ArrowLeft className="h-3.5 w-3.5" />
-            Back
+            {t('back')}
           </button>
           <StepDots current={5} total={TOTAL_STEPS} />
           <div className="w-12" />

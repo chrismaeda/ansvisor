@@ -10,6 +10,8 @@
 
 import * as cheerio from 'cheerio';
 import { fetchViaScrapeDo, fetchText } from './fetcher.js';
+import { probeBotAccess } from './bot-access.js';
+import { canonicalHref, probeAuditCanonical } from './canonical.js';
 
 /**
  * Normalize user-supplied input into an absolute http(s) URL.
@@ -47,6 +49,14 @@ export function normalizeUrl(raw) {
  * @property {string|null} robotsTxt
  * @property {string|null} llmsTxt
  * @property {string|null} query     optional target buyer query (later phases)
+ * @property {Awaited<ReturnType<typeof probeBotAccess>>} [botAccess]
+ *   the live AI-bot access test (SA-008); absent for a page not fetched
+ * @property {{ html: string, from: string } | null} [rawPage]
+ *   the page's HTML as the first AI bot let in got it, before JavaScript
+ *   (SA-009); `html` above is the page as a browser renders it
+ * @property {Awaited<ReturnType<typeof probeAuditCanonical>>} [canonicalTarget]
+ *   where the page's canonical tag points, read once when it isn't the page
+ *   (AC plan P-11, canonical.js); absent for a page not fetched
  */
 
 /**
@@ -69,33 +79,77 @@ export async function buildAuditContext(rawUrl, { query = null } = {}) {
     throw Object.assign(new Error(`Failed to fetch page (status ${page.status})`), { status: 502 });
   }
 
-  const $ = cheerio.load(page.html);
+  const read = auditContextOf({
+    url,
+    statusCode: page.status,
+    html: page.html,
+    robotsTxt: null,
+    llmsTxt: null,
+    query,
+  });
+  // The live bot test (SA-008) asks the page itself, alongside the two
+  // files; and the canonical tag's target is read once (AC plan P-11).
+  const [robotsTxt, llmsTxt, botAccess, canonicalTarget] = await Promise.all([
+    fetchText(`${origin}/robots.txt`),
+    fetchText(`${origin}/llms.txt`),
+    probeBotAccess(url).catch(() => null),
+    probeAuditCanonical(url, canonicalHref(read.$)).catch(() => null),
+  ]);
+
+  // The HTML the first AI bot let in got, before any JavaScript ran, for the
+  // no-JS check (SA-009); the bot check keeps the answers.
+  const { page: rawPage = null, ...access } = botAccess ?? {};
+  return {
+    ...read,
+    robotsTxt,
+    llmsTxt,
+    botAccess: botAccess ? access : null,
+    rawPage,
+    canonicalTarget,
+  };
+}
+
+/**
+ * The context of a page already read: its HTML parsed once, its text
+ * extracted. Pure, so a page that isn't fetched (the demo brand's, lib/demo)
+ * is read exactly as a fetched one.
+ *
+ * @param {{ url: string, statusCode: number, html: string, robotsTxt: string|null,
+ *   llmsTxt: string|null, query?: string|null, now?: number }} page
+ * @returns {AuditContext}
+ */
+export function auditContextOf({
+  url,
+  statusCode,
+  html,
+  robotsTxt,
+  llmsTxt,
+  query = null,
+  now = Date.now(),
+}) {
+  const u = new URL(url);
+  const $ = cheerio.load(html);
 
   // Plain-text extraction on a throwaway parse so the shared `$` keeps its
   // <script type="application/ld+json"> blocks intact for structural signals.
-  const $text = cheerio.load(page.html);
+  const $text = cheerio.load(html);
   $text('script, style, noscript, template, svg').remove();
   const text = $text('body').text().replace(/\s+/g, ' ').trim();
   const wordCount = text ? text.split(/\s+/).length : 0;
 
-  const [robotsTxt, llmsTxt] = await Promise.all([
-    fetchText(`${origin}/robots.txt`),
-    fetchText(`${origin}/llms.txt`),
-  ]);
-
   return {
     url,
-    origin,
+    origin: `${u.protocol}//${u.host}`,
     protocol: u.protocol.replace(':', ''),
-    statusCode: page.status,
-    html: page.html,
-    htmlBytes: Buffer.byteLength(page.html, 'utf8'),
+    statusCode,
+    html,
+    htmlBytes: Buffer.byteLength(html, 'utf8'),
     $,
     text,
     wordCount,
     robotsTxt,
     llmsTxt,
     query,
-    now: Date.now(),
+    now,
   };
 }

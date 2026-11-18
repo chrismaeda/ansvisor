@@ -5,15 +5,29 @@ import { createClient } from '@/lib/supabase/server';
 import { createTopic } from '@/lib/actions/topic';
 import { TOPIC_NAME_CHARS } from '@/lib/topic-names';
 import { API_BASE_URL } from '@/config/api';
+import { NO_ANSWER, responseFailure, type ReadFailure } from '@/lib/api-failure';
 
 const AEO_SERVER_URL = API_BASE_URL;
+
+/**
+ * The catalog category behind a topic suggested from it (AC plan P-8): its
+ * live products and how many are in stock. No topic covers it yet.
+ */
+export interface CatalogTopicSourceData {
+  category: string;
+  categoryId: string;
+  products: number;
+  inStock: number;
+}
 
 export interface TopicSuggestion {
   id: string;
   brandId: string;
   name: string;
   reason: string | null;
-  source: 'llm';
+  /** The model's idea, or a category of the brand's catalog (00525). */
+  source: 'llm' | 'catalog';
+  sourceData: CatalogTopicSourceData | null;
   status: 'new' | 'added' | 'dismissed';
   generatedAt: string;
 }
@@ -23,7 +37,8 @@ interface SuggestionRow {
   brand_id: string;
   name: string;
   reason: string | null;
-  source: 'llm';
+  source: 'llm' | 'catalog';
+  source_data?: CatalogTopicSourceData | null;
   status: 'new' | 'added' | 'dismissed';
   generated_at: string;
 }
@@ -35,6 +50,11 @@ function mapRow(row: SuggestionRow): TopicSuggestion {
     name: row.name,
     reason: row.reason,
     source: row.source,
+    // Only a catalog row carries its category, and only in its shape.
+    sourceData:
+      row.source === 'catalog' && typeof row.source_data?.category === 'string'
+        ? row.source_data
+        : null,
     status: row.status,
     generatedAt: row.generated_at,
   };
@@ -49,21 +69,34 @@ async function getSession() {
   return session;
 }
 
-export async function getTopicSuggestions(brandId: string): Promise<TopicSuggestion[]> {
-  const session = await getSession();
-  const res = await fetch(`${AEO_SERVER_URL}/api/topics/suggestions/${brandId}`, {
-    headers: { Authorization: `Bearer ${session.access_token}` },
-    cache: 'no-store',
-    // Read-only lookup — a hung upstream must not pin the suggestions card
-    // (and the serialized server-action queue behind it) indefinitely.
-    signal: AbortSignal.timeout(15_000),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || `Server error: ${res.status}`);
+export type TopicSuggestionsRead = { ok: true; suggestions: TopicSuggestion[] } | ReadFailure;
+
+/**
+ * The brand's open topic suggestions. A failure comes back as a value, never
+ * thrown: production hides a thrown message (React's #441), and an API that
+ * didn't answer is marked retryable for the card's one automatic retry.
+ */
+export async function getTopicSuggestions(brandId: string): Promise<TopicSuggestionsRead> {
+  const supabase = await createClient();
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+  if (!session) return { ok: false, failure: 'session', retryable: false };
+  try {
+    const res = await fetch(`${AEO_SERVER_URL}/api/topics/suggestions/${brandId}`, {
+      headers: { Authorization: `Bearer ${session.access_token}` },
+      cache: 'no-store',
+      // Read-only lookup — a hung upstream must not pin the suggestions card
+      // (and the serialized server-action queue behind it) indefinitely.
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) return await responseFailure(res);
+    const data = (await res.json()) as { suggestions: SuggestionRow[] };
+    return { ok: true, suggestions: data.suggestions.map(mapRow) };
+  } catch {
+    // No answer, or one cut off: a dropped connection or the timeout.
+    return NO_ANSWER;
   }
-  const data = (await res.json()) as { suggestions: SuggestionRow[] };
-  return data.suggestions.map(mapRow);
 }
 
 export async function refreshTopicSuggestions(brandId: string): Promise<TopicSuggestion[]> {

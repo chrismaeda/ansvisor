@@ -148,6 +148,7 @@ beforeEach(() => {
         category: 'recover',
         status: 'new',
         payload: {},
+        brands: { is_demo: false },
       },
     ],
     brands: [{ id: 'b1', name: 'Acme Coffee', description: null, organization_id: 'o1' }],
@@ -455,6 +456,33 @@ describe('writeTasksForAction', () => {
     expect(generateObject.mock.calls[0][0].prompt).not.toContain('Earlier rounds');
   });
 
+  it("tells the model the brand's kind of site and its page types, chosen or guessed", async () => {
+    db.brands[0] = { ...db.brands[0], site_type: 'ecommerce' };
+    generateObject.mockResolvedValueOnce(answer([task()]));
+    await writeTasksForAction('a1', { dryRun: true });
+    const { prompt, system } = generateObject.mock.calls[0][0];
+    expect(prompt).toContain(
+      'Site type: E-commerce (an online shop selling products). Its page types: product page, category page, collection page, buying guide,',
+    );
+    expect(system).toContain("Name pages and content the way the brand's kind of site does");
+
+    // None chosen: the guess, from Shopping mode or the industry, else B2B.
+    db.brands[0] = { ...db.brands[0], site_type: null, industry: 'Travel & Hospitality' };
+    generateObject.mockResolvedValueOnce(answer([task()]));
+    await writeTasksForAction('a1', { dryRun: true });
+    expect(generateObject.mock.calls[1][0].prompt).toContain(
+      'Site type: B2C (a service for consumers). Its page types: destination page, itinerary,',
+    );
+
+    // A mobile app (00456): its own page types.
+    db.brands[0] = { ...db.brands[0], site_type: 'app' };
+    generateObject.mockResolvedValueOnce(answer([task()]));
+    await writeTasksForAction('a1', { dryRun: true });
+    expect(generateObject.mock.calls[2][0].prompt).toContain(
+      'Site type: Mobile app (a mobile app people install from an app store). Its page types: feature page, comparison, alternatives,',
+    );
+  });
+
   it('calls no model when the signals name nothing to work on', async () => {
     db.signals[0].payload = {};
     const result = await writeTasksForAction('a1', { trigger: 'regenerate' });
@@ -499,6 +527,13 @@ describe('writeTasksForAction', () => {
   it('refuses an action a person sent, which carries its own tasks', async () => {
     db.actions[0].kind = 'prompt_improve';
     await expect(writeTasksForAction('a1')).rejects.toThrow('carries the tasks it was sent with');
+    // A bridge links action's tasks are its pairs' (AC plan P-10).
+    db.actions[0].kind = 'bridge_links';
+    await expect(writeTasksForAction('a1')).rejects.toMatchObject({ code: 'sent' });
+    // A product pages action's tasks are its plan's (AC plan P-6).
+    db.actions[0].kind = 'product_pages_optimize';
+    await expect(writeTasksForAction('a1')).rejects.toMatchObject({ code: 'sent' });
+    expect(generateObject).not.toHaveBeenCalled();
   });
 });
 
@@ -525,7 +560,7 @@ describe('sweepActionTasks', () => {
     beforeEach(() => vi.stubEnv('IS_CLOUD', 'true'));
     afterEach(() => vi.unstubAllEnvs());
 
-    const onPlan = (status) => ({ organizations: { subscription_status: status } });
+    const onPlan = (status) => ({ is_demo: false, organizations: { subscription_status: status } });
 
     it("writes no task for an organization whose plan has ended, and the paying one's still", async () => {
       db.actions = [
@@ -541,7 +576,7 @@ describe('sweepActionTasks', () => {
       expect(selects).toContainEqual({
         table: 'actions',
         columns:
-          'id, brand_id, kind, status, brands!inner(organizations!inner(subscription_status))',
+          'id, brand_id, kind, status, brands!inner(is_demo, organizations!inner(subscription_status))',
       });
       expect(reserveAiBudget).toHaveBeenCalledTimes(1);
       expect(ops.filter((op) => op.table === 'actions' && op.op === 'update')).not.toContainEqual(
@@ -554,12 +589,24 @@ describe('sweepActionTasks', () => {
     beforeEach(() => vi.stubEnv('IS_CLOUD', 'false'));
     afterEach(() => vi.unstubAllEnvs());
 
-    it('reads every action, unfiltered', async () => {
+    it('reads every action, unfiltered by plan', async () => {
       db.action_tasks = [];
       generateObject.mockResolvedValue(answer([task()]));
 
       expect(await sweepActionTasks()).toEqual({ written: 1, skipped: 0, failed: 0 });
-      expect(selects).toContainEqual({ table: 'actions', columns: 'id, brand_id, kind, status' });
+      expect(selects).toContainEqual({
+        table: 'actions',
+        columns: 'id, brand_id, kind, status, brands!inner(is_demo)',
+      });
+    });
+
+    it("never writes a demo brand's tasks (00380)", async () => {
+      db.actions = [{ ...db.actions[0], id: 'demo', brands: { is_demo: true } }];
+      db.action_tasks = [];
+      generateObject.mockResolvedValue(answer([task()]));
+
+      expect(await sweepActionTasks()).toEqual({ written: 0, skipped: 0, failed: 0 });
+      expect(reserveAiBudget).not.toHaveBeenCalled();
     });
   });
 });

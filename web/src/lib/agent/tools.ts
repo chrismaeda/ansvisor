@@ -25,7 +25,7 @@ import {
 } from '@/lib/mcp/mentions';
 import { MENTION_SENTIMENTS, MENTION_SORTS } from '@/lib/mentions-list';
 
-/** The Mentions & Sentiment page's filters, the same on every mentions tool. */
+/** Brand Visibility's Mentions tab's filters, the same on every mentions tool. */
 const mentionFilters = {
   brand_id: z.string().uuid(),
   date_from: z.string().optional(),
@@ -239,7 +239,7 @@ export function buildAgentTools(auth: McpAuthContext) {
 
     get_mentions_summary: tool({
       description:
-        'Mentions & Sentiment overview for a brand: times named (timesNamed, the page\'s Total mentions), responses naming it, mention rate, prompts with mentions, average position and sentiment (counts, shares, net −100…+100), now and in the window before, with changes taken on the prompts both windows answered (changes.basis), as the page\'s cards; the platform that moved net sentiment most; each platform; each day. Use for "how is AI talking about us?" / "why did sentiment drop on Gemini?". Platform ids look like "chatgpt-web", "gemini-web". 30 days when date_from is left out.',
+        'Visibility\'s Mentions overview for a brand: times named (timesNamed, the tab\'s Total mentions), responses naming it, mention rate, prompts with mentions, average position and sentiment (counts, shares, net −100…+100), now and in the window before, with changes taken on the prompts both windows answered (changes.basis), as the tab\'s cards; the platform that moved net sentiment most; each platform; each day. Use for "how is AI talking about us?" / "why did sentiment drop on Gemini?". Platform ids look like "chatgpt-web", "gemini-web". 30 days when date_from is left out.',
       inputSchema: z.object(mentionFilters),
       execute: async (args) => getMentionsSummaryFor(auth, mentionParams(args)),
     }),
@@ -287,17 +287,21 @@ export function buildAgentTools(auth: McpAuthContext) {
 
     run_site_audit: tool({
       description:
-        'Run a Site Audit (AEO/GEO page score + AI fix recommendations) for a page URL under a brand. WARNING: this consumes one of the org\'s monthly Site Audit credits (shared with the dashboard) and runs asynchronously (~30s). It returns the new audit id with status "running" — then call get_site_audit with that id until status is "completed" (or "failed") to read the result. Only run on explicit user intent to audit a specific URL; never audit unprompted.',
+        'Run a Site Audit (AEO/GEO page score + AI fix recommendations) for a page URL under a brand. WARNING: this consumes one of the org\'s monthly Site Audit credits (shared with the dashboard) and runs asynchronously (~30s). It returns the new audit id with status "running" — then call get_site_audit with that id until status is "completed" (or "failed") to read the result. A page with an audit already running returns that audit, with no new credit. A page audited in the last 10 minutes returns status "recently_audited" with that audit\'s id and starts nothing: ask the user whether to open it or audit again (force: true). Only run on explicit user intent to audit a specific URL; never audit unprompted.',
       inputSchema: z.object({
         brand_id: z.string().uuid(),
         url: z.string().url(),
+        force: z.boolean().optional(),
       }),
-      execute: async (args) => runSiteAuditFor(auth, args.brand_id, args.url),
+      execute: async (args) =>
+        args.force
+          ? runSiteAuditFor(auth, args.brand_id, args.url, { force: true })
+          : runSiteAuditFor(auth, args.brand_id, args.url),
     }),
 
     get_site_audit: tool({
       description:
-        'Fetch a Site Audit by id — status, total score, per-category scores, evaluated signals, and AI fix recommendations. Use after run_site_audit to poll for the result: while status is "running" the scores are not yet populated; once "completed" (or "failed") the full result is available. Read — no credit consumed.',
+        'Fetch a Site Audit by id — status, total score, the score\'s range, per-category scores, evaluated signals, and AI fix recommendations. scoreRange is "64 ± 2" in the audit report: ± plusMinus points, from the page\'s last `audits` complete audits up to this one, which scored low to high out of 100; null with fewer than 3. Use after run_site_audit to poll for the result: while status is "running" the scores are not yet populated; once "completed" (or "failed") the full result is available. Read — no credit consumed.',
       inputSchema: z.object({
         audit_id: z.string().uuid(),
       }),
@@ -365,6 +369,19 @@ export function buildAgentTools(auth: McpAuthContext) {
         url: z.string().describe('The URL that was audited.'),
 
         totalScore: z.number().nullable().describe('The overall Site Audit score.'),
+
+        scoreRange: z
+          .object({
+            plusMinus: z.number(),
+            low: z.number(),
+            high: z.number(),
+            audits: z.number(),
+          })
+          .nullable()
+          .optional()
+          .describe(
+            "The score's range, as get_site_audit returns it (scoreRange); null when it's null.",
+          ),
 
         categoryScores: z.record(z.string(), z.unknown()).describe('Per-category audit scores.'),
 

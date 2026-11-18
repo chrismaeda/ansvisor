@@ -6,6 +6,11 @@ import messages from '../../../../../../../messages/en.json';
 import { libraryTabCounts, type ContentDraftListItem } from '@/lib/content/drafts';
 import ContentLibraryPage from './page';
 
+const { chatPage } = vi.hoisted(() => ({ chatPage: vi.fn() }));
+vi.mock('@/components/chat/panel/chat-panel-context', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  useChatPageContext: chatPage,
+}));
 const getContentDrafts = vi.fn();
 const getContentStartOptions = vi.fn();
 const markContentDraftReady = vi.fn();
@@ -13,6 +18,10 @@ const setContentDraftStatus = vi.fn();
 const archiveContentDraft = vi.fn();
 const deleteContentDraft = vi.fn();
 const getContentDraftPages = vi.fn();
+// No white label kit: downloads keep Ansvisor's names (export-name.test.ts has a kit's).
+vi.mock('@/lib/actions/white-label', () => ({
+  getExportBranding: async () => ({ ok: true, branding: null }),
+}));
 vi.mock('@/lib/actions/content-drafts', () => ({
   getContentDraftPages: (...args: unknown[]) => getContentDraftPages(...args),
   // A list stands for a brand under the cap: its tabs count its rows.
@@ -28,9 +37,13 @@ vi.mock('@/lib/actions/content-drafts', () => ({
   deleteContentDraft: (...args: unknown[]) => deleteContentDraft(...args),
 }));
 const role = vi.hoisted(() => ({ canManage: true }));
+const takeDownDraft = vi.hoisted(() => vi.fn());
+vi.mock('@/lib/actions/cms-take-down', () => ({ takeDownDraft }));
+const chat = vi.hoisted(() => ({ on: false }));
+vi.mock('@/components/providers/chat-agentic-provider', () => ({ useChatAgentic: () => chat.on }));
 vi.mock('@/hooks/use-user-role', () => ({ useUserRole: () => role }));
 // Start's Team: its assignee picker reads the team, and the sent task is assigned.
-vi.mock('@/lib/actions/team', () => ({ listMembers: vi.fn(async () => []) }));
+vi.mock('@/lib/actions/team', () => ({ listBrandMembers: vi.fn(async () => []) }));
 vi.mock('@/lib/actions/action-center', () => ({ assignAction: vi.fn() }));
 const push = vi.fn();
 vi.mock('@/i18n/navigation', () => ({
@@ -51,15 +64,23 @@ const sendPagesToCms = vi.hoisted(() => vi.fn());
 const refreshWebflowPublished = vi.hoisted(() => vi.fn());
 const refreshWordPressPublished = vi.hoisted(() => vi.fn());
 const refreshFramerPublished = vi.hoisted(() => vi.fn());
+const refreshWixPublished = vi.hoisted(() => vi.fn());
 // Mark published (CE-013).
 const publishPage = vi.hoisted(() => vi.fn());
 const readPublishAddress = vi.hoisted(() => vi.fn());
 vi.mock('@/lib/content/publish-client', () => ({ publishPage, readPublishAddress }));
+// Time to first AI crawl (#2142): what the brand's bot logs say, as the test sets it.
+const readFirstAiCrawls = vi.hoisted(() => vi.fn());
+vi.mock('@/lib/content/first-ai-crawl', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/content/first-ai-crawl')>()),
+  readFirstAiCrawls,
+}));
 vi.mock('@/lib/content/cms-send-client', () => ({
   readCmsStatuses,
   refreshWebflowPublished,
   refreshWordPressPublished,
   refreshFramerPublished,
+  refreshWixPublished,
   readDraftCms,
   sendPagesToCms,
   readKeptFields: vi.fn(async () => new Map()),
@@ -133,6 +154,8 @@ const row = (over: Partial<ContentDraftListItem>): ContentDraftListItem => ({
   createdAt: '2026-10-18T09:00:00Z',
   updatedAt: '2026-10-20T10:00:00Z',
   archivedAt: null,
+  origin: 'editor',
+  conversation: null,
   ...over,
 });
 
@@ -177,6 +200,7 @@ beforeEach(() => {
   refreshWebflowPublished.mockReset().mockResolvedValue([]);
   refreshWordPressPublished.mockReset().mockResolvedValue([]);
   refreshFramerPublished.mockReset().mockResolvedValue([]);
+  refreshWixPublished.mockReset().mockResolvedValue([]);
   readPublishAddress.mockReset().mockResolvedValue('https://acme.example/pipeline-forecasting');
   publishPage.mockReset().mockResolvedValue({
     ok: true,
@@ -210,6 +234,7 @@ beforeEach(() => {
   }));
   saveBlob.mockReset();
   readCmsStatuses.mockReset().mockResolvedValue(new Map());
+  readFirstAiCrawls.mockReset().mockResolvedValue({ logs: false, byDraft: new Map() });
   readDraftCms.mockReset().mockResolvedValue({ fields: {}, publishedUrl: null, last: null });
   sendPagesToCms.mockReset().mockResolvedValue({
     ok: true,
@@ -265,22 +290,25 @@ describe('the Content Library', () => {
       'Feature page',
       'Optimize',
       'AL' + 'You',
+      // Made in (W4-10).
+      'Content Editor',
       'In review',
       'Oct 18',
       'Oct 20',
       '',
     ]);
-    expect(rows[1].slice(0, 5)).toEqual([
+    expect(rows[1].slice(0, 6)).toEqual([
       'Northwind vs HubSpot',
       'Comparison',
       'Create',
       'Content Agent',
+      'Content Editor',
       'In review',
     ]);
     // No title yet; a teammate with no name is named by e-mail.
     expect(rows[2][0]).toBe('Untitled');
     expect(rows[2][3]).toBe('Ggrace@acme.com');
-    expect(rows[2][5]).toBe('Dec 30, 2025');
+    expect(rows[2][6]).toBe('Dec 30, 2025');
     expect([...container.querySelectorAll('thead th')].map((th) => th.textContent)).toEqual([
       // The box to pick every row listed.
       '',
@@ -288,6 +316,7 @@ describe('the Content Library', () => {
       'Type',
       'Method',
       'By',
+      'Made in',
       'Status',
       'Created',
       'Updated',
@@ -341,7 +370,7 @@ describe('the Content Library', () => {
       ]);
       await renderPage();
       const status = [...container.querySelectorAll('tbody tr')].map(
-        (tr) => tr.querySelectorAll('td')[5].textContent,
+        (tr) => tr.querySelectorAll('td')[6].textContent,
       );
       expect(status).toEqual(['Agent writing…', 'Agent failed', 'Ready']);
       expect(getContentDrafts).toHaveBeenCalledTimes(1);
@@ -349,11 +378,31 @@ describe('the Content Library', () => {
       getContentDrafts.mockResolvedValue([row({ status: 'in_review', author: 'agent' })]);
       await act(async () => void (await vi.advanceTimersByTimeAsync(5_000)));
       expect(getContentDrafts).toHaveBeenCalledTimes(2);
-      expect(container.querySelector('tbody tr td:nth-child(6)')!.textContent).toBe('In review');
+      expect(container.querySelector('tbody tr td:nth-child(7)')!.textContent).toBe('In review');
       await act(async () => void (await vi.advanceTimersByTimeAsync(10_000)));
       expect(getContentDrafts).toHaveBeenCalledTimes(2);
     } finally {
       vi.useRealTimers();
+    }
+  });
+
+  it('shows the agent as Chat lists a run, with the new Chat on', async () => {
+    chat.on = true;
+    try {
+      getContentDrafts.mockResolvedValue([
+        row({ status: 'draft', author: 'agent', agentState: 'writing' }),
+        row({ id: 'd2', status: 'draft', agentState: 'failed' }),
+      ]);
+      await renderPage();
+      const lines = [...container.querySelectorAll('[data-slot="agent-state-line"]')];
+      expect(lines.map((line) => line.textContent)).toEqual(['Agent writing…', 'Agent failed']);
+      expect(
+        lines.map((line) =>
+          line.querySelector('[data-slot="list-dot"]')?.getAttribute('data-state'),
+        ),
+      ).toEqual(['running', 'failed']);
+    } finally {
+      chat.on = false;
     }
   });
 
@@ -473,8 +522,12 @@ describe('Send to CMS from a Library row (#1331)', () => {
           bodyHtml: '<h1>Pipeline forecasting</h1><p>Teams save [figure] hours.</p>',
           sourceUrl: null,
           authorId: null,
+          reviewerId: null,
           authorConfirmed: false,
           language: null,
+          pageType: null,
+          isNew: false,
+          schemaLeftOut: false,
         },
       ],
       rest: [],
@@ -537,6 +590,73 @@ describe('Send to CMS from a Library row (#1331)', () => {
       ['A', expect.stringMatching(/^Published Oct 24, 2026/)],
     ]);
     expect(marks[1].getAttribute('href')).toBe('https://acme.example/churn');
+  });
+
+  it('says when an AI bot first came to a page that went live, from the brand’s own bot logs (#2142)', async () => {
+    getContentDrafts.mockResolvedValue([row({ status: 'published' })]);
+    readCmsStatuses.mockResolvedValue(
+      new Map([
+        [
+          'd1',
+          {
+            status: 'published',
+            at: '2026-10-24T11:00:00Z',
+            httpStatus: 200,
+            error: null,
+            publishedUrl: 'https://acme.example/churn',
+          },
+        ],
+      ]),
+    );
+    const tip = async () => {
+      const mark = container.querySelector<HTMLElement>('[aria-label^="Published"]')!;
+      await act(async () => {
+        mark.focus();
+        mark.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
+      });
+      await act(async () => new Promise((resolve) => setTimeout(resolve, 50)));
+      return document.querySelector('[data-slot="first-ai-crawl"]')?.textContent;
+    };
+
+    readFirstAiCrawls.mockResolvedValue({
+      logs: true,
+      byDraft: new Map([['d1', { bot: 'GPTBot', at: '2026-10-24T17:00:00Z', dayOnly: false }]]),
+    });
+    await renderPage();
+    await act(async () => {});
+    expect(readFirstAiCrawls).toHaveBeenCalledWith('brand-1', [
+      { draftId: 'd1', url: 'https://acme.example/churn', at: '2026-10-24T11:00:00Z' },
+    ]);
+    expect(await tip()).toBe('First AI crawl: GPTBot, 6 hours after it went live');
+  });
+
+  it('says to connect AI bot logs when the brand sends none (#2142)', async () => {
+    getContentDrafts.mockResolvedValue([row({ status: 'published' })]);
+    readCmsStatuses.mockResolvedValue(
+      new Map([
+        [
+          'd1',
+          {
+            status: 'published',
+            at: '2026-10-24T11:00:00Z',
+            httpStatus: 200,
+            error: null,
+            publishedUrl: 'https://acme.example/churn',
+          },
+        ],
+      ]),
+    );
+    await renderPage();
+    await act(async () => {});
+    const mark = container.querySelector<HTMLElement>('[aria-label^="Published"]')!;
+    await act(async () => {
+      mark.focus();
+      mark.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
+    });
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 50)));
+    expect(document.querySelector('[data-slot="first-ai-crawl"]')?.textContent).toBe(
+      'Connect AI bot logs in AI Traffic to see when AI bots first visit it',
+    );
   });
 
   it('says a page sent to Webflow is a draft item there', async () => {
@@ -620,6 +740,34 @@ describe('Send to CMS from a Library row (#1331)', () => {
     expect(refreshWebflowPublished).not.toHaveBeenCalled();
     expect(refreshWordPressPublished).not.toHaveBeenCalled();
     expect(refreshFramerPublished).not.toHaveBeenCalled();
+    expect(refreshWixPublished).not.toHaveBeenCalled();
+  });
+
+  /** Wix (00372): its Blog's draft posts, asked once whether they went live. */
+  it('says a page sent to Wix is a draft post there, and asks Wix once', async () => {
+    getContentDrafts.mockResolvedValue([row({})]);
+    readCmsStatuses.mockResolvedValue(
+      new Map([
+        [
+          'd1',
+          {
+            status: 'sent',
+            target: 'wix',
+            at: '2026-10-28T10:00:00Z',
+            httpStatus: null,
+            error: null,
+            publishedUrl: null,
+          },
+        ],
+      ]),
+    );
+    await renderPage();
+    await act(async () => {});
+    expect(
+      container.querySelectorAll('[aria-label^="In Wix as a draft post since Oct 28, 2026"]'),
+    ).toHaveLength(1);
+    expect(refreshWixPublished).toHaveBeenCalledTimes(1);
+    expect(refreshWixPublished).toHaveBeenCalledWith('brand-1');
   });
 
   it('says a page sent to WordPress is a draft post there, and asks WordPress once', async () => {
@@ -879,6 +1027,9 @@ describe('Send to CMS from a Library row (#1331)', () => {
             authorId: null,
             authorConfirmed: false,
             language: null,
+            pageType: null,
+            isNew: false,
+            schemaLeftOut: false,
           },
         ],
         rest: [],
@@ -902,6 +1053,86 @@ describe('Send to CMS from a Library row (#1331)', () => {
     await act(async () => trigger.click());
     const items = [...document.body.querySelectorAll<HTMLElement>('[role="menuitem"]')];
     expect(items.map((el) => el.textContent)).not.toContain('Send to CMS');
+  });
+});
+
+describe('Take down from a Library row (AUTONOMOUS-GO-LIVE PR 10)', () => {
+  const live = (target: string, over = {}) =>
+    new Map([
+      [
+        'd1',
+        {
+          status: 'published',
+          target,
+          at: '2026-11-01T10:00:00Z',
+          httpStatus: null,
+          error: null,
+          publishedUrl: 'https://acme.example/blog/pipeline-forecasting',
+          ...over,
+        },
+      ],
+    ]);
+  const menu = async () => {
+    const trigger = container.querySelector<HTMLElement>(
+      '[aria-label="Actions for Pipeline forecasting"]',
+    )!;
+    await act(async () => trigger.click());
+    return [...document.body.querySelectorAll<HTMLElement>('[role="menuitem"]')];
+  };
+
+  it('takes a page live in Webflow down, says so, and reads the row again', async () => {
+    getContentDrafts.mockResolvedValue([row({})]);
+    readCmsStatuses.mockResolvedValue(live('webflow'));
+    takeDownDraft.mockResolvedValue({ ok: true, target: 'webflow' });
+    await renderPage();
+    const item = (await menu()).find((el) => el.textContent === 'Take down')!;
+    await act(async () => item.click());
+    const dialog = document.querySelector('[data-slot="take-down-dialog"]')!;
+    expect(dialog.textContent).toContain('Take down “Pipeline forecasting”?');
+    expect(dialog.textContent).toContain(
+      'It leaves acme.example now and goes back to a draft in Webflow.',
+    );
+    const reads = readCmsStatuses.mock.calls.length;
+    await act(async () =>
+      (dialog.querySelector('[data-action="takeDown.confirm"]') as HTMLElement).click(),
+    );
+    expect(takeDownDraft).toHaveBeenCalledWith('d1');
+    expect(toast.success).toHaveBeenCalledWith('Taken down. It’s a draft in Webflow again.');
+    expect(readCmsStatuses.mock.calls.length).toBeGreaterThan(reads);
+  });
+
+  it.each([
+    ['live in Wix', 'wix', {}, true],
+    ['live in Framer, which publishes the whole site', 'framer', {}, false],
+    ['sent to the webhook', 'webhook', {}, false],
+    ['only sent to Webflow', 'webflow', { status: 'sent', publishedUrl: null }, false],
+  ] as const)('on a page %s: offered %s', async (_case, target, over, offered) => {
+    getContentDrafts.mockResolvedValue([row({})]);
+    readCmsStatuses.mockResolvedValue(live(target, over));
+    await renderPage();
+    expect((await menu()).some((el) => el.textContent === 'Take down')).toBe(offered);
+  });
+
+  it('isn’t offered to an Analyst', async () => {
+    role.canManage = false;
+    getContentDrafts.mockResolvedValue([row({})]);
+    readCmsStatuses.mockResolvedValue(live('wordpress'));
+    await renderPage();
+    expect((await menu()).some((el) => el.textContent === 'Take down')).toBe(false);
+  });
+
+  it('shows a page taken down beside its status', async () => {
+    getContentDrafts.mockResolvedValue([row({})]);
+    readCmsStatuses.mockResolvedValue(
+      live('wordpress', { status: 'taken_down', at: '2026-11-02T09:30:00Z' }),
+    );
+    await renderPage();
+    expect(
+      container.querySelector(
+        '[aria-label^="Taken down Nov 2, 2026"][aria-label$=": a draft post in WordPress again"]',
+      ),
+    ).not.toBeNull();
+    expect((await menu()).some((el) => el.textContent === 'Take down')).toBe(false);
   });
 });
 
@@ -1545,7 +1776,7 @@ describe('the Library’s Shopping path column (00352)', () => {
     const headers = [...container.querySelectorAll('th')].map((th) => th.textContent);
     expect(headers).toContain('Shopping path');
     const cells = [...container.querySelectorAll('tbody tr')].map(
-      (tr) => tr.querySelectorAll('td')[6]?.textContent,
+      (tr) => tr.querySelectorAll('td')[7]?.textContent,
     );
     expect(cells).toEqual(['2 sold out', 'OK', 'None', 'Not checked yet']);
   });
@@ -1573,5 +1804,121 @@ describe('the Library’s Shopping path column (00352)', () => {
       'Shopping path',
     );
     expect(container.querySelectorAll('tbody tr')).toHaveLength(4);
+  });
+});
+
+describe('the Library’s Made in column and filter (00463, W4-10)', () => {
+  const CHAT = 'cccccccc-0000-4000-8000-000000000001';
+  const madeIn = () =>
+    [...container.querySelectorAll<HTMLElement>('[data-slot="made-in"]')].map(
+      (el) => el.textContent,
+    );
+  afterEach(() => {
+    chat.on = false;
+    window.history.replaceState(null, '', '/dashboard/content/library');
+  });
+
+  it('says where each draft was made, with Open chat to a chat the member may open', async () => {
+    chat.on = true;
+    getContentDrafts.mockResolvedValue([
+      row({
+        id: 'd1',
+        title: 'From chat',
+        origin: 'chat',
+        conversation: { id: CHAT, title: 'Pricing FAQ', mine: true },
+      }),
+      row({ id: 'd2', title: 'From a task', origin: 'action_center' }),
+      // Another's chat: its title isn't readable, so no link.
+      row({ id: 'd3', title: 'From a teammate’s chat', origin: 'chat', conversation: null }),
+    ]);
+    await renderPage();
+    expect(madeIn()).toEqual(['Chat', 'Action Center', 'Chat']);
+    // Below xl, the same on a line under By: only for a draft made outside the editor.
+    expect(
+      [...container.querySelectorAll('[data-slot="made-in-short"]')].map((el) => el.textContent),
+    ).toEqual(['in Chat', 'in Action Center', 'in Chat']);
+    // In its column, and on that line: the one chat the member may open.
+    const links = [...container.querySelectorAll('[data-action="library.openChat"]')];
+    expect(links).toHaveLength(2);
+    for (const link of links) {
+      expect(link.getAttribute('href')).toBe(`/dashboard/chat/${CHAT}`);
+      expect(link.textContent).toBe('Open chat');
+    }
+    expect(container.querySelector('[aria-label="Made in"]')!.textContent).toContain(
+      'Made in: All',
+    );
+  });
+
+  it('has no Open chat with the new Chat off', async () => {
+    getContentDrafts.mockResolvedValue([
+      row({ origin: 'chat', conversation: { id: CHAT, title: 'Pricing FAQ', mine: true } }),
+    ]);
+    await renderPage();
+    expect(madeIn()).toEqual(['Chat']);
+    expect(container.querySelector('[data-action="library.openChat"]')).toBeNull();
+  });
+
+  it('leaves the filter out while every draft was made in the editor', async () => {
+    getContentDrafts.mockResolvedValue([row({})]);
+    await renderPage();
+    expect(madeIn()).toEqual(['Content Editor']);
+    expect(container.querySelector('[data-slot="made-in-short"]')).toBeNull();
+    expect(container.querySelector('[aria-label="Made in"]')).toBeNull();
+  });
+
+  it('lists only the drafts made where the URL’s filter says', async () => {
+    window.history.replaceState(null, '', '/dashboard/content/library?madeIn=chat');
+    getContentDrafts.mockResolvedValue([
+      row({ id: 'd1', title: 'Chat page', origin: 'chat' }),
+      row({ id: 'd2', title: 'Editor page' }),
+    ]);
+    await renderPage();
+    expect(container.textContent).toContain('Chat page');
+    expect(container.textContent).not.toContain('Editor page');
+    expect(container.querySelector('[aria-label="Made in"]')!.textContent).toContain(
+      'Made in: Chat',
+    );
+  });
+});
+
+describe("what Chat's side panel sees (the owner's plan, step 9)", () => {
+  const view = () => chatPage.mock.lastCall![0];
+
+  it('sends the tab, its status as a filter, and once read the drafts listed by id', async () => {
+    getContentDrafts.mockResolvedValue([
+      row({ id: 'd1' }),
+      row({ id: 'd2', title: 'Office coffee guide', status: 'draft' }),
+    ]);
+    await renderPage();
+    expect(view()).toEqual({
+      pageName: 'Library',
+      filters: [],
+      view: {
+        tab: 'all',
+        rows: [
+          { ref: 'd1', label: 'Pipeline forecasting' },
+          { ref: 'd2', label: 'Office coffee guide' },
+        ],
+        total: 2,
+      },
+    });
+    act(() => root.unmount());
+    root = createRoot(container);
+    window.history.replaceState(null, '', '/dashboard/content/library?tab=in_review');
+    await renderPage();
+    expect(view().filters).toEqual([{ key: 'status', label: 'In review', value: 'in_review' }]);
+    expect(view().view).toEqual({
+      tab: 'in_review',
+      rows: [{ ref: 'd1', label: 'Pipeline forecasting' }],
+      total: 1,
+    });
+  });
+
+  it('sends no rows while it reads, and no status for Archived', async () => {
+    getContentDrafts.mockReturnValue(new Promise(() => {}));
+    window.history.replaceState(null, '', '/dashboard/content/library?tab=archived');
+    await renderPage();
+    expect(view().filters).toEqual([]);
+    expect(view().view).toEqual({ tab: 'archived' });
   });
 });

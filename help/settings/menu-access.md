@@ -1,0 +1,46 @@
+---
+title: Choose who sees which menu sections
+route: /dashboard/settings/menu-access
+keywords: [menu access, hide menu sections, role menu, customize menu, sidebar sections, fold menu group]
+synonyms: [hide pages from users, left menu per role, restrict menu, simplify sidebar]
+plan: all
+updated: 2026-11-17
+last_checked: 2026-11-17
+owner: Cihan
+app_version: 0.3.0
+approved: true
+sources: [docs/guides/menu-access.mdx]
+---
+**Menu access** in Settings decides which sections are on each person's left menu, so everyone sees the part of Ansvisor they use. It only hides: a section off someone's menu still opens from a link, and what their role can do there doesn't change. Ansvisor opens on **Prompts › Tracked Prompts**, or on the Action Center's **Today** tab for someone whose menu leaves Prompts off. To change what someone can do, change their role in **Settings › Team**.
+
+## Fold a group on your menu
+
+Click a group's title on the left menu, **Analytics** or **Execution**, to fold it, and again to open it; the arrow on its right shows which. This browser remembers it, and a folded group opens by itself when you go to one of its pages. **Chat** sits above the groups, so it doesn't fold. **Action Center** is first in **Execution** and folds with it; its own tabs also fold under it.
+
+## Who can change menus
+
+Admins change menus, and can let managers do it too: under **Who can change menus**, switch a manager on. That manager then sees **Menu access** in Settings, and nothing else of the admins' settings. They change what each role sees and every non-admin's menu, never an admin's.
+
+Only admins choose who changes menus. A manager who becomes another role stops changing menus.
+
+## Choose what each role sees
+
+**Sections each role sees** lists the left menu's sections, by group, with a column for each role. Tick what a role sees; each box is saved as you click it.
+
+- **Admin** always sees **Everything**.
+- **Action Center** is on everyone's menu and can't be turned off. **Agents · in Action Center**, under it, can be hidden on its own.
+- **Use a set…** fills a role's column from a work area's ready-made set, or **Everything**. Adjust it from there. **Agents** is in every set.
+
+Until an admin hides something, every role sees every section.
+
+## Change one person's menu
+
+**People** lists everyone but the admins, with their role, the work areas they picked, their menu and how many sections it keeps. A menu reads like **Analyst's menu**, or **Custom: +Prompts, −Content** when it differs from their role's.
+
+Click **Customize** to tick or untick a section for that person alone, even one their role hides. Each change is marked **shown for them** or **hidden for them**, and saved as you click. **Use Analyst's menu**, named after their role, takes their changes back.
+
+## How a menu is worked out
+
+A person's menu is their role's sections, changed by their own exceptions from **People**, then narrowed to the sections of their work areas, when they picked any.
+
+**Action Center** always stays, and nobody takes a section off an admin's menu; only an admin's own work areas narrow it. A section added to Ansvisor later is on everyone's menu until someone hides it.

@@ -74,6 +74,7 @@ vi.mock('@/lib/supabase/server', () => ({
         limit: () => chain,
         insert: (value: unknown) => ((call.op = 'insert'), (call.value = value), chain),
         update: (value: unknown) => ((call.op = 'update'), (call.value = value), chain),
+        upsert: (value: unknown) => ((call.op = 'upsert'), (call.value = value), chain),
         maybeSingle: async () => result(),
         single: async () => result(),
         then: (resolve: (r: unknown) => void) => resolve(result()),
@@ -324,6 +325,9 @@ describe('createContentDraft', () => {
       opportunity_id: OPPORTUNITY,
       prompt_ids: [PROMPT, 'p2'],
       source_url: null,
+      // Made in the editor (00463, W4-10).
+      origin: 'editor',
+      conversation_id: null,
     });
   });
 
@@ -338,6 +342,66 @@ describe('createContentDraft', () => {
     };
     await createContentDraft(BRAND, start({ typePicked: true }));
     expect(inserted()).toMatchObject({ page_type: 'solution_page', page_type_source: 'user' });
+  });
+
+  it('is made in the editor unless said, and in a chat of the person’s with its id (00463)', async () => {
+    reads = {
+      content_opportunities: {
+        id: OPPORTUNITY,
+        prompt_id: PROMPT,
+        cluster_id: null,
+        related_cluster_ids: [],
+      },
+    };
+    await createContentDraft(BRAND, start());
+    expect(inserted()).toMatchObject({ origin: 'editor', conversation_id: null });
+    calls.length = 0;
+    const CHAT = 'cccccccc-0000-4000-8000-000000000001';
+    await createContentDraft(BRAND, start({ origin: 'chat', conversationId: CHAT }));
+    expect(inserted()).toMatchObject({ origin: 'chat', conversation_id: CHAT });
+  });
+
+  it('takes the prompts its card counts when its clusters have no members (editor UX review 2026-11-03)', async () => {
+    reads = {
+      content_opportunities: {
+        id: OPPORTUNITY,
+        prompt_id: PROMPT,
+        cluster_id: 'c1',
+        related_cluster_ids: [],
+        source_data: {
+          prompts: ['Best CRM for real estate teams', 'CRM for agents', 'CRM for agents', ''],
+        },
+      },
+      prompt_cluster_members: [],
+      prompts: [
+        { id: 'p2', text: 'Best CRM for real estate teams' },
+        { id: PROMPT, text: 'CRM for agents' },
+      ],
+    };
+    await createContentDraft(BRAND, start());
+    const byWords = calls.find((call) => call.table === 'prompts')!;
+    expect(byWords.filters).toEqual([
+      ['eq', 'prompt_sets.brand_id', BRAND],
+      ['in', 'text', ['Best CRM for real estate teams', 'CRM for agents']],
+    ]);
+    // Its own prompt first, each once.
+    expect(inserted()).toMatchObject({ opportunity_id: OPPORTUNITY, prompt_ids: [PROMPT, 'p2'] });
+  });
+
+  it('keeps its own prompt when its clusters are empty and its card lists none', async () => {
+    reads = {
+      content_opportunities: {
+        id: OPPORTUNITY,
+        prompt_id: PROMPT,
+        cluster_id: 'c1',
+        related_cluster_ids: [],
+        source_data: {},
+      },
+      prompt_cluster_members: [],
+    };
+    await createContentDraft(BRAND, start());
+    expect(calls.some((call) => call.table === 'prompts')).toBe(false);
+    expect(inserted()).toMatchObject({ prompt_ids: [PROMPT] });
   });
 
   it('takes the one prompt of an opportunity with no clusters', async () => {
@@ -688,6 +752,54 @@ describe('startDraftFromAction', () => {
   const start = (page: string | null = PAGE) =>
     startDraftFromAction(BRAND, ACTION, TASK, { page, title: 'Recover visibility' });
 
+  it('puts a bridge links page’s links in Your input, in the words it is given (AC plan P-10)', async () => {
+    const pairs = {
+      linkPairs: [
+        { from: PAGE, to: 'https://northwind.example/pricing', anchor: 'Pricing' },
+        { from: 'https://northwind.example/other', to: 'https://northwind.example/demo' },
+      ],
+    };
+    reads = {
+      actions: action(pairs),
+      action_tasks: { id: TASK, task_key: 'optimize_content', status: 'in_progress' },
+      content_drafts: [],
+      brands: { site_type: 'b2b', industry: 'Software', shopping_mode_enabled: false },
+      prompts: [],
+      content_opportunities: null,
+    };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(JSON.stringify({ error: 'x' }), { status: 502 })),
+    );
+    const labels = { name: 'Links to add on this page', linkTo: 'Link to', anchor: 'Link text' };
+    await startDraftFromAction(BRAND, ACTION, TASK, { page: PAGE, title: 'x', linkLabels: labels });
+    expect(calls.filter((call) => call.op === 'upsert')).toEqual([
+      {
+        table: 'content_draft_inputs',
+        op: 'upsert',
+        value: {
+          draft_id: 'action-draft',
+          data: [
+            {
+              name: 'Links to add on this page',
+              rows: [
+                ['Link to', 'Link text'],
+                ['https://northwind.example/pricing', 'Pricing'],
+              ],
+            },
+          ],
+          updated_by: 'u1',
+        },
+        filters: [],
+      },
+    ]);
+
+    // Without its words, or for a page with no link, nothing is written there.
+    calls = [];
+    await startDraftFromAction(BRAND, ACTION, TASK, { page: PAGE, title: 'x' });
+    expect(calls.some((call) => call.op === 'upsert')).toBe(false);
+  });
+
   it('writes the draft for the page, linked to the action, and starts the task', async () => {
     reads = {
       actions: action({ title: undefined }),
@@ -714,6 +826,14 @@ describe('startDraftFromAction', () => {
       draftId: 'action-draft',
       created: true,
       importFailed: false,
+      // As written, for the Content Agent's run on it (Write this's).
+      draft: expect.objectContaining({
+        method: 'optimize',
+        title: 'Forecasting',
+        sourceUrl: PAGE,
+        bodyHtml: '<h1>Forecasting</h1><p>Forecast every deal.</p>',
+        rules: expect.objectContaining({ importLength: 100 }),
+      }),
     });
     expect(
       JSON.parse((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body as string),
@@ -747,6 +867,8 @@ describe('startDraftFromAction', () => {
           action_id: ACTION,
           // The live page's own length, raised to the Length rule's least.
           rules: expect.objectContaining({ importLength: 100 }),
+          // Made from an Action Center task (00463, W4-10).
+          origin: 'action_center',
         }),
       },
     ]);
@@ -819,9 +941,10 @@ describe('startDraftFromAction', () => {
       vi.fn(async () => new Response('{}', { status: 502 })),
     );
     await expect(start()).resolves.toMatchObject({ created: true, importFailed: true });
+    // A page to update is named by its path, not the action, when it can't be read.
     expect(admin.inserts[0].value).toMatchObject({
-      title: 'Pipeline forecasting',
-      body_html: '<h1>Pipeline forecasting</h1>',
+      title: '/forecasting',
+      body_html: '<h1>/forecasting</h1>',
       source_url: PAGE,
     });
 
@@ -855,6 +978,139 @@ describe('startDraftFromAction', () => {
     expect(admin.inserts).toEqual([]);
   });
 
+  it('takes the prompts it targets, or its topic’s, when it lists none (AC plan P-3)', async () => {
+    reads = {
+      actions: action({
+        promptIds: undefined,
+        pages: [],
+        targetEntity: 'prompts',
+        targets: [{ id: PROMPT, label: 'best crm' }],
+      }),
+      action_tasks: { id: TASK, task_key: 'create_content_draft', status: 'todo' },
+      content_drafts: [],
+      brands: null,
+      prompts: [{ id: PROMPT }],
+      content_opportunities: null,
+    };
+    await expect(start(null)).resolves.toMatchObject({ created: true });
+    expect(calls.find((call) => call.table === 'prompts')!.filters).toEqual([
+      ['eq', 'prompt_sets.brand_id', BRAND],
+      ['in', 'id', [PROMPT]],
+    ]);
+    expect(admin.inserts[0].value).toMatchObject({ prompt_ids: [PROMPT] });
+
+    // G16 and C09 opened before the night kept their prompts: the topic's.
+    calls = [];
+    admin.inserts = [];
+    reads.actions = action({
+      promptIds: undefined,
+      pages: [],
+      targetEntity: 'topics',
+      targets: [{ id: TOPIC, label: 'Forecasting' }],
+    });
+    await expect(start(null)).resolves.toMatchObject({ created: true });
+    expect(calls.find((call) => call.table === 'prompts')!.filters).toEqual([
+      ['eq', 'prompt_sets.brand_id', BRAND],
+      ['in', 'topic_id', [TOPIC]],
+    ]);
+    expect(admin.inserts[0].value).toMatchObject({ prompt_ids: [PROMPT] });
+  });
+
+  it('gives a new page its play’s type, and on a shop locks the action’s product into its path', async () => {
+    reads = {
+      actions: action({
+        pages: [],
+        play: { id: 'buying_guide', assetType: 'buying_guide' },
+        target: { type: 'product', id: 'prod-1', name: 'Trail boot' },
+      }),
+      action_tasks: { id: TASK, task_key: 'create_content_draft', status: 'todo' },
+      content_drafts: [],
+      brands: { site_type: 'ecommerce', industry: null, shopping_mode_enabled: true },
+      prompts: [],
+      content_opportunities: null,
+    };
+    const fetchMock = vi.fn(
+      async () => new Response(JSON.stringify({ path: null, reason: 'no_match' })),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const DRAFT = 'abababab-abab-4bab-8bab-abababababab';
+    admin.result = { data: { id: DRAFT }, error: null };
+    await expect(start(null)).resolves.toMatchObject({ created: true });
+    expect(admin.inserts[0].value).toMatchObject({
+      page_type: 'buying_guide',
+      shopping_path: expect.objectContaining({
+        pageType: 'buying_guide',
+        locked: ['prod-1'],
+        added: ['prod-1'],
+      }),
+    });
+    // The path built around it, as Pick again builds it.
+    expect((fetchMock.mock.calls[0] as unknown as [string])[0]).toMatch(
+      new RegExp(`/api/content-drafts/${DRAFT}/shopping-path$`),
+    );
+
+    // Not a shop: no path, and nothing built.
+    admin.inserts = [];
+    fetchMock.mockClear();
+    reads.brands = { site_type: 'b2b', industry: null, shopping_mode_enabled: false };
+    await expect(start(null)).resolves.toMatchObject({ created: true });
+    expect(admin.inserts[0].value).not.toHaveProperty('shopping_path');
+    expect(fetchMock).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
+  });
+
+  it('titles a new page by its main prompt, with the type its opportunity carries, never none', async () => {
+    const SECOND = '12121212-1212-4212-8212-121212121212';
+    reads = {
+      actions: action({
+        title: 'Close the visibility gap with 1 competitor',
+        pages: [],
+        promptIds: [PROMPT, SECOND],
+      }),
+      action_tasks: { id: TASK, task_key: 'create_content_draft', status: 'todo' },
+      content_drafts: [],
+      brands: { site_type: 'ecommerce', industry: null, shopping_mode_enabled: false },
+      // Read back in any order: the first the action lists is the main prompt.
+      prompts: [
+        { id: SECOND, text: 'Best coffee subscriptions' },
+        { id: PROMPT, text: 'Is a coffee subscription worth it?' },
+      ],
+      content_opportunities: { id: OPPORTUNITY, brief: null, assetType: 'buying_guide' },
+    };
+    await expect(start(null)).resolves.toMatchObject({
+      created: true,
+      draft: {
+        method: 'create',
+        title: 'Is a coffee subscription worth it?',
+        pageType: 'buying_guide',
+        sourceUrl: null,
+        prompts: 2,
+      },
+    });
+    expect(admin.inserts[0].value).toMatchObject({
+      title: 'Is a coffee subscription worth it?',
+      body_html: '<h1>Is a coffee subscription worth it?</h1>',
+      page_type: 'buying_guide',
+      opportunity_id: OPPORTUNITY,
+      prompt_ids: [SECOND, PROMPT],
+    });
+    expect(calls.find((call) => call.table === 'content_opportunities')).toBeDefined();
+
+    // The opportunity's brief names the page first; with no type known, Start's default.
+    admin.inserts = [];
+    reads.brands = { site_type: 'b2b', industry: null, shopping_mode_enabled: false };
+    reads.content_opportunities = {
+      id: OPPORTUNITY,
+      brief: { suggestedTitle: 'Coffee subscriptions: are they worth it?' },
+      assetType: null,
+    };
+    await expect(start(null)).resolves.toMatchObject({ created: true });
+    expect(admin.inserts[0].value).toMatchObject({
+      title: 'Coffee subscriptions: are they worth it?',
+      page_type: expect.any(String),
+    });
+  });
+
   // The work's draft was archived: the read skips it (as the DB's filter
   // does) and the one-per-work key counts only drafts not archived (00233),
   // so Start writes a new one rather than fail on the archived one's key.
@@ -867,7 +1123,7 @@ describe('startDraftFromAction', () => {
       prompts: [],
       content_opportunities: null,
     };
-    await expect(start(null)).resolves.toEqual({
+    await expect(start(null)).resolves.toMatchObject({
       draftId: 'action-draft',
       created: true,
       importFailed: false,

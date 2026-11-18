@@ -3,72 +3,74 @@
 import { useEffect, useState } from 'react';
 import { useTranslations } from 'next-intl';
 import { Link, usePathname } from '@/i18n/navigation';
-import { useBrandStore } from '@/stores/use-brand-store';
-import { useUserRole } from '@/hooks/use-user-role';
-import { getNewSignalCount } from '@/lib/actions/signals';
-import { getTaskReviewCount } from '@/lib/actions/action-task-reviews';
 import { cn } from '@/lib/utils';
-import { ACTION_CENTER_TABS, REVIEW_TAB, TASK_REVIEWS_CHANGED } from '@/lib/action-center/tabs';
+import {
+  ACTION_CENTER_TABS,
+  AGENTS_SECTION,
+  actionCenterTabOf,
+  agentsWaitingOn,
+  type ActionCenterTabKey,
+} from '@/lib/action-center/tabs';
+import type { AgentListItem } from '@/lib/chat/agents';
+import { useChatAgentic } from '@/components/providers/chat-agentic-provider';
+import { useHiddenMenuSections } from '@/components/providers/menu-access-provider';
+import { useFeatureGate } from '@/hooks/use-feature-gate';
 import { FirstRunNote } from './first-run-note';
 
 /**
- * The Action Center's section nav: Actions | Signals | KPIs | History, and
- * Needs review for admins and managers (AC-010). Route-backed rather than
- * state-backed tabs so each section is linkable and the browser back button
- * works across them. The first run's note sits under it while a new brand's
- * first analysis goes on.
+ * The Action Center's section nav: Today | Actions | Signals | Agents |
+ * History, each a page of its own, so each is linkable and the browser's
+ * back button works across them. History is the tab on
+ * KPIs, one of its views; Needs review is reached from Today. Agents is
+ * Agent Center, there only with the new Chat on, a plan with agents and its
+ * section on the person's menu (menu access). Actions and Signals carry no
+ * count: a number that differed from their lists' read as wrong, and the
+ * menu's dots say when something is new or waiting. Agents counts the
+ * person's agents whose newest run waits on them, as Agents › Your agents
+ * shows them: best-effort, read on each page change, a failed read showing
+ * nothing. A plain number, as in the mockup: the menu's green and yellow
+ * dots keep their colours to themselves. The first run's note sits under
+ * it while a new brand's first analysis goes on.
  */
 export function ActionCenterTabs() {
   const pathname = usePathname();
   const t = useTranslations('actionCenter.tabs');
+  const chatAgentic = useChatAgentic();
+  const { canUse } = useFeatureGate();
+  const hiddenSections = useHiddenMenuSections();
+  const agentsOn = chatAgentic && canUse('ai_agent') && !hiddenSections.has(AGENTS_SECTION);
 
-  // Untriaged-signal count on the Signals tab: information ("something new
-  // is waiting"), not decoration. Best-effort — a failed count shows nothing.
-  const brandId = useBrandStore((s) => s.activeBrandId);
-  const [newSignals, setNewSignals] = useState(0);
+  // The person's agents, as Agents › Your agents lists them: those whose run waits on them.
+  const [agentsWaiting, setAgentsWaiting] = useState(0);
   useEffect(() => {
-    if (!brandId) return;
+    if (!agentsOn) return;
     let cancelled = false;
-    getNewSignalCount(brandId)
-      .then((count) => {
-        if (!cancelled) setNewSignals(count);
+    fetch('/api/chat/agents?view=mine', { cache: 'no-store' })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((body: { ok?: boolean; agents?: AgentListItem[] } | null) => {
+        if (!cancelled && body?.ok && Array.isArray(body.agents)) {
+          setAgentsWaiting(agentsWaitingOn(body.agents));
+        }
       })
       .catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, [brandId, pathname]);
+  }, [agentsOn, pathname]);
 
-  // Tasks waiting for review, on their own tab: admins and managers fill and approve them.
-  const { canManage } = useUserRole();
-  // Kept with its brand: another brand's count isn't shown while this one's loads.
-  const [reviewCount, setReviewCount] = useState<{ brandId: string; count: number } | null>(null);
-  const reviews = reviewCount && reviewCount.brandId === brandId ? reviewCount.count : 0;
-  useEffect(() => {
-    if (!brandId || !canManage) return;
-    let cancelled = false;
-    const load = () => {
-      getTaskReviewCount(brandId)
-        .then((count) => {
-          if (!cancelled) setReviewCount({ brandId, count });
-        })
-        .catch(() => {});
-    };
-    load();
-    // Approved or dismissed on the review page itself.
-    window.addEventListener(TASK_REVIEWS_CHANGED, load);
-    return () => {
-      cancelled = true;
-      window.removeEventListener(TASK_REVIEWS_CHANGED, load);
-    };
-  }, [brandId, canManage, pathname]);
-  const tabs = canManage ? [...ACTION_CENTER_TABS, REVIEW_TAB] : ACTION_CENTER_TABS;
+  const counts: Partial<Record<ActionCenterTabKey, number>> = {
+    agents: agentsOn ? agentsWaiting : 0,
+  };
+  const current = actionCenterTabOf(pathname);
+  const tabs = ACTION_CENTER_TABS.filter((tab) => tab.key !== 'agents' || agentsOn);
 
   return (
     <>
       <nav className="flex gap-6 border-b" aria-label={t('label')}>
         {tabs.map((tab) => {
-          const isActive = pathname.startsWith(tab.href);
+          const isActive = tab.key === current;
+          const counted = tab.key in counts;
+          const count = counts[tab.key] ?? 0;
           return (
             <Link
               key={tab.key}
@@ -82,14 +84,14 @@ export function ActionCenterTabs() {
               )}
             >
               {t(tab.key)}
-              {tab.key === 'signals' && newSignals > 0 && (
-                <span className="ml-1.5 rounded-full bg-blue-500/10 px-1.5 py-0.5 text-[10px] font-medium text-blue-600 dark:text-blue-400">
-                  {newSignals}
-                </span>
-              )}
-              {tab.key === 'review' && reviews > 0 && (
-                <span className="ml-1.5 rounded-full bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-400">
-                  {reviews}
+              {/* The count's room is kept from the first paint, empty until it
+                  arrives, so the row doesn't move under an early click. */}
+              {counted && (
+                <span
+                  data-count={tab.key}
+                  className="ml-1.5 inline-block min-w-[2ch] font-normal tabular-nums text-muted-foreground"
+                >
+                  {count > 0 ? count : null}
                 </span>
               )}
             </Link>

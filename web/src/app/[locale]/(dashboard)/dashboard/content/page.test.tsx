@@ -37,7 +37,11 @@ const plan = vi.hoisted(() => ({
   setPlanRowPriority: vi.fn(async () => undefined),
 }));
 vi.mock('@/lib/actions/content-plan', () => plan);
-vi.mock('@/hooks/use-user-role', () => ({ useUserRole: () => ({ canManage: true }) }));
+// An admin or a manager unless a test says otherwise.
+const viewer = vi.hoisted(() => ({ canManage: true }));
+vi.mock('@/hooks/use-user-role', () => ({
+  useUserRole: () => ({ canManage: viewer.canManage }),
+}));
 const brandState = vi.hoisted(() => ({
   activeBrandId: 'b1',
   brands: [{ id: 'b1', name: 'Acme', slug: 'acme', siteType: 'b2b' }],
@@ -69,12 +73,31 @@ vi.mock('@/components/content/new-content-dialog', () => ({
     return null;
   },
 }));
-vi.mock('@/components/content/opportunity-detail', () => ({ OpportunityDetail: () => null }));
+const detail = vi.hoisted(() => ({ id: null as string | null }));
+vi.mock('@/components/content/opportunity-detail', () => ({
+  OpportunityDetail: ({ id }: { id: string }) => {
+    detail.id = id;
+    return null;
+  },
+}));
+const toast = vi.hoisted(() =>
+  Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn(), warning: vi.fn() }),
+);
 vi.mock('sonner', () => ({
-  toast: Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn(), warning: vi.fn() }),
+  toast,
+}));
+
+// The brand's first tracking run: none going unless a test says so, and whether the page asked.
+const firstRun = vi.hoisted(() => ({ run: null as unknown, asked: [] as boolean[] }));
+vi.mock('@/hooks/use-first-run', () => ({
+  useFirstRun: ({ enabled }: { enabled: boolean }) => {
+    firstRun.asked.push(enabled);
+    return enabled ? firstRun.run : null;
+  },
 }));
 
 const { default: ContentPage } = await import('./page');
+const { ChatPageSetterContext } = await import('@/components/chat/panel/chat-panel-context');
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT =
   true;
@@ -134,8 +157,12 @@ const rowItem = async (item: string) => {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  firstRun.run = null;
+  firstRun.asked = [];
+  viewer.canManage = true;
   opened.newOpportunities = false;
   opened.newContent = false;
+  detail.id = null;
   window.history.replaceState(null, '', '/dashboard/content');
   content.getOpportunities.mockResolvedValue({
     opportunities: [OPPORTUNITY],
@@ -288,5 +315,200 @@ describe('Content Opportunities on an active plan', () => {
       'Dismiss opportunities?',
     );
     expect(openUpgrade).not.toHaveBeenCalled();
+  });
+});
+
+describe('Content Opportunities for an analyst or an agency partner', () => {
+  const labels = () =>
+    [...document.body.querySelectorAll('button, [role="menuitem"]')].map((el) =>
+      el.textContent?.trim(),
+    );
+
+  // 2026-11-03: sending to the webhook is for admins and managers too, so
+  // nothing is left to do in bulk.
+  it('gives no boxes to tick, so no bulk bar', async () => {
+    viewer.canManage = false;
+    await render(false);
+    expect(container.querySelector('tbody [role="checkbox"]')).toBeNull();
+    expect(container.querySelector('thead [role="checkbox"]')).toBeNull();
+    for (const label of ['Send All', 'Done', 'Dismiss All', 'Delete']) {
+      expect(labels(), label).not.toContain(label);
+    }
+  });
+
+  it('leaves New out, and says who generates opportunities', async () => {
+    viewer.canManage = false;
+    await render(false);
+    expect(labels()).not.toContain('New');
+    expect(container.textContent).toContain('Ask an admin or a manager to generate opportunities.');
+  });
+
+  it("leaves Send to Workflow and Dismiss out of the row's menu", async () => {
+    viewer.canManage = false;
+    await render(false);
+    const trigger = container.querySelector<HTMLElement>(
+      '[aria-label="Actions for Office coffee subscriptions"]',
+    )!;
+    await act(async () => trigger.click());
+    expect(document.body.querySelector('[role="menu"]')).not.toBeNull();
+    for (const label of ['Send to Workflow', 'Dismiss']) {
+      expect(labels(), label).not.toContain(label);
+    }
+  });
+});
+
+describe('A "+ New" request for one prompt', () => {
+  // An in-memory localStorage holding the running job: the test environment has none.
+  const store = new Map<string, string>();
+  beforeEach(() => {
+    store.clear();
+    Object.defineProperty(window, 'localStorage', {
+      configurable: true,
+      value: {
+        getItem: (key: string) => store.get(key) ?? null,
+        setItem: (key: string, value: string) => void store.set(key, value),
+        removeItem: (key: string) => void store.delete(key),
+      },
+    });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    Reflect.deleteProperty(window, 'localStorage');
+  });
+
+  it('offers the open opportunity that already answers the prompt', async () => {
+    localStorage.setItem(
+      'aeo:content-generation',
+      JSON.stringify({ brandId: 'b1', jobId: 'j1', startedAt: Date.now(), count: 1 }),
+    );
+    content.getGenerationJobStatus.mockResolvedValue({
+      status: 'completed',
+      progress: null,
+      result: { generated: 0, duplicates: 0, existingId: 'o9' },
+      failedReason: null,
+    });
+    vi.useFakeTimers();
+    await render(false);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+
+    expect(toast).toHaveBeenCalledWith('This prompt already has an opportunity', {
+      action: { label: 'Open existing', onClick: expect.any(Function) },
+    });
+    await act(async () => toast.mock.calls[0][1].action.onClick());
+    expect(detail.id).toBe('o9');
+    expect(new URL(window.location.href).searchParams.get('opportunity')).toBe('o9');
+  });
+
+  it('says why fewer came back than were asked for', async () => {
+    localStorage.setItem(
+      'aeo:content-generation',
+      JSON.stringify({ brandId: 'b1', jobId: 'j1', startedAt: Date.now(), count: 3 }),
+    );
+    content.getGenerationJobStatus.mockResolvedValue({
+      status: 'completed',
+      progress: null,
+      result: {
+        generated: 1,
+        duplicates: 0,
+        scope: { focus: 'auto', requested: 3, needs: 11, covered: 10, noAnswers: 0 },
+      },
+      failedReason: null,
+    });
+    vi.useFakeTimers();
+    await render(false);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+
+    expect(toast.success).toHaveBeenCalledWith('1 of 3 opportunities created', {
+      description:
+        '10 needs already have one. Add prompts for new needs, or use Another angle on an opportunity.',
+    });
+  });
+});
+
+describe('Content Opportunities while the first tracking run goes on', () => {
+  beforeEach(() => {
+    content.getOpportunities.mockResolvedValue({
+      opportunities: [],
+      total: 0,
+      aggregates: { avgScore: 0, highImpactCount: 0, sentCount: 0, signalCount: 0 },
+    });
+  });
+
+  it('says the first results are on their way in place of "No content opportunities yet"', async () => {
+    firstRun.run = {
+      brandId: 'b1',
+      queued: false,
+      progress: { current: 6, total: 24 },
+      left: { minutes: 9 },
+    };
+    await render(false);
+    expect(container.textContent).toContain('Your first answers are arriving (6 of 24) · ~9 min.');
+    expect(container.textContent).not.toContain('No content opportunities yet');
+  });
+
+  it('keeps its own empty state once the first run is done, and reads it only for the empty list', async () => {
+    await render(false);
+    expect(container.textContent).toContain('No content opportunities yet');
+    content.getOpportunities.mockResolvedValue({
+      opportunities: [OPPORTUNITY],
+      total: 1,
+      aggregates: { avgScore: 74, highImpactCount: 1, sentCount: 0, signalCount: 0 },
+    });
+    firstRun.asked = [];
+    act(() => root.unmount());
+    root = createRoot(container);
+    await render(false);
+    expect(firstRun.asked.at(-1)).toBe(false);
+  });
+});
+
+// The owner's plan (2026-11-16, item 8): Chat's side panel sees the sort, the search and the
+// page of opportunities on screen, with how many match.
+describe("what Chat's side panel sees", () => {
+  async function renderWithPanel(setPage: (page: unknown) => void) {
+    await act(async () => {
+      root.render(
+        <NextIntlClientProvider locale="en" messages={messages} timeZone="UTC">
+          <ChatPageSetterContext.Provider value={setPage}>
+            <UpgradeDialogContext.Provider
+              value={{ isLocked: false, reason: 'ended', adminName: null, openUpgrade }}
+            >
+              <ContentPage />
+            </UpgradeDialogContext.Provider>
+          </ChatPageSetterContext.Provider>
+        </NextIntlClientProvider>,
+      );
+    });
+    await act(async () => {});
+  }
+
+  it('tells the sort the URL names, and once read the opportunities on screen and the total', async () => {
+    window.history.replaceState(null, '', '/dashboard/content?sort=oldest&opportunity=o1');
+    content.getOpportunities.mockResolvedValue({
+      opportunities: [OPPORTUNITY, { ...OPPORTUNITY, id: 'o2', title: 'Decaf guide' }],
+      total: 140,
+      aggregates: { avgScore: 74, highImpactCount: 1, sentCount: 0, signalCount: 0 },
+    });
+    const setPage = vi.fn();
+    await renderWithPanel(setPage);
+    expect(setPage.mock.lastCall![0].view).toEqual({
+      sort: { key: 'oldest', dir: 'asc' },
+      rows: [
+        { ref: 'o1', label: 'Office coffee subscriptions' },
+        { ref: 'o2', label: 'Decaf guide' },
+      ],
+      total: 140,
+    });
+  });
+
+  it('sends no rows or count while the list is read', async () => {
+    content.getOpportunities.mockReturnValue(new Promise(() => {}));
+    const setPage = vi.fn();
+    await renderWithPanel(setPage);
+    expect(setPage.mock.lastCall![0].view).toEqual({ sort: { key: 'newest', dir: 'desc' } });
   });
 });

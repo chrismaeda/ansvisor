@@ -17,13 +17,13 @@ description: "Common questions about Ansvisor."
   <Accordion title="What happens when my plan ends?">
     On Ansvisor Cloud, a workspace becomes **read-only** when a cancelled plan or free trial reaches its end, or when a payment fails (the first charge after the trial too), until the payment method is updated. Everything you set up stays.
 
-    The 14-day free trial starts with a card at checkout, and the plan starts on day 15: a trial that simply ends becomes a paid plan. Cancelling in **Billing**, during the trial or after it, keeps the workspace working until the last day of the trial or of the period you paid for.
+    The 14-day free trial starts with a card at checkout, and the plan starts on day 15: a trial that simply ends becomes a paid plan. Buying the plan during the trial, from **Billing**, ends the trial that day: the first paid period starts then, with the plan's full monthly AI usage, starting again from 0%. Cancelling in **Billing**, during the trial or after it, keeps the workspace working until the last day of the trial or of the period you paid for.
 
     While it's read-only:
 
     - Everyone can still sign in, open every page and read everything.
     - Adding, running, writing and AI open a dialog: **Choose a plan to keep going**, or **Update your payment method to keep going** after a failed payment. Admins choose a plan or update the payment method from it; other members are asked to turn to an admin.
-    - These still work: **Billing** and choosing a plan, your own profile and signing out; stopping a tracking job that is running and stopping the Content Agent; disconnecting Search Console, Analytics, Webflow, an AI-bot log or a store; removing your own AI provider key; deleting an Agent Chat conversation; deleting API keys, removing members, revoking invitations and accepting an invitation; creating API keys (the [MCP server](/guides/mcp-server) only reads for this workspace); and deleting a brand.
+    - These still work: **Billing** and choosing a plan, your own profile and signing out; stopping a tracking job that is running and stopping the Content Agent; disconnecting Search Console, Analytics, Webflow, an AI-bot log or a store; removing your own AI provider key; deleting an Agent Chat conversation; deleting API keys and disconnecting connected apps, removing members, revoking invitations and accepting an invitation; creating API keys (the [MCP server](/guides/mcp-server) only reads for this workspace); and deleting a brand.
     - Nothing runs on its own: no tracking, scraping or AI, no agents, no syncs with outside services, no new signals, actions or suggestions. AI-bot logs, the tracking snippet's visits and [webhook](/api-reference/webhooks) callbacks are answered but not stored.
 
     Once an admin chooses a plan, the workspace works as before. Self-hosted installs are never read-only. Setup is unchanged: a new workspace that has never had a plan goes through setup and its plan step as before. Setup suggests its topics, prompts and competitors with three suggestion requests, and a workspace can make 20 suggestion requests a day in all.
@@ -36,7 +36,7 @@ description: "Common questions about Ansvisor."
   </Accordion>
 
   <Accordion title="How often does tracking run?">
-    Default schedule is once per day per brand. You can configure per-platform frequency under brand settings (e.g. ChatGPT daily, Perplexity 3x/week, Gemini weekly) to manage AI provider costs.
+    Default schedule is once per day per brand. You can configure per-platform frequency under brand settings (e.g. ChatGPT daily, Grok 3x/week, Gemini weekly) to manage AI provider costs.
   </Accordion>
 
   <Accordion title="My visibility score is 0. Did setup go wrong?">
@@ -44,7 +44,7 @@ description: "Common questions about Ansvisor."
   </Accordion>
 
   <Accordion title="Can I see the actual AI responses, not just metrics?">
-    Yes. Click any prompt or platform cell on the Insights page; the drill-down sheet shows the full LLM response, parsed citations, sentiment, and detected competitor mentions.
+    Yes. Click any prompt or platform cell on Visibility's Overview; the drill-down sheet shows the full LLM response, parsed citations, sentiment, and detected competitor mentions.
   </Accordion>
 
   <Accordion title="How do I get help?">
@@ -55,6 +55,14 @@ description: "Common questions about Ansvisor."
 
   <Accordion title="Is my data private?">
     For self-hosted: 100% on your infrastructure, never touches Ansvisor servers. For cloud: standard SaaS privacy — your prompts and responses are stored in our managed Supabase, isolated per organization via RLS, never used for training. Full DPA available on request for enterprise plans.
+  </Accordion>
+
+  <Accordion title="Can I try Ansvisor without a card?">
+    On Ansvisor Cloud, both ways to start a plan, buying it or the 14-day free trial, take a card. Without one, explore a demo brand with sample data from the plan step of sign-up. Your own brand stays saved, and tracking starts on it when you pick a plan. See [Demo brand](/guides/demo-brand).
+  </Accordion>
+
+  <Accordion title="Is there a dark mode?">
+    Yes. The sun/moon button beside the logo, at the top of the main menu while it is open, switches between light and dark, and the choice is kept per browser. On Ansvisor Cloud, new people start in dark mode for now, from the sign-up page on; people who already use Ansvisor keep the mode they have. Signing in on a new browser or device starts in dark mode there too. A mode someone picked is kept. Self-hosted installs start in light mode.
   </Accordion>
 
   <Accordion title="Does Ansvisor work for non-English brands?">

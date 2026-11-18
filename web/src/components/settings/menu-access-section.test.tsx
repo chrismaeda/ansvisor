@@ -14,9 +14,12 @@ const toast = vi.hoisted(() => ({ error: vi.fn(), success: vi.fn() }));
 vi.mock('sonner', () => ({ toast }));
 
 let canManageMenus = true;
-vi.mock('@/components/providers/menu-access-provider', () => ({
+vi.mock('@/components/providers/menu-access-provider', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/components/providers/menu-access-provider')>()),
   useCanManageMenus: () => canManageMenus,
 }));
+let chatOn = true;
+let adsOn = false;
 
 const actions = vi.hoisted(() => ({
   getMenuAccessSettings: vi.fn(),
@@ -25,6 +28,8 @@ const actions = vi.hoisted(() => ({
 vi.mock('@/lib/actions/menu-access', () => actions);
 
 const { MenuAccessSection, hiddenForSet } = await import('./menu-access-section');
+const { ChatAgenticProvider } = await import('@/components/providers/chat-agentic-provider');
+const { AdsProvider } = await import('@/components/providers/ads-provider');
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT =
   true;
@@ -35,6 +40,8 @@ let root: Root;
 beforeEach(() => {
   vi.clearAllMocks();
   canManageMenus = true;
+  chatOn = true;
+  adsOn = false;
   actions.getMenuAccessSettings.mockResolvedValue({
     roles: { manager: [], analyst: ['content', 'audit'], agency_partner: [] },
     members: [],
@@ -55,7 +62,11 @@ async function render() {
   await act(async () => {
     root.render(
       <NextIntlClientProvider locale="en" messages={messages}>
-        <MenuAccessSection />
+        <ChatAgenticProvider enabled={chatOn}>
+          <AdsProvider enabled={adsOn}>
+            <MenuAccessSection />
+          </AdsProvider>
+        </ChatAgenticProvider>
       </NextIntlClientProvider>,
     );
   });
@@ -69,11 +80,47 @@ describe('MenuAccessSection', () => {
     await render();
     expect(box('Analyst sees Content')?.getAttribute('aria-checked')).toBe('false');
     expect(box('Analyst sees Audit')?.getAttribute('aria-checked')).toBe('false');
-    expect(box('Analyst sees Brand Visibility')?.getAttribute('aria-checked')).toBe('true');
+    expect(box('Analyst sees Visibility')?.getAttribute('aria-checked')).toBe('true');
+    expect(box('Analyst sees Competitors')?.getAttribute('aria-checked')).toBe('true');
     expect(box('Manager sees Content')?.getAttribute('aria-checked')).toBe('true');
     expect(container.textContent).toContain('Product Visibility');
     expect(container.textContent).toContain('Execution');
     expect(container.textContent).toContain('Analytics');
+  });
+
+  it('lists Agents under the Action Center, every role seeing it until it is hidden', async () => {
+    await render();
+    for (const role of ['Manager', 'Analyst', 'Agency Partner']) {
+      expect(box(`${role} sees Agents · in Action Center`)?.getAttribute('aria-checked')).toBe(
+        'true',
+      );
+    }
+    await act(async () => box('Analyst sees Agents · in Action Center')!.click());
+    expect(actions.setRoleMenu).toHaveBeenCalledWith('analyst', ['agents', 'content', 'audit']);
+  });
+
+  it('lists Ads only while Ads is on, after AI Referral Traffic, for each role to hide', async () => {
+    await render();
+    expect(box('Analyst sees Ads')).toBeNull();
+    expect(box('Analyst sees AI Referral Traffic')).not.toBeNull();
+
+    adsOn = true;
+    await render();
+    const text = container.textContent ?? '';
+    expect(text.indexOf('Ads')).toBeGreaterThan(text.indexOf('AI Referral Traffic'));
+    for (const role of ['Manager', 'Analyst', 'Agency Partner']) {
+      expect(box(`${role} sees Ads`)?.getAttribute('aria-checked')).toBe('true');
+    }
+    await act(async () => box('Analyst sees Ads')!.click());
+    expect(actions.setRoleMenu).toHaveBeenCalledWith('analyst', ['ads', 'content', 'audit']);
+  });
+
+  it('leaves Agent Center out while the new Chat is off, Chat staying', async () => {
+    chatOn = false;
+    await render();
+    expect(container.textContent).not.toContain('Agent Center');
+    expect(box('Analyst sees Agent Center')).toBeNull();
+    expect(box('Analyst sees Chat')).not.toBeNull();
   });
 
   it('keeps Action Center and the admins’ column on', async () => {
@@ -132,11 +179,12 @@ describe('MenuAccessSection', () => {
       option.click();
     });
     expect(actions.setRoleMenu).toHaveBeenCalledWith('manager', [
-      'content',
-      'audit',
       'prompts',
       'shopping',
       'traffic',
+      'ads',
+      'content',
+      'audit',
     ]);
     expect(box('Manager sees Content')?.getAttribute('aria-checked')).toBe('false');
   });
@@ -159,7 +207,79 @@ describe('MenuAccessSection', () => {
 
 describe('hiddenForSet', () => {
   it('hides what a ready-made set leaves out, never Action Center', () => {
-    expect(hiddenForSet('brand')).toEqual(['content', 'audit', 'prompts', 'shopping', 'traffic']);
+    expect(hiddenForSet('brand')).toEqual([
+      'prompts',
+      'shopping',
+      'traffic',
+      'ads',
+      'content',
+      'audit',
+    ]);
+    // Ads is for the sets that weigh paid and earned answers.
+    expect(hiddenForSet('growth')).not.toContain('ads');
+    // The sets that don't compare the brand with others leave Competitors off.
+    expect(hiddenForSet('content')).toContain('competitors');
     expect(hiddenForSet('all')).toEqual([]);
+  });
+});
+
+// The menu's sections, saved by the same names, in its groups; Agent Center
+// is Action Center › Agents.
+describe('MenuAccessSection and the menu’s groups', () => {
+  const rows = () =>
+    [...container.querySelectorAll('tbody tr')].map(
+      (row) => row.querySelector('td')?.textContent ?? '',
+    );
+
+  it('lists Analytics, then Execution with Agents under the Action Center’s row', async () => {
+    await render();
+    expect(rows()).toEqual([
+      'Chat',
+      'Analytics',
+      'Prompts',
+      'Visibility',
+      'Mentions',
+      'Citations',
+      'Product Visibility',
+      'Competitors',
+      'AI Referral Traffic',
+      'Execution',
+      'Action Center',
+      'Agents · in Action Center',
+      'Content',
+      'Audit',
+      'Reports',
+    ]);
+    expect(rows()).not.toContain('More');
+    expect(container.textContent).not.toContain('Agent Center');
+  });
+
+  it('hides Agents for a role under its old name, agents, as before', async () => {
+    actions.getMenuAccessSettings.mockResolvedValue({
+      roles: { manager: [], analyst: ['agents', 'content'], agency_partner: [] },
+      members: [],
+      viewerIsAdmin: true,
+    });
+    await render();
+    expect(box('Analyst sees Agents · in Action Center')?.getAttribute('aria-checked')).toBe(
+      'false',
+    );
+    expect(box('Manager sees Agents · in Action Center')?.getAttribute('aria-checked')).toBe(
+      'true',
+    );
+    await act(async () => box('Manager sees Agents · in Action Center')!.click());
+    expect(actions.setRoleMenu).toHaveBeenCalledWith('manager', ['agents']);
+    // Action Center, Today and its other tabs with it, stays on every menu.
+    expect(box('Everyone sees Action Center')?.disabled).toBe(true);
+  });
+
+  it('leaves Agents out while the new Chat is off, and lists Ads last in Analytics with Ads on', async () => {
+    chatOn = false;
+    adsOn = true;
+    await render();
+    expect(rows()).not.toContain('Agents · in Action Center');
+    const all = rows();
+    expect(all.indexOf('Ads')).toBe(all.indexOf('AI Referral Traffic') + 1);
+    expect(all.indexOf('Execution')).toBe(all.indexOf('Ads') + 1);
   });
 });

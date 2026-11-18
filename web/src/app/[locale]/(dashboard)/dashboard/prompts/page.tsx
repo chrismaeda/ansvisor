@@ -25,18 +25,28 @@ import {
   PromptUsageCards,
   countByStatus,
   locationQuotaFromUsage,
+  locationsWarning,
   matchesStatusFilter,
   newFirst,
+  planUsageHref,
   promptStatus,
   usePromptUsage,
   type PromptStatus,
   type PromptStatusFilter,
 } from './_usage-cards';
+import {
+  LocationFilter,
+  LocationsWarningLine,
+  NotAnalyzedLine,
+  PromptsListSwitch,
+  PromptsMoreMenu,
+} from './_prompts-header';
 import { INTENT_LABELS, INTENT_COLORS } from '@/config/intent-labels';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { Button, buttonVariants } from '@/components/ui/button';
+import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
 import {
   Table,
   TableBody,
@@ -46,7 +56,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import { Tabs, TabsContent, TabsList, TabsTrigger, tabsListVariants } from '@/components/ui/tabs';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import {
   Dialog,
   DialogContent,
@@ -65,6 +75,8 @@ import {
 import { CompetitionBars } from '@/components/ui/competition-bars';
 import { WorkStatusBadge } from '@/components/prompts/work-status';
 import { BulkImportPrompts } from '@/components/prompts/bulk-import-prompts';
+import { AddTopicLink, TopicFirstNotice } from '@/components/prompts/topic-first';
+import { isNoTopics } from '@/lib/topics-required';
 import { promptKey } from '@/lib/prompt-import';
 import {
   DropdownMenu,
@@ -86,14 +98,10 @@ import {
   RefreshCw,
   Pencil,
   Plus,
-  Settings2,
-  Download,
   ChevronUp,
   ChevronDown,
   Trash2,
   X,
-  ListChecks,
-  Sparkles,
   ArrowUp,
   ArrowDown,
   MoreHorizontal,
@@ -120,26 +128,33 @@ import {
 } from '@/lib/prompt-position-summary';
 import { mentionRateLabel } from '@/lib/prompt-improve';
 import { useBrandStore } from '@/stores/use-brand-store';
+import { useFirstRun } from '@/hooks/use-first-run';
+import { FirstRunEmptyState } from '@/components/first-run/first-run-empty-state';
+import { AskAboutThis } from '@/components/chat/panel/ask-about-this';
+import { useChatPageContext } from '@/components/chat/panel/chat-panel-context';
+import { rangeChipLabel } from '@/lib/chat/page-context';
+import { viewRows, type ChatPageView } from '@/lib/chat/page-view';
 import {
   startPromptVolumeAnalysis,
   getVolumeAnalysisStatus,
   refreshVolumes,
+  type VolumeAnalysisStatus,
   type VolumeQuota,
   type VolumeErrorCode,
 } from '@/lib/actions/volumes';
 import {
   deletePrompt,
   deletePrompts,
-  getPromptsPageData,
   importPrompts,
   setPromptActive,
   setPromptsActive,
   updatePrompt,
   type LocationQuota,
 } from '@/lib/actions/prompt';
+import { readPromptsPageData, readPromptVolumes, VOLUME_READ_RETRIES } from '@/lib/prompts-reads';
 import { Checkbox } from '@/components/ui/checkbox';
 import { useUserRole } from '@/hooks/use-user-role';
-import { usePlanContext } from '@/components/providers/plan-provider';
+import { useWaitingForSpotToast } from '@/components/prompts/waiting-for-spot';
 import { useUpgradeGate } from '@/components/providers/upgrade-gate';
 import { isNoPlan } from '@/lib/billing/no-plan';
 import {
@@ -155,10 +170,13 @@ import {
   type PromptRangePreset,
 } from '@/config/prompt-options';
 import { DateRangeFilter } from '@/components/filters/date-range-filter';
-import { getBrandFilterOptions } from '@/lib/actions/tracking';
-import { formatRegionDisplay, isValidLocation, locationCode, regionLabel } from '@/lib/region';
+// Through /api/visibility/read, as the Visibility tabs read it: a fetch, beside the table's.
+import { getBrandFilterOptions } from '@/lib/visibility-reads';
+import { formatRegionDisplay, regionLabel } from '@/lib/region';
 import { SuggestionsTab } from './_suggestions-tab';
-import { PLANS } from '@/config/plans';
+import { VolumesFailedCard } from './_volumes-failed';
+import { brandLocation, useAllowedEngines } from './_prompt-defaults';
+import { TrackNowLine, useTrackNow } from './_track-now';
 import { getPromptUsage, isPromptLimitReached } from '@/lib/prompt-usage';
 import { getTopics } from '@/lib/actions/topic';
 import type { PromptVisibilitySummary } from '@/lib/actions/tracking';
@@ -189,6 +207,7 @@ import {
 } from '@/lib/prompt-bulk-actions';
 import { toCsv } from '@/lib/csv';
 import { formatRelative } from '@/lib/format-relative';
+import { frictionFlow } from '@/lib/friction-events';
 import {
   compareNullsLast,
   comparePromptSortRows,
@@ -197,8 +216,12 @@ import {
   type SortDir,
 } from './prompt-sort';
 import { BulkActionBar } from './_bulk-action-bar';
+import { TagFilter } from './_tag-filter';
 import { ColumnsPanel } from './_columns-panel';
-import { PromptLimitActions } from './_prompt-limit-actions';
+import { PlanLimitButtons } from './_plan-limit-buttons';
+import { PromptLimitDialog } from './_prompt-limit-dialog';
+import { ImprovingLink, useImprovingPrompts } from './_improving-link';
+import { WaitingBanner, oldestWaiting } from './_waiting-banner';
 import {
   LocationMatrix,
   LocationPending,
@@ -206,10 +229,13 @@ import {
   loadLocationMatrix,
 } from './_location-matrix';
 import { AddLocationsDialog, type AddLocationsPreset } from './_add-locations-dialog';
-import { getPromptTableViews, type PromptTableViews } from '@/lib/actions/prompt-table-views';
+import { BulkTagsDialog, type BulkTagsPreset } from './_bulk-tags-dialog';
+import type { PromptTableViews } from '@/lib/actions/prompt-table-views';
+import type { ImprovingAction } from '@/lib/improve-outcome';
 import {
   effectiveView,
   parseLocationColumn,
+  pendingColumn,
   visibleColumns,
   type PromptColumnId,
 } from '@/lib/prompt-table-columns';
@@ -223,6 +249,7 @@ import { readUrlChoice } from '@/lib/url-state';
 import { promptsTableState } from './table-state';
 import { formatCompactNumber, formatDate, formatNumber } from '@/lib/format';
 import {
+  AI_ADOPTION_RATE,
   averageEstimate,
   promptVolumeEstimate,
   sumEstimates,
@@ -238,8 +265,11 @@ import { usePagination, TablePager } from '@/components/table-pager';
 import { PromptPositionsSheet } from '@/components/prompts/prompt-positions-sheet';
 import {
   ClampedText,
+  ClampedTextPreview,
   ClampedTextTooltip,
   createClampedTextHandle,
+  useTextCut,
+  type ClampedTextHandle,
 } from '@/components/prompts/clamped-text';
 import {
   panelRangeFromTable,
@@ -248,6 +278,7 @@ import {
   type PositionsRange,
 } from '@/lib/positions-range';
 import { viewerTimeZone } from '@/lib/time-zone';
+import { exportFileName } from '@/lib/white-label/export-name';
 import { HeaderWithAiUsage } from '@/components/ai-usage/ai-usage-meter';
 
 // ─── Info Tooltip ─────────────────────────────────────────────────────────────
@@ -393,11 +424,14 @@ const promptExportHeaders = (suffix: string) => [
   'last_run_at',
 ];
 
-const PROMPT_EXPORT_HINT = 'No prompts yet - add prompts first.';
-
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const VALID_TABS = ['all', 'topics', 'fanout', 'insights'] as const;
+
+/** Today's columns: no view of the person's or the brand's (PROMPT-015a). */
+const NO_TABLE_VIEWS: PromptTableViews = { mine: null, brand: null };
+/** No Improve action tracked for any prompt (PROMPT-008). */
+const NO_IMPROVING: Record<string, ImprovingAction> = {};
 
 /**
  * The window a tab opens on. Query Fan-out opens on 7 days: one day of
@@ -408,6 +442,15 @@ function defaultRangeFor(tab: string): PromptRangePreset {
   return tab === 'fanout' ? '7d' : DEFAULT_PROMPT_RANGE_PRESET;
 }
 type TabId = (typeof VALID_TABS)[number];
+
+/**
+ * Whether a tab reads the Location filter: only All Prompts' table does.
+ * Topics and Query Fan-out read every location and Insights' volumes carry
+ * none, so the filter and Chat's location chip are left off there.
+ */
+function tabUsesLocation(tab: TabId): boolean {
+  return tab === 'all';
+}
 
 const PROMPT_VIEWS = ['tracked', 'suggestions'] as const;
 type PromptsView = (typeof PROMPT_VIEWS)[number];
@@ -425,35 +468,6 @@ function visibilityBarClass(score: number): string {
 }
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
-
-/**
- * Plan- and brand-scoped engine lists shared by the Add / Edit prompt dialogs.
- * Shopping tracking is opt-in per brand (#155): the engine is hidden entirely
- * when the pref is off. The write actions strip it server-side too.
- */
-function useAllowedEngines(shoppingEnabled: boolean) {
-  const { planId, allowedModelIds: planAllowedModelIds } = usePlanContext();
-
-  const allowedScraperIds = useMemo(() => {
-    const allowed = PLANS[planId].limits.allowedScrapers;
-    const ids = allowed ? [...allowed] : ALL_SCRAPERS.map((s) => s.id);
-    return shoppingEnabled ? ids : ids.filter((id) => id !== 'chatgpt-shopping');
-  }, [planId, shoppingEnabled]);
-  const allowedModelIds = useMemo(
-    () => planAllowedModelIds ?? ALL_MODELS.map((m) => m.id),
-    [planAllowedModelIds],
-  );
-  const visibleScrapers = useMemo(
-    () => ALL_SCRAPERS.filter((s) => allowedScraperIds.includes(s.id)),
-    [allowedScraperIds],
-  );
-  const visibleModels = useMemo(
-    () => ALL_MODELS.filter((m) => allowedModelIds.includes(m.id)),
-    [allowedModelIds],
-  );
-
-  return { allowedScraperIds, allowedModelIds, visibleScrapers, visibleModels };
-}
 
 /**
  * Shared form body of the Add / Edit prompt dialogs (#460, #484): text input,
@@ -631,14 +645,10 @@ function PromptFormFields({
   );
 }
 
-/** The brand's tracking location, as new prompts get it (addPromptToSet). */
-function brandLocation(region: string | undefined, state: string | undefined): string {
-  const country = region ?? 'US';
-  const candidate = locationCode(country, state ?? null);
-  return isValidLocation(candidate) ? candidate : country;
-}
-
 // ─── Tracked prompt limit (PROMPT-009) ────────────────────────────────────────
+
+/** prompt_add: from Add prompt's opening to prompts added. */
+const PROMPT_ADD = frictionFlow('prompt_add');
 
 /**
  * Quick-add dialog for the active brand (#460). Same mechanism as the Add
@@ -657,6 +667,7 @@ function AddPromptDialog({
   open,
   onClose,
   onAdded,
+  onAddTopic,
 }: {
   brandId: string;
   shoppingEnabled: boolean;
@@ -669,18 +680,26 @@ function AddPromptDialog({
   open: boolean;
   onClose: () => void;
   onAdded: () => void;
+  /** "Add a topic" on a brand without one: the page's Topics tab, with Add Topic open. */
+  onAddTopic: () => void;
 }) {
-  const limitReached =
+  const planFull =
     !!locationQuota &&
     isPromptLimitReached(getPromptUsage(locationQuota.used, locationQuota.maxPrompts));
+  // A full plan keeps the form; what is added waits for a spot.
+  const showWaiting = useWaitingForSpotToast();
+  const tWaiting = useTranslations('prompts.waiting');
   const { allowedScraperIds, allowedModelIds, visibleScrapers, visibleModels } =
     useAllowedEngines(shoppingEnabled);
+  const tCommon = useTranslations('common');
 
   const [text, setText] = useState('');
   const [category, setCategory] = useState('');
   const [scrapers, setScrapers] = useState<string[]>([]);
   const [models, setModels] = useState<string[]>([]);
   const [topics, setTopics] = useState<Topic[]>([]);
+  // The brand has no topic yet: the dialog asks for one instead of the form.
+  const [noTopics, setNoTopics] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [mode, setMode] = useState<'single' | 'bulk'>('single');
@@ -695,17 +714,21 @@ function AddPromptDialog({
   // dialog must cost zero requests until it is actually opened.
   useEffect(() => {
     if (!open) return;
+    PROMPT_ADD.started();
     setText('');
     setError(null);
+    setNoTopics(false);
     setMode('single');
     setStaged([]);
     setScrapers(allowedScraperIds);
     setModels(allowedModelIds);
     let cancelled = false;
+    // Read on every open, so a topic added on the Topics tab counts on return.
     getTopics(brandId)
       .then((t) => {
         if (cancelled) return;
         setTopics(t);
+        setNoTopics(t.length === 0);
         setCategory((prev) => prev || (t[0]?.name ?? ''));
       })
       .catch(() => {});
@@ -772,30 +795,38 @@ function AddPromptDialog({
         })),
       );
       if ('error' in result) {
-        setError(result.error);
+        PROMPT_ADD.failed(result.code);
+        if (isNoTopics(result)) setNoTopics(true);
+        else setError(result.error);
         return;
       }
       const added = result.importedIdx.length;
       const skipped = toSave.length - added;
+      const waiting = result.waitingIdx?.length ?? 0;
       if (added === 0) {
+        PROMPT_ADD.failed('none_added');
         setError(
           'Nothing was added: your plan limit is reached, or these prompts are already tracked.',
         );
         return;
       }
-      toast.success(
-        `${added} prompt${added === 1 ? '' : 's'} added${skipped ? ` · ${skipped} not added (plan limit or duplicate)` : ''}`,
-        {
-          description: result.analysisStarted
-            ? 'Analyzing them now.'
-            : 'They will be picked up by the next tracking run.',
-        },
-      );
+      if (!showWaiting('dialog', added - waiting, waiting)) {
+        toast.success(
+          `${added} prompt${added === 1 ? '' : 's'} added${skipped ? ` · ${skipped} not added (plan limit or duplicate)` : ''}`,
+          {
+            description: result.analysisStarted
+              ? 'Analyzing them now.'
+              : 'They will be picked up by the next tracking run.',
+          },
+        );
+      }
+      PROMPT_ADD.completed();
       setStaged([]);
       setText('');
       if (closeAfter) onClose();
       onAdded();
     } catch {
+      PROMPT_ADD.failed();
       setError('Failed to add prompts. Please try again.');
     } finally {
       setSaving(false);
@@ -807,7 +838,7 @@ function AddPromptDialog({
       <DialogContent
         className={cn(
           'max-h-[85vh] overflow-y-auto',
-          mode === 'bulk' && !limitReached ? 'sm:max-w-3xl' : 'sm:max-w-md',
+          mode === 'bulk' ? 'sm:max-w-3xl' : 'sm:max-w-md',
         )}
       >
         <DialogHeader>
@@ -819,29 +850,14 @@ function AddPromptDialog({
             Track a new prompt for this brand across the selected platforms.
           </DialogDescription>
         </DialogHeader>
-        {limitReached && locationQuota ? (
+        {noTopics ? (
           <>
-            <div className="flex items-start gap-2.5 rounded-lg border border-red-200 bg-red-50 p-3 text-sm dark:border-red-900/50 dark:bg-red-950/30">
-              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-600 dark:text-red-500" />
-              <div className="space-y-1">
-                <p className="font-medium text-red-900 dark:text-red-200">
-                  You&apos;ve reached your prompt limit
-                </p>
-                <p className="text-red-800/80 dark:text-red-300/80">
-                  Your {locationQuota.planName} plan tracks up to {locationQuota.maxPrompts} active
-                  prompt locations and {locationQuota.used} are in use. Each prompt counts once per
-                  location it targets; paused prompts don&apos;t count. Pause or remove prompts or
-                  locations to free a slot, or{' '}
-                  {locationQuota.planId === 'starter' ? 'upgrade your plan' : 'contact us'} to track
-                  more.
-                </p>
-              </div>
-            </div>
+            <TopicFirstNotice />
             <DialogFooter>
               <Button type="button" variant="outline" onClick={handleClose}>
-                Close
+                {tCommon('cancel')}
               </Button>
-              <PromptLimitActions planId={locationQuota.planId} />
+              <AddTopicLink onAddTopic={onAddTopic} />
             </DialogFooter>
           </>
         ) : (
@@ -851,6 +867,11 @@ function AddPromptDialog({
               <TabsTrigger value="bulk">Bulk import</TabsTrigger>
             </TabsList>
             <TabsContent value="single" className="mt-3 space-y-4">
+              {planFull && (
+                <p className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200">
+                  {tWaiting('full')}
+                </p>
+              )}
               <div className="space-y-3">
                 <PromptFormFields
                   autoFocus
@@ -956,9 +977,12 @@ function AddPromptDialog({
                 defaultRegion={defaultRegion}
                 quota={locationQuota}
                 limitActions={
-                  locationQuota ? <PromptLimitActions planId={locationQuota.planId} /> : null
+                  locationQuota ? (
+                    <PlanLimitButtons planId={locationQuota.planId} source="import" size="sm" />
+                  ) : null
                 }
                 onImported={() => {
+                  PROMPT_ADD.completed();
                   onClose();
                   onAdded();
                 }}
@@ -995,6 +1019,7 @@ function EditPromptDialog({
 }) {
   const { allowedScraperIds, allowedModelIds, visibleScrapers, visibleModels } =
     useAllowedEngines(shoppingEnabled);
+  const tTags = useTranslations('prompts.tags');
 
   const [text, setText] = useState('');
   const [category, setCategory] = useState('');
@@ -1006,6 +1031,8 @@ function EditPromptDialog({
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [tags, setTags] = useState<string[]>([]);
+  const [tagDraft, setTagDraft] = useState('');
 
   const promptId = prompt?.id;
 
@@ -1018,6 +1045,8 @@ function EditPromptDialog({
     if (!prompt) return;
     setText(prompt.text);
     setCategory(prompt.category ?? '');
+    setTags(prompt.tags ?? []);
+    setTagDraft('');
     setScrapers(prompt.platforms.filter((id) => allowedScraperIds.includes(id)));
     setModels(prompt.models.filter((id) => allowedModelIds.includes(id)));
     setIsActive(prompt.isActive);
@@ -1067,6 +1096,7 @@ function EditPromptDialog({
         category: category || undefined,
         platforms: scrapers,
         models,
+        tags,
       });
       onClose();
       toast.success('Prompt updated.');
@@ -1127,6 +1157,44 @@ function EditPromptDialog({
             visibleModels={visibleModels}
             saving={busy}
           />
+
+          <div className="space-y-1.5">
+            <Label htmlFor="prompt-tags">{tTags('label')}</Label>
+            {tags.length > 0 && (
+              <div className="flex flex-wrap gap-1.5">
+                {tags.map((tag) => (
+                  <Badge key={tag} variant="secondary" className="gap-1 pr-1.5">
+                    {tag}
+                    <button
+                      type="button"
+                      className="text-muted-foreground hover:text-foreground"
+                      aria-label={tTags('removeTag', { tag })}
+                      disabled={busy}
+                      onClick={() => setTags(tags.filter((t) => t !== tag))}
+                    >
+                      ×
+                    </button>
+                  </Badge>
+                ))}
+              </div>
+            )}
+            <Input
+              id="prompt-tags"
+              value={tagDraft}
+              onChange={(e) => setTagDraft(e.target.value)}
+              maxLength={50}
+              placeholder={tTags('placeholder')}
+              disabled={busy || tags.length >= 10}
+              onKeyDown={(e) => {
+                if (e.key !== 'Enter') return;
+                e.preventDefault();
+                const tag = tagDraft.trim().slice(0, 50);
+                if (tag && tags.length < 10 && !tags.includes(tag)) setTags([...tags, tag]);
+                setTagDraft('');
+              }}
+            />
+            <p className="text-xs text-muted-foreground">{tTags('hint')}</p>
+          </div>
 
           <label className="flex w-fit cursor-pointer items-center gap-2 text-sm">
             <Checkbox
@@ -1294,6 +1362,11 @@ export default function PromptsPage() {
   const [refreshing, setRefreshing] = useState(false);
   const [quota, setQuota] = useState<VolumeQuota | null>(null);
   const [addPromptOpen, setAddPromptOpen] = useState(false);
+  // The usage cards (PROMPT-012), opened from the "…" menu's Show usage:
+  // folded whenever the page opens, so the table sits right under the controls.
+  const [usageOpen, setUsageOpen] = useState(false);
+  // "Add a topic" was asked for on a tab: the Topics tab opens Add Topic once it shows.
+  const [addTopicPending, setAddTopicPending] = useState(false);
   // Where a tab's own buttons go: beside the tabs, as the Prompts tab's do.
   const [headerActions, setHeaderActions] = useState<HTMLDivElement | null>(null);
   const [editingPrompt, setEditingPrompt] = useState<Prompt | null>(null);
@@ -1307,10 +1380,13 @@ export default function PromptsPage() {
   const openAddPrompt = guard(() => setAddPromptOpen(true), { action: tActions('addPrompts') });
 
   const activeBrandId = useBrandStore((s) => s.activeBrandId);
-  const tCommon = useTranslations('common');
+  // The brand's first run while it goes on: the table's answers are still coming.
+  const firstRun = useFirstRun();
   const tNav = useTranslations('nav');
   const tPrompts = useTranslations('prompts');
   const tVolumes = useTranslations('prompts.volumeInsights');
+  const tChat = useTranslations('chatPanel.suggest');
+  const tChatRange = useTranslations('chatPanel.range');
   // One method note per table: these tables list every analyzed prompt.
   const volumeTableNote = useMemo(() => createEstimateNoteHandle(), []);
   const opportunityTableNote = useMemo(() => createEstimateNoteHandle(), []);
@@ -1323,9 +1399,18 @@ export default function PromptsPage() {
   const [usageVersion, setUsageVersion] = useState(0);
   const { state: usageState, retry: retryUsage } = usePromptUsage(activeBrandId, usageVersion);
   const usage = usageState.status === 'ready' ? usageState.usage : null;
+  const tHeader = useTranslations('prompts.header');
+  const now = useNow({ updateInterval: 60_000 });
   const locationQuota = useMemo(() => (usage ? locationQuotaFromUsage(usage) : null), [usage]);
-  const [statusFilter, setStatusFilter] = useState<PromptStatusFilter>('tracked');
   const searchParams = useSearchParams();
+  // Prompts saved past the plan's limit wait for a spot (00535), with their
+  // own Status, a banner, and the swap dialog. Today's "Free up a spot"
+  // opens the waiting prompts, and the dialog for the oldest.
+  const [statusFilter, setStatusFilter] = useState<PromptStatusFilter>(() =>
+    searchParams.get('status') === 'waiting' ? 'waiting' : 'tracked',
+  );
+  const swapAsked = useRef(searchParams.get('swap') === '1');
+  const [swapFor, setSwapFor] = useState<string | null>(null);
   // On /dashboard/prompts/{tracked,suggestions,topics,fan-outs,insights} the route
   // names the view (PROMPT-001); ?tab= / ?view= are the older links' shape.
   const section = sectionFromPath(usePathname());
@@ -1357,6 +1442,10 @@ export default function PromptsPage() {
     return 'tracked';
   })();
   const [view, setView] = useState<PromptsView>(initialView);
+  // What Chat's side panel sees of the Tracked table, which keeps its own sort and search.
+  const [tableView, setTableView] = useState<ChatPageView | null>(null);
+  // And the Topics table's (step 9).
+  const [topicsView, setTopicsView] = useState<ChatPageView | null>(null);
 
   const initialRange: PromptRangePreset = (() => {
     const raw = searchParams.get('range');
@@ -1373,6 +1462,9 @@ export default function PromptsPage() {
   // routes from the sidebar (PROMPT-001).
   const [regionFilter, setRegionFilter] = useState(() => searchParams.get('region') ?? '');
   const [availableRegions, setAvailableRegions] = useState<string[]>([]);
+  // The brand whose locations have been read: until then the Location filter
+  // keeps its place for a brand whose prompts track more than one.
+  const [regionsFor, setRegionsFor] = useState<string | null>(null);
   const [customFrom, setCustomFrom] = useState(() => searchParams.get('from') ?? '');
   const [customTo, setCustomTo] = useState(() => searchParams.get('to') ?? '');
 
@@ -1476,6 +1568,19 @@ export default function PromptsPage() {
     [tab, rangePreset, customFrom, customTo, regionFilter, writeUrl],
   );
 
+  /**
+   * "Add a topic" from Add prompt, Suggestions or Query Fan-out on a brand
+   * without topics: the Topics tab, with Add Topic open, in place. A link to
+   * /dashboard/prompts/topics?new=1 would change the address alone: the page
+   * reads its tab from the route only when it opens. Back on the tab, the
+   * flow reads the topics again.
+   */
+  const addTopicInPlace = useCallback(() => {
+    setAddPromptOpen(false);
+    setAddTopicPending(true);
+    showSection('topics', view);
+  }, [showSection, view]);
+
   // Deep link from the Insights Recommendations row (#459): the target card
   // only exists once the Insights tab's volume data has rendered, so a bare
   // anchor never scrolls on its own — re-apply the hash after loading ends.
@@ -1486,11 +1591,35 @@ export default function PromptsPage() {
     }
   }, [tab, loading]);
 
+  // The table's column views (PROMPT-015a), read with the brand's first rows
+  // so the table opens on its own columns; Columns' changes land here too.
+  const [columnViews, setColumnViews] = useState<{
+    brandId: string;
+    views: PromptTableViews;
+  } | null>(null);
+  // The Improve actions still tracked, by prompt id (PROMPT-008), read with the rows.
+  const [improvingRead, setImprovingRead] = useState<{
+    brandId: string;
+    byPrompt: Record<string, ImprovingAction>;
+  } | null>(null);
+  // The active prompts with no answers yet (Track now), read with the rows;
+  // null when that read failed.
+  const [withoutAnswers, setWithoutAnswers] = useState<{
+    brandId: string;
+    ids: string[] | null;
+  } | null>(null);
+  // The brand whose first read (with its column views) came back.
+  const firstReadFor = useRef<string | null>(null);
+  // The latest table read: one sent earlier that lands after it is dropped,
+  // so a slow read of the old range never overwrites the new one's rows.
+  const loadSeq = useRef(0);
+
   const loadData = useCallback(
     async (isCancelled?: () => boolean) => {
+      const seq = ++loadSeq.current;
+      const stale = () => seq !== loadSeq.current || Boolean(isCancelled?.());
       if (!activeBrandId) {
-        if (isCancelled?.()) return;
-        setVolumes([]);
+        if (stale()) return;
         setAllPrompts([]);
         setVisibility({});
         setPositions({});
@@ -1498,41 +1627,49 @@ export default function PromptsPage() {
         return;
       }
 
+      const brandId = activeBrandId;
+      const first = firstReadFor.current !== brandId;
       setLoading(true);
       setLoadFailed(false);
       try {
-        // One consolidated server action: Next.js queues client-fired server
-        // actions sequentially, so the old three separate calls cost their
-        // SUM on a cold load — the main culprit behind the slow first paint.
-        const page = await getPromptsPageData(activeBrandId, {
+        // Everything the table shows in one read, run in parallel on the
+        // server, through /api/prompts/read: a fetch, so it doesn't wait in
+        // Next's server-action queue behind the menu's and the page's other
+        // actions, as it did as a server action. The volumes are read beside
+        // it (loadVolumes), so the rows never wait for the volumes API.
+        const page = await readPromptsPageData(brandId, {
           days: range?.days,
           from: range?.from,
           to: range?.to,
           region: regionFilter || undefined,
+          first,
+          withoutAnswers: canManage,
+          volumes: false,
         });
-        if (isCancelled?.()) return;
-        setVolumes(page.volumes);
-        if (page.quota) setQuota(page.quota);
+        if (stale()) return;
         const prompts = page.promptSets.flatMap((ps) => ps.prompts);
         setAllPrompts(prompts);
         setVisibility(page.visibility);
         setPositions(page.positions);
-        // A read-only workspace's volumes are refused (402): their columns
-        // stay empty, without a warning that something broke.
-        if (page.volumesDegraded && !isLocked) {
-          toast.warning('Volume data is temporarily unavailable — showing prompts without it.');
+        setImprovingRead({ brandId, byPrompt: page.improving ?? {} });
+        if (page.withoutAnswers !== undefined) {
+          setWithoutAnswers({ brandId, ids: page.withoutAnswers });
+        }
+        if (first) {
+          firstReadFor.current = brandId;
+          setColumnViews(page.tableViews ? { brandId, views: page.tableViews } : null);
         }
         if (page.visibilityDegraded) toast.warning(tPrompts('visibilityDegraded'));
       } catch (err) {
-        if (isCancelled?.()) return;
+        if (stale()) return;
         console.error('Failed to load prompt data:', err);
         setLoadFailed(true);
         toast.error('Failed to load prompt data');
       } finally {
-        if (!isCancelled?.()) setLoading(false);
+        if (!stale()) setLoading(false);
       }
     },
-    [activeBrandId, range, regionFilter, tPrompts, isLocked],
+    [activeBrandId, range, regionFilter, tPrompts, canManage],
   );
 
   useEffect(() => {
@@ -1544,14 +1681,99 @@ export default function PromptsPage() {
     };
   }, [loadData, promptDataWanted]);
 
+  // The volumes (and the quota), read beside the rows. They have no date, so
+  // a range or location change doesn't read them again. 'loading' until the
+  // brand's are in: the Volume and Competition cells wait in place, and
+  // neither the not-analyzed line nor Insights' "No volume data yet" is said
+  // before the volumes are known. A failed read is tried once more before the
+  // page says so ('failed'). A read-only workspace's volumes are refused
+  // (402): their columns stay empty, without a warning that something broke.
+  const [volumesState, setVolumesState] = useState<'loading' | 'ready' | 'failed'>('loading');
+  const volumesSeq = useRef(0);
+  // The brand whose volumes are on screen: read again, they stay up meanwhile.
+  const volumesFor = useRef<string | null>(null);
+  // Whether a volume analysis was running when the brand's volumes first came.
+  const [arrivalStatus, setArrivalStatus] = useState<{
+    brandId: string;
+    status: VolumeAnalysisStatus | null;
+  } | null>(null);
+  const loadVolumes = useCallback(async () => {
+    const seq = ++volumesSeq.current;
+    const stale = () => seq !== volumesSeq.current;
+    if (!activeBrandId) return;
+    const brandId = activeBrandId;
+    const shown = volumesFor.current === brandId;
+    if (!shown) setVolumesState('loading');
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        const read = await readPromptVolumes(brandId);
+        if (stale()) return;
+        volumesFor.current = brandId;
+        setVolumes(read.volumes);
+        if (read.quota) setQuota(read.quota);
+        setVolumesState('ready');
+        setArrivalStatus((prev) =>
+          prev?.brandId === brandId ? prev : { brandId, status: read.status ?? null },
+        );
+        return;
+      } catch (err) {
+        if (stale()) return;
+        if (isLocked) {
+          volumesFor.current = brandId;
+          setVolumes([]);
+          setVolumesState('ready');
+          return;
+        }
+        if (attempt < VOLUME_READ_RETRIES) continue;
+        console.error('Failed to load volumes:', err);
+        toast.warning('Volume data is temporarily unavailable — showing prompts without it.');
+        // A failed re-read keeps the volumes already shown.
+        if (!shown) {
+          setVolumes([]);
+          setVolumesState('failed');
+        }
+        return;
+      }
+    }
+  }, [activeBrandId, isLocked]);
+
+  useEffect(() => {
+    if (!promptDataWanted) return undefined;
+    void loadVolumes();
+    return () => {
+      volumesSeq.current += 1;
+    };
+  }, [loadVolumes, promptDataWanted]);
+
   // After prompts are added, paused, resumed, deleted or retargeted: reload
-  // the table and the usage cards together, and read the locations' figures
-  // (PROMPT-015b) anew.
+  // the table, its volumes and the usage cards together, and read the
+  // locations' figures (PROMPT-015b) anew.
   const reloadAfterChange = useCallback(() => {
     clearLocationMatrixCache();
     setUsageVersion((v) => v + 1);
+    void loadVolumes();
     return loadData();
-  }, [loadData]);
+  }, [loadData, loadVolumes]);
+
+  // The swap dialog is for those who can act, on a plan that hasn't ended.
+  const canSwap = canManage && !isLocked;
+  const waitingFirst = useMemo(() => oldestWaiting(allPrompts), [allPrompts]);
+  // Opened with ?swap=1 (Today's "Free up a spot"): once the prompts are in,
+  // the dialog for the prompt waiting longest. The link's words then leave the URL.
+  useEffect(() => {
+    if (!swapAsked.current || loading) return;
+    swapAsked.current = false;
+    const params = new URLSearchParams(window.location.search);
+    params.delete('swap');
+    params.delete('status');
+    const query = params.toString();
+    window.history.replaceState(
+      null,
+      '',
+      `${window.location.pathname}${query ? `?${query}` : ''}${window.location.hash}`,
+    );
+    if (canSwap && waitingFirst) setSwapFor(waitingFirst.id);
+  }, [loading, canSwap, waitingFirst]);
 
   // Locations the brand has actually produced results in — the same
   // whole-brand list the Visibility page offers, so the two pages never
@@ -1564,12 +1786,18 @@ export default function PromptsPage() {
     }
     if (!promptDataWanted) return;
     let cancelled = false;
-    getBrandFilterOptions(activeBrandId)
+    const brandId = activeBrandId;
+    getBrandFilterOptions(brandId)
       .then((options) => {
         if (cancelled) return;
         setAvailableRegions([...options.regions].sort((a, b) => a.localeCompare(b)));
       })
-      .catch(() => {});
+      .catch(() => {
+        if (!cancelled) setAvailableRegions([]);
+      })
+      .finally(() => {
+        if (!cancelled) setRegionsFor(brandId);
+      });
     return () => {
       cancelled = true;
     };
@@ -1583,12 +1811,12 @@ export default function PromptsPage() {
     }
   }, [availableRegions, regionFilter]);
 
-  // loadData changes identity whenever the date range does. The watch below
-  // must not restart for that, so it reaches the current one through a ref.
-  const loadDataRef = useRef(loadData);
+  // The watch below reaches the current loadVolumes through a ref, so it
+  // doesn't restart when that changes.
+  const loadVolumesRef = useRef(loadVolumes);
   useEffect(() => {
-    loadDataRef.current = loadData;
-  }, [loadData]);
+    loadVolumesRef.current = loadVolumes;
+  }, [loadVolumes]);
 
   /**
    * Follow a run that is already going.
@@ -1630,30 +1858,28 @@ export default function PromptsPage() {
    * reopened, a return to this brand — the page has to ask whether one is
    * already going. Without this it offers the Analyze button again while the
    * work is still in flight, which reads as though nothing were happening.
+   * The answer comes with the brand's first volumes read (loadVolumes), not
+   * as a server action of its own.
    *
    * Leaving the brand ends the watch. The run itself carries on; only this
    * page's narration of it stops.
    */
+  const arrival = arrivalStatus?.brandId === activeBrandId ? arrivalStatus : null;
   useEffect(() => {
-    if (!activeBrandId || !promptDataWanted) return undefined;
-
-    const brandId = activeBrandId;
+    if (!arrival?.status?.running) return undefined;
+    const { brandId, status } = arrival;
     const gen = ++analysisGenRef.current;
+    setAnalyzing(true);
+    setAnalysisProgress(status.done === null ? null : { done: status.done, total: status.total });
 
     (async () => {
-      const status = await getVolumeAnalysisStatus(brandId);
-      if (analysisGenRef.current !== gen || !status?.running) return;
-
-      setAnalyzing(true);
-      setAnalysisProgress(status.done === null ? null : { done: status.done, total: status.total });
-
       const { finished, superseded } = await watchVolumeAnalysis(brandId, gen);
       if (superseded || analysisGenRef.current !== gen) return;
 
       setAnalyzing(false);
       setAnalysisProgress(null);
       if (finished) {
-        await loadDataRef.current();
+        await loadVolumesRef.current();
         toast.success('Volume analysis finished.');
       }
     })();
@@ -1663,7 +1889,17 @@ export default function PromptsPage() {
       setAnalyzing(false);
       setAnalysisProgress(null);
     };
-  }, [activeBrandId, promptDataWanted, watchVolumeAnalysis]);
+  }, [arrival, watchVolumeAnalysis]);
+
+  // Another brand ends any watch of this one's run, the page's own included.
+  useEffect(
+    () => () => {
+      analysisGenRef.current += 1;
+      setAnalyzing(false);
+      setAnalysisProgress(null);
+    },
+    [activeBrandId],
+  );
 
   /**
    * Start a run, then follow it to the end.
@@ -1729,7 +1965,7 @@ export default function PromptsPage() {
       const { finished, superseded } = await watchVolumeAnalysis(activeBrandId, gen);
       if (superseded) return;
 
-      await loadData();
+      await loadVolumes();
       if (analysisGenRef.current === gen) {
         toast.success(
           finished
@@ -1776,7 +2012,7 @@ export default function PromptsPage() {
         });
       }
       toast.success(`Refreshed volumes for ${result.refreshed} prompts`);
-      await loadData();
+      await loadVolumes();
     } catch (err: unknown) {
       console.error('Volume refresh failed:', err);
       toast.error('Volumes could not be refreshed. Please try again.');
@@ -1785,6 +2021,7 @@ export default function PromptsPage() {
     }
   };
 
+  // Volumes are bought per prompt: admins and managers analyze them (2026-11-03); the buttons below follow.
   const handleReanalyzeAll = guard(() => runVolumeAnalysis(true), {
     action: tActions('analyzePrompts'),
   });
@@ -1799,6 +2036,9 @@ export default function PromptsPage() {
   const totalAiVol = volumes.reduce((s, v) => s + v.estAiVolume, 0);
   const totalEstimate = sumEstimates(volumes.map((v) => estimateByPromptId.get(v.promptId)!));
   const averagePerPrompt = averageEstimate(totalEstimate);
+  // The rate the volumes were estimated with, as the AI Adoption Rate card
+  // and the Prompt Volumes caption both say it.
+  const adoptionRate = `${((volumes[0]?.aiVolumeMultiplier ?? AI_ADOPTION_RATE) * 100).toFixed(0)}%`;
   const estimateOf = (v: PromptVolume) => estimateByPromptId.get(v.promptId)!;
   // High Opportunity Prompts: a low-confidence estimate isn't listed on its own.
   const opportunityRows = volumes
@@ -1843,9 +2083,38 @@ export default function PromptsPage() {
     [allPrompts, volumeByPromptId],
   );
 
-  const canExport = !loading && allPrompts.length > 0;
+  // Track now (moved from the brand's Manage prompts page): the active
+  // prompts with no answers yet, for admins and managers, who can track them
+  // now. They come with the table's read (getPromptsPageData), again after
+  // a change, rather than from a read of their own once the table is in.
+  const activePromptIds = useMemo(
+    () => new Set(allPrompts.filter((p) => p.isActive).map((p) => p.id)),
+    [allPrompts],
+  );
+  const trackNow = useTrackNow({
+    brandId: activeBrandId,
+    ids: canManage && withoutAnswers?.brandId === activeBrandId ? withoutAnswers.ids : null,
+    activeIds: activePromptIds,
+  });
+  const startTrackNow = guard((ids: string[]) => void trackNow.start(ids), {
+    action: tActions('trackPrompts'),
+  });
 
-  const handleExportCsv = useCallback(() => {
+  // The export carries the volumes: it waits for them, as the table's cells do.
+  const canExport = !loading && volumesState !== 'loading' && allPrompts.length > 0;
+
+  // Tracked's count in the switch: the table's own (Active + New), once the
+  // prompts are read. Suggestions has no count without a read of its own.
+  const trackedCount =
+    allPrompts.length > 0 || (!loading && !loadFailed)
+      ? countByStatus(allPrompts, now.getTime()).tracked
+      : undefined;
+  // The plan's prompt locations once nearly or fully used: said beside the
+  // menu's Show usage and in the table's status line. Plan & usage's link.
+  const usageWarning = locationsWarning(usageState);
+  const planHref = planUsageHref(usageState);
+
+  const handleExportCsv = useCallback(async () => {
     if (!canExport) return;
 
     const rangeSuffix = rangePreset;
@@ -1884,7 +2153,7 @@ export default function PromptsPage() {
     const slug = activeBrand?.slug ?? 'brand';
 
     link.href = url;
-    link.download = `ansvisor_${slug}_prompts_${date}.csv`;
+    link.download = await exportFileName(`${slug}_prompts_${date}.csv`);
     link.click();
 
     URL.revokeObjectURL(url);
@@ -1898,6 +2167,45 @@ export default function PromptsPage() {
     rangePreset,
   ]);
 
+  // Chat's side panel sees the page (W1-08): its range, its location where
+  // the tab reads one, and a tracked prompt the brand doesn't show up for
+  // (the one asked most).
+  const tracked = tab === 'all' && view === 'tracked';
+  const unseen = allPrompts
+    .filter((prompt) => (visibility[prompt.id]?.runs ?? 0) > 0)
+    .filter((prompt) => visibility[prompt.id].visibleRuns === 0)
+    .sort((a, b) => visibility[b.id].runs - visibility[a.id].runs)[0];
+  useChatPageContext(
+    activeBrandId
+      ? {
+          dateRange: {
+            from: rangePreset === 'custom' ? customFrom : rangePreset,
+            to: rangePreset === 'custom' ? customTo : null,
+            label: rangeChipLabel(rangePreset, { from: customFrom, to: customTo }, (key, values) =>
+              tChatRange(key, values),
+            ),
+          },
+          filters:
+            regionFilter && tabUsesLocation(tab)
+              ? [{ key: 'region', label: formatRegionDisplay(regionFilter), value: regionFilter }]
+              : [],
+          suggestions: [
+            ...(unseen ? [tChat('promptUnseen', { prompt: unseen.text })] : []),
+            tChat('promptsNext'),
+            tChat('actions'),
+          ],
+          // And what else it shows (the owner's plan, item 8): the open tab, and on Tracked
+          // the table's sort, search, the prompts on screen and how many match; on Topics
+          // (step 9) its sort, its topics in the table's order and how many.
+          view: {
+            tab: tab === 'all' ? view : tab,
+            ...(tracked && tableView ? tableView : {}),
+            ...(tab === 'topics' && topicsView ? topicsView : {}),
+          },
+        }
+      : null,
+  );
+
   if (!activeBrandId) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
@@ -1908,25 +2216,19 @@ export default function PromptsPage() {
 
   return (
     <div className="space-y-6">
-      {/* Header */}
-      <HeaderWithAiUsage>
-        <div className="flex items-center justify-between gap-4 flex-wrap">
-          <div>
-            <h1 className="text-2xl font-bold tracking-tight">Prompts</h1>
-            <p className="text-muted-foreground text-sm">
-              Manage every tracked prompt and review estimated AI demand
-            </p>
-          </div>
-        </div>
+      {/* Header: the title alone, with the AI meter and Ask Chat at the right.
+          The meter keeps its room on every tab, read or not, so the row never moves. */}
+      <HeaderWithAiUsage reserveMeter>
+        <h1 className="text-2xl font-bold tracking-tight">{tHeader('title')}</h1>
       </HeaderWithAiUsage>
 
       <Tabs value={tab} onValueChange={(v) => showSection(v as TabId, view)}>
-        <div className="flex items-center justify-between gap-4 flex-wrap">
-          <TabsList>
-            <TabsTrigger value="all">Prompts</TabsTrigger>
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+          <TabsList data-tour="prompts">
+            <TabsTrigger value="all">{tHeader('tabs.prompts')}</TabsTrigger>
             <TabsTrigger value="topics">{tNav('topics')}</TabsTrigger>
-            <TabsTrigger value="fanout">Query Fan-out</TabsTrigger>
-            <TabsTrigger value="insights">Insights</TabsTrigger>
+            <TabsTrigger value="fanout">{tHeader('tabs.fanout')}</TabsTrigger>
+            <TabsTrigger value="insights">{tHeader('tabs.insights')}</TabsTrigger>
           </TabsList>
           <div className="flex items-center gap-2">
             {/* A tab's own buttons, portalled in (Topics). `contents` keeps
@@ -1935,125 +2237,61 @@ export default function PromptsPage() {
             {tab === 'all' && canManage && (
               <Button type="button" size="sm" className="gap-2" onClick={openAddPrompt}>
                 <Plus className="h-4 w-4" />
-                Add prompt
+                {tHeader('addPrompt')}
               </Button>
             )}
+            {/* The rest in "…": Export CSV, Plan & usage and the usage cards,
+                all the Prompts tab's. Topics has its own buttons in its place;
+                Query Fan-out and Insights have none here. */}
             {tab === 'all' && (
-              <span title={!canExport ? PROMPT_EXPORT_HINT : undefined}>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className="gap-2"
-                  onClick={handleExportCsv}
-                  disabled={!canExport}
-                >
-                  <Download className="h-4 w-4" />
-                  {tCommon('exportCsv')}
-                </Button>
-              </span>
-            )}
-
-            {/* Topics has Manage topics in its place. */}
-            {tab !== 'topics' && (
-              <Link
-                href={`/dashboard/brands/${activeBrandId}/prompts`}
-                className={buttonVariants({ variant: 'outline', size: 'sm' })}
-              >
-                <Settings2 className="h-4 w-4" />
-                Manage prompts
-              </Link>
+              <PromptsMoreMenu
+                onExportCsv={handleExportCsv}
+                exportDisabled={!canExport}
+                planHref={planHref}
+                usage={
+                  view === 'tracked'
+                    ? {
+                        open: usageOpen,
+                        onToggle: () => setUsageOpen((o) => !o),
+                        warning: usageWarning,
+                      }
+                    : undefined
+                }
+              />
             )}
           </div>
         </div>
 
-        {/* Tracked vs suggested: two views of the same roster. A segmented
-            control rather than a second Tabs, so it reads as a filter on
-            this panel and not as another level of page navigation. It sits
-            above the filter bar so the controls go from general to specific:
-            which area, which list, then which period. It looks like the tabs
-            above it (the muted track, the selected item a card), so the
-            selected item reads the same in both. */}
-        {tab === 'all' && (
-          <div
-            className={cn(tabsListVariants(), 'mt-4 h-8')}
-            role="tablist"
-            aria-label="Prompt view"
-          >
-            {(
-              [
-                { id: 'tracked' as const, label: 'Tracked Prompts', Icon: ListChecks },
-                { id: 'suggestions' as const, label: 'Prompt Suggestions', Icon: Sparkles },
-              ] satisfies { id: PromptsView; label: string; Icon: typeof ListChecks }[]
-            ).map(({ id, label, Icon }) => (
-              <button
-                key={id}
-                type="button"
-                role="tab"
-                aria-selected={view === id}
-                onClick={() => showSection(tab, id)}
-                className={cn(
-                  'flex h-[calc(100%-1px)] items-center gap-2 rounded-md border border-transparent px-2.5 text-sm font-medium transition-all',
-                  view === id
-                    ? 'bg-card text-foreground shadow-sm dark:border-input dark:bg-input/30'
-                    : 'text-foreground/60 hover:text-foreground dark:text-muted-foreground dark:hover:text-foreground',
-                )}
-              >
-                <Icon className="h-4 w-4" />
-                {label}
-              </button>
-            ))}
-          </div>
-        )}
-
-        {/* Filter bar — same shape and position as Visibility and Citations
-            (#713). It sits outside the tab panels because the range governs
-            All Prompts, Topics and Query Fan-out. Location doesn't apply to
-            Topics, so it is left off there.
+        {/* Which list, then which period. Tracked vs suggested are two views
+            of the same roster: a compact switch rather than a second Tabs, so
+            it reads as a filter on this panel and not as another level of
+            page navigation. The range governs All Prompts, Topics and Query
+            Fan-out, so it sits outside the tab panels, at the right on each.
             Hidden on Insights: that tab shows keyword volume estimates, which
             carry no date dimension, so a range there would be a control that
-            changes nothing. */}
+            changes nothing. Location, which only the table reads, is in the
+            table's own filter row. */}
         {tab !== 'insights' && (
-          <div className="mt-4 flex flex-wrap items-end gap-3">
-            <DateRangeFilter
-              value={rangePreset}
-              presets={PROMPT_RANGE_PRESETS}
-              onChange={setRangePreset}
-              from={customFrom}
-              to={customTo}
-              onFromChange={setCustomFrom}
-              onToChange={setCustomTo}
-            />
-
-            {availableRegions.length > 1 && tab !== 'topics' && (
-              <div>
-                <label className="mb-1.5 block text-xs font-medium text-muted-foreground">
-                  Location
-                </label>
-                <Select
-                  value={regionFilter || null}
-                  onValueChange={(v) => setRegionFilter(!v || v === '__all__' ? '' : String(v))}
-                >
-                  <SelectTrigger className="h-8 w-48 text-xs">
-                    <SelectValue placeholder="All Locations">
-                      {(value) =>
-                        value && value !== '__all__'
-                          ? formatRegionDisplay(String(value))
-                          : 'All Locations'
-                      }
-                    </SelectValue>
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="__all__">All Locations</SelectItem>
-                    {availableRegions.map((r) => (
-                      <SelectItem key={r} value={r}>
-                        {formatRegionDisplay(r)}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
+          <div className="mt-4 flex flex-wrap items-end justify-between gap-3">
+            {tab === 'all' && (
+              <PromptsListSwitch
+                view={view}
+                onSelect={(next) => showSection(tab, next)}
+                trackedCount={trackedCount}
+              />
             )}
+            <div className="ml-auto flex flex-wrap items-end justify-end gap-3">
+              <DateRangeFilter
+                value={rangePreset}
+                presets={PROMPT_RANGE_PRESETS}
+                onChange={setRangePreset}
+                from={customFrom}
+                to={customTo}
+                onFromChange={setCustomFrom}
+                onToChange={setCustomTo}
+                labelHidden
+              />
+            </div>
           </div>
         )}
 
@@ -2065,62 +2303,41 @@ export default function PromptsPage() {
                 <SuggestionsTab
                   brandId={activeBrandId}
                   onAccepted={reloadAfterChange}
-                  planId={locationQuota?.planId}
+                  onAddTopic={addTopicInPlace}
                   limitActions={
-                    locationQuota ? <PromptLimitActions planId={locationQuota.planId} /> : null
+                    locationQuota ? (
+                      <PlanLimitButtons
+                        planId={locationQuota.planId}
+                        source="suggestions"
+                        size="sm"
+                      />
+                    ) : null
                   }
                 />
               </>
             )
           ) : (
             <>
-              {activeBrandId && (
+              {usageOpen && (
                 <PromptUsageCards
                   state={usageState}
                   brandName={activeBrand?.name}
-                  readOnly={!canManage}
                   prompts={allPrompts}
                   filter={statusFilter}
                   onFilter={setStatusFilter}
                   onRetry={retryUsage}
+                  onHide={() => setUsageOpen(false)}
                 />
               )}
-              {!loading && unanalyzedCount > 0 && (
-                <div className="flex flex-col gap-3 rounded-lg border border-amber-200 bg-amber-50 p-3 sm:flex-row sm:items-center sm:justify-between dark:border-amber-900/50 dark:bg-amber-950/30">
-                  <div className="flex items-start gap-2.5">
-                    <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-500" />
-                    <div className="text-sm">
-                      <p className="font-medium text-amber-900 dark:text-amber-200">
-                        {unanalyzedCount} prompt{unanalyzedCount === 1 ? '' : 's'} haven&apos;t been
-                        analyzed yet
-                      </p>
-                      <p className="text-amber-800/80 dark:text-amber-300/80">
-                        {quotaExhausted
-                          ? 'Their Volume & Competition stay empty until analyzed — but your monthly volume analysis limit is reached. Upgrade your plan to analyze more.'
-                          : 'Run volume analysis to fill in their Volume & Competition.'}
-                      </p>
-                    </div>
-                  </div>
-                  <Button
-                    size="sm"
-                    className="shrink-0"
-                    onClick={handleAnalyzeNew}
-                    disabled={analyzing || quotaExhausted}
-                  >
-                    {analyzing ? (
-                      <>
-                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                        {analyzingLabel}
-                      </>
-                    ) : (
-                      <>
-                        <BarChart3 className="mr-2 h-4 w-4" />
-                        Analyze {unanalyzedCount} prompt{unanalyzedCount === 1 ? '' : 's'}
-                      </>
-                    )}
-                  </Button>
-                </div>
+              {!loading && waitingFirst && (
+                <WaitingBanner
+                  prompts={allPrompts}
+                  quota={locationQuota}
+                  onShow={() => setStatusFilter('waiting')}
+                  onFreeUp={canSwap ? () => setSwapFor(waitingFirst.id) : undefined}
+                />
               )}
+              {firstRun && allPrompts.length > 0 && <FirstRunEmptyState run={firstRun} />}
               <AllPromptsTab
                 loading={loading}
                 failed={loadFailed}
@@ -2135,8 +2352,69 @@ export default function PromptsPage() {
                 positionsWindow={positionsWindow}
                 positionsPreset={range ? rangePreset : '30d'}
                 regionFilter={regionFilter}
+                tableViews={
+                  columnViews?.brandId === activeBrandId ? columnViews.views : NO_TABLE_VIEWS
+                }
+                onTableViewsChange={(views) => setColumnViews({ brandId: activeBrandId, views })}
+                improvingSeed={
+                  improvingRead?.brandId === activeBrandId ? improvingRead.byPrompt : NO_IMPROVING
+                }
+                volumesPending={volumesState === 'loading'}
+                // Location, in the table's filter row: for a brand tracked in more than one.
+                // Until the brand's locations are read, a brand whose prompts
+                // track more than one keeps the filter's place.
+                locationFilter={
+                  !tabUsesLocation(tab) ? null : availableRegions.length > 1 ? (
+                    <LocationFilter
+                      regions={availableRegions}
+                      value={regionFilter}
+                      onChange={setRegionFilter}
+                    />
+                  ) : regionsFor !== activeBrandId && matrixLocations(allPrompts).length > 1 ? (
+                    <Skeleton data-location-filter-pending className="h-8 w-44" />
+                  ) : null
+                }
+                // The status line's quiet notes: the plan's prompt locations
+                // near the limit, kept in sight with the usage cards folded;
+                // active prompts with no volume yet, whose Volume and
+                // Competition cells are blank until Analyze fills them in; and
+                // active prompts with no answers yet, which Track now runs.
+                notices={
+                  <>
+                    {usageWarning && (
+                      <LocationsWarningLine warning={usageWarning} planHref={planHref} />
+                    )}
+                    {!loading && volumesState === 'ready' && unanalyzedCount > 0 && (
+                      <NotAnalyzedLine
+                        count={unanalyzedCount}
+                        onAnalyze={canManage ? handleAnalyzeNew : undefined}
+                        analyzing={analyzing}
+                        progress={analysisProgress}
+                        limitReached={quotaExhausted}
+                      />
+                    )}
+                    {!loading && canManage && (
+                      <TrackNowLine
+                        count={trackNow.noAnswers.size}
+                        starting={trackNow.starting}
+                        startedCount={trackNow.startedCount}
+                        onTrack={() => startTrackNow([...trackNow.noAnswers])}
+                      />
+                    )}
+                  </>
+                }
+                trackNow={
+                  canManage
+                    ? {
+                        noAnswers: trackNow.noAnswers,
+                        busy: trackNow.starting,
+                        onTrack: (prompts: Prompt[]) => startTrackNow(prompts.map((p) => p.id)),
+                      }
+                    : undefined
+                }
                 statusFilter={statusFilter}
                 onStatusFilterChange={setStatusFilter}
+                onSwap={canSwap ? (p: Prompt) => setSwapFor(p.id) : undefined}
                 onAddPrompt={canManage ? openAddPrompt : undefined}
                 onEditPrompt={
                   canManage
@@ -2146,6 +2424,7 @@ export default function PromptsPage() {
                     : undefined
                 }
                 onChanged={reloadAfterChange}
+                onChatView={setTableView}
               />
             </>
           )}
@@ -2161,6 +2440,9 @@ export default function PromptsPage() {
               customFrom={customFrom}
               customTo={customTo}
               onLoaded={() => setPromptDataWanted(true)}
+              openAddTopic={addTopicPending}
+              onAddTopicOpened={() => setAddTopicPending(false)}
+              onChatView={setTopicsView}
             />
           )}
         </TabsContent>
@@ -2173,6 +2455,7 @@ export default function PromptsPage() {
               range={range}
               rangeLabel={rangeLabel}
               onTracked={reloadAfterChange}
+              onAddTopic={addTopicInPlace}
             />
           )}
         </TabsContent>
@@ -2191,7 +2474,7 @@ export default function PromptsPage() {
                 {noPlan ? tReadOnly('noPlan') : `${quota.remaining}/${quota.limit} analyses left`}
               </span>
             )}
-            {volumes.length > 0 && (
+            {volumes.length > 0 && canManage && (
               <>
                 <Button
                   onClick={guard(handleRefreshVolumes, { action: tActions('refreshVolumes') })}
@@ -2224,6 +2507,7 @@ export default function PromptsPage() {
               </>
             )}
             {volumes.length > 0 &&
+              canManage &&
               allPrompts.filter((p) => p.isActive && !volumes.find((v) => v.promptId === p.id))
                 .length > 0 && (
                 <Button
@@ -2242,10 +2526,12 @@ export default function PromptsPage() {
               )}
           </div>
 
-          {loading ? (
-            <div className="flex items-center justify-center py-10">
-              <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
-            </div>
+          {/* "No volume data yet" only once the read has said so: while the
+              volumes are on their way, their cards and chart wait in place. */}
+          {loading || volumesState === 'loading' ? (
+            <InsightsSkeleton />
+          ) : volumesState === 'failed' ? (
+            <VolumesFailedCard onRetry={() => void loadVolumes()} />
           ) : volumes.length === 0 ? (
             <Card>
               <CardContent className="flex flex-col items-center justify-center py-16 gap-4">
@@ -2258,7 +2544,7 @@ export default function PromptsPage() {
                       : 'Add prompts to your brand first, then analyze their volumes.'}
                   </p>
                 </div>
-                {allPrompts.length > 0 && (
+                {allPrompts.length > 0 && canManage && (
                   <>
                     <Button
                       onClick={handleAnalyzeNew}
@@ -2314,7 +2600,7 @@ export default function PromptsPage() {
                 <KpiCard
                   title="AI Adoption Rate"
                   icon={TrendingUp}
-                  value={`${((volumes[0]?.aiVolumeMultiplier ?? 0.15) * 100).toFixed(0)}%`}
+                  value={adoptionRate}
                   sub="of Google search volume"
                 />
                 <KpiCard
@@ -2338,11 +2624,13 @@ export default function PromptsPage() {
               <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
                 <Card className="lg:col-span-2">
                   <CardHeader className="pb-2">
-                    <CardTitle className="text-sm font-medium">Prompt Volumes</CardTitle>
+                    {/* The chart splits the total estimate: the same badge and note as its card. */}
+                    <div className="flex flex-wrap items-center gap-2">
+                      <CardTitle className="text-sm font-medium">Prompt Volumes</CardTitle>
+                      {totalAiVol > 0 && <EstimateBadge estimate={totalEstimate} kind="total" />}
+                    </div>
                     <p className="text-xs text-muted-foreground">
-                      Total estimated AI-answered queries across all topic clusters, split by
-                      answer-engine share. Weights include Google AI Overviews (~35% of Google
-                      searches), Google AI Mode, and standalone chatbots.
+                      {tVolumes('chartCaption', { rate: adoptionRate })}
                     </p>
                   </CardHeader>
                   <CardContent>
@@ -2553,6 +2841,7 @@ export default function PromptsPage() {
           open={addPromptOpen}
           onClose={() => setAddPromptOpen(false)}
           onAdded={reloadAfterChange}
+          onAddTopic={addTopicInPlace}
         />
       )}
 
@@ -2565,6 +2854,28 @@ export default function PromptsPage() {
           onChanged={reloadAfterChange}
         />
       )}
+
+      {canSwap && (
+        <PromptLimitDialog
+          promptId={swapFor}
+          onClose={() => setSwapFor(null)}
+          onDone={reloadAfterChange}
+        />
+      )}
+    </div>
+  );
+}
+
+/** Insights while its volumes load: the KPI cards and the chart, in place. */
+function InsightsSkeleton() {
+  return (
+    <div data-insights-loading className="space-y-6" aria-busy="true">
+      <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+        {Array.from({ length: 4 }).map((_, i) => (
+          <Skeleton key={i} className="h-28 w-full rounded-xl" />
+        ))}
+      </div>
+      <Skeleton className="h-72 w-full rounded-xl" />
     </div>
   );
 }
@@ -2683,6 +2994,7 @@ function RowActionsMenu({
   onDelete: () => void;
 }) {
   const t = useTranslations('prompts.content');
+  const tWaiting = useTranslations('prompts.waiting');
   const router = useRouter();
   // With the month's quota used up, or without an active plan, a prompt that
   // already has a suggestion can still open it, which costs nothing; the menu
@@ -2717,7 +3029,11 @@ function RowActionsMenu({
         </DropdownMenuItem>
         <DropdownMenuItem className="gap-2" onClick={onToggleActive}>
           {prompt.isActive ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
-          {prompt.isActive ? 'Pause tracking' : 'Resume tracking'}
+          {prompt.isActive
+            ? 'Pause tracking'
+            : prompt.waitingSince
+              ? tWaiting('track')
+              : 'Resume tracking'}
         </DropdownMenuItem>
         <DropdownMenuItem className="gap-2" onClick={onImprove}>
           <TrendingUp className="h-3.5 w-3.5" />
@@ -2789,9 +3105,18 @@ const STATUS_BADGE: Record<PromptStatus, string> = {
   active: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
   new: 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400',
   paused: 'border-muted-foreground/20 text-muted-foreground',
+  waiting: 'border-amber-500/40 bg-amber-500/15 text-amber-700 dark:text-amber-300',
 };
 
-const STATUS_FILTERS: PromptStatusFilter[] = ['tracked', 'active', 'new', 'paused', 'all'];
+/** The Status filter: the prompts waiting for a spot have one of their own. */
+const STATUS_FILTERS: PromptStatusFilter[] = [
+  'tracked',
+  'active',
+  'new',
+  'paused',
+  'waiting',
+  'all',
+];
 
 type PerformanceFilter = 'all' | PromptPerformance;
 
@@ -2808,6 +3133,41 @@ const WORK_FILTER_LABELS: Record<string, string> = {
   none: 'No status',
 };
 
+/**
+ * The prompt cell's text: the link keeps its navigation, and when the cell
+ * cuts the text a "Show full text" preview button appears next to it (the
+ * hover/focus tooltip from ClampedText stays as a shortcut).
+ */
+function PromptCellText({
+  handle,
+  id,
+  text,
+  previewLabel,
+}: {
+  handle: ClampedTextHandle;
+  id: string;
+  text: string;
+  previewLabel: string;
+}) {
+  const [ref, cut] = useTextCut<HTMLAnchorElement>();
+  return (
+    <>
+      <ClampedText
+        handle={handle}
+        text={text}
+        render={
+          <Link
+            ref={ref}
+            href={`/dashboard/prompts/${id}`}
+            className="line-clamp-2 wrap-break-word whitespace-normal transition-colors hover:text-primary hover:underline"
+          />
+        }
+      />
+      {cut ? <ClampedTextPreview label={previewLabel} heading={text} /> : null}
+    </>
+  );
+}
+
 function AllPromptsTab({
   loading,
   failed,
@@ -2822,11 +3182,20 @@ function AllPromptsTab({
   positionsWindow,
   positionsPreset,
   regionFilter,
+  tableViews,
+  onTableViewsChange,
+  improvingSeed,
+  volumesPending,
+  locationFilter,
+  notices,
+  trackNow,
   statusFilter,
   onStatusFilterChange,
+  onSwap,
   onAddPrompt,
   onEditPrompt,
   onChanged,
+  onChatView,
 }: {
   loading: boolean;
   /** The last read failed: say so and offer to read again, never "No prompts yet". */
@@ -2847,17 +3216,54 @@ function AllPromptsTab({
   positionsPreset: PromptRangePreset;
   /** Selected location; empty means every location. */
   regionFilter: string;
+  /**
+   * The columns' views (PROMPT-015a), read with the rows: the person's, the
+   * brand's, or none (today's columns). Columns' changes go back up.
+   */
+  tableViews: PromptTableViews;
+  onTableViewsChange: (views: PromptTableViews) => void;
+  /** The Improve actions still tracked, by prompt id, read with the rows (PROMPT-008). */
+  improvingSeed: Record<string, ImprovingAction>;
+  /** The volumes aren't in yet: Volume and Competition wait in their cells. */
+  volumesPending: boolean;
+  /** The page's Location filter, in the filter row; null when there is one location. */
+  locationFilter?: React.ReactNode;
+  /**
+   * Quiet notes under the filter row, at the right of the count: the prompt
+   * locations near the plan's limit, and the prompts not analyzed yet.
+   */
+  notices?: React.ReactNode;
+  /**
+   * Track now in the bulk bar, for the selected prompts with no answers yet;
+   * undefined for those who can't track.
+   */
+  trackNow?: {
+    /** The active prompts with no answers yet. */
+    noAnswers: ReadonlySet<string>;
+    /** A run is starting: the button waits for it. */
+    busy: boolean;
+    onTrack: (prompts: Prompt[]) => void;
+  };
   /** Which rows show, set by the usage cards above (PROMPT-012) or the Status filter. */
   statusFilter: PromptStatusFilter;
   onStatusFilterChange: (filter: PromptStatusFilter) => void;
+  /**
+   * Opens the swap dialog for a prompt that doesn't fit the plan:
+   * tracking a waiting one or resuming a paused one past the limit. Undefined
+   * keeps the refusal's toast (flag off, members, a plan that ended).
+   */
+  onSwap?: (prompt: Prompt) => void;
   /** Opens the Add Prompt dialog; undefined when the user can't write (member role). */
   onAddPrompt?: () => void;
   /** Opens the Edit Prompt dialog for a row; undefined hides the row menu (member role). */
   onEditPrompt?: (prompt: Prompt) => void;
   /** Reloads the page data after a row is paused, resumed or deleted from its menu. */
   onChanged: () => void;
+  /** What Chat's side panel sees of the table (its sort, search and rows on screen); null when gone. */
+  onChatView?: (view: ChatPageView | null) => void;
 }) {
   const tCommon = useTranslations('common');
+  const tManagers = useTranslations('managersOnly');
   const failureToast = useFailureToast();
   const tPrompts = useTranslations('prompts');
   // One tooltip for every prompt and topic the table cuts short.
@@ -2868,6 +3274,9 @@ function AllPromptsTab({
   const tDelete = useTranslations('prompts.bulkDelete');
   const tPerformance = useTranslations('prompts.performance');
   const tStatus = useTranslations('prompts.status');
+  const tWaiting = useTranslations('prompts.waiting');
+  const statusLabel = (value: PromptStatusFilter) =>
+    value === 'waiting' ? tWaiting('status') : tStatus(value);
   const tColumns = useTranslations('prompts.columns');
   const tTips = useTranslations('prompts.columns.tips');
   const now = useNow({ updateInterval: 60_000 }).getTime();
@@ -2880,24 +3289,8 @@ function AllPromptsTab({
     (st) => st.brands.find((b) => b.id === activeBrandId)?.name ?? '',
   );
   // The columns shown and their order (PROMPT-015a): the person's view, else
-  // the brand's shared one, else today's. Today's until read.
-  const [columnViews, setColumnViews] = useState<{
-    brandId: string;
-    views: PromptTableViews;
-  } | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    getPromptTableViews(activeBrandId)
-      .then((views) => {
-        if (!cancelled) setColumnViews({ brandId: activeBrandId, views });
-      })
-      .catch((err) => console.error('Failed to read the Tracked Prompts columns:', err));
-    return () => {
-      cancelled = true;
-    };
-  }, [activeBrandId]);
-  const tableViews =
-    columnViews?.brandId === activeBrandId ? columnViews.views : { mine: null, brand: null };
+  // the brand's shared one, else today's. Read with the rows, so the table
+  // opens on them.
   const columns = visibleColumns(effectiveView(tableViews.mine, tableViews.brand));
   const tLocations = useTranslations('prompts.locations');
   const tMetrics = useTranslations('prompts.locations.metrics');
@@ -3080,6 +3473,11 @@ function AllPromptsTab({
       try {
         const result = await setPromptActive(prompt.id, !prompt.isActive);
         if ('error' in result) {
+          // Past the limit, the swap dialog offers what to pause for it.
+          if (result.code === 'plan_limit' && onSwap) {
+            onSwap(prompt);
+            return;
+          }
           // Resuming needs a free slot on the plan; the message says how many.
           toast.error(
             result.code === 'plan_limit'
@@ -3089,15 +3487,20 @@ function AllPromptsTab({
           );
           return;
         }
-        toast.success(prompt.isActive ? 'Tracking paused' : 'Tracking resumed', {
-          description: prompt.text,
-        });
+        toast.success(
+          prompt.isActive
+            ? 'Tracking paused'
+            : prompt.waitingSince
+              ? tWaiting('tracked')
+              : 'Tracking resumed',
+          { description: prompt.text },
+        );
         onChanged();
       } catch {
         toast.error('Failed to update the prompt.');
       }
     },
-    [onChanged],
+    [onChanged, onSwap, tWaiting],
   );
 
   // Bulk Pause / Resume: one write for the selected prompts that change.
@@ -3146,7 +3549,12 @@ function AllPromptsTab({
   const [contentUsageFailed, setContentUsageFailed] = useState(false);
   const [usageVersion, setUsageVersion] = useState(0);
   const [suggestingIds, setSuggestingIds] = useState<Set<string>>(new Set());
+  // Only the row menu and the bulk bar use it: read once the rows are in,
+  // not before them, where it held the table's read up in the action queue.
+  const [contentUsageWanted, setContentUsageWanted] = useState(false);
+  if (!loading && !contentUsageWanted) setContentUsageWanted(true);
   useEffect(() => {
+    if (!contentUsageWanted) return undefined;
     let cancelled = false;
     getContentUsage().then(
       (usage) => {
@@ -3163,7 +3571,7 @@ function AllPromptsTab({
     return () => {
       cancelled = true;
     };
-  }, [activeBrandId, usageVersion]);
+  }, [activeBrandId, usageVersion, contentUsageWanted]);
   const hasOpportunityLimit =
     hasContentQuota(contentUsage) && contentUsage.opportunities.limit !== -1;
   // Without an active plan the quota reads 0 of 0: Suggest content stays
@@ -3322,6 +3730,10 @@ function AllPromptsTab({
   const [workFilter, setWorkFilter] = useState<'all' | 'none' | PromptWorkStatus>('all');
   // Where the brand stands in each prompt's answers: Best, Good, Late, Missing.
   const [performanceFilter, setPerformanceFilter] = useState<PerformanceFilter>('all');
+  // Custom tags (#2151): all prompts, or only those carrying one.
+  // Custom tags (#2151, #2378): any set of them, all or any matching.
+  const [tagFilter, setTagFilter] = useState<string[]>([]);
+  const [tagMatch, setTagMatch] = useState<'all' | 'any'>('all');
   // Optimistic per-row status overrides — the prompts prop belongs to the
   // parent's load cycle; a full reload for a one-column change would flash
   // the whole table.
@@ -3357,10 +3769,18 @@ function AllPromptsTab({
   if (!loading && positionsId && !openPositions) setPositionsId(null);
 
   // The panel opens on the table's window; changing it there only moves the panel.
-  // Track in more locations (PROMPT-015c): from the Locations view, or a cell's + Track.
+  // Track in more locations (PROMPT-015c), or stop tracking in some: from the
+  // Locations view, a cell, a column's menu or the bulk bar. Each opener is
+  // guarded, so a read-only workspace gets the upgrade dialog, not this one.
   const [addLocations, setAddLocations] = useState<{
     open: boolean;
     preset: AddLocationsPreset | null;
+  }>({ open: false, preset: null });
+  // Add or remove custom tags on the selected prompts (#2378), from the bulk
+  // bar; each opener is guarded, as the locations dialog's.
+  const [bulkTags, setBulkTags] = useState<{
+    open: boolean;
+    preset: BulkTagsPreset | null;
   }>({ open: false, preset: null });
   // A Locations view cell opens the panel on its location (PROMPT-015b).
   const [panelRegion, setPanelRegion] = useState<string | null>(null);
@@ -3487,8 +3907,19 @@ function AllPromptsTab({
         workFilter === 'none' ? statusOf(p) === null : statusOf(p) === workFilter,
       );
     }
+    if (tagFilter.length > 0) {
+      list = list.filter((p) =>
+        tagMatch === 'all'
+          ? tagFilter.every((tag) => (p.tags ?? []).includes(tag))
+          : tagFilter.some((tag) => (p.tags ?? []).includes(tag)),
+      );
+    }
     return list;
-  }, [prompts, search, statusFilter, workFilter, statusOf, now]);
+  }, [prompts, search, statusFilter, workFilter, tagFilter, tagMatch, statusOf, now]);
+  const tagOptions = useMemo(
+    () => [...new Set(prompts.flatMap((p) => p.tags ?? []))].sort(),
+    [prompts],
+  );
 
   const performanceCounts = useMemo(() => {
     const counts: Record<PerformanceFilter, number> = {
@@ -3572,6 +4003,28 @@ function AllPromptsTab({
   const statusCounts = useMemo(() => countByStatus(allRows, now), [allRows, now]);
   const promptsPager = usePagination(filtered.length, promptsResetKey);
 
+  // What Chat's side panel sees of the table (the owner's plan, item 8): the sort picked (none
+  // until a header is), the search, the page of prompts on screen and how many match.
+  const chatView = loading
+    ? null
+    : JSON.stringify({
+        ...(isAllPromptsSortKey(rawSort)
+          ? { sort: { key: activeSort, dir } }
+          : latenessOrder
+            ? { sort: { key: 'behind', dir: 'desc' } }
+            : {}),
+        ...(search.trim() ? { search: search.trim() } : {}),
+        rows: viewRows(filtered.slice(promptsPager.start, promptsPager.end), (p) => ({
+          ref: p.id,
+          label: p.text,
+        })),
+        total: filtered.length,
+      } satisfies ChatPageView);
+  useEffect(() => {
+    onChatView?.(chatView ? (JSON.parse(chatView) as ChatPageView) : null);
+  }, [onChatView, chatView]);
+  useEffect(() => () => onChatView?.(null), [onChatView]);
+
   // Rows ticked for the bulk action bar. Only rows on screen can be ticked,
   // so the selection starts over whenever the rows on screen change.
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
@@ -3597,7 +4050,23 @@ function AllPromptsTab({
     });
   }, []);
 
-  const state = promptsTableState({ loading, failed, rows: prompts.length });
+  // Improve actions still tracked for the rows on screen (PROMPT-008), one
+  // read a page: a link under the Work chip opens the Improve tab.
+  const improving = useImprovingPrompts(
+    activeBrandId,
+    !loading && layout === 'table' && columns.includes('work')
+      ? filtered.slice(promptsPager.start, promptsPager.end).map((p) => p.id)
+      : [],
+    positionsId !== null,
+    improvingSeed,
+  );
+
+  // Sorted by volume, the rows wait for the volumes rather than move when they come.
+  const state = promptsTableState({
+    loading: loading || (volumesPending && activeSort === 'volume' && !latenessOrder),
+    failed,
+    rows: prompts.length,
+  });
   if (state === 'loading') {
     return (
       <div className="flex items-center justify-center py-10">
@@ -3632,20 +4101,14 @@ function AllPromptsTab({
               Add prompts to your brand to start tracking their AI visibility.
             </p>
           </div>
-          <div className="flex items-center gap-2">
-            {onAddPrompt && (
-              <Button size="sm" className="gap-2" onClick={onAddPrompt}>
-                <Plus className="h-4 w-4" />
-                Add prompt
-              </Button>
-            )}
-            <Link href={`/dashboard/brands/${activeBrandId}/prompts`}>
-              <Button size="sm" variant={onAddPrompt ? 'outline' : 'default'} className="gap-2">
-                <Pencil className="h-4 w-4" />
-                Manage prompts
-              </Button>
-            </Link>
-          </div>
+          {onAddPrompt ? (
+            <Button size="sm" className="gap-2" onClick={onAddPrompt}>
+              <Plus className="h-4 w-4" />
+              Add prompt
+            </Button>
+          ) : (
+            <p className="text-xs text-muted-foreground">{tManagers('addPrompts')}</p>
+          )}
         </CardContent>
       </Card>
     );
@@ -3654,6 +4117,8 @@ function AllPromptsTab({
   const pageRows = filtered.slice(promptsPager.start, promptsPager.end);
   const pageIds = pageRows.map((p) => p.id);
   const selectedPrompts = pageRows.filter((p) => selectedIds.has(p.id));
+  // The selected prompts Track now can start: active, with no answers yet.
+  const trackable = trackNow ? selectedPrompts.filter((p) => trackNow.noAnswers.has(p.id)) : [];
   // A delete that fits in one call is over before the bar could say so.
   const showDeleteProgress = deleteProgress !== null && deleteProgress.total > PROMPT_DELETE_BATCH;
 
@@ -3782,14 +4247,130 @@ function AllPromptsTab({
   };
 
   return (
-    <Card>
-      <CardHeader className="pb-3">
-        <div className="flex items-center justify-between gap-4 flex-wrap">
+    <Card data-tour="positions">
+      {/* The filters first, then what they show: the count, the status
+          filter's note and, at the right, the prompts missing volume and
+          competition. The line sits apart from the filters, with the table. */}
+      <CardHeader className="gap-2 pb-2">
+        <div className="flex flex-wrap items-center gap-2" data-filter-row>
+          <div
+            role="group"
+            aria-label={tLocations('view')}
+            className="inline-flex gap-0.5 rounded-full bg-muted p-0.5"
+          >
+            {(['table', 'locations'] as const).map((l) => (
+              <button
+                key={l}
+                type="button"
+                aria-pressed={layout === l}
+                onClick={() => changeLayout(l)}
+                // Read ahead, so the Locations view opens on its data.
+                onPointerEnter={l === 'locations' ? prefetchLocations : undefined}
+                onFocus={l === 'locations' ? prefetchLocations : undefined}
+                className={cn(
+                  'h-7 rounded-full px-3 text-xs transition-colors',
+                  layout === l
+                    ? 'bg-background font-medium text-foreground shadow-sm'
+                    : 'text-muted-foreground hover:text-foreground',
+                )}
+              >
+                {tLocations(l)}
+              </button>
+            ))}
+          </div>
+          <Select
+            value={statusFilter}
+            onValueChange={(v) => onStatusFilterChange((v as PromptStatusFilter | null) ?? 'all')}
+            items={STATUS_FILTERS.map((value) => ({ value, label: statusLabel(value) }))}
+          >
+            <SelectTrigger
+              // "Waiting for a spot" needs the room.
+              className="h-8 w-40 text-xs"
+              aria-label={tStatus('label')}
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {STATUS_FILTERS.map((value) => (
+                <SelectItem key={value} value={value}>
+                  {statusLabel(value)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Select
+            value={workFilter}
+            onValueChange={(v) => setWorkFilter((v as typeof workFilter) ?? 'all')}
+          >
+            <SelectTrigger className="h-8 w-32 text-xs">
+              <SelectValue placeholder="All work">
+                {(value) => WORK_FILTER_LABELS[(value as string) ?? 'all'] ?? 'All work'}
+              </SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All work</SelectItem>
+              <SelectItem value="todo">To do</SelectItem>
+              <SelectItem value="in_progress">In progress</SelectItem>
+              <SelectItem value="done">Done</SelectItem>
+              <SelectItem value="none">No status</SelectItem>
+            </SelectContent>
+          </Select>
+          {locationFilter}
+          <TagFilter
+            tagOptions={tagOptions}
+            tagFilter={tagFilter}
+            tagMatch={tagMatch}
+            onFilterChange={setTagFilter}
+            onMatchChange={setTagMatch}
+          />
+          <Select
+            value={performanceFilter}
+            onValueChange={(v) => changePerformance((v as PerformanceFilter | null) ?? 'all')}
+            items={performanceItems}
+          >
+            <SelectTrigger
+              className="h-8 w-36 text-xs"
+              aria-label={tPerformance('label')}
+              title={tPerformance('title')}
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {performanceItems.map((item) => (
+                <SelectItem key={item.value} value={item.value}>
+                  {item.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <div className="relative w-60">
+            <Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-muted-foreground" />
+            <Input
+              placeholder="Search prompts…"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              className="pl-8 h-8 text-xs"
+            />
+          </div>
+          {layout === 'table' && (
+            <ColumnsPanel
+              brandId={activeBrandId}
+              brandName={brandName}
+              canManage={canManage}
+              views={tableViews}
+              onViewsChange={onTableViewsChange}
+              locations={trackedLocations}
+            />
+          )}
+        </div>
+        <div className="mt-3 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
           <div className="flex flex-wrap items-baseline gap-x-2.5 gap-y-0.5">
             <CardTitle className="text-sm font-medium">
-              {tUsage(`table.${statusFilter}`, {
-                count: format.number(statusCounts[statusFilter]),
-              })}
+              {statusFilter === 'waiting'
+                ? tWaiting('table', { count: format.number(statusCounts.waiting) })
+                : tUsage(`table.${statusFilter}`, {
+                    count: format.number(statusCounts[statusFilter]),
+                  })}
             </CardTitle>
             {statusFilter !== 'all' && (
               <span className="text-xs text-muted-foreground">
@@ -3804,104 +4385,8 @@ function AllPromptsTab({
               </span>
             )}
           </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <div
-              role="group"
-              aria-label={tLocations('view')}
-              className="inline-flex gap-0.5 rounded-full bg-muted p-0.5"
-            >
-              {(['table', 'locations'] as const).map((l) => (
-                <button
-                  key={l}
-                  type="button"
-                  aria-pressed={layout === l}
-                  onClick={() => changeLayout(l)}
-                  // Read ahead, so the Locations view opens on its data.
-                  onPointerEnter={l === 'locations' ? prefetchLocations : undefined}
-                  onFocus={l === 'locations' ? prefetchLocations : undefined}
-                  className={cn(
-                    'h-7 rounded-full px-3 text-xs transition-colors',
-                    layout === l
-                      ? 'bg-background font-medium text-foreground shadow-sm'
-                      : 'text-muted-foreground hover:text-foreground',
-                  )}
-                >
-                  {tLocations(l)}
-                </button>
-              ))}
-            </div>
-            <Select
-              value={statusFilter}
-              onValueChange={(v) => onStatusFilterChange((v as PromptStatusFilter | null) ?? 'all')}
-              items={STATUS_FILTERS.map((value) => ({ value, label: tStatus(value) }))}
-            >
-              <SelectTrigger className="h-8 w-32 text-xs" aria-label={tStatus('label')}>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {STATUS_FILTERS.map((value) => (
-                  <SelectItem key={value} value={value}>
-                    {tStatus(value)}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Select
-              value={workFilter}
-              onValueChange={(v) => setWorkFilter((v as typeof workFilter) ?? 'all')}
-            >
-              <SelectTrigger className="h-8 w-32 text-xs">
-                <SelectValue placeholder="All work">
-                  {(value) => WORK_FILTER_LABELS[(value as string) ?? 'all'] ?? 'All work'}
-                </SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">All work</SelectItem>
-                <SelectItem value="todo">To do</SelectItem>
-                <SelectItem value="in_progress">In progress</SelectItem>
-                <SelectItem value="done">Done</SelectItem>
-                <SelectItem value="none">No status</SelectItem>
-              </SelectContent>
-            </Select>
-            <Select
-              value={performanceFilter}
-              onValueChange={(v) => changePerformance((v as PerformanceFilter | null) ?? 'all')}
-              items={performanceItems}
-            >
-              <SelectTrigger
-                className="h-8 w-36 text-xs"
-                aria-label={tPerformance('label')}
-                title={tPerformance('title')}
-              >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {performanceItems.map((item) => (
-                  <SelectItem key={item.value} value={item.value}>
-                    {item.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <div className="relative w-60">
-              <Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-muted-foreground" />
-              <Input
-                placeholder="Search prompts…"
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                className="pl-8 h-8 text-xs"
-              />
-            </div>
-            {layout === 'table' && (
-              <ColumnsPanel
-                brandId={activeBrandId}
-                brandName={brandName}
-                canManage={canManage}
-                views={tableViews}
-                onViewsChange={(views) => setColumnViews({ brandId: activeBrandId, views })}
-                locations={trackedLocations}
-              />
-            )}
+          <div className="flex flex-wrap items-center justify-end gap-x-4 gap-y-1" data-notices>
+            {notices}
           </div>
         </div>
       </CardHeader>
@@ -3922,6 +4407,9 @@ function AllPromptsTab({
                   }))
             }
             deleting={showDeleteProgress ? deleteProgress : null}
+            trackNowCount={trackable.length}
+            trackNowBusy={trackNow?.busy ?? false}
+            onTrackNow={trackNow ? () => trackNow.onTrack(trackable) : undefined}
             onPause={guard(() => void setActiveFor(selectedPrompts, false), {
               action: tActions('pausePrompts'),
             })}
@@ -3930,6 +4418,19 @@ function AllPromptsTab({
             })}
             onSuggestContent={guard(() => void suggestFor(selectedPrompts), {
               action: tActions('suggestContent'),
+            })}
+            onAddLocations={guard(() => setAddLocations({ open: true, preset: { mode: 'add' } }), {
+              action: tActions('changeLocations'),
+            })}
+            onRemoveLocations={guard(
+              () => setAddLocations({ open: true, preset: { mode: 'remove' } }),
+              { action: tActions('removeLocations') },
+            )}
+            onAddTags={guard(() => setBulkTags({ open: true, preset: { mode: 'add' } }), {
+              action: tActions('changeTags'),
+            })}
+            onRemoveTags={guard(() => setBulkTags({ open: true, preset: { mode: 'remove' } }), {
+              action: tActions('removeTags'),
             })}
             onDelete={guard(() => setConfirmDelete(selectedPrompts), {
               action: tActions('deletePrompts'),
@@ -3946,15 +4447,34 @@ function AllPromptsTab({
             onOpenCell={(promptId, region) => openPositionsPanel(promptId, 'platforms', region)}
             onTrack={
               onEditPrompt
-                ? (prompt, region) =>
-                    setAddLocations({
-                      open: true,
-                      preset: { promptId: prompt.id, locations: [region] },
-                    })
+                ? guard(
+                    (prompt: Prompt, region: string) =>
+                      setAddLocations({
+                        open: true,
+                        preset: { promptId: prompt.id, locations: [region] },
+                      }),
+                    { action: tActions('changeLocations') },
+                  )
+                : undefined
+            }
+            onStopTracking={
+              onEditPrompt
+                ? guard(
+                    (prompt: Prompt | null, region: string) =>
+                      setAddLocations({
+                        open: true,
+                        preset: { mode: 'remove', promptId: prompt?.id, locations: [region] },
+                      }),
+                    { action: tActions('removeLocations') },
+                  )
                 : undefined
             }
             onAddLocations={
-              onEditPrompt ? () => setAddLocations({ open: true, preset: null }) : undefined
+              onEditPrompt
+                ? guard(() => setAddLocations({ open: true, preset: null }), {
+                    action: tActions('changeLocations'),
+                  })
+                : undefined
             }
           />
         ) : (
@@ -4003,14 +4523,33 @@ function AllPromptsTab({
                 const vol = volumeByPromptId.get(p.id);
                 const vis = visibility[p.id];
                 const status = promptStatus(p, now);
-                // Its empty location columns wait for their first answers only
-                // while it's new, or answered elsewhere (a location just added).
+                // With no answers (in a location column, or at all), it waits for
+                // its first ones only while it's new, or answered elsewhere (a
+                // location just added); otherwise a dash.
                 const awaiting = awaitsFirstAnswers(
                   p,
                   Boolean(vis) ||
                     Object.values(locationMatrix?.[p.id] ?? {}).some((c) => c.runs > 0),
                   now,
                 );
+                // No answers in the window yet: when they come, or why not, said
+                // once in the first answer column shown, the others a dash.
+                const pendingAt = pendingColumn(p, {
+                  hasAnswers: Boolean(vis),
+                  region: regionFilter,
+                  columns,
+                });
+                const noAnswers = (id: PromptColumnId) =>
+                  pendingAt === id ? (
+                    <LocationPending
+                      prompt={p}
+                      region={regionFilter || undefined}
+                      window={positionsWindow}
+                      awaiting={awaiting}
+                    />
+                  ) : (
+                    <span className="text-xs text-muted-foreground">—</span>
+                  );
                 const cells: Record<PromptColumnId, React.ReactNode> = {
                   topic: (
                     <TableCell key="topic">
@@ -4034,9 +4573,15 @@ function AllPromptsTab({
                       <Badge
                         variant="outline"
                         className={cn('text-xs', STATUS_BADGE[status])}
-                        title={status === 'new' ? tStatus('newHint') : undefined}
+                        title={
+                          status === 'new'
+                            ? tStatus('newHint')
+                            : status === 'waiting'
+                              ? tWaiting('statusHint')
+                              : undefined
+                        }
                       >
-                        {tStatus(status)}
+                        {statusLabel(status)}
                       </Badge>
                     </TableCell>
                   ),
@@ -4065,6 +4610,12 @@ function AllPromptsTab({
                           >
                             {p.citedUrlCount}/{p.targetUrlCount} cited
                           </span>
+                        )}
+                        {improving[p.id] && (
+                          <ImprovingLink
+                            action={improving[p.id]}
+                            onOpen={() => openPositionsPanel(p.id, 'improve')}
+                          />
                         )}
                       </div>
                     </TableCell>
@@ -4101,26 +4652,18 @@ function AllPromptsTab({
                           </div>
                         </div>
                       ) : (
-                        <span className="text-xs text-muted-foreground">—</span>
+                        noAnswers('visibility')
                       )}
                     </TableCell>
                   ),
                   mentions: (
                     <TableCell key="mentions" className="text-right tabular-nums text-sm">
-                      {vis ? (
-                        formatNumber(vis.totalMentions)
-                      ) : (
-                        <span className="text-xs text-muted-foreground">—</span>
-                      )}
+                      {vis ? formatNumber(vis.totalMentions) : noAnswers('mentions')}
                     </TableCell>
                   ),
                   citations: (
                     <TableCell key="citations" className="text-right tabular-nums text-sm">
-                      {vis ? (
-                        formatNumber(vis.totalCitations)
-                      ) : (
-                        <span className="text-xs text-muted-foreground">—</span>
-                      )}
+                      {vis ? formatNumber(vis.totalCitations) : noAnswers('citations')}
                     </TableCell>
                   ),
                   positions: (
@@ -4128,7 +4671,11 @@ function AllPromptsTab({
                       {/* Fixed widths so the value, dots and See line up on every row. */}
                       <div className="inline-flex items-center gap-2">
                         <div className="w-[5.5rem] whitespace-nowrap">
-                          <PositionValue cell={positions[p.id]} vis={vis} />
+                          {pendingAt === 'positions' ? (
+                            noAnswers('positions')
+                          ) : (
+                            <PositionValue cell={positions[p.id]} vis={vis} />
+                          )}
                         </div>
                         <div className="w-6">
                           {/* Whenever it has answers: a prompt never named is the one to open. */}
@@ -4150,7 +4697,9 @@ function AllPromptsTab({
                   ),
                   volume: (
                     <TableCell key="volume" className="text-right">
-                      {vol ? (
+                      {volumesPending ? (
+                        <Skeleton data-volume-pending className="ml-auto h-4 w-16" />
+                      ) : vol ? (
                         <EstimateRange
                           estimate={estimateByPromptId.get(p.id)!}
                           handle={volumeNote}
@@ -4164,20 +4713,20 @@ function AllPromptsTab({
                   competition: (
                     <TableCell key="competition" className="text-center">
                       <div className="flex justify-center">
-                        <CompetitionBars
-                          index={vol?.competitionIndex ?? null}
-                          label={vol?.competition ?? null}
-                        />
+                        {volumesPending ? (
+                          <Skeleton data-volume-pending className="h-4 w-10" />
+                        ) : (
+                          <CompetitionBars
+                            index={vol?.competitionIndex ?? null}
+                            label={vol?.competition ?? null}
+                          />
+                        )}
                       </div>
                     </TableCell>
                   ),
                   runs: (
                     <TableCell key="runs" className="text-right tabular-nums text-sm">
-                      {vis ? (
-                        formatNumber(vis.runs)
-                      ) : (
-                        <span className="text-xs text-muted-foreground">—</span>
-                      )}
+                      {vis ? formatNumber(vis.runs) : noAnswers('runs')}
                     </TableCell>
                   ),
                   added: (
@@ -4194,7 +4743,9 @@ function AllPromptsTab({
                   ),
                   lastRun: (
                     <TableCell key="lastRun" className="text-right text-xs text-muted-foreground">
-                      {formatRelative(vis?.lastRunAt, tCommon)}
+                      {pendingAt === 'lastRun'
+                        ? noAnswers('lastRun')
+                        : formatRelative(vis?.lastRunAt, tCommon)}
                     </TableCell>
                   ),
                 };
@@ -4210,17 +4761,26 @@ function AllPromptsTab({
                             aria-label={`Select ${p.text}`}
                           />
                         )}
-                        <ClampedText
+                        <PromptCellText
                           handle={fullText}
+                          id={p.id}
                           text={p.text}
-                          render={
-                            <Link
-                              href={`/dashboard/prompts/${p.id}`}
-                              className="line-clamp-2 transition-colors hover:text-primary hover:underline"
-                            />
-                          }
+                          previewLabel={tPrompts('showFullText')}
+                        />
+                        <AskAboutThis
+                          reference={{ type: 'prompt', id: p.id, label: p.text }}
+                          className="-mt-0.5 shrink-0"
                         />
                       </div>
+                      {(p.tags ?? []).length > 0 && (
+                        <div className="mt-1 flex flex-wrap gap-1">
+                          {(p.tags ?? []).map((tag) => (
+                            <Badge key={tag} variant="secondary" className="text-[10px]">
+                              {tag}
+                            </Badge>
+                          ))}
+                        </div>
+                      )}
                     </TableCell>
                     {columns.map((id) => {
                       const loc = parseLocationColumn(id);
@@ -4328,7 +4888,7 @@ function AllPromptsTab({
             // The table opens on Tracked: a brand whose prompts are all paused
             // must not look empty with no way back.
             <div className="py-10 text-center text-sm text-muted-foreground">
-              {tUsage(`table.none.${statusFilter}`)}{' '}
+              {statusFilter === 'waiting' ? tWaiting('none') : tUsage(`table.none.${statusFilter}`)}{' '}
               <button
                 type="button"
                 onClick={() => onStatusFilterChange('all')}
@@ -4340,19 +4900,29 @@ function AllPromptsTab({
           ))}
       </CardContent>
       {onEditPrompt && (
-        <AddLocationsDialog
-          open={addLocations.open}
-          onOpenChange={(open) => setAddLocations((prev) => ({ ...prev, open }))}
-          brandId={activeBrandId}
-          prompts={filtered}
-          selectedIds={selectedIds}
-          preset={addLocations.preset}
-          onDone={() => {
-            // The prompts' locations changed: read the matrix again.
-            clearLocationMatrixCache();
-            onChanged();
-          }}
-        />
+        <>
+          <AddLocationsDialog
+            open={addLocations.open}
+            onOpenChange={(open) => setAddLocations((prev) => ({ ...prev, open }))}
+            brandId={activeBrandId}
+            prompts={filtered}
+            selectedIds={selectedIds}
+            preset={addLocations.preset}
+            onDone={() => {
+              // The prompts' locations changed: read the matrix again.
+              clearLocationMatrixCache();
+              onChanged();
+            }}
+          />
+          <BulkTagsDialog
+            open={bulkTags.open}
+            onOpenChange={(open) => setBulkTags((prev) => ({ ...prev, open }))}
+            prompts={filtered}
+            selectedIds={selectedIds}
+            preset={bulkTags.preset}
+            onDone={onChanged}
+          />
+        </>
       )}
       <PromptPositionsSheet
         prompt={openPositions}

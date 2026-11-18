@@ -33,6 +33,7 @@ import {
   controlScope,
   measureBasket,
   netEffect,
+  topicPromptIds,
 } from './basket-metrics.js';
 import { auditOutcome, auditRecheck } from './audit-recheck.js';
 
@@ -318,13 +319,17 @@ export function fullWindowCounts(metrics, gaps) {
   });
 }
 
-/** A target the night engine names that a basket can be measured on (learning A1). */
-const TARGET_BASKETS = new Set(['prompts', 'pages']);
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/**
+ * A target the night engine names that a basket can be measured on
+ * (learning A1); a topic (G16, C09) on its prompts (AC plan §11, P-4).
+ */
+const TARGET_BASKETS = new Set(['prompts', 'pages', 'topics']);
+/** A prompt id, as against a key that is a prompt's text (a suggestion's). */
+export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** The brand's primary domain as a host, for a page target written as a path. */
-async function primaryHost(brandId) {
-  const { data, error } = await supabaseAdmin
+export async function primaryHost(brandId, { db = supabaseAdmin } = {}) {
+  const { data, error } = await db
     .from('brand_domains')
     .select('domain')
     .eq('brand_id', brandId)
@@ -343,10 +348,12 @@ async function primaryHost(brandId) {
  * The basket a night-engine action is measured on (learning A1): the
  * prompts or pages its payload names, every one it counts (`targetIds`)
  * when it shows fewer, a page written as a path read on the brand's primary
- * domain. Null for another kind of target, or none: such an action is
- * measured brand-wide, as before.
+ * domain. A topic's action (G16, C09) on its topic's prompts (AC plan §11):
+ * the ones it kept as it opened (`promptIds`, work-scope.js), else the
+ * topic's prompts now. Null for another kind of target, or none: such an
+ * action is measured brand-wide, as before.
  */
-export async function targetScope(action) {
+export async function targetScope(action, { db = supabaseAdmin } = {}) {
   const payload = action.payload ?? {};
   if (!TARGET_BASKETS.has(payload.targetEntity)) return null;
   const listed = Array.isArray(payload.targetIds)
@@ -357,7 +364,21 @@ export async function targetScope(action) {
     const promptIds = keys.filter((k) => UUID.test(k));
     return promptIds.length ? { entity: 'prompts', promptIds, pages: [] } : null;
   }
-  const host = keys.some((k) => k.startsWith('/')) ? await primaryHost(action.brand_id) : null;
+  if (payload.targetEntity === 'topics') {
+    const kept = (Array.isArray(payload.promptIds) ? payload.promptIds : []).filter(
+      (id) => typeof id === 'string' && UUID.test(id),
+    );
+    const topics = keys.filter((k) => UUID.test(k));
+    const promptIds = kept.length
+      ? [...new Set(kept)]
+      : topics.length
+        ? await topicPromptIds(action.brand_id, topics, { db })
+        : [];
+    return promptIds.length ? { entity: 'topics', promptIds, pages: [] } : null;
+  }
+  const host = keys.some((k) => k.startsWith('/'))
+    ? await primaryHost(action.brand_id, { db })
+    : null;
   const pages = keys
     .map((k) => (k.startsWith('/') ? (host ? `https://${host}${k}` : null) : k))
     .filter((url) => url && /^https?:\/\//i.test(url));
@@ -501,6 +522,12 @@ function fullWindowControl({ before, after }, nights) {
   };
 }
 
+/** The id of the play an action was opened with (playbooks.js), or null. */
+export function playOf(payload) {
+  const id = payload?.play?.id;
+  return typeof id === 'string' && id && id.length <= 60 ? id : null;
+}
+
 /**
  * One reading of a closed action (learning B1): what it keeps and its
  * verdict, over the week `afterWindow` against the week before it was raised.
@@ -553,7 +580,14 @@ async function measureReading(
     const measured = net.length
       ? { ...read, control: { basis: control.basis, prompts: control.prompts, net } }
       : read;
-    const beside = { ...(signals ? { signals } : {}), ...(audit ? { audit } : {}), ...gaps };
+    // The play it was opened with (AC plan §11): the scorecard groups by it.
+    const play = playOf(action.payload);
+    const beside = {
+      ...(signals ? { signals } : {}),
+      ...(audit ? { audit } : {}),
+      ...gaps,
+      ...(play && measured ? { play } : {}),
+    };
     const kept =
       measured || Object.keys(beside).length
         ? { measuredAt: now.toISOString(), ...(measured ?? {}), ...beside }
@@ -575,7 +609,8 @@ async function measureReading(
   // Content Editor (CE-015) on its prompts and its page, and a product or
   // category sent from Product Visibility (ECOM-013) on its shopping
   // questions and the product's page. A page sent from a Site Audit report
-  // (learning D2) on that page.
+  // (learning D2) on that page. A finding sent from Chat (CHAT-09 §E) on the
+  // prompts and pages it named.
   if (
     action.kind === 'content_opportunity' ||
     action.kind === 'content_draft' ||
@@ -586,7 +621,8 @@ async function measureReading(
     action.kind === 'traffic_pages' ||
     action.kind === 'shopping_product' ||
     action.kind === 'shopping_category' ||
-    action.kind === 'audit_page'
+    action.kind === 'audit_page' ||
+    action.kind === 'chat_finding'
   ) {
     const scope = await basketScope(action);
     const [before, after] = await Promise.all([
@@ -762,7 +798,11 @@ export async function sweepActionValidation({ now = new Date() } = {}) {
   for (;;) {
     let query = supabaseAdmin
       .from('actions')
-      .select('id, brand_id, kind, payload, kpi_keys, created_at, completed_at, validation')
+      .select(
+        'id, brand_id, kind, payload, kpi_keys, created_at, completed_at, validation, brands!inner(is_demo)',
+      )
+      // A demo brand's actions (00380) are sample data: their outcomes are written with them.
+      .eq('brands.is_demo', false)
       .eq('status', 'completed')
       // Never measured, or read but not for the last time yet (learning B1).
       // One measured once before the later readings came keeps its result.

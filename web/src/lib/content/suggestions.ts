@@ -13,15 +13,26 @@
 import { safeLinkHref } from './editor';
 import { SUGGESTION_SOURCE_KINDS, type SuggestionSourceKind } from './sources';
 
+/**
+ * The rule a request typed in Chat beside the editor goes to the Content
+ * Agent as (CHAT-25 §4 item 5, W4-14): its suggestions carry it in their
+ * rule keys, so the editor says they came "from your chat".
+ */
+export const CHAT_RULE_KEY = 'chat';
+
+/** A suggestion made for a request typed in Chat beside the editor. */
+export const fromChat = (suggestion: Pick<DraftSuggestion, 'ruleKeys'>) =>
+  suggestion.ruleKeys.includes(CHAT_RULE_KEY);
+
 export const SUGGESTION_STATUSES = ['open', 'accepted', 'rejected'] as const;
 export type SuggestionStatus = (typeof SUGGESTION_STATUSES)[number];
 
 export interface DraftSuggestion {
   id: string;
   batchId: string;
-  /** The Action Center action the run came from, with its number ("AC-214"). */
+  /** The Action Center action the run came from, with the number its code shows ("AC-03": actionCodeNo). */
   actionId: string | null;
-  actionNo: number | null;
+  actionNo: number | string | null;
   kind: 'replace' | 'insert' | 'page';
   /** The passage's text when the agent read it. */
   blockText: string;

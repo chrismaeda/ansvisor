@@ -1,0 +1,313 @@
+// @vitest-environment node
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { ChatGeneralAccess } from '@/lib/chat/general-settings';
+
+/**
+ * The person's Chat settings (CHAT-01 items 4f, 9d, 16; CHAT-04 item 16;
+ * Settings › General; DECISIONS N3): written to their own chat_user_prefs row, only with the new
+ * Chat on, only what they may pick, and answered as a value — never thrown
+ * (#1777).
+ */
+
+const db = vi.hoisted(() => ({
+  user: { id: 'user-1' } as { id: string } | null,
+  upserts: [] as { row: unknown; options: unknown }[],
+  error: null as { message: string } | null,
+  throws: false,
+  access: {
+    modes: true,
+    fullAutoLock: null,
+    slack: false,
+  } as ChatGeneralAccess | null,
+}));
+
+vi.mock('@/lib/supabase/server', () => ({
+  createClient: async () => {
+    if (db.throws) throw new Error('down');
+    return {
+      auth: { getUser: async () => ({ data: { user: db.user } }) },
+      from: (table: string) => ({
+        select: () => ({
+          eq: () => ({
+            maybeSingle: async () => ({ data: { organization_id: 'org-1' }, error: null }),
+          }),
+        }),
+        upsert: async (row: unknown, options: unknown) => {
+          expect(table).toBe('chat_user_prefs');
+          db.upserts.push({ row, options });
+          return { error: db.error };
+        },
+      }),
+    };
+  },
+}));
+vi.mock('@/lib/supabase/admin', () => ({ supabaseAdmin: {} }));
+vi.mock('@/lib/chat/general-settings', async (original) => ({
+  ...(await original<typeof import('@/lib/chat/general-settings')>()),
+  readChatGeneral: vi.fn(async () => (db.access ? { settings: {}, access: db.access } : null)),
+}));
+
+const {
+  dismissAgentsForYou,
+  dismissChatWelcome,
+  markFocusPrompted,
+  saveChatFocus,
+  saveChatGeneralSettings,
+  saveChatMenuOpen,
+  saveChatPanelSize,
+  saveChatRailOpen,
+  saveDefaultHome,
+  saveHomeSeen,
+  saveUsageNoticePeriod,
+  skipChatFocus,
+} = await import('./chat-prefs');
+const { readChatGeneral } = await import('@/lib/chat/general-settings');
+
+let errorLog: ReturnType<typeof vi.spyOn>;
+
+beforeEach(() => {
+  vi.stubEnv('CHAT_AGENTIC', 'true');
+  db.user = { id: 'user-1' };
+  db.upserts = [];
+  db.error = null;
+  db.throws = false;
+  db.access = { modes: true, fullAutoLock: null, slack: false };
+  errorLog = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+});
+afterEach(() => {
+  vi.unstubAllEnvs();
+  errorLog.mockRestore();
+});
+
+describe('saveChatMenuOpen and saveChatRailOpen', () => {
+  it("keeps the choice on the person's own row", async () => {
+    expect(await saveChatMenuOpen(false)).toEqual({ ok: true });
+    expect(await saveChatRailOpen(true)).toEqual({ ok: true });
+    expect(db.upserts).toEqual([
+      { row: { user_id: 'user-1', menu_open: false }, options: { onConflict: 'user_id' } },
+      { row: { user_id: 'user-1', rail_open: true }, options: { onConflict: 'user_id' } },
+    ]);
+  });
+
+  it('does nothing while the new Chat is off, signed out or for a bad value', async () => {
+    db.user = null;
+    expect(await saveChatMenuOpen(true)).toEqual({ ok: false });
+    expect(await saveChatRailOpen(true)).toEqual({ ok: false });
+    db.user = { id: 'user-1' };
+    vi.stubEnv('CHAT_AGENTIC', 'false');
+    expect(await saveChatMenuOpen(true)).toEqual({ ok: false });
+    expect(await saveChatRailOpen(true)).toEqual({ ok: false });
+    vi.stubEnv('CHAT_AGENTIC', 'true');
+    expect(await saveChatMenuOpen('yes' as unknown as boolean)).toEqual({ ok: false });
+    expect(await saveChatRailOpen(1 as unknown as boolean)).toEqual({ ok: false });
+    expect(db.upserts).toEqual([]);
+  });
+
+  it('answers a failed write or a thrown error as a value', async () => {
+    db.error = { message: 'nope' };
+    expect(await saveChatMenuOpen(true)).toEqual({ ok: false });
+    expect(await saveChatRailOpen(true)).toEqual({ ok: false });
+    db.throws = true;
+    expect(await saveChatMenuOpen(true)).toEqual({ ok: false });
+    expect(await saveChatRailOpen(true)).toEqual({ ok: false });
+  });
+});
+
+describe('saveChatGeneralSettings', () => {
+  it('keeps each General setting as its column', async () => {
+    expect(
+      await saveChatGeneralSettings({
+        defaultMode: 'ask_first',
+        answerLanguage: 'tr',
+        notifyVia: 'inbox',
+        showThought: false,
+        panelOnPages: false,
+      }),
+    ).toEqual({ ok: true });
+    expect(await saveChatGeneralSettings({ answerLanguage: null })).toEqual({ ok: true });
+    expect(db.upserts.map((u) => u.row)).toEqual([
+      {
+        user_id: 'user-1',
+        default_mode: 'ask_first',
+        answer_language: 'tr',
+        notify_via: 'inbox',
+        show_thought: false,
+        panel_on_pages: false,
+      },
+      { user_id: 'user-1', answer_language: null },
+    ]);
+    expect(readChatGeneral).toHaveBeenCalledWith({ userId: 'user-1', organizationId: 'org-1' });
+  });
+
+  it('refuses an unknown setting, a bad value or nothing at all', async () => {
+    for (const bad of [
+      {},
+      null,
+      { theme: 'dark' },
+      { defaultMode: 'yolo' },
+      { answerLanguage: 'xx' },
+      { showThought: 'yes' },
+    ]) {
+      expect(await saveChatGeneralSettings(bad)).toEqual({ ok: false });
+    }
+    expect(db.upserts).toEqual([]);
+  });
+
+  it('refuses what the person may not pick: a mode for a reader, locked Full auto, Slack unconnected', async () => {
+    db.access = { modes: false, fullAutoLock: null, slack: false };
+    expect(await saveChatGeneralSettings({ defaultMode: 'auto' })).toEqual({ ok: false });
+    // A reader still keeps their other settings.
+    expect(await saveChatGeneralSettings({ showThought: false })).toEqual({ ok: true });
+    db.access = { modes: true, fullAutoLock: 'plan', slack: false };
+    expect(await saveChatGeneralSettings({ defaultMode: 'full_auto' })).toEqual({ ok: false });
+    expect(await saveChatGeneralSettings({ notifyVia: 'inbox_slack' })).toEqual({ ok: false });
+    db.access = null;
+    expect(await saveChatGeneralSettings({ showThought: true })).toEqual({ ok: false });
+    expect(db.upserts.map((u) => u.row)).toEqual([{ user_id: 'user-1', show_thought: false }]);
+  });
+
+  it('answers a failure as a value', async () => {
+    db.error = { message: 'nope' };
+    expect(await saveChatGeneralSettings({ showThought: true })).toEqual({ ok: false });
+    db.throws = true;
+    expect(await saveChatGeneralSettings({ showThought: true })).toEqual({ ok: false });
+    vi.mocked(readChatGeneral).mockRejectedValueOnce(new Error('down'));
+    db.throws = false;
+    expect(await saveChatGeneralSettings({ showThought: true })).toEqual({ ok: false });
+  });
+});
+
+describe('saveChatPanelSize', () => {
+  it("keeps the panel's size on the person's own row", async () => {
+    expect(await saveChatPanelSize('wide')).toEqual({ ok: true });
+    expect(db.upserts).toEqual([
+      { row: { user_id: 'user-1', panel_size: 'wide' }, options: { onConflict: 'user_id' } },
+    ]);
+  });
+
+  it('keeps no size it does not know', async () => {
+    expect(await saveChatPanelSize('huge' as 'wide')).toEqual({ ok: false });
+    expect(db.upserts).toEqual([]);
+  });
+});
+
+describe('saveUsageNoticePeriod', () => {
+  it('keeps the period whose 80% line the person saw on their own row', async () => {
+    expect(await saveUsageNoticePeriod('2026-10-01')).toEqual({ ok: true });
+    expect(db.upserts).toEqual([
+      {
+        row: { user_id: 'user-1', usage_notice_period: '2026-10-01' },
+        options: { onConflict: 'user_id' },
+      },
+    ]);
+  });
+
+  it('keeps nothing that is not a day', async () => {
+    expect(await saveUsageNoticePeriod('2026-10-01T00:00:00Z')).toEqual({ ok: false });
+    expect(await saveUsageNoticePeriod(7 as unknown as string)).toEqual({ ok: false });
+    expect(db.upserts).toEqual([]);
+  });
+});
+
+describe('saveHomeSeen', () => {
+  it('keeps when the person left Chat Home on their own row', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-10-31T09:00:00Z'));
+    expect(await saveHomeSeen()).toEqual({ ok: true });
+    vi.useRealTimers();
+    expect(db.upserts).toEqual([
+      {
+        row: { user_id: 'user-1', home_seen_at: '2026-10-31T09:00:00.000Z' },
+        options: { onConflict: 'user_id' },
+      },
+    ]);
+  });
+});
+
+describe('dismissAgentsForYou (00483)', () => {
+  it('keeps when the person hid Agents for you on their own row, for every device', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-11-05T09:00:00Z'));
+    expect(await dismissAgentsForYou()).toEqual({ ok: true });
+    vi.useRealTimers();
+    expect(db.upserts).toEqual([
+      {
+        row: { user_id: 'user-1', agents_for_you_dismissed_at: '2026-11-05T09:00:00.000Z' },
+        options: { onConflict: 'user_id' },
+      },
+    ]);
+  });
+
+  it('answers a failed save, signed out or with the new Chat off, as a value', async () => {
+    db.error = { message: 'down' };
+    expect(await dismissAgentsForYou()).toEqual({ ok: false });
+    db.error = null;
+    db.user = null;
+    expect(await dismissAgentsForYou()).toEqual({ ok: false });
+    db.user = { id: 'user-1' };
+    vi.stubEnv('CHAT_AGENTIC', 'false');
+    expect(await dismissAgentsForYou()).toEqual({ ok: false });
+  });
+});
+
+describe('dismissChatWelcome (00486)', () => {
+  it("keeps Not now on the person's own row, so the welcome card stays hidden", async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-11-06T09:00:00Z'));
+    expect(await dismissChatWelcome()).toEqual({ ok: true });
+    vi.useRealTimers();
+    expect(db.upserts).toEqual([
+      {
+        row: { user_id: 'user-1', welcome_dismissed_at: '2026-11-06T09:00:00.000Z' },
+        options: { onConflict: 'user_id' },
+      },
+    ]);
+  });
+
+  it('does nothing while the new Chat is off, and answers a failure as a value', async () => {
+    vi.stubEnv('CHAT_AGENTIC', 'false');
+    expect(await dismissChatWelcome()).toEqual({ ok: false });
+    vi.stubEnv('CHAT_AGENTIC', 'true');
+    db.error = { message: 'nope' };
+    expect(await dismissChatWelcome()).toEqual({ ok: false });
+  });
+});
+
+describe('saveChatFocus, saveDefaultHome, skipChatFocus and markFocusPrompted (CHAT-24 §3)', () => {
+  it('keeps the picks in their order with Home on them, none as the Default view, a skip as none, and when the picker opened', async () => {
+    expect(await saveChatFocus(['pd', 'comp'])).toEqual({ ok: true });
+    expect(await saveChatFocus([])).toEqual({ ok: true });
+    expect(await saveDefaultHome()).toEqual({ ok: true });
+    expect(await skipChatFocus()).toEqual({ ok: true });
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-10-31T09:00:00Z'));
+    expect(await markFocusPrompted()).toEqual({ ok: true });
+    vi.useRealTimers();
+    expect(db.upserts.map((u) => u.row)).toEqual([
+      { user_id: 'user-1', focus: ['pd', 'comp'], home_view: 'focus' },
+      { user_id: 'user-1', focus: [], home_view: 'default' },
+      // The Default view over a focus keeps the focus, for the picker to tick (00485).
+      { user_id: 'user-1', home_view: 'default' },
+      { user_id: 'user-1', focus: [] },
+      { user_id: 'user-1', focus_prompted_at: '2026-10-31T09:00:00.000Z' },
+    ]);
+  });
+
+  it('keeps no area it does not know, none twice, and nothing that is not a list', async () => {
+    for (const bad of [['pd', 'pd'], ['devtools'], 'pd', null, [1]]) {
+      expect(await saveChatFocus(bad)).toEqual({ ok: false });
+    }
+    expect(db.upserts).toEqual([]);
+  });
+
+  it('does nothing while the new Chat is off, and answers a failure as a value', async () => {
+    vi.stubEnv('CHAT_AGENTIC', 'false');
+    expect(await saveChatFocus(['lead'])).toEqual({ ok: false });
+    expect(await skipChatFocus()).toEqual({ ok: false });
+    vi.stubEnv('CHAT_AGENTIC', 'true');
+    db.error = { message: 'nope' };
+    expect(await saveChatFocus(['lead'])).toEqual({ ok: false });
+    db.throws = true;
+    expect(await markFocusPrompted()).toEqual({ ok: false });
+  });
+});

@@ -6,12 +6,14 @@ import messages from '../../../messages/en.json';
 import { UpgradeDialogContext } from '@/components/providers/upgrade-gate';
 
 /**
- * Settings › API keys on a read-only workspace (plan not active): the keys
+ * Settings › MCP & API Keys on a read-only workspace (plan not active): the keys
  * show and both New key and revoking stay open. A key costs nothing, and the
  * MCP surface it opens only reads for such a workspace.
  */
 
 vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+// The Connected apps card's Choose a plan link (MCP over OAuth).
+vi.mock('@/i18n/navigation', () => ({ Link: () => null }));
 
 const { ApiKeysSection } = await import('./api-keys-section');
 
@@ -75,6 +77,12 @@ const button = (text: string) =>
   [...document.body.querySelectorAll('button')].find((b) => b.textContent?.trim() === text);
 
 describe('ApiKeysSection', () => {
+  it('is titled MCP & API Keys, as the Settings menu names it', async () => {
+    await render(false);
+    expect(container.querySelector('[data-slot="card-title"]')?.textContent).toBe('MCP & API Keys');
+    expect(messages.settings.apiKeys).toBe('MCP & API Keys');
+  });
+
   it('creates and revokes keys on a read-only workspace', async () => {
     await render(true);
     expect(container.textContent).toContain('MCP — laptop');
@@ -87,6 +95,100 @@ describe('ApiKeysSection', () => {
     await act(async () => button('Revoke')!.click());
     expect(fetchMock).toHaveBeenCalledWith('/api/keys/k1', { method: 'DELETE' });
     expect(openUpgrade).not.toHaveBeenCalled();
+  });
+
+  it('says on the cloud that MCP writes need Growth, and nothing self-hosted', async () => {
+    vi.stubEnv('NEXT_PUBLIC_IS_CLOUD', 'true');
+    await render(false);
+    expect(container.querySelector('[data-slot="mcp-plan-note"]')?.textContent).toBe(
+      'On Starter and in the free trial, MCP tools and the API can read. Changes need Growth.',
+    );
+    act(() => root.unmount());
+    vi.stubEnv('NEXT_PUBLIC_IS_CLOUD', 'false');
+    root = createRoot(container);
+    await render(false);
+    expect(container.querySelector('[data-slot="mcp-plan-note"]')).toBeNull();
+    vi.unstubAllEnvs();
+  });
+
+  it('shows the new key and its MCP setup outside session replays', async () => {
+    fetchMock.mockImplementation(async (_url: string, init?: RequestInit) =>
+      init?.method === 'POST'
+        ? json({ key: { id: 'k2', name: 'laptop', prefix: 'ak_9876', token: 'ak_9876_secret' } })
+        : json({ keys: [] }),
+    );
+    await render(false);
+    await act(async () => button('New key')!.click());
+    const name = document.querySelector<HTMLInputElement>('#apiKeyName')!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(
+        name,
+        'laptop',
+      );
+      name.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await act(async () => button('Create')!.click());
+
+    const shown = [...document.querySelectorAll('code, pre')].filter((el) =>
+      el.textContent?.includes('ak_9876_secret'),
+    );
+    expect(shown.map((el) => el.tagName)).toEqual(['CODE', 'PRE']);
+    for (const el of shown) expect(el.closest('.ph-no-capture')).not.toBeNull();
+  });
+
+  it.each([
+    ['on', true],
+    ['off', false],
+  ])('says Claude and ChatGPT can sign in only while app sign-in is %s', async (_on, on) => {
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === '/api/oauth/connections') {
+        return on
+          ? json({ connections: [], access: 'ok', isAdmin: true })
+          : json({ error: 'not_found' }, 404);
+      }
+      return init?.method === 'POST'
+        ? json({ key: { id: 'k2', name: 'laptop', prefix: 'ak_9876', token: 'ak_9876_secret' } })
+        : json({ keys: [] });
+    });
+    await render(false);
+    expect(container.textContent?.includes('Claude and ChatGPT: add this address')).toBe(on);
+    expect(container.textContent?.includes('Create a key to get a ready-to-paste setup')).toBe(!on);
+
+    // The new key's setup for Claude Desktop: with sign-in on, it says the key can be left out.
+    await act(async () => button('New key')!.click());
+    const name = document.querySelector<HTMLInputElement>('#apiKeyName')!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(
+        name,
+        'laptop',
+      );
+      name.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await act(async () => button('Create')!.click());
+    const trigger = document.querySelector<HTMLElement>('[role="dialog"] [role="combobox"]')!;
+    await act(async () => {
+      trigger.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true }));
+      trigger.click();
+    });
+    const list = document.getElementById(trigger.getAttribute('aria-controls')!)!;
+    const option = [...list.querySelectorAll<HTMLElement>('[role="option"]')].find(
+      (o) => o.textContent === 'Claude Desktop',
+    )!;
+    // Base UI picks the highlighted option: the pointer moves onto it first.
+    await act(async () => {
+      option.dispatchEvent(new MouseEvent('mousemove', { bubbles: true }));
+    });
+    await act(async () => {
+      option.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true }));
+      option.click();
+    });
+    const where = document.querySelector('[data-slot="mcp-connect-where"]')?.textContent;
+    expect(where).toBe(
+      on
+        ? messages.settings.apiKeys_connectWhereClaudeDesktopSignIn
+        : messages.settings.apiKeysConnectWhere['claude-desktop'],
+    );
+    expect(document.querySelector('pre')?.textContent).toContain('Authorization = Bearer');
   });
 
   it('opens New key on an active plan', async () => {

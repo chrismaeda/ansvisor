@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { readdirSync, readFileSync, statSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { basename, join, relative } from 'node:path';
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
@@ -22,6 +22,11 @@ import { describe, expect, it } from 'vitest';
  * setup action (assertWritable({ onboarding: true })) never runs one in its
  * file that checks without it — that check would refuse the organization
  * setup lets through.
+ *
+ * A gated action that takes a brand id hands it to its check
+ * (assertWritable({ brandId })), which refuses the demo brand (00380): a
+ * parameter named brandId, an object parameter whose type in its file has
+ * one, or a brand's own id named below.
  */
 
 const ACTIONS_DIR = join(__dirname, 'actions');
@@ -35,6 +40,18 @@ const SCHEMA = join(__dirname, '../../../supabase/schema.sql');
  */
 const OPEN_ACTIONS: Record<string, string> = {
   'organization.ts:updateAccountName': "the person's own profile",
+  'organization.ts:updateAccountTimeZone':
+    "the person's own profile: the time zone their own times are read in, nothing that costs",
+  'chat-notices.ts:markChatNoticesRead':
+    "the person's own record of seeing a notice (00441), nothing that runs or costs",
+  'chat-notices.ts:closeChatNotice':
+    "the person's own record of opening a notice about an agent (00446), nothing that runs or costs",
+  'chat-prefs.ts:saveChatMenuOpen': "the person's own Chat layout, no cost",
+  'chat-prefs.ts:saveChatRailOpen': "the person's own Chat layout, no cost",
+  'chat-prefs.ts:saveChatGeneralSettings':
+    "the person's own Chat settings, no cost; a run they start is checked by the engine",
+  'chat-prefs.ts:saveUsageNoticePeriod':
+    "the person's own record of a notice seen, nothing that costs",
   'team.ts:acceptInvitation': "the invited person's own account joins",
   'team.ts:revokeInvitation': 'takes back access, never gives it',
   'team.ts:removeMember': 'takes back access, never gives it',
@@ -47,8 +64,67 @@ const OPEN_ACTIONS: Record<string, string> = {
     'a column layout: costs nothing, and read-only shows the data the same way',
   'prompt-table-views.ts:removePromptTableView':
     'a column layout: costs nothing, and read-only shows the data the same way',
+  // A person's Today and menu state on a brand (00529): UI state, on the demo brand too.
+  'user-brand-state.ts:markSeen':
+    "the person's own record of opening a page (a menu dot clears), nothing that costs",
+  'user-brand-state.ts:setFocus':
+    "the person's own Today focus: which open actions they keep in view, nothing that costs",
+  'user-brand-state.ts:hideCard':
+    "the person's own hidden or snoozed Today cards, nothing that costs",
+  'user-brand-state.ts:markPageSeen':
+    "the person's own record of opening an action or an Audit tab (a page dot clears), nothing that costs",
   'menu-access.ts:setMyWorkAreas':
-    'the person\'s own profile; it answers "What do you work on?", which /dashboard/welcome waits on',
+    "the person's own profile: their work areas only narrow their own menu",
+  'chat-uploads.ts:prepareChatUpload':
+    'checks the plan itself (isSubscriptionActive), to answer read_only instead of throwing',
+  'chat-uploads.ts:finishChatUpload':
+    "marks the person's own file, already let up by prepareChatUpload, as arrived",
+  'chat-uploads.ts:removeChatUpload': "takes the person's own draft file away, never adds one",
+  'chat-prefs.ts:saveChatPanelSize':
+    "the person's own Chat layout (panel size), nothing that costs",
+  'chat-prefs.ts:saveHomeSeen': "the person's own record of leaving Chat Home, nothing that costs",
+  'chat-prefs.ts:dismissAgentsForYou':
+    "the person's own record of hiding Agents for you on Chat Home, nothing that costs",
+  'chat-prefs.ts:saveChatFocus':
+    "the person's own Chat focus: it only shapes suggestions, nothing that costs",
+  'chat-prefs.ts:saveDefaultHome': "the person's own Chat Home view, nothing that costs",
+  'chat-prefs.ts:dismissChatWelcome':
+    "the person's own Not now on Chat Home's welcome card (00486), nothing that costs",
+  // The product tour (00486): scripted turns in the person's own tour chat, no run. A
+  // read-only workspace and the demo meet the product through it.
+  'chat-tour.ts:showTourTopic':
+    "adds the tour's scripted turn to the person's own tour chat: no model run, nothing that costs",
+  'chat-tour.ts:endChatTour':
+    "adds the tour's last scripted line and keeps the tour ended on the person: nothing that costs",
+  'chat-prefs.ts:skipChatFocus': "the person's own Chat focus left empty, nothing that costs",
+  'chat-prefs.ts:markFocusPrompted':
+    "the person's own record of being asked their focus, nothing that costs",
+  'chat-range.ts:saveChatDateRange':
+    "the person's own Chat date range (00528): it only sets the period a run reads, nothing that costs",
+  // requestAccess writes through lib/chat/access-request-store.ts: asking an Admin
+  // costs nothing, and a read-only workspace is one of the things to ask about.
+  'chat-access-requests.ts:withdrawAccessRequest': 'takes back a request, never gives access',
+  'chat-access-requests.ts:decideAccessRequest':
+    "marks a request decided; it changes no one's access, and an approved memory line is checked against the plan by the memory store (read_only)",
+  // Chat's settings (Admins): asAdmin() checks the plan itself (ctx.plan.writable,
+  // as assertWritable) to answer read_only as a result instead of throwing.
+  'chat-settings.ts:setToolPolicy': 'checks ctx.plan.writable itself, answering read_only',
+  'chat-settings.ts:resetToolPolicies': 'checks ctx.plan.writable itself, answering read_only',
+  'chat-settings.ts:setChatSwitch': 'checks ctx.plan.writable itself, answering read_only',
+  'chat-settings.ts:setManagerExecute': 'checks ctx.plan.writable itself, answering read_only',
+  'chat-settings.ts:setAutoGoLive': 'checks ctx.plan.writable itself, answering read_only',
+  'chat-settings.ts:setModelProvider': 'checks ctx.plan.writable itself, answering read_only',
+  'chat-settings.ts:setAgentWork': 'checks ctx.plan.writable itself, answering read_only',
+  'chat-settings.ts:removeAutoChoice':
+    "removes the person's own Don't ask again tick: takes an auto-approval back, never gives one",
+  // An add-on pack (CHAT-18): only on an active, paid plan.
+  'add-ons.ts:startAddOnPurchase':
+    'checks the plan itself (subscription_status active), answering trial or no_plan',
+};
+
+/** Actions that take a brand's own id under another name: file:function → the parameter. */
+const BRAND_ID_PARAMS: Record<string, string> = {
+  'brand.ts:updateBrand': 'id',
 };
 
 /** Write routes that stay open while read-only: path:METHOD → why. */
@@ -62,6 +138,12 @@ const OPEN_ROUTES: Record<string, string> = {
   'keys/[id]:DELETE': 'revoking a key takes back access',
   'mcp:POST': 'its tools are gated one by one (gateWriteTools)',
   'mcp:DELETE': 'ends an MCP session',
+  // MCP over OAuth (#2141): no person is signed in here, and no workspace is
+  // known yet. The plan is checked at the consent page and on every MCP call.
+  'oauth/register:POST': 'an app registers itself, before any workspace: no cost',
+  'oauth/token:POST':
+    'an app redeems a code or refreshes its tokens; the MCP calls check the plan (oauthMcpAccess)',
+  'oauth/revoke:POST': 'an app ends its own connection: takes back access',
   'settings/ai-providers:DELETE': 'removing a key takes back access',
   'stripe/checkout:POST': 'billing: choosing a plan',
   'stripe/portal:POST': 'billing: the payment method',
@@ -70,6 +152,61 @@ const OPEN_ROUTES: Record<string, string> = {
   'stripe/subscription:DELETE': 'billing: canceling the plan',
   'stripe/webhook:POST': "Stripe's own calls",
   'traffic/read:POST': 'reads only',
+  'visibility/read:POST': 'reads only',
+  'prompts/read:POST': 'reads only (Tracked Prompts: the table and its volumes)',
+  // Settings › Connected apps (MCP over OAuth, #2141): Disconnect ends one of
+  // the person's own connections.
+  'oauth/connections/[id]:DELETE': 'disconnecting an app takes back access',
+  // Chat's runs: the engine answers 402 with the server's body itself
+  // (startChatRun, prepareResume), but for a request to the Admins.
+  'chat/conversations:POST':
+    'an empty chat of your own starts no cost; its first message is a run, which the engine refuses with 402',
+  'chat/conversations/[id]:PATCH':
+    'pinning, renaming, sharing or archiving your own chat starts no cost',
+  'chat/conversations/[id]:DELETE':
+    'deleting your own chat starts no cost, as the old Agent chats (#1613)',
+  // Memory (W3-11): a person's own Me lines are their personal data (KVKK/GDPR).
+  'chat/memory/[id]:DELETE':
+    "deleting your own Me memory line stays open; the store answers 402 for a brand's or the workspace's",
+  'chat/memory/[id]/restore:POST':
+    'bringing back your own Me line you just deleted; the store answers 402 for the rest',
+  'chat/memory/settings:PATCH':
+    "turning your own Use memory off or on stays open; the store answers 402 for the workspace's switch",
+  'chat/conversations/[id]/read:POST': 'marking your own chat read starts no cost',
+  'chat/home-seen:POST': "the person's own record of leaving Chat Home starts no cost",
+  'chat/whats-new/read:POST':
+    "marking What's new read is the person's own record and starts no cost",
+  'chat/conversations/[id]/restore:POST': 'undoing a delete starts no cost',
+  'chat/runs:POST': 'the engine refuses a read-only workspace with the 402 body (startChatRun)',
+  'chat/runs/[id]/approve:POST': 'the engine answers 402 (prepareResume), but for Ask your Admin',
+  'chat/runs/[id]/skip:POST': 'saying no to a change starts no cost',
+  'chat/runs/[id]/answer:POST': 'the engine answers 402 (prepareResume) while read-only',
+  'chat/runs/[id]/stop:POST': 'stopping a run starts no cost',
+  'chat/files/zip:POST': 'reads only: the picked files as one .zip, nothing kept',
+  // The Content Editor's AI image options (W4-09): making them is gated (images:POST).
+  'content/drafts/[id]/images/options:POST':
+    'dropping unused AI image options stays open (cleanup, no cost); keeping one checks the plan (writeRefusal) before it moves',
+  // The API server's cron and hooks (CHAT_INTERNAL_SECRET), never a person: the
+  // triggers fire nothing in a read-only workspace, and the agent run driver
+  // starts no run in one (readArmedOrgs, openAgentRun).
+  'internal/chat/agents/tick:POST':
+    "the server's cron; it starts no agent run in a read-only workspace",
+  'internal/chat/agents/signals:POST':
+    "the server's signal hook; it starts no agent run in a read-only workspace",
+  // The same cron after the agents': a read-only workspace's due job is kept as
+  // Skipped, and runs nothing (fireDueJobs).
+  'internal/chat/schedules/tick:POST':
+    "the server's cron; it runs no scheduled job in a read-only workspace",
+  // The API server's report card queue (CRON_SECRET): Ansvisor's own free report card, no workspace.
+  'internal/report-card/pdf:POST':
+    "draws a free report card's PDF for the API server; no workspace, nothing written",
+  // The API server's daily suggestions job (CRON_SECRET): words an action for its Slack post (#2139).
+  'internal/slack/suggestion:POST':
+    "words an action for the API server's Slack post; reads only, nothing written",
+  // The API server's Slack message for an agent run that waits (#2139): reads the card only.
+  // Its Approve and Reject (internal/chat/slack/decide) check the plan.
+  'internal/chat/slack/card:POST':
+    "reads the card an agent run waits on for the API server's Slack message; nothing written",
 };
 
 /** What checks a route's plan before it writes. */
@@ -120,6 +257,10 @@ interface FunctionFacts {
   strictGate: boolean;
   /** It calls assertWritable({ onboarding: true }). */
   onboardingGate: boolean;
+  /** The brand id it takes: `brandId`, `input.brandId`… (null when it takes none). */
+  brandParam: string | null;
+  /** It hands a brand id to assertWritable ({ brandId }). */
+  brandGate: boolean;
   /** What it awaits first, outside the functions inside it: the callee's name, else the text. */
   firstAwait: string | null;
   callees: string[];
@@ -202,20 +343,64 @@ function readFunctions(
     true,
   );
   const bound = readBindings(source);
-  const bodies = new Map<string, { node: ts.Node; exported: boolean }>();
+  // The interfaces and type aliases in the file with a brandId member.
+  const hasBrandId = (members: ts.NodeArray<ts.TypeElement>) =>
+    members.some((m) => m.name?.getText(source) === 'brandId');
+  const brandTypes = new Set<string>();
+  for (const statement of source.statements) {
+    if (ts.isInterfaceDeclaration(statement) && hasBrandId(statement.members)) {
+      brandTypes.add(statement.name.text);
+    } else if (
+      ts.isTypeAliasDeclaration(statement) &&
+      ts.isTypeLiteralNode(statement.type) &&
+      hasBrandId(statement.type.members)
+    ) {
+      brandTypes.add(statement.name.text);
+    }
+  }
+  /** The brand id a function's parameters carry, as its body names it. */
+  const brandParamOf = (fn: ts.SignatureDeclaration): string | null => {
+    for (const param of fn.parameters) {
+      const { name, type } = param;
+      if (ts.isIdentifier(name) && name.text === 'brandId') return 'brandId';
+      if (
+        ts.isObjectBindingPattern(name) &&
+        name.elements.some((e) => e.name.getText(source) === 'brandId')
+      ) {
+        return 'brandId';
+      }
+      if (
+        ts.isIdentifier(name) &&
+        type &&
+        ((ts.isTypeReferenceNode(type) && brandTypes.has(type.typeName.getText(source))) ||
+          (ts.isTypeLiteralNode(type) && hasBrandId(type.members)))
+      ) {
+        return `${name.text}.brandId`;
+      }
+    }
+    return null;
+  };
+  const bodies = new Map<string, { node: ts.Node; exported: boolean; brandParam: string | null }>();
   const isExported = (node: ts.Node) =>
     ts.canHaveModifiers(node) &&
     (ts.getModifiers(node) ?? []).some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
   for (const statement of source.statements) {
     if (ts.isFunctionDeclaration(statement) && statement.name && statement.body) {
-      bodies.set(statement.name.text, { node: statement.body, exported: isExported(statement) });
+      const name = statement.name.text;
+      bodies.set(name, {
+        node: statement.body,
+        exported: isExported(statement),
+        brandParam: BRAND_ID_PARAMS[`${basename(file)}:${name}`] ?? brandParamOf(statement),
+      });
     } else if (ts.isVariableStatement(statement)) {
       for (const declaration of statement.declarationList.declarations) {
         const init = declaration.initializer;
         if (init && (ts.isArrowFunction(init) || ts.isFunctionExpression(init))) {
-          bodies.set(declaration.name.getText(source), {
+          const name = declaration.name.getText(source);
+          bodies.set(name, {
             node: init,
             exported: isExported(statement),
+            brandParam: BRAND_ID_PARAMS[`${basename(file)}:${name}`] ?? brandParamOf(init),
           });
         }
       }
@@ -223,7 +408,7 @@ function readFunctions(
   }
 
   const facts = new Map<string, FunctionFacts>();
-  for (const [name, { node, exported }] of bodies) {
+  for (const [name, { node, exported, brandParam }] of bodies) {
     const fact: FunctionFacts = {
       exported,
       writes: [],
@@ -231,6 +416,8 @@ function readFunctions(
       gates: [],
       strictGate: false,
       onboardingGate: false,
+      brandParam,
+      brandGate: false,
       firstAwait: firstAwaitIn(node),
       callees: [],
     };
@@ -264,6 +451,19 @@ function readFunctions(
             const onboarding = n.arguments.some((a) => /onboarding:\s*true/.test(a.getText()));
             if (onboarding) fact.onboardingGate = true;
             else fact.strictGate = true;
+            // Its brand: `{ brandId }`, or `{ brandId: <the brand id it takes> }`.
+            const arg = n.arguments[0];
+            if (arg && ts.isObjectLiteralExpression(arg)) {
+              for (const prop of arg.properties) {
+                if (prop.name?.getText() !== 'brandId') continue;
+                const value = ts.isShorthandPropertyAssignment(prop)
+                  ? 'brandId'
+                  : ts.isPropertyAssignment(prop)
+                    ? prop.initializer.getText()
+                    : null;
+                if (value !== null && value === brandParam) fact.brandGate = true;
+              }
+            }
           }
           if (bodies.has(called)) fact.callees.push(called);
           if (
@@ -379,6 +579,29 @@ describe('read-only coverage', () => {
       }
     }
     expect(late).toEqual([]);
+  });
+
+  it('has every gated action that takes a brand id hand it to the check, which refuses the demo brand', () => {
+    const missing: string[] = [];
+    let takers = 0;
+    for (const { file, facts } of actionFiles) {
+      for (const [name, fact] of facts) {
+        const key = `${file}:${name}`;
+        if (!fact.exported || key in OPEN_ACTIONS || !reach(facts, name).writes.length) continue;
+        if (!fact.brandParam) continue;
+        takers += 1;
+        if (!fact.brandGate) missing.push(`${key} (takes ${fact.brandParam})`);
+      }
+    }
+    expect(missing).toEqual([]);
+    // The brand's own id under another name is still one it takes.
+    for (const key of Object.keys(BRAND_ID_PARAMS)) {
+      const [file, name] = key.split(':');
+      const fact = actionFiles.find((a) => a.file === file)?.facts.get(name);
+      expect(fact?.brandParam, key).toBe(BRAND_ID_PARAMS[key]);
+    }
+    // Sanity: the scan finds the actions that take a brand.
+    expect(takers).toBeGreaterThan(40);
   });
 
   it("has no setup action run a function in its file whose check refuses setup's organization", () => {

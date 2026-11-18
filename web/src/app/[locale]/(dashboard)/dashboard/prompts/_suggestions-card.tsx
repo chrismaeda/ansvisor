@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback, useMemo, useTransition, useRef } from 'react';
 import { createPortal } from 'react-dom';
-import { useTranslations } from 'next-intl';
+import { useFormatter, useTranslations } from 'next-intl';
 import { Link } from '@/i18n/navigation';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -25,6 +25,9 @@ import {
   BarChart3,
   Clock,
   ShoppingBag,
+  Package,
+  Building2,
+  Tags,
 } from 'lucide-react';
 import { Filter } from 'lucide-react';
 import { Input } from '@/components/ui/input';
@@ -44,19 +47,24 @@ import {
   EstimateRange,
   createEstimateNoteHandle,
 } from '@/components/prompts/volume-estimate';
-import { readUrlChoice } from '@/lib/url-state';
+import { readUrlChoice, readUrlParam } from '@/lib/url-state';
 import {
   getPromptSuggestions,
   refreshPromptSuggestions,
   acceptSuggestion,
   dismissSuggestion,
+  dismissSuggestions,
   trackSuggestions,
+  type BusinessHubTopicsResult,
   type PromptSuggestion,
 } from '@/lib/actions/prompt-suggestions';
-import type { PlanId } from '@/config/plans';
 import { priceText } from '@/lib/shopping/price';
 import {
+  businessHubSourceData,
+  catalogProductSourceData,
   catalogSourceData,
+  fromBusinessHub,
+  fromCatalog,
   fromYourData,
   gaSourceData,
   gscSourceData,
@@ -65,6 +73,29 @@ import {
 } from '@/lib/prompt-suggestion-source';
 import type { SuggestionSourceStates } from '@/lib/actions/integrations';
 import { useUpgradeGate } from '@/components/providers/upgrade-gate';
+import { useUserRole } from '@/hooks/use-user-role';
+import { readWithOneRetry, type ReadFailure } from '@/lib/api-failure';
+import { NO_TOPICS, isNoTopics } from '@/lib/topics-required';
+import { useFailureToast } from '@/hooks/use-failure-toast';
+import type { PromptAddFailureCode } from '@/lib/actions/prompt';
+import { useTopicFirstDialog } from '@/components/prompts/topic-first';
+import { SuggestionsLoadError } from './_suggestions-load-error';
+import { BusinessHubTopicsDialog } from './_business-hub-topics-dialog';
+import { GenerateByTopic } from './_topic-prompts';
+import { SuggestionText } from './_suggestion-text';
+import {
+  trackSavedWaiting,
+  useWaitingForSpotToast,
+  waitingTitle,
+} from '@/components/prompts/waiting-for-spot';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 
 /**
  * Analytics evidence, in the customer's own numbers (#705). A blind spot is
@@ -158,14 +189,45 @@ function HoverTip({ content, children }: { content: string; children: React.Reac
  * Every suggestion is phrased by our own generation step, so `Ansvisor Agents`
  * is always present; a data source badge joins it when the suggestion was
  * mined from the brand's own Search Console or Analytics, or drawn from its
- * catalog (ECOM-003), rather than from the model alone. Two badges is the
- * honest reading — the data and the phrasing come from different places.
+ * catalog (ECOM-003: a category; AC plan P-8: a top product), rather than
+ * from the model alone. Two badges is the honest reading — the data and the
+ * phrasing come from different places.
  */
 function SourceBadges({ suggestion }: { suggestion: PromptSuggestion }) {
   const tCatalog = useTranslations('prompts.suggestions.catalog');
+  const tHub = useTranslations('prompts.suggestions.businessHub');
+  const format = useFormatter();
+  const hub = businessHubSourceData(suggestion);
+  // The period's last day is a date; when it was entered, a moment.
+  const hubTip = hub
+    ? hub.periodEnd
+      ? tHub('tooltipPeriod', {
+          topic: hub.topic,
+          date: format.dateTime(new Date(`${hub.periodEnd}T00:00:00Z`), {
+            dateStyle: 'medium',
+            timeZone: 'UTC',
+          }),
+        })
+      : tHub('tooltip', {
+          topic: hub.topic,
+          date: format.dateTime(new Date(hub.enteredAt), { dateStyle: 'medium' }),
+        })
+    : null;
   const gsc = gscSourceData(suggestion);
   const ga = gaSourceData(suggestion);
   const catalog = catalogSourceData(suggestion);
+  const product = catalogProductSourceData(suggestion);
+  const catalogTip = product
+    ? tCatalog('tooltipProduct', { product: product.product })
+    : catalog && catalog.priceUnder !== null
+      ? tCatalog('tooltipPrice', {
+          category: catalog.category,
+          products: catalog.products,
+          price: priceText(catalog.priceUnder, catalog.currency),
+        })
+      : catalog
+        ? tCatalog('tooltip', { category: catalog.category, products: catalog.products })
+        : null;
 
   return (
     <div className="flex flex-wrap items-center gap-1.5">
@@ -202,21 +264,19 @@ function SourceBadges({ suggestion }: { suggestion: PromptSuggestion }) {
           </Badge>
         </HoverTip>
       )}
-      {catalog && (
-        <HoverTip
-          content={
-            catalog.priceUnder !== null
-              ? tCatalog('tooltipPrice', {
-                  category: catalog.category,
-                  products: catalog.products,
-                  price: priceText(catalog.priceUnder, catalog.currency),
-                })
-              : tCatalog('tooltip', { category: catalog.category, products: catalog.products })
-          }
-        >
+      {catalogTip && (
+        <HoverTip content={catalogTip}>
           <Badge variant="outline" className="gap-1.5 bg-card text-xs font-normal">
             <ShoppingBag className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
             {tCatalog('badge')}
+          </Badge>
+        </HoverTip>
+      )}
+      {hubTip && (
+        <HoverTip content={hubTip}>
+          <Badge variant="outline" className="gap-1.5 bg-card text-xs font-normal">
+            <Building2 className="h-3.5 w-3.5 text-teal-600 dark:text-teal-400" />
+            {tHub('badge')}
           </Badge>
         </HoverTip>
       )}
@@ -231,12 +291,21 @@ function SourceBadges({ suggestion }: { suggestion: PromptSuggestion }) {
 }
 
 /** Which data source a row carries, for the source filter. */
-type SourceFilter = 'all' | 'data' | 'gsc' | 'ga' | 'shopping' | 'agents';
+type SourceFilter = 'all' | 'data' | 'gsc' | 'ga' | 'shopping' | 'business_hub' | 'agents';
 
-const SOURCE_FILTERS: SourceFilter[] = ['all', 'data', 'gsc', 'ga', 'shopping', 'agents'];
+const SOURCE_FILTERS: SourceFilter[] = [
+  'all',
+  'data',
+  'gsc',
+  'ga',
+  'shopping',
+  'business_hub',
+  'agents',
+];
 
-// Shopping's label is translated (prompts.suggestions.catalog.filter).
-const SOURCE_FILTER_LABELS: Record<Exclude<SourceFilter, 'shopping'>, string> = {
+// Shopping's and Business Hub's labels are translated
+// (prompts.suggestions.catalog.filter, prompts.suggestions.businessHub.filter).
+const SOURCE_FILTER_LABELS: Record<Exclude<SourceFilter, 'shopping' | 'business_hub'>, string> = {
   all: 'All sources',
   // Either Google source: Getting started's high-value prompts step links here
   // with ?source=data.
@@ -253,10 +322,10 @@ function isMeasuredSuggestion(s: PromptSuggestion): boolean {
 interface Props {
   brandId: string;
   onAccepted?: () => void;
+  /** "Add a topic" on a brand without one: the page's Topics tab, with Add Topic open. */
+  onAddTopic?: () => void;
   /** Connected sources and whether their data has landed; null when unknown. */
   sourceStates: SuggestionSourceStates | null;
-  /** The organization's plan, for the prompt limit note's wording; absent while unknown. */
-  planId?: PlanId;
   /** Where to go for more prompts (upgrade or contact us), shown in the prompt limit note. */
   limitActions?: React.ReactNode;
 }
@@ -308,8 +377,8 @@ function sourceNotice(
 export function SuggestionsCard({
   brandId,
   onAccepted,
+  onAddTopic,
   sourceStates,
-  planId,
   limitActions,
 }: Props) {
   const t = useTranslations('prompts.suggestions');
@@ -317,40 +386,65 @@ export function SuggestionsCard({
   // dismissing open the upgrade dialog instead.
   const { guard } = useUpgradeGate();
   const tActions = useTranslations('readOnly.actions');
+  // Adding a prompt is for admins and managers; dismissing a suggestion is
+  // open to analysts too, as the server and the table's update rule allow.
+  const { role, canManage } = useUserRole();
+  const canDismiss = canManage || role === 'analyst';
+  // Generating suggestions costs AI: admins and managers start it.
+  const tManagers = useTranslations('managersOnly');
   // One method note for the list's volume ranges (PROMPT-013).
   const volumeNote = useMemo(() => createEstimateNoteHandle(), []);
   const [suggestions, setSuggestions] = useState<PromptSuggestion[]>([]);
   const [loading, setLoading] = useState(false);
   const [loaded, setLoaded] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ReadFailure | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [pendingId, setPendingId] = useState<string | null>(null);
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all');
+  // ChatGPT Business Hub's topics (BUSINESS_HUB_ENABLED, read with the list).
+  const [businessHub, setBusinessHub] = useState(false);
+  const [hubOpen, setHubOpen] = useState(false);
+  // Generate by topic's picker (moved from the brand's Manage prompts page).
+  const [byTopicOpen, setByTopicOpen] = useState(false);
+  // Suggestions edited before they are added, by id: + and Add All save these texts.
+  const [editedTexts, setEditedTexts] = useState<Record<string, string>>({});
+  const textOf = (s: PromptSuggestion) => editedTexts[s.id] ?? s.suggestedText;
+  // A link can ask for its dialog (?source=business_hub&hub=1), once the list says it's on.
+  const hubAsked = useRef(false);
   // A link can open the list on a source (?source=data).
   useEffect(() => {
     setSourceFilter(readUrlChoice<SourceFilter>('source', SOURCE_FILTERS, 'all'));
+    hubAsked.current = readUrlParam('hub') === '1';
   }, []);
   const [search, setSearch] = useState('');
   const [clearing, setClearing] = useState(false);
+  // Clear All asks first: how many it dismisses, and how many of them come
+  // from Search Console or Analytics (hidden for 30 days once dismissed).
+  const [confirmClear, setConfirmClear] = useState(false);
   const [adding, setAdding] = useState(false);
-  // What Add All left behind when the plan's prompt limit stopped it.
-  const [limitNote, setLimitNote] = useState<{ added: number; left: number } | null>(null);
+  // Add All saved some waiting for a spot, the plan's prompt locations full.
+  const [limitNote, setLimitNote] = useState<{ added: number; waiting: number } | null>(null);
+  const tWaiting = useTranslations('prompts.waiting');
+  const showWaiting = useWaitingForSpotToast();
   const [, startTransition] = useTransition();
+  // A brand with no topic yet: generating or adding asks for one first.
+  const topicFirst = useTopicFirstDialog({ onAddTopic });
+  // A failed generation in plain words, with the one thing to do (or the upgrade dialog).
+  const failureToast = useFailureToast();
 
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
-    try {
-      const { suggestions: s } = await getPromptSuggestions(brandId);
-      setSuggestions(s);
+    // Once more by itself when the API didn't answer, as while it restarts.
+    const read = await readWithOneRetry(() => getPromptSuggestions(brandId));
+    if (read.ok) {
+      setSuggestions(read.suggestions);
+      setBusinessHub(read.businessHub === true);
       setLoaded(true);
-    } catch (err) {
-      console.error('Failed to load suggestions:', err);
-      setError(err instanceof Error ? err.message : 'Failed to load suggestions');
-      toast.error('Failed to load suggestions');
-    } finally {
-      setLoading(false);
+    } else {
+      setError(read);
     }
+    setLoading(false);
   }, [brandId]);
 
   useEffect(() => {
@@ -358,6 +452,7 @@ export function SuggestionsCard({
     setSuggestions([]);
     setError(null);
     setLimitNote(null);
+    setEditedTexts({});
   }, [brandId]);
 
   // Fetching on mount is safe here because this component only mounts when
@@ -370,16 +465,40 @@ export function SuggestionsCard({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded, brandId]);
 
+  // Admins and managers generate suggestions; the link's dialog opens for them only.
+  const canUseHub = businessHub && canManage;
+  useEffect(() => {
+    if (!canUseHub || !hubAsked.current) return;
+    hubAsked.current = false;
+    setHubOpen(true);
+  }, [canUseHub]);
+
+  /** Business Hub's prompts join the list at its top, and the list shows them alone. */
+  const handleHubAdded = (result: BusinessHubTopicsResult) => {
+    if (result.suggestions.length === 0) return;
+    const ids = new Set(result.suggestions.map((s) => s.id));
+    setSuggestions((prev) => [...result.suggestions, ...prev.filter((s) => !ids.has(s.id))]);
+    setLoaded(true);
+    setError(null);
+    setSourceFilter('business_hub');
+  };
+
   const handleRefresh = async () => {
     setRefreshing(true);
     try {
       const fresh = await refreshPromptSuggestions(brandId);
-      setSuggestions(fresh);
+      if (!fresh.ok) {
+        if (fresh.failure === NO_TOPICS) topicFirst.show();
+        else failureToast(fresh.failure);
+        return;
+      }
+      setSuggestions(fresh.suggestions);
       setLoaded(true);
       setError(null);
       toast.success('Suggestions refreshed');
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Refresh failed');
+    } catch {
+      // The request to Next itself failed: production hides why.
+      failureToast('failed');
     } finally {
       setRefreshing(false);
     }
@@ -391,26 +510,36 @@ export function SuggestionsCard({
       if (sourceFilter === 'data' && !fromYourData(s)) return false;
       if (sourceFilter === 'gsc' && !gscSourceData(s)) return false;
       if (sourceFilter === 'ga' && !gaSourceData(s)) return false;
-      if (sourceFilter === 'shopping' && !catalogSourceData(s)) return false;
-      if (sourceFilter === 'agents' && (fromYourData(s) || catalogSourceData(s))) return false;
+      if (sourceFilter === 'shopping' && !fromCatalog(s)) return false;
+      if (sourceFilter === 'business_hub' && !fromBusinessHub(s)) return false;
+      if (sourceFilter === 'agents' && (fromYourData(s) || fromCatalog(s) || fromBusinessHub(s))) {
+        return false;
+      }
       if (!q) return true;
       return (
         s.suggestedText.toLowerCase().includes(q) ||
+        (editedTexts[s.id] ?? '').toLowerCase().includes(q) ||
         (s.topicName ?? '').toLowerCase().includes(q) ||
         (s.reason ?? '').toLowerCase().includes(q)
       );
     });
-  }, [suggestions, sourceFilter, search]);
+  }, [suggestions, sourceFilter, search, editedTexts]);
 
-  // Shopping is offered once the catalog gave a suggestion (ECOM-003), or a link asked for it.
-  const filters = SOURCE_FILTERS.filter(
-    (key) =>
-      key !== 'shopping' ||
-      sourceFilter === 'shopping' ||
-      suggestions.some((s) => catalogSourceData(s) !== null),
+  // Shopping is offered once the catalog gave a suggestion (ECOM-003, P-8),
+  // and ChatGPT Business Hub once its topics gave one, or a link asked for either.
+  const filters = SOURCE_FILTERS.filter((key) =>
+    key === 'shopping'
+      ? sourceFilter === 'shopping' || suggestions.some(fromCatalog)
+      : key === 'business_hub'
+        ? sourceFilter === 'business_hub' || suggestions.some(fromBusinessHub)
+        : true,
   );
   const filterLabel = (key: SourceFilter) =>
-    key === 'shopping' ? t('catalog.filter') : SOURCE_FILTER_LABELS[key];
+    key === 'shopping'
+      ? t('catalog.filter')
+      : key === 'business_hub'
+        ? t('businessHub.filter')
+        : SOURCE_FILTER_LABELS[key];
 
   const notice = useMemo(
     () => sourceNotice(sourceStates, suggestions),
@@ -418,30 +547,33 @@ export function SuggestionsCard({
   );
 
   /**
-   * Dismiss only generated rows on screen. Search Console and Analytics rows
-   * carry a 30-day cooldown, so bulk clear keeps them visible unless the user
-   * explicitly dismisses each one.
+   * Dismiss every suggestion listed, after the confirmation: each one as
+   * one by one would, so Search Console and Analytics ones stay hidden for
+   * 30 days. They leave the list at once; the ones that couldn't be
+   * dismissed come back.
    */
-  const handleClearAll = () => {
-    const preserved = visible.filter(isMeasuredSuggestion);
-    const doomed = visible.filter((s) => !isMeasuredSuggestion(s));
-    if (preserved.length > 0) {
-      toast.info(t('measuredSuggestionsKept'));
-    }
+  const handleClearAll = async () => {
+    setConfirmClear(false);
+    const doomed = visible;
     if (doomed.length === 0) return;
     setClearing(true);
     const ids = new Set(doomed.map((d) => d.id));
     setSuggestions((prev) => prev.filter((x) => !ids.has(x.id)));
-    Promise.allSettled(doomed.map((d) => dismissSuggestion(d.id)))
-      .then((results) => {
-        const failed = results.filter((r) => r.status === 'rejected').length;
-        if (failed > 0) {
-          toast.error(`${failed} suggestion${failed === 1 ? '' : 's'} could not be dismissed`);
-          load();
-        }
-      })
-      .finally(() => setClearing(false));
+    try {
+      const result = await dismissSuggestions([...ids]);
+      if (!result.ok) {
+        setSuggestions((prev) => [...prev, ...doomed]);
+        toast.error(t('clearAllFailed'));
+      } else if (result.failed.length > 0) {
+        const failed = new Set(result.failed);
+        setSuggestions((prev) => [...prev, ...doomed.filter((d) => failed.has(d.id))]);
+        toast.error(t('clearAllPartial', { count: failed.size }));
+      }
+    } finally {
+      setClearing(false);
+    }
   };
+  const measuredToClear = visible.filter(isMeasuredSuggestion).length;
 
   /**
    * Track every suggestion on screen, in batches trackSuggestions takes. Each
@@ -452,15 +584,28 @@ export function SuggestionsCard({
   const handleAddAll = async () => {
     const ids = visible.map((s) => s.id);
     if (ids.length === 0) return;
+    // The texts edited before adding; the rest keep the suggestion's own.
+    const edited = new Map(
+      ids.filter((id) => editedTexts[id] !== undefined).map((id) => [id, editedTexts[id]]),
+    );
     setAdding(true);
     setLimitNote(null);
     const added: string[] = [];
     const gone: string[] = [];
-    let failure: { error: string; code?: 'plan_limit' } | null = null;
+    let waiting = 0;
+    let failure: { error: string; code?: PromptAddFailureCode } | null = null;
     try {
       for (let i = 0; i < ids.length && !failure; i += TRACK_BATCH) {
-        const result = await trackSuggestions(ids.slice(i, i + TRACK_BATCH));
+        const batch = ids.slice(i, i + TRACK_BATCH);
+        const texts = Object.fromEntries(
+          batch.filter((id) => edited.has(id)).map((id) => [id, edited.get(id)!]),
+        );
+        const result =
+          Object.keys(texts).length > 0
+            ? await trackSuggestions(batch, { texts })
+            : await trackSuggestions(batch);
         added.push(...result.trackedIds);
+        waiting += result.waitingIds?.length ?? 0;
         // Accepted or dismissed elsewhere: they leave the list too.
         gone.push(...result.skippedIds);
         if (result.error) failure = { error: result.error, code: result.code };
@@ -471,12 +616,16 @@ export function SuggestionsCard({
 
     const leaving = new Set([...added, ...gone]);
     if (leaving.size > 0) setSuggestions((prev) => prev.filter((x) => !leaving.has(x.id)));
-    if (added.length > 0) {
-      onAccepted?.();
+    if (added.length > 0) onAccepted?.();
+    if (waiting > 0) {
+      // "N added, M waiting for a spot" in the note, in place of the success toast.
+      trackSavedWaiting('add_all', waiting);
+      setLimitNote({ added: added.length - waiting, waiting });
+    } else if (added.length > 0) {
       toast.success(t('addAllDone', { count: added.length }));
     }
-    if (failure?.code === 'plan_limit') {
-      setLimitNote({ added: added.length, left: ids.length - leaving.size });
+    if (isNoTopics(failure)) {
+      topicFirst.show();
     } else if (failure) {
       toast.error(failure.error);
     } else if (added.length === 0) {
@@ -489,14 +638,21 @@ export function SuggestionsCard({
     setPendingId(s.id);
     startTransition(async () => {
       try {
-        const result = await acceptSuggestion(s.id);
+        const edited = editedTexts[s.id];
+        const result =
+          edited === undefined
+            ? await acceptSuggestion(s.id)
+            : await acceptSuggestion(s.id, { text: edited });
         if ('error' in result) {
-          toast.error(result.error);
+          if (isNoTopics(result)) topicFirst.show();
+          else toast.error(result.error);
           return;
         }
         setSuggestions((prev) => prev.filter((x) => x.id !== s.id));
         onAccepted?.();
-        toast.success('Prompt added to your tracked list');
+        if (!showWaiting('suggestion', 0, result.waiting ? 1 : 0)) {
+          toast.success('Prompt added to your tracked list');
+        }
       } catch (err) {
         toast.error(err instanceof Error ? err.message : 'Failed to add');
       } finally {
@@ -571,57 +727,121 @@ export function SuggestionsCard({
                 />
               </div>
 
-              <Button
-                onClick={guard(handleRefresh, { action: tActions('suggestPrompts') })}
-                disabled={refreshing}
-                size="sm"
-                variant="outline"
-                className="gap-2"
-              >
-                {refreshing ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <RefreshCw className="h-3.5 w-3.5" />
-                )}
-                {refreshing ? 'Generating…' : 'New'}
-              </Button>
+              {canUseHub && (
+                <Button
+                  onClick={guard(() => setHubOpen(true), { action: tActions('suggestPrompts') })}
+                  size="sm"
+                  variant="outline"
+                  className="gap-2"
+                >
+                  <Building2 className="h-3.5 w-3.5" />
+                  {t('businessHub.button')}
+                </Button>
+              )}
 
-              <Button
-                onClick={guard(handleAddAll, { action: tActions('addPrompts') })}
-                disabled={adding || clearing || visible.length === 0}
-                size="sm"
-                variant="outline"
-                className="gap-2"
-                title={t('addAllTitle')}
-              >
-                {adding ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <ListPlus className="h-3.5 w-3.5" />
-                )}
-                {adding ? t('addingAll') : t('addAll')}
-              </Button>
+              {canManage && (
+                <Button
+                  onClick={guard(() => setByTopicOpen(true), {
+                    action: tActions('generatePrompts'),
+                  })}
+                  size="sm"
+                  variant="outline"
+                  className="gap-2"
+                  title={t('byTopic.buttonTitle')}
+                >
+                  <Tags className="h-3.5 w-3.5" />
+                  {t('byTopic.button')}
+                </Button>
+              )}
 
-              <Button
-                onClick={guard(handleClearAll, { action: tActions('dismissSuggestions') })}
-                disabled={clearing || adding || visible.length === 0}
-                size="sm"
-                variant="outline"
-                className="gap-2 text-muted-foreground"
-                title="Dismiss every suggestion listed below"
-              >
-                {clearing ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <Trash2 className="h-3.5 w-3.5" />
-                )}
-                Clear All
-              </Button>
+              {canManage && (
+                <Button
+                  onClick={guard(handleRefresh, { action: tActions('suggestPrompts') })}
+                  disabled={refreshing}
+                  size="sm"
+                  variant="outline"
+                  className="gap-2"
+                >
+                  {refreshing ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <RefreshCw className="h-3.5 w-3.5" />
+                  )}
+                  {refreshing ? 'Generating…' : 'New'}
+                </Button>
+              )}
+
+              {canManage && (
+                <Button
+                  onClick={guard(handleAddAll, { action: tActions('addPrompts') })}
+                  disabled={adding || clearing || visible.length === 0}
+                  size="sm"
+                  variant="outline"
+                  className="gap-2"
+                  title={t('addAllTitle')}
+                >
+                  {adding ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <ListPlus className="h-3.5 w-3.5" />
+                  )}
+                  {adding ? t('addingAll') : t('addAll')}
+                </Button>
+              )}
+
+              {canDismiss && (
+                <Button
+                  onClick={guard(() => setConfirmClear(true), {
+                    action: tActions('dismissSuggestions'),
+                  })}
+                  disabled={clearing || adding || visible.length === 0}
+                  size="sm"
+                  variant="outline"
+                  className="gap-2 text-muted-foreground"
+                  title="Dismiss every suggestion listed below"
+                >
+                  {clearing ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Trash2 className="h-3.5 w-3.5" />
+                  )}
+                  Clear All
+                </Button>
+              )}
             </div>
           )}
         </div>
       </CardHeader>
+      <Dialog open={confirmClear} onOpenChange={setConfirmClear}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t('clearAllConfirm.title')}</DialogTitle>
+            <DialogDescription>
+              {t('clearAllConfirm.body', { count: visible.length })}
+            </DialogDescription>
+          </DialogHeader>
+          {measuredToClear > 0 && (
+            <p className="text-sm text-muted-foreground">
+              {t('clearAllConfirm.measured', { count: measuredToClear })}
+            </p>
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmClear(false)}>
+              {t('clearAllConfirm.cancel')}
+            </Button>
+            <Button onClick={() => void handleClearAll()}>{t('clearAllConfirm.confirm')}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <CardContent>
+        <GenerateByTopic
+          brandId={brandId}
+          open={byTopicOpen}
+          onOpenChange={setByTopicOpen}
+          onAdded={onAccepted}
+          onAddTopic={onAddTopic}
+          onNoTopics={topicFirst.show}
+        />
         {limitNote && (
           <div
             role="alert"
@@ -631,14 +851,10 @@ export function SuggestionsCard({
             <div className="min-w-0 flex-1 space-y-2.5 text-sm">
               <div>
                 <p className="font-medium text-amber-900 dark:text-amber-200">
-                  {t('limitTitle', { count: limitNote.left })}
+                  {waitingTitle(tWaiting, limitNote.added, limitNote.waiting)}
                 </p>
                 <p className="text-amber-800/80 dark:text-amber-300/80">
-                  {t('limitBody', {
-                    added: limitNote.added,
-                    count: limitNote.left,
-                    plan: planId ?? 'unknown',
-                  })}
+                  {tWaiting('body', { count: limitNote.waiting })}
                 </p>
               </div>
               <div className="flex flex-wrap items-center gap-2">
@@ -682,7 +898,7 @@ export function SuggestionsCard({
                   : `${joinNames(notice.names)} is connected and its first sync is in progress. Suggestions from it will be available once it finishes, usually within a few minutes.`}
               </p>
             </div>
-            {notice.kind === 'ready' && (
+            {notice.kind === 'ready' && canManage && (
               <Button
                 onClick={guard(handleRefresh, { action: tActions('suggestPrompts') })}
                 disabled={refreshing}
@@ -704,36 +920,61 @@ export function SuggestionsCard({
             <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
           </div>
         ) : error ? (
-          <div className="flex flex-col items-center justify-center py-10 text-center">
-            <AlertTriangle className="h-8 w-8 text-destructive/60 mb-2" />
-            <p className="text-sm font-medium mb-1">Couldn&apos;t load suggestions</p>
-            <p className="text-xs text-muted-foreground mb-3 max-w-sm">{error}</p>
-            <Button onClick={load} disabled={loading} size="sm" variant="outline" className="gap-2">
-              <RefreshCw className="h-3.5 w-3.5" />
-              Retry
-            </Button>
-          </div>
+          <SuggestionsLoadError failure={error} onRetry={load} />
         ) : suggestions.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-10 text-center">
             <Sparkles className="h-8 w-8 text-muted-foreground/40 mb-2" />
             <p className="text-sm font-medium mb-1">No suggestions right now</p>
-            <p className="text-xs text-muted-foreground mb-3 max-w-sm">
-              Click refresh to generate new prompt ideas tailored to your brand and competitor
-              activity.
-            </p>
-            <Button
-              onClick={guard(handleRefresh, { action: tActions('suggestPrompts') })}
-              disabled={refreshing}
-              size="sm"
-              className="gap-2"
-            >
-              {refreshing ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <Sparkles className="h-3.5 w-3.5" />
-              )}
-              Generate Suggestions
-            </Button>
+            {canManage ? (
+              <>
+                <p className="text-xs text-muted-foreground mb-3 max-w-sm">
+                  Click refresh to generate new prompt ideas tailored to your brand and competitor
+                  activity.
+                </p>
+                <Button
+                  onClick={guard(handleRefresh, { action: tActions('suggestPrompts') })}
+                  disabled={refreshing}
+                  size="sm"
+                  className="gap-2"
+                >
+                  {refreshing ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Sparkles className="h-3.5 w-3.5" />
+                  )}
+                  Generate Suggestions
+                </Button>
+                <Button
+                  onClick={guard(() => setByTopicOpen(true), {
+                    action: tActions('generatePrompts'),
+                  })}
+                  size="sm"
+                  variant="outline"
+                  className="mt-2 gap-2"
+                  title={t('byTopic.buttonTitle')}
+                >
+                  <Tags className="h-3.5 w-3.5" />
+                  {t('byTopic.emptyButton')}
+                </Button>
+                {canUseHub && (
+                  <Button
+                    onClick={guard(() => setHubOpen(true), {
+                      action: tActions('suggestPrompts'),
+                    })}
+                    size="sm"
+                    variant="outline"
+                    className="mt-2 gap-2"
+                  >
+                    <Building2 className="h-3.5 w-3.5" />
+                    {t('businessHub.button')}
+                  </Button>
+                )}
+              </>
+            ) : (
+              <p className="text-xs text-muted-foreground max-w-sm">
+                {tManagers('suggestPrompts')}
+              </p>
+            )}
           </div>
         ) : (
           <div className="space-y-2">
@@ -756,6 +997,8 @@ export function SuggestionsCard({
                   const busy = pendingId === s.id;
                   const gsc = gscSourceData(s);
                   const ga = gaSourceData(s);
+                  const product = catalogProductSourceData(s);
+                  const category = catalogSourceData(s);
                   return (
                     <li
                       key={s.id}
@@ -766,13 +1009,50 @@ export function SuggestionsCard({
                       </span>
 
                       <div className="min-w-0 space-y-1.5">
-                        <p className="text-sm font-medium leading-snug">{s.suggestedText}</p>
+                        <SuggestionText
+                          text={textOf(s)}
+                          edited={editedTexts[s.id] !== undefined}
+                          onChange={
+                            canManage
+                              ? (text) =>
+                                  setEditedTexts((prev) => {
+                                    const next = { ...prev };
+                                    // Back to the suggestion's own words: nothing edited.
+                                    if (text === s.suggestedText) delete next[s.id];
+                                    else next[s.id] = text;
+                                    return next;
+                                  })
+                              : undefined
+                          }
+                        />
                         <div className="flex flex-wrap items-center gap-1.5">
                           {s.topicName && (
                             <Badge variant="outline" className="gap-1 text-xs font-normal">
                               <Tag className="h-3 w-3" />
                               {s.topicName}
                             </Badge>
+                          )}
+                          {/* What a catalog suggestion is about: its product or its category. */}
+                          {product ? (
+                            <Badge
+                              variant="outline"
+                              className="max-w-[16rem] gap-1 text-xs font-normal"
+                              title={t('catalog.productLabel', { product: product.product })}
+                            >
+                              <Package className="h-3 w-3 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                              <span className="truncate">{product.product}</span>
+                            </Badge>
+                          ) : (
+                            category && (
+                              <Badge
+                                variant="outline"
+                                className="max-w-[16rem] gap-1 text-xs font-normal"
+                                title={t('catalog.categoryLabel', { category: category.category })}
+                              >
+                                <ShoppingBag className="h-3 w-3 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                                <span className="truncate">{category.category}</span>
+                              </Badge>
+                            )
                           )}
                           {/* Measured rows carry real figures — showing the
                               modelled estimate beside measured data reads as a
@@ -830,36 +1110,40 @@ export function SuggestionsCard({
                       <SourceBadges suggestion={s} />
 
                       <div className="flex items-center justify-end gap-1">
-                        <Button
-                          size="icon"
-                          variant="outline"
-                          className="h-8 w-8"
-                          onClick={guard(() => handleAccept(s), {
-                            action: tActions('addPrompts'),
-                          })}
-                          disabled={busy}
-                          title="Add to tracked prompts"
-                          aria-label="Add to tracked prompts"
-                        >
-                          {busy ? (
-                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                          ) : (
-                            <Plus className="h-3.5 w-3.5" />
-                          )}
-                        </Button>
-                        <Button
-                          size="icon"
-                          variant="ghost"
-                          className="h-8 w-8 text-muted-foreground"
-                          onClick={guard(() => handleDismiss(s), {
-                            action: tActions('dismissSuggestions'),
-                          })}
-                          disabled={busy}
-                          title="Dismiss suggestion"
-                          aria-label="Dismiss suggestion"
-                        >
-                          <X className="h-3.5 w-3.5" />
-                        </Button>
+                        {canManage && (
+                          <Button
+                            size="icon"
+                            variant="outline"
+                            className="h-8 w-8"
+                            onClick={guard(() => handleAccept(s), {
+                              action: tActions('addPrompts'),
+                            })}
+                            disabled={busy}
+                            title="Add to tracked prompts"
+                            aria-label="Add to tracked prompts"
+                          >
+                            {busy ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <Plus className="h-3.5 w-3.5" />
+                            )}
+                          </Button>
+                        )}
+                        {canDismiss && (
+                          <Button
+                            size="icon"
+                            variant="ghost"
+                            className="h-8 w-8 text-muted-foreground"
+                            onClick={guard(() => handleDismiss(s), {
+                              action: tActions('dismissSuggestions'),
+                            })}
+                            disabled={busy}
+                            title="Dismiss suggestion"
+                            aria-label="Dismiss suggestion"
+                          >
+                            <X className="h-3.5 w-3.5" />
+                          </Button>
+                        )}
                       </div>
                     </li>
                   );
@@ -869,6 +1153,16 @@ export function SuggestionsCard({
           </div>
         )}
         <EstimateNoteTooltip handle={volumeNote} />
+        {topicFirst.dialog}
+        {canUseHub && (
+          <BusinessHubTopicsDialog
+            brandId={brandId}
+            open={hubOpen}
+            onOpenChange={setHubOpen}
+            onAdded={handleHubAdded}
+            onNoTopics={topicFirst.show}
+          />
+        )}
       </CardContent>
     </Card>
   );

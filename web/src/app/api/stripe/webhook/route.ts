@@ -3,6 +3,12 @@ import { stripe } from '@/lib/stripe';
 import { supabaseAdmin } from '@/lib/supabase/admin';
 import { alignPromptsToPlanForOrg } from '@/lib/plan-engines';
 import { periodEndIso } from '@/lib/billing/period-end';
+import { startFirstTrackingRun } from '@/lib/billing/first-run';
+import { isSubscriptionActive } from '@/config/plans';
+import { hideDemoBrandAfterPurchase } from '@/lib/demo/hide-after-purchase';
+import { handleAddOnEvent } from '@/lib/billing/add-on-webhook';
+import { syncAddOns } from '@/lib/billing/add-on-sync';
+import { handleTrialWillEnd } from '@/lib/billing/trial-ending';
 import type Stripe from 'stripe';
 
 /**
@@ -39,6 +45,12 @@ export async function POST(req: NextRequest) {
   }
 
   try {
+    // Add-on packs (CHAT-18): granted here only. A pack's Checkout and a
+    // packs-only invoice are theirs alone; the plan's handlers never see them.
+    if (await handleAddOnEvent(event)) {
+      return NextResponse.json({ received: true });
+    }
+
     switch (event.type) {
       case 'checkout.session.completed': {
         const session = event.data.object as Stripe.Checkout.Session;
@@ -79,6 +91,8 @@ export async function POST(req: NextRequest) {
                 stripe_customer_id: customerId,
                 stripe_subscription_id: subscriptionId,
                 ...(endsAt ? { subscription_ends_at: endsAt } : {}),
+                // A new subscription renews: the app-wide "plan ends" band is off.
+                cancel_at_period_end: subscription.cancel_at_period_end ?? false,
               })
               .eq('id', orgId);
             if (error) {
@@ -89,6 +103,20 @@ export async function POST(req: NextRequest) {
               // ahead of the redirect (or that happen out-of-band entirely)
               // still get prompts in sync. Idempotent.
               await alignPromptsSafe(orgId, planId || 'starter', 'checkout');
+              // A plan bought: the demo brand steps aside. Here only, at the
+              // start of a subscription; never on its updates.
+              await hideDemoBrandAfterPurchase(orgId, subscription.status, 'webhook:checkout');
+              // The first run too, after the alignment so it tracks the plan's
+              // engines: the return page may never load (a closed tab). One
+              // run per checkout, whichever of the two comes first.
+              await startFirstTrackingRun({
+                orgId,
+                subscriptionStatus: subscription.status,
+                purchaseStarted: session.created,
+                ctx: 'webhook:checkout',
+              });
+              // Growth's add-ons on it (00546), once the row names it.
+              await syncAddOns(subscriptionId);
             }
           }
         } else {
@@ -110,6 +138,9 @@ export async function POST(req: NextRequest) {
         if (customerId) {
           const updates: Record<string, unknown> = {
             subscription_status: subscription.status,
+            // Canceled to the end of its period, or resumed: the app-wide
+            // "plan ends" band (00386).
+            cancel_at_period_end: subscription.cancel_at_period_end ?? false,
           };
           // Skipped when Stripe gives no period end, rather than cleared.
           const endsAt = periodEndIso(subscription);
@@ -137,12 +168,48 @@ export async function POST(req: NextRequest) {
             .update(updates)
             .eq('stripe_customer_id', customerId);
 
-          if (orgBefore && newPlanId && newPlanId !== orgBefore.plan) {
+          const planChanged = Boolean(orgBefore && newPlanId && newPlanId !== orgBefore.plan);
+          if (orgBefore && planChanged) {
             // Plan changed — re-align prompts. Handles both expansion
-            // (Starter → Growth: 2 → 8 engines) and contraction
-            // (Growth → Starter: 8 → 2 engines). Issue #79.
+            // (Starter → Growth: 2 → 5 engines) and contraction
+            // (Growth → Starter: 4 → 2 engines). Issue #79.
             await alignPromptsSafe(orgBefore.id, newPlanId, 'subscription.updated');
           }
+
+          // A delayed payment (SEPA, for one) that went through: the
+          // checkout left the subscription incomplete, so nothing started
+          // the first run then. Only on that change, never on a renewal.
+          const previous = event.data.previous_attributes as
+            | Partial<Stripe.Subscription>
+            | undefined;
+          if (orgBefore && previous?.status === 'incomplete') {
+            // Stripe doesn't order its events: this one can come before the
+            // checkout's, whose alignment then hasn't run. Align here too, so
+            // the run tracks only the plan's engines. Idempotent.
+            if (!planChanged && isSubscriptionActive(subscription.status)) {
+              await alignPromptsSafe(
+                orgBefore.id,
+                newPlanId || orgBefore.plan || 'starter',
+                'subscription.updated',
+              );
+            }
+            // The purchase started only now: the demo brand steps aside, as
+            // on a checkout paid at once.
+            await hideDemoBrandAfterPurchase(
+              orgBefore.id,
+              subscription.status,
+              'webhook:subscription.updated',
+            );
+            await startFirstTrackingRun({
+              orgId: orgBefore.id,
+              subscriptionStatus: subscription.status,
+              purchaseStarted: subscription.created,
+              ctx: 'webhook:subscription.updated',
+            });
+          }
+          // Growth's add-ons (00546): an item added, changed or removed, or
+          // the status they count under. Read from Stripe afresh.
+          await syncAddOns(subscription.id);
         }
         break;
       }
@@ -169,6 +236,8 @@ export async function POST(req: NextRequest) {
             .update({
               subscription_status: 'canceled',
               plan: 'starter',
+              // Ended: read-only now, so no "plan ends" band.
+              cancel_at_period_end: false,
             })
             .eq('stripe_customer_id', customerId);
 
@@ -178,6 +247,19 @@ export async function POST(req: NextRequest) {
             // longer covers. Issue #79.
             await alignPromptsSafe(orgBefore.id, 'starter', 'subscription.deleted');
           }
+          // Its add-ons ended with it (00546).
+          await syncAddOns(subscription.id);
+        }
+        break;
+      }
+
+      case 'customer.subscription.trial_will_end': {
+        // 3 days before a free trial ends: the trial reminder e-mail, once
+        // per trial, cloud only (lib/billing/trial-ending.ts). Resend rate
+        // limited it (a 429): answer 500, so Stripe sends the event again.
+        const subscription = event.data.object as Stripe.Subscription;
+        if ((await handleTrialWillEnd(stripe, subscription.id)) === 'retry') {
+          return NextResponse.json({ error: 'Trial reminder not sent' }, { status: 500 });
         }
         break;
       }

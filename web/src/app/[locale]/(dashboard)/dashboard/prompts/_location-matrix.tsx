@@ -2,10 +2,17 @@
 
 import { useEffect, useId, useState } from 'react';
 import { useTranslations } from 'next-intl';
-import { Clock, Lock } from 'lucide-react';
+import { Clock, Lock, MoreHorizontal, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { useFirstRun } from '@/hooks/use-first-run';
 import {
   Table,
   TableBody,
@@ -123,7 +130,10 @@ export function clearLocationMatrixCache() {
 /**
  * A location a prompt is tracked in that has no answers yet, and why: a
  * paused prompt; none of its engines answering from there; or, usually,
- * just added: the next daily run asks it, within 24 hours.
+ * just added: the next daily run asks it, within 24 hours. While the
+ * brand's first run goes on, that run is asking it now ("Arriving now").
+ * Without a location, the same for the prompt in the Table view
+ * (pendingColumn).
  */
 export function LocationPending({
   prompt,
@@ -132,8 +142,9 @@ export function LocationPending({
   awaiting,
   className,
 }: {
-  prompt: Pick<Prompt, 'isActive' | 'platforms' | 'models'>;
-  region: string;
+  prompt: Pick<Prompt, 'isActive' | 'platforms' | 'models' | 'waitingSince'>;
+  /** Undefined for the prompt across every location it's tracked in. */
+  region?: string;
   /** The table's window: one that ended before today just had no answers there. */
   window: { to?: string };
   /**
@@ -144,13 +155,17 @@ export function LocationPending({
   className?: string;
 }) {
   const t = useTranslations('prompts.locations');
+  const tWaiting = useTranslations('prompts.waiting');
   const countries = useTrackingCountries();
+  const firstRun = useFirstRun();
   const tipId = useId();
-  const parsed = parseLocation(region);
+  const parsed = region ? parseLocation(region) : null;
   const state = !reachesToday(window)
     ? null
     : !prompt.isActive
-      ? 'paused'
+      ? prompt.waitingSince
+        ? 'waiting'
+        : 'paused'
       : parsed && !answersFrom(prompt, parsed, countries)
         ? 'noEngine'
         : awaiting
@@ -158,12 +173,23 @@ export function LocationPending({
           : null;
   if (!state) {
     return (
-      <span className={cn('text-xs text-muted-foreground', className)} title={t('noAnswers')}>
+      <span
+        className={cn('text-xs text-muted-foreground', className)}
+        title={region ? t('noAnswers') : undefined}
+      >
         —
       </span>
     );
   }
-  const tip = t(`${state}Tip`, { location: regionLabel(region) });
+  // A new prompt in the brand's first run: asked now, not by the next daily run.
+  const arriving = state === 'pending' && firstRun !== null;
+  const tip = arriving
+    ? t('arrivingTip')
+    : state === 'waiting'
+      ? tWaiting('cellTip')
+      : !region && state === 'pending'
+        ? t('promptPendingTip')
+        : t(`${state}Tip`, { location: region ? regionLabel(region) : '' });
   // Why, on hover and on keyboard focus; and for a screen reader, as the
   // label's description.
   return (
@@ -187,7 +213,7 @@ export function LocationPending({
           }
         >
           {state === 'pending' && <Clock className="h-3 w-3" aria-hidden />}
-          {t(state)}
+          {arriving ? t('arriving') : state === 'waiting' ? tWaiting('cell') : t(state)}
         </TooltipTrigger>
         <TooltipContent className="max-w-72">{tip}</TooltipContent>
       </Tooltip>
@@ -209,7 +235,8 @@ function locationKind(code: string): 'country' | 'state' | 'city' {
  * location the brand tracks, side by side, for one metric at a time, in
  * Brand Visibility's Topics vs competitors shades. A cell opens the
  * prompt's Positions panel for that location; one the prompt isn't tracked
- * in offers + Track.
+ * in offers + Track, one it is (and not only there) offers Stop tracking
+ * here, and a location's column menu stops it for the prompts shown.
  */
 export function LocationMatrix({
   brandId,
@@ -218,6 +245,7 @@ export function LocationMatrix({
   window,
   onOpenCell,
   onTrack,
+  onStopTracking,
   onAddLocations,
 }: {
   brandId: string;
@@ -230,6 +258,11 @@ export function LocationMatrix({
   onOpenCell: (promptId: string, region: string) => void;
   /** Adds the location to the prompt; undefined for members who can't edit. */
   onTrack?: (prompt: Prompt, region: string) => void;
+  /**
+   * Opens stop tracking for the location, for one prompt or (null) the
+   * prompts shown; undefined for members who can't edit.
+   */
+  onStopTracking?: (prompt: Prompt | null, region: string) => void;
   /** Opens Track in more locations; undefined for members who can't edit. */
   onAddLocations?: () => void;
 }) {
@@ -403,7 +436,24 @@ export function LocationMatrix({
             <TableHead>{t('topic')}</TableHead>
             {regions.map((r) => (
               <TableHead key={r} className="min-w-[96px] text-center">
-                <span className="block text-xs font-medium text-foreground">{label(r)}</span>
+                <span className="flex items-center justify-center gap-0.5 text-xs font-medium text-foreground">
+                  {label(r)}
+                  {onStopTracking && (
+                    <DropdownMenu>
+                      <DropdownMenuTrigger
+                        className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+                        aria-label={t('columnMenu', { location: regionLabel(r) })}
+                      >
+                        <MoreHorizontal className="h-3.5 w-3.5" />
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end" className="w-56">
+                        <DropdownMenuItem onClick={() => onStopTracking(null, r)}>
+                          {t('stopColumn', { location: regionLabel(r) })}
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  )}
+                </span>
                 <span className="block text-[11px] font-normal text-muted-foreground">
                   {t(`kind.${locationKind(r)}`)}
                 </span>
@@ -500,9 +550,23 @@ export function LocationMatrix({
                       </TableCell>
                     );
                   }
+                  // The counterpart of + Track, on hover or keyboard focus; never
+                  // clickable unseen (a touch screen has no hover), and not on a
+                  // prompt's last location, which it keeps.
+                  const stop = onStopTracking && p.regions.some((code) => code !== r) && (
+                    <button
+                      type="button"
+                      aria-label={t('stopLabel', { prompt: p.text, location: where })}
+                      title={t('stop')}
+                      onClick={() => onStopTracking(p, r)}
+                      className="pointer-events-none absolute right-1.5 top-2 inline-flex h-4 w-4 items-center justify-center rounded-full border bg-background text-muted-foreground opacity-0 shadow-sm transition-opacity hover:text-foreground focus-visible:pointer-events-auto focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 group-hover/cell:pointer-events-auto group-hover/cell:opacity-100"
+                    >
+                      <X className="h-2.5 w-2.5" aria-hidden />
+                    </button>
+                  );
                   if (!cell || cell.runs === 0) {
                     return (
-                      <TableCell key={r} className="px-1 py-1.5 text-center">
+                      <TableCell key={r} className="group/cell relative px-1 py-1.5 text-center">
                         <LocationPending
                           prompt={p}
                           region={r}
@@ -510,11 +574,12 @@ export function LocationMatrix({
                           awaiting={awaiting}
                           className="w-full py-1.5"
                         />
+                        {stop}
                       </TableCell>
                     );
                   }
                   return (
-                    <TableCell key={r} className="px-1 py-1.5">
+                    <TableCell key={r} className="group/cell relative px-1 py-1.5">
                       <button
                         type="button"
                         aria-label={t('open', { prompt: p.text, location: where })}
@@ -526,6 +591,7 @@ export function LocationMatrix({
                       >
                         {v === null ? t('notNamed') : shown(v)}
                       </button>
+                      {stop}
                     </TableCell>
                   );
                 })}

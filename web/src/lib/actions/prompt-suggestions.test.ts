@@ -8,6 +8,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
  */
 
 let slotsLeft = Infinity;
+/** SIMPLE_NAV: addPromptToSet saves a prompt past the limit waiting instead of refusing it. */
+let waitWhenFull = false;
 let added: string[] = [];
 /** Suggestions still 'new'; others were accepted or dismissed elsewhere. */
 let open: Set<string>;
@@ -17,6 +19,13 @@ let brandTopics: string[] = [];
 let madeTopics: string[] = [];
 let removedTopics: string[] = [];
 let categories: (string | undefined)[] = [];
+/** Each added prompt's source (prompts.source_data, 00525), in order. */
+let sources: unknown[] = [];
+/** Suggestions drawn from the catalog, by id: their source_data. */
+let catalogRows: Record<string, unknown> = {};
+/** ChatGPT Business Hub suggestions (00527), by id: their topic name. */
+let hubRows: Record<string, string> = {};
+const GENERATED_AT = '2026-11-09T08:00:00+00:00';
 
 vi.mock('next/cache', () => ({ revalidatePath: vi.fn() }));
 vi.mock('@/config/api', () => ({ API_BASE_URL: 'http://server' }));
@@ -31,7 +40,12 @@ vi.mock('@/lib/supabase/server', () => ({
         id,
         brand_id: 'b1',
         suggested_text: `prompt ${id}`,
-        topic_name: 'GEO tools',
+        topic_name: hubRows[id] ?? 'GEO tools',
+        source: hubRows[id] ? 'business_hub' : catalogRows[id] ? 'catalog' : 'llm',
+        source_data: hubRows[id]
+          ? { topic: hubRows[id], periodEnd: null, enteredAt: GENERATED_AT }
+          : (catalogRows[id] ?? null),
+        generated_at: GENERATED_AT,
       });
       const row = () =>
         table === 'prompt_sets' ? { id: 'ps1' } : { platforms: ['chatgpt-web'], models: [] };
@@ -43,8 +57,9 @@ vi.mock('@/lib/supabase/server', () => ({
           ids = val;
           return chain;
         },
-        eq: (_col: string, val: string) => {
+        eq: (col: string, val: string) => {
           if (removing) removedTopics.push(val);
+          if (col === 'id') ids = [val];
           return chain;
         },
         order: () => chain,
@@ -58,7 +73,10 @@ vi.mock('@/lib/supabase/server', () => ({
           removing = true;
           return chain;
         },
-        single: async () => ({ data: made, error: null }),
+        single: async () =>
+          table === 'prompt_suggestions'
+            ? { data: open.has(ids[0]) ? suggestion(ids[0]) : null, error: null }
+            : { data: made, error: null },
         maybeSingle: async () => ({ data: row(), error: null }),
         then: (resolve: (r: unknown) => void) =>
           resolve(
@@ -73,15 +91,31 @@ vi.mock('@/lib/supabase/server', () => ({
 }));
 
 vi.mock('@/lib/actions/prompt', () => ({
-  addPromptToSet: vi.fn(async ({ text, category }: { text: string; category?: string }) => {
-    categories.push(category);
-    if (slotsLeft <= 0) {
-      return { error: 'Your plan’s prompt locations are full.', code: 'plan_limit' };
-    }
-    slotsLeft -= 1;
-    added.push(text);
-    return { prompt: { id: `p-${added.length}` } };
-  }),
+  addPromptToSet: vi.fn(
+    async ({
+      text,
+      category,
+      sourceData,
+    }: {
+      text: string;
+      category?: string;
+      sourceData?: unknown;
+    }) => {
+      categories.push(category);
+      if (slotsLeft <= 0 && waitWhenFull) {
+        added.push(text);
+        sources.push(sourceData);
+        return { prompt: { id: `p-${added.length}` }, waiting: true };
+      }
+      if (slotsLeft <= 0) {
+        return { error: 'Your plan’s prompt locations are full.', code: 'plan_limit' };
+      }
+      slotsLeft -= 1;
+      added.push(text);
+      sources.push(sourceData);
+      return { prompt: { id: `p-${added.length}` } };
+    },
+  ),
 }));
 
 const targets: { promptId: string; url: string }[] = [];
@@ -97,10 +131,19 @@ vi.mock('@/lib/actions/prompt-workflow', () => ({
 const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }));
 vi.stubGlobal('fetch', fetchMock);
 
-const { trackPagePrompts, trackSuggestions } = await import('./prompt-suggestions');
+const {
+  acceptSuggestion,
+  dismissSuggestions,
+  getPromptSuggestions,
+  refreshPromptSuggestions,
+  suggestPromptsFromBusinessHub,
+  trackPagePrompts,
+  trackSuggestions,
+} = await import('./prompt-suggestions');
 
 beforeEach(() => {
   slotsLeft = Infinity;
+  waitWhenFull = false;
   added = [];
   targets.length = 0;
   targetError = null;
@@ -108,6 +151,9 @@ beforeEach(() => {
   madeTopics = [];
   removedTopics = [];
   categories = [];
+  sources = [];
+  catalogRows = {};
+  hubRows = {};
   reads = [];
   open = new Set(['s1', 's2', 's3', 's4']);
   fetchMock.mockClear();
@@ -137,6 +183,28 @@ describe('trackSuggestions', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it('with SIMPLE_NAV, adds them all and says which wait for a spot', async () => {
+    slotsLeft = 2;
+    waitWhenFull = true;
+    expect(await trackSuggestions(['s1', 's2', 's3', 's4'])).toEqual({
+      trackedIds: ['s1', 's2', 's3', 's4'],
+      waitingIds: ['s3', 's4'],
+      skippedIds: [],
+    });
+    // A waiting prompt is still the suggestion's: each is marked added.
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it('one + marks the suggestion added with the waiting prompt', async () => {
+    slotsLeft = 0;
+    waitWhenFull = true;
+    expect(await acceptSuggestion('s1')).toEqual({ promptId: 'p-1', waiting: true });
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://server/api/prompts/suggestions/s1/accept',
+      expect.objectContaining({ body: JSON.stringify({ promptId: 'p-1' }) }),
+    );
+  });
+
   it('skips suggestions accepted or dismissed elsewhere and tracks the rest', async () => {
     open.delete('s1');
     expect(await trackSuggestions(['s1', 's2', 's3'])).toEqual({
@@ -158,11 +226,255 @@ describe('trackSuggestions', () => {
   });
 });
 
+/**
+ * Prompt Suggestions lets a suggestion's text be edited before it is added
+ * (moved from the brand's Manage prompts page): + and Add All save the edited
+ * text, under the suggestion's topic, and mark the suggestion added; the
+ * others keep their own text. An empty or overlong text is refused, nothing added.
+ */
+describe('adding a suggestion edited first', () => {
+  it('one + saves the edited text, tidied, and marks the suggestion added', async () => {
+    expect(await acceptSuggestion('s1', { text: '  best   decaf beans  ' })).toEqual({
+      promptId: 'p-1',
+    });
+    expect(added).toEqual(['best decaf beans']);
+    expect(categories).toEqual(['GEO tools']);
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://server/api/prompts/suggestions/s1/accept',
+      expect.objectContaining({ body: JSON.stringify({ promptId: 'p-1' }) }),
+    );
+  });
+
+  it('one + without a text saves the suggestion as written', async () => {
+    await acceptSuggestion('s1');
+    expect(added).toEqual(['prompt s1']);
+  });
+
+  it('Add All saves the edited ones as edited and the rest as written', async () => {
+    expect(
+      await trackSuggestions(['s1', 's2', 's3'], { texts: { s2: 'decaf beans delivered weekly' } }),
+    ).toEqual({ trackedIds: ['s1', 's2', 's3'], skippedIds: [] });
+    expect(added).toEqual(['prompt s1', 'decaf beans delivered weekly', 'prompt s3']);
+  });
+
+  it('ignores an edited text for a suggestion not being added', async () => {
+    await trackSuggestions(['s1'], { texts: { s9: 'something else' } });
+    expect(added).toEqual(['prompt s1']);
+  });
+
+  it('refuses an empty or overlong text, adding nothing', async () => {
+    expect(await acceptSuggestion('s1', { text: '   ' })).toEqual({
+      error: 'Write the prompt in 1 to 500 characters.',
+    });
+    expect((await trackSuggestions(['s1', 's2'], { texts: { s2: 'x'.repeat(501) } })).error).toBe(
+      'Write the prompt in 1 to 500 characters.',
+    );
+    expect(added).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Tracking a ChatGPT Business Hub suggestion (Business Hub plan, PR 6): its
+ * discovery topic, when none of the brand's fit, is made only now, so the
+ * prompt is filed under it rather than under no topic.
+ */
+describe('tracking a ChatGPT Business Hub suggestion makes its topic', () => {
+  it("makes a topic the brand lacks once, and uses the brand's own spelling of one it has", async () => {
+    brandTopics = ['Coffee Subscriptions'];
+    hubRows = { s1: 'decaf beans', s2: 'Decaf  Beans', s3: 'coffee subscriptions' };
+    expect((await trackSuggestions(['s1', 's2', 's3', 's4'])).trackedIds).toHaveLength(4);
+    expect(madeTopics).toEqual(['decaf beans']);
+    expect(categories).toEqual(['decaf beans', 'decaf beans', 'Coffee Subscriptions', 'GEO tools']);
+    expect(removedTopics).toEqual([]);
+  });
+
+  it('takes back a topic made for a prompt the plan had no room for', async () => {
+    brandTopics = ['Coffee Subscriptions'];
+    hubRows = { s1: 'decaf beans' };
+    slotsLeft = 0;
+    expect((await trackSuggestions(['s1'])).code).toBe('plan_limit');
+    expect(madeTopics).toEqual(['decaf beans']);
+    expect(removedTopics).toEqual(['topic-1']);
+  });
+
+  it('makes no topic on a brand without one: the add asks for a topic first', async () => {
+    hubRows = { s1: 'decaf beans' };
+    await trackSuggestions(['s1']);
+    expect(madeTopics).toEqual([]);
+  });
+
+  it('one + makes it too', async () => {
+    brandTopics = ['Coffee Subscriptions'];
+    hubRows = { s2: 'decaf beans' };
+    expect(await acceptSuggestion('s2')).toEqual({ promptId: 'p-1' });
+    expect(madeTopics).toEqual(['decaf beans']);
+    expect(categories).toEqual(['decaf beans']);
+  });
+
+  it('makes no topic for any other suggestion', async () => {
+    brandTopics = ['Coffee Subscriptions'];
+    await trackSuggestions(['s1']);
+    expect(madeTopics).toEqual([]);
+    expect(categories).toEqual(['GEO tools']);
+  });
+});
+
+describe('suggestPromptsFromBusinessHub', () => {
+  const json = (body: unknown, status = 200) =>
+    new Response(JSON.stringify(body), {
+      status,
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+  it('is not found while BUSINESS_HUB_ENABLED is off, without asking the API', async () => {
+    vi.stubEnv('BUSINESS_HUB_ENABLED', '');
+    expect(await suggestPromptsFromBusinessHub('b1', ['decaf beans'])).toEqual({
+      ok: false,
+      failure: 'not_found',
+      retryable: false,
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+    vi.unstubAllEnvs();
+  });
+
+  it('sends the topics and returns what was written', async () => {
+    vi.stubEnv('BUSINESS_HUB_ENABLED', 'true');
+    fetchMock.mockResolvedValueOnce(
+      json({
+        added: 1,
+        alreadyTracked: 2,
+        alreadySuggested: 0,
+        topics: [{ topic: 'decaf beans', added: 1, matchedTopic: null }],
+        suggestions: [
+          {
+            id: 'h1',
+            brand_id: 'b1',
+            suggested_text: 'Which decaf beans taste best?',
+            source: 'business_hub',
+            source_data: { topic: 'decaf beans', periodEnd: null, enteredAt: GENERATED_AT },
+          },
+        ],
+      }),
+    );
+    const answer = await suggestPromptsFromBusinessHub('b1', ['decaf beans'], '2026-11-09');
+    expect(answer).toMatchObject({
+      ok: true,
+      result: { added: 1, alreadyTracked: 2, suggestions: [{ id: 'h1', source: 'business_hub' }] },
+    });
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('http://server/api/prompts/suggestions/b1/business-hub');
+    expect(JSON.parse(String(init.body))).toEqual({
+      topics: ['decaf beans'],
+      periodEnd: '2026-11-09',
+    });
+    vi.unstubAllEnvs();
+  });
+
+  it('says the brand needs a topic first, and returns any other failure as a value', async () => {
+    vi.stubEnv('BUSINESS_HUB_ENABLED', 'true');
+    fetchMock.mockResolvedValueOnce(json({ code: 'no_topics' }, 409));
+    expect(await suggestPromptsFromBusinessHub('b1', ['x'])).toEqual({
+      ok: false,
+      failure: 'no_topics',
+    });
+    // The limiter's 10 an hour: wait, not upgrade.
+    fetchMock.mockResolvedValueOnce(json({ success: false, message: 'Too many requests' }, 429));
+    expect(await suggestPromptsFromBusinessHub('b1', ['x'])).toMatchObject({ failure: 'busy' });
+    fetchMock.mockRejectedValueOnce(new TypeError('fetch failed'));
+    expect(await suggestPromptsFromBusinessHub('b1', ['x'])).toEqual({
+      ok: false,
+      failure: 'failed',
+      retryable: true,
+    });
+    vi.unstubAllEnvs();
+  });
+});
+
+/**
+ * A prompt accepted from a catalog suggestion keeps where it came from
+ * (prompts.source_data, 00525, AC plan P-8), through the same add and the
+ * same plan check as any other.
+ */
+describe('accepting a catalog suggestion keeps where it came from', () => {
+  const CATEGORY_ID = '7a1c2b9e-2222-4c3d-8e9f-000000000002';
+  const PRODUCT_ID = '7a1c2b9e-1111-4c3d-8e9f-000000000001';
+  const fromProduct = {
+    product: 'Atmos AG 65',
+    productId: PRODUCT_ID,
+    productType: 'Backpack',
+    category: 'Bags > Hiking backpacks',
+    categoryId: CATEGORY_ID,
+    cardPrompts: 4,
+    orders: 12,
+  };
+  const fromCategory = {
+    category: 'Bags > Hiking backpacks',
+    categoryId: CATEGORY_ID,
+    products: 18,
+    priceLow: 60,
+    priceHigh: 180,
+    priceUnder: 150,
+    currency: 'USD',
+  };
+
+  it('Add All keeps each one’s product or category, and nothing for the others', async () => {
+    catalogRows = { s1: fromProduct, s2: fromCategory };
+    expect((await trackSuggestions(['s1', 's2', 's3'])).trackedIds).toEqual(['s1', 's2', 's3']);
+    expect(sources).toEqual([
+      {
+        kind: 'catalog_product',
+        product_ids: [PRODUCT_ID],
+        category_id: CATEGORY_ID,
+        category: 'Bags > Hiking backpacks',
+        suggested_at: GENERATED_AT,
+      },
+      {
+        kind: 'catalog_category',
+        category_id: CATEGORY_ID,
+        category: 'Bags > Hiking backpacks',
+        suggested_at: GENERATED_AT,
+      },
+      null,
+    ]);
+  });
+
+  it('Add All still stops where the plan’s prompt locations run out', async () => {
+    catalogRows = { s1: fromProduct, s2: fromProduct, s3: fromCategory };
+    slotsLeft = 1;
+    expect(await trackSuggestions(['s1', 's2', 's3'])).toEqual({
+      trackedIds: ['s1'],
+      skippedIds: [],
+      error: 'Your plan’s prompt locations are full.',
+      code: 'plan_limit',
+    });
+    expect(sources).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('one + keeps it too, and is refused at the limit like any other', async () => {
+    catalogRows = { s1: fromProduct };
+    expect(await acceptSuggestion('s1')).toEqual({ promptId: 'p-1' });
+    expect(sources).toEqual([expect.objectContaining({ kind: 'catalog_product' })]);
+
+    slotsLeft = 0;
+    expect(await acceptSuggestion('s2')).toEqual({
+      error: 'Your plan’s prompt locations are full.',
+      code: 'plan_limit',
+    });
+  });
+});
+
 describe('trackPagePrompts (AT-006 part B2)', () => {
   const picked = [
     { text: 'Best coffee gifts under 50 dollars?', topic: 'Gift Ideas' },
     { text: 'Which coffee gift set suits a beginner?', topic: 'Gift Ideas' },
   ];
+
+  // The brand has a topic: prompts can be added (a brand without one is below).
+  beforeEach(() => {
+    brandTopics = ['Espresso'];
+  });
 
   it('tracks each prompt pointing at the page', async () => {
     const result = await trackPagePrompts('b1', 'https://acme.example/gifts', picked);
@@ -181,6 +493,16 @@ describe('trackPagePrompts (AT-006 part B2)', () => {
       error: 'Your plan’s prompt locations are full.',
       code: 'plan_limit',
     });
+  });
+
+  it('with SIMPLE_NAV, keeps the ones past the limit waiting, each still pointing at the page', async () => {
+    slotsLeft = 1;
+    waitWhenFull = true;
+    expect(await trackPagePrompts('b1', 'https://acme.example/gifts', picked)).toEqual({
+      promptIds: ['p-1', 'p-2'],
+      waitingIds: ['p-2'],
+    });
+    expect(targets.map((t) => t.promptId)).toEqual(['p-1', 'p-2']);
   });
 
   it('keeps a prompt tracked when its target URL could not be saved, or without a domain', async () => {
@@ -222,5 +544,174 @@ describe('trackPagePrompts (AT-006 part B2)', () => {
     await trackPagePrompts('b1', null, [{ text: 'Best coffee gifts?', topic: 'Coffee Gifts' }]);
     expect(madeTopics).toEqual(['Coffee Gifts']);
     expect(removedTopics).toEqual(['topic-1']);
+  });
+
+  it('asks for a topic first on a brand without one, before making a topic or a prompt', async () => {
+    brandTopics = [];
+    expect(await trackPagePrompts('b1', null, picked)).toEqual({
+      promptIds: [],
+      error: 'Add a topic first: prompts are grouped under topics.',
+      code: 'no_topics',
+    });
+    expect(madeTopics).toEqual([]);
+    expect(added).toEqual([]);
+  });
+});
+
+/**
+ * refreshPromptSuggestions: a brand with no topic yet comes back as a value,
+ * as production hides a thrown message, so the card can ask for a topic.
+ */
+describe('refreshPromptSuggestions', () => {
+  const json = (body: unknown, status = 200) =>
+    new Response(JSON.stringify(body), {
+      status,
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+  it('returns the fresh suggestions', async () => {
+    fetchMock.mockResolvedValueOnce(
+      json({ suggestions: [{ id: 's1', brand_id: 'b1', suggested_text: 'Best GEO tools?' }] }),
+    );
+    const result = await refreshPromptSuggestions('b1');
+    expect(result.ok && result.suggestions.map((x) => x.suggestedText)).toEqual([
+      'Best GEO tools?',
+    ]);
+  });
+
+  it('says the brand needs a topic first', async () => {
+    fetchMock.mockResolvedValueOnce(
+      json(
+        { error: 'Add a topic first: prompts are grouped under topics.', code: 'no_topics' },
+        409,
+      ),
+    );
+    expect(await refreshPromptSuggestions('b1')).toEqual({ ok: false, failure: 'no_topics' });
+  });
+
+  it('returns every other failure as a value too, never throwing', async () => {
+    // The month's AI budget: plan-guard's 429 plan_limit.
+    fetchMock.mockResolvedValueOnce(json({ error: 'plan_limit', message: 'Budget used' }, 429));
+    expect(await refreshPromptSuggestions('b1')).toEqual({
+      ok: false,
+      failure: 'limit',
+      retryable: false,
+    });
+    // The demo brand, or a read-only workspace: the upgrade dialog.
+    fetchMock.mockResolvedValueOnce(json({ error: 'plan_limit', code: 'demo_brand' }, 402));
+    expect(await refreshPromptSuggestions('b1')).toMatchObject({ failure: 'subscription' });
+    // A role refusal, and an error of the API's own.
+    fetchMock.mockResolvedValueOnce(
+      json({ error: 'Only admins and managers can generate prompt suggestions.' }, 403),
+    );
+    expect(await refreshPromptSuggestions('b1')).toMatchObject({ failure: 'failed' });
+    fetchMock.mockResolvedValueOnce(json({ error: 'Failed to generate suggestions' }, 500));
+    expect(await refreshPromptSuggestions('b1')).toMatchObject({
+      failure: 'failed',
+      retryable: false,
+    });
+    // The proxy while the API restarts, and no answer at all: worth trying again.
+    fetchMock.mockResolvedValueOnce(new Response('<html>Bad Gateway</html>', { status: 502 }));
+    expect(await refreshPromptSuggestions('b1')).toEqual({
+      ok: false,
+      failure: 'failed',
+      retryable: true,
+    });
+    fetchMock.mockRejectedValueOnce(new TypeError('fetch failed'));
+    expect(await refreshPromptSuggestions('b1')).toEqual({
+      ok: false,
+      failure: 'failed',
+      retryable: true,
+    });
+  });
+});
+
+/**
+ * getPromptSuggestions: its failures come back as values, as production
+ * hides a thrown server action's message behind React's #441.
+ */
+describe('getPromptSuggestions', () => {
+  const json = (body: unknown, status = 200) =>
+    new Response(JSON.stringify(body), {
+      status,
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+  it('returns the open suggestions', async () => {
+    fetchMock.mockResolvedValueOnce(
+      json({
+        suggestions: [{ id: 's1', brand_id: 'b1', suggested_text: 'Best GEO tools?' }],
+        stale: false,
+      }),
+    );
+    const read = await getPromptSuggestions('b1');
+    expect(read).toMatchObject({ ok: true, stale: false, businessHub: false });
+    expect(read.ok && read.suggestions.map((x) => x.suggestedText)).toEqual(['Best GEO tools?']);
+  });
+
+  it('says whether Business Hub topics can be used, as BUSINESS_HUB_ENABLED says', async () => {
+    vi.stubEnv('BUSINESS_HUB_ENABLED', 'true');
+    fetchMock.mockResolvedValueOnce(json({ suggestions: [], stale: true }));
+    expect(await getPromptSuggestions('b1')).toMatchObject({ ok: true, businessHub: true });
+    vi.unstubAllEnvs();
+  });
+
+  it('marks a proxy that says the API is down as worth retrying', async () => {
+    fetchMock.mockResolvedValueOnce(new Response('<html>Bad Gateway</html>', { status: 502 }));
+    expect(await getPromptSuggestions('b1')).toEqual({
+      ok: false,
+      failure: 'failed',
+      retryable: true,
+    });
+  });
+
+  it('returns no answer, never throws, when the request fails or times out', async () => {
+    fetchMock.mockRejectedValueOnce(new DOMException('The operation timed out.', 'TimeoutError'));
+    expect(await getPromptSuggestions('b1')).toEqual({
+      ok: false,
+      failure: 'failed',
+      retryable: true,
+    });
+  });
+
+  it("says why when trying again wouldn't help", async () => {
+    fetchMock.mockResolvedValueOnce(
+      json({ error: "This brand isn't in your workspace", code: 'not_in_workspace' }, 403),
+    );
+    expect(await getPromptSuggestions('b1')).toEqual({
+      ok: false,
+      failure: 'workspace',
+      retryable: false,
+    });
+  });
+});
+
+describe('dismissSuggestions', () => {
+  it('dismisses each one through the route one by one uses, a few at a time', async () => {
+    const ids = Array.from({ length: 12 }, (_, i) => `s${i + 1}`);
+    expect(await dismissSuggestions([...ids, 's1'])).toEqual({
+      ok: true,
+      dismissed: ids,
+      failed: [],
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(12);
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://server/api/prompts/suggestions/s1/dismiss',
+      expect.objectContaining({ method: 'POST', headers: { Authorization: 'Bearer t' } }),
+    );
+  });
+
+  it('lists the ones that could not be dismissed, and never throws', async () => {
+    fetchMock.mockImplementation((async (url: string) => {
+      if (url.includes('/s2/')) return new Response('{}', { status: 403 });
+      if (url.includes('/s3/')) throw new Error('network down');
+      return new Response('{}', { status: 200 });
+    }) as never);
+    expect(await dismissSuggestions(['s1', 's2', 's3'])).toEqual({
+      ok: true,
+      dismissed: ['s1'],
+      failed: ['s2', 's3'],
+    });
+    fetchMock.mockImplementation(async () => new Response('{}', { status: 200 }));
   });
 });

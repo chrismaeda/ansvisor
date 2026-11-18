@@ -29,12 +29,16 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { ActionCenterTabs } from '@/components/action-center/action-center-tabs';
+import { HistoryViews } from '@/components/action-center/history-views';
 import { KpiFrameworkDrawer } from '@/components/action-center/kpi-framework-drawer';
 import { KpiTable } from '@/components/action-center/kpi-table';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
 import { cn } from '@/lib/utils';
 import { HeaderWithAiUsage } from '@/components/ai-usage/ai-usage-meter';
+import { useChatPageContext } from '@/components/chat/panel/chat-panel-context';
+import { rangeChipLabel, type ChatPageFilter } from '@/lib/chat/page-context';
+import { viewRows } from '@/lib/chat/page-view';
 
 type KpiDatePreset = '7d' | '30d' | '90d';
 const KPI_DATE_PRESETS: readonly KpiDatePreset[] = ['7d', '30d', '90d'];
@@ -49,6 +53,7 @@ function utcDay(offset = 0): string {
 export default function ActionCenterKpisPage() {
   const brand = useBrandStore((s) => s.getActiveBrand());
   const t = useTranslations('actionCenter.kpis');
+  // KPIs is one of History's views: the tab shown above it is History's.
 
   return (
     <div className="space-y-6">
@@ -59,6 +64,7 @@ export default function ActionCenterKpisPage() {
         </div>
       </HeaderWithAiUsage>
       <ActionCenterTabs />
+      <HistoryViews current="kpis" />
       {brand ? (
         <KpisContent key={brand.id} brand={brand} />
       ) : (
@@ -176,6 +182,45 @@ function KpisContent({ brand }: { brand: Brand }) {
       setBusyKey(null);
     }
   };
+
+  // Chat's side panel sees the page (the owner's plan of 2026-11-16, step 9): its range, its
+  // filters, and once read the KPIs listed by key, with how many.
+  const tChatRange = useTranslations('chatPanel.range');
+  const tRegistry = useTranslations('actionCenter.registry');
+  const statuses = KPI_STATUSES.filter((status) => statusFilter.has(status));
+  const chatFilters: ChatPageFilter[] = [
+    ...(category !== 'all'
+      ? [{ key: 'category', label: tCategories(category), value: category }]
+      : []),
+    ...(statuses.length > 0
+      ? [
+          {
+            key: 'status',
+            label: statuses.map((status) => t(`status.${status}`)).join(', '),
+            value: statuses.join(','),
+          },
+        ]
+      : []),
+  ];
+  useChatPageContext({
+    pageName: t('title'),
+    dateRange: {
+      from: datePreset,
+      to: null,
+      label: rangeChipLabel(datePreset, {}, (key, values) => tChatRange(key, values)),
+    },
+    filters: chatFilters,
+    view:
+      isLoading || loadFailed
+        ? {}
+        : {
+            rows: viewRows(visible, (kpi) => ({
+              ref: kpi.key,
+              label: tRegistry(`${kpi.key}.name`),
+            })),
+            total: visible.length,
+          },
+  });
 
   if (isLoading) {
     return (

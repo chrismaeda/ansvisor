@@ -17,19 +17,36 @@ let db;
 function table(name) {
   let op = 'select';
   let row = null;
+  const filters = {};
   const result = (single = false) => {
     if (op === 'insert') {
       db.inserts.push({ table: name, row });
-      return { data: name === 'prompt_suggestions' ? row : null, error: null };
+      if (name !== 'prompt_suggestions') return { data: null, error: null };
+      if (db.insertError) return { data: null, error: db.insertError };
+      return { data: row.map((r, i) => ({ id: `new-${i}`, ...r })), error: null };
     }
-    if (op === 'delete') return { data: null, error: null };
+    if (op === 'update') {
+      db.updates.push({ table: name, row, filters });
+      return { data: { ...row, id: filters.id }, error: null };
+    }
+    if (op === 'delete') {
+      db.deletes.push({ table: name, filters });
+      return { data: null, error: null };
+    }
+    // The undecided batch the refresh replaces.
+    if (name === 'prompt_suggestions') return { data: db.current, error: null };
     if (name === 'brands') {
       const brand = { id: 'b1', name: 'Acme', language: 'en', organization_id: 'o1' };
       return { data: brand, error: null };
     }
-    if (name === 'profiles') return { data: { organization_id: 'o1' }, error: null };
-    // The topic lookup for each suggestion finds one; the topic list is empty.
-    if (name === 'topics') return { data: single ? { id: 't1' } : [], error: null };
+    if (name === 'profiles') return { data: { organization_id: 'o1', role: 'admin' }, error: null };
+    // The topic lookup for each suggestion finds one (none for a brand
+    // without topics); the topic list is empty.
+    if (name === 'topics') {
+      return { data: single && !db.noTopics ? { id: 't1' } : single ? null : [], error: null };
+    }
+    // The brand's prompts, whose texts a suggestion mustn't repeat.
+    if (name === 'prompts') return { data: db.prompts, error: null };
     return { data: [], error: null };
   };
   const chain = new Proxy(
@@ -50,6 +67,19 @@ function table(name) {
         if (prop === 'delete') {
           return () => {
             op = 'delete';
+            return chain;
+          };
+        }
+        if (prop === 'update') {
+          return (r) => {
+            op = 'update';
+            row = r;
+            return chain;
+          };
+        }
+        if (prop === 'eq' || prop === 'in') {
+          return (column, value) => {
+            filters[column] = value;
             return chain;
           };
         }
@@ -75,7 +105,11 @@ vi.mock('../lib/ai-provider.js', () => ({ resolveModel: vi.fn(() => 'model') }))
 vi.mock('../lib/gsc-suggestions.js', () => ({ getGscSuggestionCandidates: async () => [] }));
 vi.mock('../lib/ga-suggestions.js', () => ({ getGaSuggestionCandidates: async () => [] }));
 const getCatalogSuggestionCandidates = vi.fn();
-vi.mock('../lib/catalog-suggestions.js', () => ({ getCatalogSuggestionCandidates }));
+const getCatalogProductCandidates = vi.fn();
+vi.mock('../lib/catalog-suggestions.js', () => ({
+  getCatalogSuggestionCandidates,
+  getCatalogProductCandidates,
+}));
 // Retries without the real backoff delay.
 vi.mock('../lib/retry.js', () => ({
   withRetry: async (fn, { attempts }) => {
@@ -114,9 +148,18 @@ const modelEnv = process.env.PROMPT_SUGGESTION_MODEL;
 beforeEach(async () => {
   vi.clearAllMocks();
   delete process.env.PROMPT_SUGGESTION_MODEL;
-  db = { inserts: [] };
+  db = {
+    inserts: [],
+    updates: [],
+    deletes: [],
+    current: [],
+    insertError: null,
+    noTopics: false,
+    prompts: [],
+  };
   reserveRelevanceAllowance.mockResolvedValue({ unlimited: false, id: 'r1' });
   getCatalogSuggestionCandidates.mockResolvedValue([]);
+  getCatalogProductCandidates.mockResolvedValue([]);
   settleRelevanceUsage.mockResolvedValue();
   generateObject.mockResolvedValue(answer({ relevance: 8 }));
 
@@ -124,7 +167,7 @@ beforeEach(async () => {
   app.use(express.json());
   app.use((req, _res, next) => {
     req.user = { id: 'u1' };
-    req.log = { error: vi.fn(), info: vi.fn() };
+    req.log = { error: vi.fn(), info: vi.fn(), warn: vi.fn() };
     next();
   });
   app.use('/api/prompts', router);
@@ -266,5 +309,233 @@ describe('suggestion refresh from the catalog (ECOM-003)', () => {
     const { system, prompt } = generateObject.mock.calls[0][0];
     expect(system).not.toContain('WHAT THE BRAND SELLS');
     expect(prompt).not.toContain('product catalog categories');
+    expect(system).not.toContain("THE BRAND'S TOP PRODUCTS");
+    expect(prompt).not.toContain('top products');
+  });
+});
+
+describe('suggestion refresh from the top products (AC plan P-8)', () => {
+  const atmos = {
+    productId: '7a1c2b9e-1111-4c3d-8e9f-000000000001',
+    product: 'Atmos AG 65',
+    productType: 'Backpack',
+    category: 'Bags > Hiking backpacks',
+    categoryId: '7a1c2b9e-2222-4c3d-8e9f-000000000002',
+    cardPrompts: 4,
+    orders: 12,
+    aiVisits: 30,
+  };
+
+  it('asks for buyer questions about them in the same call, and keeps the product each is about', async () => {
+    getCatalogProductCandidates.mockResolvedValue([atmos]);
+    getCatalogSuggestionCandidates.mockResolvedValue([
+      {
+        category: 'Bags > Hiking backpacks',
+        categoryId: atmos.categoryId,
+        products: 18,
+        priceLow: 60,
+        priceHigh: 180,
+        priceUnder: 150,
+        currency: 'USD',
+      },
+    ]);
+    const suggestions = Array.from({ length: 15 }, (_, i) => suggestion(i));
+    // A product says more than its category: the product wins.
+    suggestions[0] = suggestion(0, {
+      sourceProduct: 'atmos ag 65',
+      sourceCategory: 'Bags > Hiking backpacks',
+    });
+    suggestions[1] = suggestion(1, { sourceCategory: 'Bags > Hiking backpacks' });
+    // A product the catalog never offered: a plain suggestion.
+    suggestions[2] = suggestion(2, { sourceProduct: 'Exos 48' });
+    generateObject.mockResolvedValue({ object: { suggestions }, usage: {} });
+
+    expect((await refresh()).status).toBe(200);
+    // One model call for every source.
+    expect(generateObject).toHaveBeenCalledTimes(1);
+    const { system, prompt } = generateObject.mock.calls[0][0];
+    expect(system).toContain("THE BRAND'S TOP PRODUCTS");
+    expect(system).toContain('Derive at least 1 buyer suggestions');
+    expect(prompt).toContain(
+      '"Atmos AG 65" — in "Bags > Hiking backpacks", type: Backpack; shown on shopping cards for 4 tracked prompts, 12 orders, 30 AI visits',
+    );
+
+    const [rows] = insertsInto('prompt_suggestions');
+    expect(rows[0]).toMatchObject({
+      source: 'catalog',
+      source_data: {
+        product: 'Atmos AG 65',
+        productId: atmos.productId,
+        productType: 'Backpack',
+        category: 'Bags > Hiking backpacks',
+        categoryId: atmos.categoryId,
+        cardPrompts: 4,
+        orders: 12,
+      },
+    });
+    // A category's suggestion keeps the category's id too.
+    expect(rows[1]).toMatchObject({
+      source: 'catalog',
+      source_data: { category: 'Bags > Hiking backpacks', categoryId: atmos.categoryId },
+    });
+    expect(rows[2]).toMatchObject({ source: 'llm', source_data: null });
+  });
+
+  it("tells the products' reader which prompts the brand has, so a named product isn't offered", async () => {
+    db.prompts = [{ text: 'Is the Atmos AG 65 good for long hikes?' }];
+    expect((await refresh()).status).toBe(200);
+    expect(getCatalogProductCandidates).toHaveBeenCalledWith('b1', {
+      trackedTexts: ['Is the Atmos AG 65 good for long hikes?'],
+    });
+  });
+});
+
+describe('suggestion refresh never repeats a prompt the brand has', () => {
+  it('leaves out a suggestion whose text is a prompt of the brand, case and spacing aside', async () => {
+    db.prompts = [{ text: `${suggestion(4).text.toUpperCase()}  ?` }, { text: 'something else' }];
+
+    expect((await refresh()).status).toBe(200);
+    const [rows] = insertsInto('prompt_suggestions');
+    expect(rows).toHaveLength(14);
+    expect(rows.some((r) => r.suggested_text === suggestion(4).text)).toBe(false);
+  });
+});
+
+describe('suggestion refresh for a brand without topics', () => {
+  it('asks for a topic first, before anything is generated, reserved or written', async () => {
+    db.noTopics = true;
+    const res = await refresh();
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({
+      error: 'Add a topic first: prompts are grouped under topics.',
+      code: 'no_topics',
+    });
+    expect(generateObject).not.toHaveBeenCalled();
+    expect(reserveRelevanceAllowance).not.toHaveBeenCalled();
+    expect(db.inserts).toEqual([]);
+  });
+});
+
+describe('suggestion refresh keeps the list', () => {
+  const old = (id, text) => ({ id, brand_id: 'b1', suggested_text: text, status: 'new' });
+  const deletedIds = () =>
+    db.deletes.filter((d) => d.table === 'prompt_suggestions').flatMap((d) => d.filters.id);
+
+  it('adds the new batch first, then removes the old one', async () => {
+    db.current = [old('o1', 'an old question'), old('o2', 'another old question')];
+
+    const res = await refresh();
+
+    expect(res.status).toBe(200);
+    const [rows] = insertsInto('prompt_suggestions');
+    expect(rows).toHaveLength(15);
+    expect(deletedIds()).toEqual(['o1', 'o2']);
+    expect(db.deletes[0].filters).toMatchObject({ status: 'new' });
+    const { suggestions } = await res.json();
+    expect(suggestions).toHaveLength(15);
+  });
+
+  it('leaves the old batch in place when the insert fails', async () => {
+    db.current = [old('o1', 'an old question')];
+    // A database without 00362 turns down source 'catalog'.
+    db.insertError = { code: '23514', message: 'violates check constraint' };
+
+    expect((await refresh()).status).toBe(500);
+    expect(db.deletes).toEqual([]);
+    expect(db.updates).toEqual([]);
+  });
+
+  it('refreshes a text it already has in its own row, not a second one', async () => {
+    const repeated = suggestion(3).text;
+    db.current = [old('o1', repeated.toUpperCase()), old('o2', 'an old question')];
+
+    const res = await refresh();
+
+    expect(res.status).toBe(200);
+    const [rows] = insertsInto('prompt_suggestions');
+    expect(rows).toHaveLength(14);
+    expect(rows.some((r) => r.suggested_text === repeated)).toBe(false);
+    expect(db.updates).toHaveLength(1);
+    expect(db.updates[0]).toMatchObject({
+      row: { suggested_text: repeated, status: 'new' },
+      filters: { id: 'o1', status: 'new' },
+    });
+    expect(deletedIds()).toEqual(['o2']);
+    const { suggestions } = await res.json();
+    expect(suggestions).toHaveLength(15);
+    expect(suggestions[3]).toMatchObject({ id: 'o1', suggested_text: repeated });
+  });
+});
+
+describe('suggestion refresh keeps the Business Hub suggestions (00527)', () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  const hub = (id, text, expiresInDays = 20) => ({
+    id,
+    brand_id: 'b1',
+    suggested_text: text,
+    status: 'new',
+    source: 'business_hub',
+    source_data: { topic: 'office coffee', periodEnd: null, enteredAt: '2026-11-01T00:00:00Z' },
+    expires_at: new Date(Date.now() + expiresInDays * DAY).toISOString(),
+  });
+  const old = (id, text) => ({ id, brand_id: 'b1', suggested_text: text, status: 'new' });
+  const deletedIds = () =>
+    db.deletes.filter((d) => d.table === 'prompt_suggestions').flatMap((d) => d.filters.id);
+
+  it('neither removes nor rewrites one, and lists it after the new batch', async () => {
+    db.current = [hub('h1', 'which office coffee subscription is best'), old('o1', 'an old one')];
+
+    const res = await refresh();
+
+    expect(res.status).toBe(200);
+    expect(deletedIds()).toEqual(['o1']);
+    expect(db.updates).toEqual([]);
+    const { suggestions } = await res.json();
+    expect(suggestions).toHaveLength(16);
+    expect(suggestions.at(-1)).toMatchObject({ id: 'h1', source: 'business_hub' });
+  });
+
+  it('leaves out a refreshed text one of them has, and keeps that one as it is', async () => {
+    const repeated = suggestion(2).text;
+    db.current = [hub('h1', repeated.toUpperCase())];
+
+    const res = await refresh();
+
+    expect(res.status).toBe(200);
+    const [rows] = insertsInto('prompt_suggestions');
+    expect(rows).toHaveLength(14);
+    expect(rows.some((r) => r.suggested_text === repeated)).toBe(false);
+    expect(db.updates).toEqual([]);
+    expect(deletedIds()).toEqual([]);
+    const { suggestions } = await res.json();
+    expect(suggestions.filter((s) => s.id === 'h1')).toHaveLength(1);
+  });
+
+  it('removes one past its 30 days with the old batch', async () => {
+    db.current = [hub('h1', 'which office coffee subscription is best', -1)];
+
+    expect((await refresh()).status).toBe(200);
+    expect(deletedIds()).toEqual(['h1']);
+  });
+});
+
+describe('the suggestions list', () => {
+  it('leaves out a Business Hub suggestion past its 30 days, and reads staleness from the batch', async () => {
+    const day = 24 * 60 * 60 * 1000;
+    const at = (days) => new Date(Date.now() + days * day).toISOString();
+    db.current = [
+      { id: 'h1', source: 'business_hub', status: 'new', expires_at: at(10) },
+      { id: 'h2', source: 'business_hub', status: 'new', expires_at: at(-1) },
+      { id: 'l1', source: 'llm', status: 'new', expires_at: at(-1) },
+    ];
+
+    const res = await fetch(`${baseUrl}/suggestions/b1`);
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.suggestions.map((s) => s.id)).toEqual(['h1', 'l1']);
+    // The refresh's batch is past its 48 hours: stale, whatever Business Hub's say.
+    expect(body.stale).toBe(true);
   });
 });

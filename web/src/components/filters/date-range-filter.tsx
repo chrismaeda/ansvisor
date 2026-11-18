@@ -3,6 +3,7 @@
 import { useTranslations } from 'next-intl';
 import { Input } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
+import type { DateRangePreset } from '@/config/date-presets';
 
 /**
  * The one date range control (#713).
@@ -18,16 +19,7 @@ import { cn } from '@/lib/utils';
  * not pretending every page answers the same question.
  */
 
-export type DateRangePreset = '24h' | '7d' | '30d' | '90d' | 'all' | 'custom';
-
-export const ALL_DATE_PRESETS: readonly DateRangePreset[] = [
-  '24h',
-  '7d',
-  '30d',
-  '90d',
-  'all',
-  'custom',
-];
+export { ALL_DATE_PRESETS, type DateRangePreset } from '@/config/date-presets';
 
 export function dateRangePresetLabel(preset: DateRangePreset, t: (key: string) => string): string {
   if (preset === 'custom') return t('custom');
@@ -46,6 +38,15 @@ interface DateRangeFilterProps<P extends string = DateRangePreset> {
   to?: string;
   onFromChange?: (value: string) => void;
   onToChange?: (value: string) => void;
+  /** Every preset off, as on a page with no data to show yet (Ads). */
+  disabled?: boolean;
+  /**
+   * No label above the buttons, the group still named by it: in a tab row,
+   * whose height it would double (Ads).
+   */
+  labelHidden?: boolean;
+  /** Each preset button's `data-action` id, for a page that names its controls (Ads). */
+  action?: string;
   className?: string;
 }
 
@@ -63,6 +64,9 @@ export function DateRangeFilter<P extends string = DateRangePreset>({
   to,
   onFromChange,
   onToChange,
+  disabled = false,
+  labelHidden = false,
+  action,
   className,
 }: DateRangeFilterProps<P>) {
   const t = useTranslations('common');
@@ -72,11 +76,14 @@ export function DateRangeFilter<P extends string = DateRangePreset>({
   return (
     <>
       <div className={className}>
-        <label className="mb-1.5 block text-xs font-medium text-muted-foreground">
-          {resolvedLabel}
-        </label>
+        {!labelHidden && (
+          <label className="mb-1.5 block text-xs font-medium text-muted-foreground">
+            {resolvedLabel}
+          </label>
+        )}
+        {/* h-8: as tall as the selects and buttons beside it, and the date inputs. */}
         <div
-          className="flex rounded-md border overflow-hidden"
+          className="flex h-8 rounded-md border overflow-hidden"
           role="group"
           aria-label={resolvedLabel}
         >
@@ -85,9 +92,11 @@ export function DateRangeFilter<P extends string = DateRangePreset>({
               key={preset}
               type="button"
               onClick={() => onChange(preset)}
+              disabled={disabled}
               aria-pressed={value === preset}
+              data-action={action}
               className={cn(
-                'px-3 py-1.5 text-xs font-medium transition-colors',
+                'px-3 py-1.5 text-xs font-medium transition-colors disabled:pointer-events-none disabled:opacity-50',
                 value === preset
                   ? 'bg-primary text-primary-foreground'
                   : 'bg-card hover:bg-muted text-foreground',

@@ -4,18 +4,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Brand } from '@/types';
 import type { ActionItem } from '@/lib/actions/action-center';
 import { UpgradeDialogContext } from '@/components/providers/upgrade-gate';
-import {
-  buildGettingStarted,
-  type GettingStartedFacts,
-  type GettingStartedStatus,
-  type GettingStartedStep,
-} from '@/lib/getting-started/steps';
 
 /**
  * The actions list's Export CSV (AC-005): it reads what each listed action's
  * Affected tab names, then downloads the list with it, as UTF-8 Excel reads.
- * And Getting started (AC-ALT2 §4): its steps open the page while a brand
- * runs it, and the page is unchanged for a brand that doesn't.
+ * Actions lists actions only: the set-up steps are Today's.
  */
 
 (
@@ -59,77 +52,90 @@ const action: ActionItem = {
   priorityReason: null,
 };
 
-const {
-  getActions,
-  getActionsAffected,
-  getGettingStarted,
-  startGettingStarted,
-  skipGettingStarted,
-  role,
-  saveBlob,
-  toast,
-} = vi.hoisted(() => ({
+const { getActions, getActionsAffected, role, saveBlob, toast, firstRun } = vi.hoisted(() => ({
   getActions: vi.fn(),
   getActionsAffected: vi.fn(),
-  getGettingStarted: vi.fn(),
-  startGettingStarted: vi.fn(),
-  skipGettingStarted: vi.fn(),
   role: { canManage: true },
   saveBlob: vi.fn(),
   toast: Object.assign(vi.fn(), { error: vi.fn(), success: vi.fn() }),
+  // Who listens for the end of the brand's first run.
+  firstRun: { finished: new Set<(brandId: string) => void>() },
 }));
 
-vi.mock('next-intl', () => ({
-  useTranslations: () => (key: string) => key,
+// No white label kit: downloads keep Ansvisor's names (export-name.test.ts has a kit's).
+vi.mock('@/lib/actions/white-label', () => ({
+  getExportBranding: async () => ({ ok: true, branding: null }),
 }));
+vi.mock('next-intl', () => ({
+  // Chat's "How do I finish …" names its action: the test reads which one.
+  useTranslations: () => (key: string, values?: { title?: string }) =>
+    key === 'actionHow' ? `${key}: ${values?.title}` : key,
+}));
+const setActiveBrand = vi.hoisted(() => vi.fn());
 vi.mock('@/stores/use-brand-store', () => ({
-  useBrandStore: (selector: (state: { getActiveBrand: () => Brand }) => unknown) =>
-    selector({ getActiveBrand: () => brand }),
+  useBrandStore: (
+    selector: (state: {
+      getActiveBrand: () => Brand;
+      brands: Brand[];
+      setActiveBrand: (id: string) => void;
+    }) => unknown,
+  ) =>
+    selector({
+      getActiveBrand: () => brand,
+      brands: [brand, { ...brand, id: 'other-brand' }],
+      setActiveBrand,
+    }),
 }));
 vi.mock('@/lib/actions/action-center', () => ({ getActions, getActionsAffected }));
-vi.mock('@/lib/actions/getting-started', () => ({
-  getGettingStarted,
-  startGettingStarted,
-  skipGettingStarted,
+// A row's Start now (AC plan P-3) reads its work through content-drafts, which needs the
+// server's Supabase client; the list's rows are stubbed here.
+vi.mock('@/components/action-center/start-now', () => ({
+  useStartNow: () => ({ busy: false, start: vi.fn() }),
 }));
+vi.mock('@/lib/actions/content-drafts', () => ({ getStartNowWork: vi.fn() }));
 vi.mock('@/hooks/use-user-role', () => ({ useUserRole: () => role }));
-vi.mock('@/lib/actions/team', () => ({ listMembers: vi.fn(async () => []) }));
+vi.mock('@/hooks/use-first-run', () => ({
+  onFirstRunFinished: (listener: (brandId: string) => void) => {
+    firstRun.finished.add(listener);
+    return () => firstRun.finished.delete(listener);
+  },
+}));
+vi.mock('@/lib/actions/team', () => ({ listBrandMembers: vi.fn(async () => []) }));
 vi.mock('@/lib/download', () => ({ saveBlob }));
 vi.mock('sonner', () => ({ toast }));
 vi.mock('@/components/ai-usage/ai-usage-meter', () => ({
   HeaderWithAiUsage: ({ children }: { children: React.ReactNode }) => children,
 }));
 vi.mock('@/components/action-center/action-center-tabs', () => ({ ActionCenterTabs: () => null }));
-vi.mock('@/components/action-center/action-table', () => ({ ActionTable: () => null }));
-vi.mock('@/components/action-center/action-drawer', () => ({ ActionDrawer: () => null }));
-vi.mock('@/components/getting-started/getting-started-table', () => ({
-  GettingStartedTable: ({
-    steps,
-    showNote,
-    onSelect,
-  }: {
-    steps: GettingStartedStep[];
-    showNote: boolean;
-    onSelect: (step: GettingStartedStep) => void;
-  }) => (
-    <div data-testid="steps">
-      <span data-testid="steps-summary">{`${steps.length} steps${showNote ? ', with the note' : ''}`}</span>
-      {steps.map((step) => (
-        <button key={step.key} data-step={step.key} onClick={() => onSelect(step)}>
-          {step.key}
-        </button>
-      ))}
-    </div>
-  ),
-  readyWhenKey: () => 'setup',
+// The table as the page renders it: its rows in order, its sort, and where a header click goes.
+const table = vi.hoisted(() => ({
+  props: null as {
+    actions: ActionItem[];
+    sort?: string;
+    onSortChange?: (sort: string) => void;
+  } | null,
 }));
-vi.mock('@/components/getting-started/step-card', () => ({
-  GettingStartedStepCard: ({ step }: { step: GettingStartedStep }) => (
-    <div data-testid="card">{step.key}</div>
-  ),
+vi.mock('@/components/action-center/action-table', () => ({
+  ActionTable: (props: NonNullable<typeof table.props>) => {
+    table.props = props;
+    return null;
+  },
 }));
-
+// The drawer as the page opens it: its action, and where it reports a change.
+const drawer = vi.hoisted(() => ({
+  props: null as {
+    action: ActionItem | null;
+    onPatched: (id: string, patch: Partial<ActionItem>) => void;
+  } | null,
+}));
+vi.mock('@/components/action-center/action-drawer', () => ({
+  ActionDrawer: (props: NonNullable<typeof drawer.props>) => {
+    drawer.props = props;
+    return null;
+  },
+}));
 const { default: ActionCenterActionsPage } = await import('./page');
+const { ChatPageSetterContext } = await import('@/components/chat/panel/chat-panel-context');
 
 let container: HTMLDivElement;
 let root: Root;
@@ -153,21 +159,37 @@ async function render(isLocked = false) {
 beforeEach(() => {
   window.history.replaceState(null, '', '/');
   getActions.mockReset().mockResolvedValue([action]);
-  getGettingStarted.mockReset().mockResolvedValue(null);
-  startGettingStarted.mockReset().mockResolvedValue(undefined);
-  skipGettingStarted.mockReset().mockResolvedValue(undefined);
   role.canManage = true;
   container = document.createElement('div');
   document.body.append(container);
   root = createRoot(container);
   getActionsAffected.mockReset();
   saveBlob.mockReset();
+  toast.mockReset();
   toast.error.mockReset();
 });
 
 afterEach(() => {
   act(() => root.unmount());
   container.remove();
+});
+
+describe('the Stale filter (00432)', () => {
+  it('lists only New actions no one has worked on for a month, from the URL', async () => {
+    window.history.replaceState(null, '', '/?status=stale');
+    const stale: ActionItem = { ...action, id: 'a2', staleAt: '2026-10-31T03:00:00Z' };
+    const leftNew: ActionItem = {
+      ...action,
+      id: 'a3',
+      status: 'on_hold',
+      staleAt: '2026-10-31T03:00:00Z',
+    };
+    getActions.mockResolvedValue([action, stale, leftNew]);
+    getActionsAffected.mockResolvedValue({});
+    await render();
+    await act(async () => exportButton().click());
+    expect(getActionsAffected).toHaveBeenLastCalledWith('brand-id', ['a2']);
+  });
 });
 
 describe('the From Products chip (ECOM-013)', () => {
@@ -252,6 +274,9 @@ describe('the actions list Export CSV', () => {
     const [header, row] = new TextDecoder().decode(bytes.slice(3)).split('\n');
     expect(header).toContain(',signal_count,affected_count,affected_items,created');
     expect(row).toContain(',3,3,Best coffee subscription?; Coffee delivery,');
+    // Each row starts with the code the list shows and Chat names it by.
+    expect(header.startsWith('number,')).toBe(true);
+    expect(row.startsWith('AC-35,')).toBe(true);
     expect(exportButton().disabled).toBe(false);
   });
 
@@ -280,214 +305,305 @@ describe('the actions list Export CSV', () => {
   });
 });
 
-const started = (over: Partial<GettingStartedFacts> = {}): GettingStartedStatus =>
-  buildGettingStarted({
-    startedAt: '2026-10-20T10:00:00Z',
-    dismissedAt: null,
-    confirmedAt: '2026-10-20T10:00:00Z',
-    records: {},
-    recordedAt: {},
-    kpiSetupAt: null,
-    competitors: 1,
-    topicPrompts: [],
-    gsc: false,
-    ga: false,
-    firstAnswer: false,
-    firstVisit: false,
-    dataSuggestions: 0,
-    dataTracked: 0,
-    contentSuggestions: 0,
-    contentPicked: 0,
-    contentCreated: 0,
-    contentRecent: 0,
-    audits: 0,
-    draftsCreated: 0,
-    draftsOptimized: 0,
-    ...over,
-  });
-
-const steps = () => container.querySelector('[data-testid="steps"]');
 const text = () => container.textContent ?? '';
 
-describe('Getting started in the actions list', () => {
-  it("leaves the page as it is for a brand that doesn't run it", async () => {
-    getGettingStarted.mockResolvedValue(started({ startedAt: null }));
+describe('the actions list', () => {
+  it('lists the actions only, with the five cards and the filters', async () => {
     await render();
-
-    expect(steps()).toBeNull();
-    expect(text()).not.toContain('card.title');
     expect(text()).toContain('cards.priority');
+    expect(text()).not.toContain('card.title');
     expect(exportButton()).toBeDefined();
   });
 
-  it('opens on its steps for a new brand, the ranking cards waiting for the first signals', async () => {
-    getActions.mockResolvedValue([]);
-    getGettingStarted.mockResolvedValue(started());
+  it('reads the list again when the first run finishes, and once more for the first actions', async () => {
     await render();
+    expect(getActions).toHaveBeenCalledTimes(1);
 
-    expect(container.querySelector('[data-testid="steps-summary"]')?.textContent).toBe(
-      '17 steps, with the note',
-    );
-    expect(text()).toContain('card.title');
-    expect(text().match(/firstSignals/g)).toHaveLength(3);
-    // Getting started takes Highest Priority's place; the filters are for actions.
-    expect(text()).not.toContain('cards.priority');
-    expect(exportButton()).toBeUndefined();
-  });
+    vi.useFakeTimers();
+    try {
+      // Another brand's run: nothing to read here.
+      await act(async () => firstRun.finished.forEach((listener) => listener('other-brand')));
+      expect(getActions).toHaveBeenCalledTimes(1);
 
-  it("opens a step's card, and says when a step still waiting for data opens", async () => {
-    getGettingStarted.mockResolvedValue(started());
-    await render();
-    const card = () => container.querySelector('[data-testid="card"]');
-    expect(card()).toBeNull();
+      await act(async () => firstRun.finished.forEach((listener) => listener('brand-id')));
+      expect(getActions).toHaveBeenCalledTimes(2);
 
-    const stepButton = (key: string) =>
-      container.querySelector<HTMLButtonElement>(`[data-step="${key}"]`)!;
-    await act(async () => stepButton('competitors').click());
-    expect(card()?.textContent).toBe('competitors');
-
-    // Mentions waits for the first answers.
-    await act(async () => stepButton('mentions').click());
-    expect(toast).toHaveBeenCalledWith('opensWhenReady');
-    expect(card()?.textContent).toBe('competitors');
-  });
-
-  // gkhngyk on #1235: Create action, a signal and the history drawer link to
-  // ?action=<id>; on a new brand the drawer opened over the steps.
-  it('lists the actions for a link to one action, or to a filtered list', async () => {
-    for (const search of ['?action=a1', '?status=new', '?q=coffee']) {
-      window.history.replaceState(null, '', `/${search}`);
-      getGettingStarted.mockResolvedValue(started());
-      await render();
-      expect(steps(), search).toBeNull();
-      act(() => root.unmount());
-      root = createRoot(container);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(90_000);
+      });
+      expect(getActions).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
     }
   });
 
-  it('keeps a category the URL names, and lists the actions', async () => {
-    window.history.replaceState(null, '', '/?category=all');
-    getGettingStarted.mockResolvedValue(started());
+  /** Chat's Open in Actions (actions/[id]) names the action's brand, so its drawer opens. */
+  it('switches to the brand a link names, once, when it is one of the person’s', async () => {
+    setActiveBrand.mockClear();
+    window.history.replaceState(null, '', '/?action=a1&brand=other-brand');
     await render();
-
-    expect(steps()).toBeNull();
-    expect(text()).toContain('card.title');
-    expect(exportButton()).toBeDefined();
+    expect(setActiveBrand).toHaveBeenCalledWith('other-brand');
+    expect(setActiveBrand).toHaveBeenCalledTimes(1);
+    act(() => root.unmount());
+    root = createRoot(container);
+    setActiveBrand.mockClear();
+    window.history.replaceState(null, '', '/?action=a1&brand=not-theirs');
+    await render();
+    expect(setActiveBrand).not.toHaveBeenCalled();
   });
 
-  it('reads as before when Getting started cannot be read', async () => {
-    getGettingStarted.mockRejectedValue(new Error('offline'));
+  /** Where actions/[id] sends a Chat answer's "AC-1497": its drawer, or none for an action not here. */
+  it('opens the drawer of the action a link names, and none for one it doesn’t hold', async () => {
+    const opened = () => drawer.props?.action?.id ?? null;
+    window.history.replaceState(null, '', '/?action=a1&brand=brand-id');
     await render();
+    expect(opened()).toBe('a1');
+    act(() => root.unmount());
+    root = createRoot(container);
+    drawer.props = null;
+    window.history.replaceState(null, '', '/?action=not-here&brand=brand-id');
+    await render();
+    expect(opened()).toBeNull();
+  });
 
-    expect(steps()).toBeNull();
+  it('keeps a category the URL names', async () => {
+    window.history.replaceState(null, '', '/?category=recover');
+    await render();
     expect(text()).toContain('cards.priority');
+    expect(exportButton()).toBeDefined();
   });
 });
 
-// Dialogs open in a portal on the body.
-const pageText = () => document.body.textContent ?? '';
-const buttonNamed = (label: string) =>
-  [...document.querySelectorAll('button')].find((b) => b.textContent?.trim() === label);
-
-// AC-ALT2 §5: existing customers, skipping, and a brand added beside others.
-describe('starting and skipping Getting started', () => {
-  it('offers Start to a manager whose brand isn’t set up, and runs it', async () => {
-    getGettingStarted
-      .mockResolvedValueOnce(started({ startedAt: null }))
-      .mockResolvedValue(started({ competitors: 4 }));
-    await render();
-    expect(text()).toContain('start.hint');
-    await act(async () => buttonNamed('start.button')!.click());
-
-    expect(startGettingStarted).toHaveBeenCalledWith('brand-id');
-    expect(toast.success).toHaveBeenCalledWith('start.started');
-    expect(steps()).not.toBeNull();
+describe('what Chat’s side panel sees (W1-08)', () => {
+  it('tells the panel its filters, questions and the actions in view', async () => {
+    const setPage = vi.fn();
+    await act(async () =>
+      root.render(
+        <ChatPageSetterContext.Provider value={setPage}>
+          <UpgradeDialogContext.Provider
+            value={{ isLocked: false, reason: 'ended', adminName: null, openUpgrade }}
+          >
+            <ActionCenterActionsPage />
+          </UpgradeDialogContext.Provider>
+        </ChatPageSetterContext.Provider>,
+      ),
+    );
+    const page = setPage.mock.lastCall![0];
+    expect(page).toMatchObject({
+      pageName: 'title',
+      filters: [],
+      referenceables: [{ type: 'task', id: action.id }],
+    });
+    expect(page.suggestions).toEqual(expect.arrayContaining(['actionsImpact', 'actionsWeek']));
+    // And its view (the owner's plan, item 8): the default sort and the actions in view by code.
+    expect(page.view).toEqual({
+      sort: { key: 'updated', dir: 'desc' },
+      rows: [{ ref: 'AC-35', label: expect.any(String) }],
+      total: 1,
+    });
+    // Leaving the page takes it back.
+    act(() => root.unmount());
+    expect(setPage).toHaveBeenLastCalledWith(null);
+    root = createRoot(container);
   });
 
-  it('offers nothing to a brand that is set up, nor to someone who can’t set it up', async () => {
-    const setUp = { startedAt: null, competitors: 3, topicPrompts: [3, 3, 3], gsc: true };
-    getGettingStarted.mockResolvedValue(started({ ...setUp, contentRecent: 1 }));
+  it('tells the panel the sort and search picked, and the rows on screen in that order (item 8)', async () => {
+    const numbered = (n: number, priorityScore: number): ActionItem => ({
+      ...action,
+      id: `a${n}`,
+      actionNo: n,
+      brandNo: n,
+      priorityScore,
+    });
+    getActions.mockResolvedValue([numbered(3, 40), numbered(7, 95), numbered(12, 60)]);
+    const setPage = vi.fn();
+    const renderWithPanel = async () => {
+      act(() => root.unmount());
+      root = createRoot(container);
+      await act(async () =>
+        root.render(
+          <ChatPageSetterContext.Provider value={setPage}>
+            <UpgradeDialogContext.Provider
+              value={{ isLocked: false, reason: 'ended', adminName: null, openUpgrade }}
+            >
+              <ActionCenterActionsPage />
+            </UpgradeDialogContext.Provider>
+          </ChatPageSetterContext.Provider>,
+        ),
+      );
+      return setPage.mock.lastCall![0].view;
+    };
+    window.history.replaceState(null, '', '/?sort=priority');
+    const sorted = await renderWithPanel();
+    expect(sorted).toMatchObject({ sort: { key: 'priority', dir: 'desc' }, total: 3 });
+    // By the code the list shows (the brand's number), in the list's order.
+    expect(sorted.rows.map((row: { ref: string }) => row.ref)).toEqual(['AC-07', 'AC-12', 'AC-03']);
+    // A search that finds none: its words, no rows, and how many match.
+    window.history.replaceState(null, '', '/?sort=priority_asc&q=nothing-like-this');
+    expect(await renderWithPanel()).toEqual({
+      sort: { key: 'priority', dir: 'asc' },
+      search: 'nothing-like-this',
+      rows: [],
+      total: 0,
+    });
+    // Before the list is read: no rows and no count yet.
+    getActions.mockReturnValue(new Promise(() => {}));
+    window.history.replaceState(null, '', '/?sort=due_date');
+    expect(await renderWithPanel()).toEqual({ sort: { key: 'due_date', dir: 'asc' } });
+  });
+
+  it('asks how to finish the first of the Top actions, whatever order the list came in', async () => {
+    const opportunity = (id: string, title: string, priorityScore: number): ActionItem => ({
+      ...action,
+      id,
+      kind: 'content_opportunity',
+      payload: { title },
+      priorityScore,
+    });
+    getActions.mockResolvedValue([
+      opportunity('low', 'Low one', 20),
+      opportunity('high', 'High one', 95),
+      opportunity('mid', 'Mid one', 60),
+    ]);
+    const setPage = vi.fn();
+    await act(async () =>
+      root.render(
+        <ChatPageSetterContext.Provider value={setPage}>
+          <UpgradeDialogContext.Provider
+            value={{ isLocked: false, reason: 'ended', adminName: null, openUpgrade }}
+          >
+            <ActionCenterActionsPage />
+          </UpgradeDialogContext.Provider>
+        </ChatPageSetterContext.Provider>,
+      ),
+    );
+    expect(setPage.mock.lastCall![0].suggestions[0]).toBe('actionHow: High one');
+  });
+});
+
+/**
+ * Owner's feedback (14 Nov): the list opens on the date it shows, Updated,
+ * most recent first; Newest (by creation, shown nowhere) is gone, its old
+ * links landing on the one date sort; the Updated header flips it.
+ */
+describe('the list’s order', () => {
+  const at = (id: string, actionNo: number, updatedAt: string, createdAt: string): ActionItem => ({
+    ...action,
+    id,
+    actionNo,
+    updatedAt,
+    createdAt,
+  });
+  // Created newest first, but updated in another order: Newest used to list a, b, c.
+  const rows = [
+    at('a', 3, '2026-10-29T00:00:00+00:00', '2026-11-01T00:00:00+00:00'),
+    at('b', 2, '2026-11-09T00:00:00+00:00', '2026-10-20T00:00:00+00:00'),
+    at('c', 1, '2026-11-08T00:00:00+00:00', '2026-10-10T00:00:00+00:00'),
+  ];
+  const ids = () => table.props!.actions.map((row) => row.id);
+  const sortParam = () => new URLSearchParams(window.location.search).get('sort');
+  /** The URL is written 300ms after a change. */
+  const settle = () =>
+    act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+    });
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    table.props = null;
+    getActions.mockResolvedValue(rows);
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it('opens on the most recently updated first, with no sort in the URL', async () => {
     await render();
-    expect(buttonNamed('start.button')).toBeUndefined();
+    expect(table.props!.sort).toBe('updated');
+    expect(ids()).toEqual(['b', 'c', 'a']);
+    expect(text()).toContain('sort.updated');
+    await settle();
+    expect(sortParam()).toBeNull();
+  });
+
+  it('takes an old link’s ?sort=newest to the same date sort', async () => {
+    window.history.replaceState(null, '', '/?sort=newest&status=new');
+    await render();
+    expect(table.props!.sort).toBe('updated');
+    expect(ids()).toEqual(['b', 'c', 'a']);
+    await settle();
+    expect(sortParam()).toBeNull();
+    expect(new URLSearchParams(window.location.search).get('status')).toBe('new');
+  });
+
+  it('turns the other way round on a header click, and back, in the URL', async () => {
+    await render();
+    await act(async () => table.props!.onSortChange!('updated_asc'));
+    expect(ids()).toEqual(['a', 'c', 'b']);
+    expect(table.props!.sort).toBe('updated_asc');
+    expect(text()).toContain('sort.updated_asc');
+    await settle();
+    expect(sortParam()).toBe('updated_asc');
+
+    await act(async () => table.props!.onSortChange!('updated'));
+    expect(ids()).toEqual(['b', 'c', 'a']);
+    await settle();
+    expect(sortParam()).toBeNull();
+  });
+
+  it('keeps a sort the URL names, Priority included', async () => {
+    window.history.replaceState(null, '', '/?sort=updated_asc');
+    await render();
+    expect(ids()).toEqual(['a', 'c', 'b']);
 
     act(() => root.unmount());
     root = createRoot(container);
-    role.canManage = false;
-    getGettingStarted.mockResolvedValue(started({ startedAt: null }));
+    window.history.replaceState(null, '', '/?sort=priority');
+    getActions.mockResolvedValue([
+      { ...rows[0], priorityScore: 40 },
+      { ...rows[1], priorityScore: 10 },
+      { ...rows[2], priorityScore: 70 },
+    ]);
     await render();
-    expect(buttonNamed('start.button')).toBeUndefined();
+    expect(table.props!.sort).toBe('priority');
+    expect(ids()).toEqual(['c', 'a', 'b']);
+    await settle();
+    expect(sortParam()).toBe('priority');
+  });
+});
+
+/** Owner's feedback (14 Nov): Chat says "AC-251"; the list's search finds it. */
+describe('finding an action by its code', () => {
+  const numbered = (id: string, actionNo: number): ActionItem => ({ ...action, id, actionNo });
+  const ids = () => table.props?.actions.map((row) => row.id) ?? [];
+
+  beforeEach(() => {
+    getActions.mockResolvedValue([
+      numbered('n251', 251),
+      numbered('n2510', 2510),
+      numbered('n1251', 1251),
+      numbered('n25', 25),
+    ]);
   });
 
-  it('skips it only after asking, then lists the actions', async () => {
-    getGettingStarted
-      .mockResolvedValueOnce(started())
-      .mockResolvedValue(started({ dismissedAt: '2026-10-20T12:00:00Z' }));
+  for (const query of ['AC-251', 'ac-251', '251']) {
+    it(`lists only AC-251 for “${query}”`, async () => {
+      table.props = null;
+      window.history.replaceState(null, '', `/?q=${encodeURIComponent(query)}`);
+      await render();
+      expect(ids()).toEqual(['n251']);
+    });
+  }
+
+  it('lists nothing for a number no action has, and every action without a search', async () => {
+    table.props = null;
+    window.history.replaceState(null, '', '/?q=AC-999');
     await render();
-    await act(async () => buttonNamed('skip.button')!.click());
-    expect(skipGettingStarted).not.toHaveBeenCalled();
-    expect(pageText()).toContain('skip.body');
-
-    await act(async () => buttonNamed('skip.confirm')!.click());
-    expect(skipGettingStarted).toHaveBeenCalledWith('brand-id');
-    expect(toast.success).toHaveBeenCalledWith('skip.done');
-    expect(steps()).toBeNull();
-    // Start stays available after a skip.
-    expect(buttonNamed('start.button')).toBeDefined();
-  });
-
-  it("closes the new brand's question when the answer can't be saved, and keeps it closed", async () => {
-    getGettingStarted.mockResolvedValue(started({ confirmedAt: null }));
-    startGettingStarted.mockRejectedValue(new Error('missing column confirmed_at'));
-    await render();
-    expect(pageText()).toContain('secondBrand.title');
-
-    await act(async () => buttonNamed('secondBrand.run')!.click());
-    expect(toast.error).toHaveBeenCalledWith('start.failed');
-    expect(pageText()).not.toContain('secondBrand.title');
-    // Start takes the question's place, to run it later.
-    expect(buttonNamed('start.button')).toBeDefined();
-  });
-
-  // next-intl is mocked: the upgrade dialog's label is its key.
-  it('starts and skips nothing on a read-only workspace: each opens the upgrade dialog', async () => {
-    openUpgrade.mockReset();
-    getGettingStarted.mockResolvedValue(started({ startedAt: null }));
-    await render(true);
-    await act(async () => buttonNamed('start.button')!.click());
-    expect(openUpgrade).toHaveBeenLastCalledWith('startGettingStarted');
-    expect(startGettingStarted).not.toHaveBeenCalled();
+    expect(table.props).toBeNull();
+    expect(text()).toContain('noResults');
 
     act(() => root.unmount());
     root = createRoot(container);
-    getGettingStarted.mockResolvedValue(started());
-    await render(true);
-    await act(async () => buttonNamed('skip.button')!.click());
-    expect(openUpgrade).toHaveBeenLastCalledWith('skipGettingStarted');
-    expect(pageText()).not.toContain('skip.body');
-    expect(skipGettingStarted).not.toHaveBeenCalled();
-  });
-
-  it("doesn't ask on a read-only workspace whether to run it for a new brand: Start waits", async () => {
-    openUpgrade.mockReset();
-    getGettingStarted.mockResolvedValue(started({ confirmedAt: null }));
-    await render(true);
-    expect(pageText()).not.toContain('secondBrand.title');
-    await act(async () => buttonNamed('start.button')!.click());
-    expect(openUpgrade).toHaveBeenCalledExactlyOnceWith('startGettingStarted');
-    expect(startGettingStarted).not.toHaveBeenCalled();
-  });
-
-  it('asks a manager whether to run it for a brand added beside others', async () => {
-    getGettingStarted
-      .mockResolvedValueOnce(started({ confirmedAt: null }))
-      .mockResolvedValue(started());
+    window.history.replaceState(null, '', '/');
     await render();
-    expect(pageText()).toContain('secondBrand.title');
-    expect(steps()).toBeNull();
-
-    await act(async () => buttonNamed('secondBrand.run')!.click());
-    expect(startGettingStarted).toHaveBeenCalledWith('brand-id');
-    expect(toast.success).toHaveBeenCalledWith('secondBrand.ran');
-    expect(steps()).not.toBeNull();
+    expect(ids()).toHaveLength(4);
   });
 });

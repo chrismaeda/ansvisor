@@ -9,12 +9,18 @@ import { Skeleton } from '@/components/ui/skeleton';
 
 // Reuse the insights page's Recharts trend chart (same VisibilityTrendPoint
 // shape the report payload stores), loaded client-only like insights does.
-const TrendChart = dynamic(() => import('../../insights/_charts').then((m) => m.TrendChart), {
-  ssr: false,
-  loading: () => <Skeleton className="h-48 w-full" />,
-});
+const TrendChart = dynamic(
+  () => import('../../(brand-visibility)/insights/_charts').then((m) => m.TrendChart),
+  {
+    ssr: false,
+    loading: () => <Skeleton className="h-48 w-full" />,
+  },
+);
 import { toast } from 'sonner';
 import { getReport, type Report } from '@/lib/actions/reports';
+import { getReportBranding } from '@/lib/actions/white-label';
+import { reportFileName, reportLook, type ReportBranding } from '@/lib/white-label/kit';
+import { pdfImage } from '@/lib/white-label/pdf-image';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import {
@@ -26,16 +32,32 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { ArrowLeft, FileDown, Loader2, RotateCw } from 'lucide-react';
-import { formatDate } from '@/lib/format';
+import { formatDate, formatMoney, formatNumber, percentChange } from '@/lib/format';
+import { getPlatformName } from '@/lib/traffic-platforms';
 import { cn } from '@/lib/utils';
 import { PLATFORM_LABELS } from '@/config/platform-labels';
 import { REPORT_TEMPLATES } from '@/lib/reports/templates';
+import { auditScoreView } from '@/lib/reports/audit-score';
+import { ScoreRangeMark, useScoreRangeTip } from '@/components/audit/score-range';
 import { HeaderWithAiUsage } from '@/components/ai-usage/ai-usage-meter';
+import { useChatPageContext } from '@/components/chat/panel/chat-panel-context';
+import { rangeChipLabel } from '@/lib/chat/page-context';
 
 const KNOWN_TEMPLATE_IDS = new Set<string>(REPORT_TEMPLATES.map((tpl) => tpl.id));
 
+const BRANDING_FAILED = { ok: false, failure: 'failed' } as const;
+
 /** Signed percentage delta, or an explicit raw count for a new zero-base metric. */
-function Delta({ value, zeroBaseCount }: { value: number | null; zeroBaseCount?: number }) {
+function Delta({
+  value,
+  zeroBaseCount,
+  unit = '%',
+}: {
+  value: number | null;
+  zeroBaseCount?: number;
+  /** '%' for a percentage change; '' for points, such as the Site Audit score's. */
+  unit?: '%' | '';
+}) {
   if (zeroBaseCount !== undefined) {
     return <span className="text-xs font-medium text-emerald-600">+{zeroBaseCount} new</span>;
   }
@@ -44,7 +66,8 @@ function Delta({ value, zeroBaseCount }: { value: number | null; zeroBaseCount?:
   return (
     <span className={cn('text-xs font-medium', up ? 'text-emerald-600' : 'text-red-600')}>
       {up ? '+' : ''}
-      {value}%
+      {value}
+      {unit}
     </span>
   );
 }
@@ -78,25 +101,75 @@ function KpiCard({
   );
 }
 
+/**
+ * The white label kit's cover (00429), as the PDF opens: the agency's logo
+ * (or its name), "Prepared for" the brand, the client's logo, and the kit's
+ * color under them. The paper is white in both themes, as the PDF is.
+ */
+function ReportCover({ branding, brandName }: { branding: ReportBranding; brandName: string }) {
+  const t = useTranslations('reports');
+  const look = reportLook(branding);
+  return (
+    <div className="rounded-lg border bg-white p-5 text-zinc-900 shadow-sm">
+      <div className="flex min-h-10 items-center justify-between gap-4">
+        {branding.logo ? (
+          // eslint-disable-next-line @next/next/no-img-element -- the logo itself, as a data URL
+          <img
+            src={branding.logo}
+            alt={branding.companyName ?? ''}
+            className="max-h-10 max-w-48 object-contain"
+          />
+        ) : (
+          <span className="font-semibold">{branding.companyName}</span>
+        )}
+        {branding.clientLogo && (
+          // eslint-disable-next-line @next/next/no-img-element -- the logo itself, as a data URL
+          <img
+            src={branding.clientLogo}
+            alt={brandName}
+            className="max-h-10 max-w-48 object-contain"
+          />
+        )}
+      </div>
+      <p className="mt-3 text-sm font-medium" style={{ color: look.textAccent }}>
+        {t('preparedFor', { brand: brandName })}
+      </p>
+      <div className="mt-3 h-0.5" style={{ backgroundColor: look.accent }} />
+    </div>
+  );
+}
+
 export default function ReportDetailPage() {
   const params = useParams();
   const id = params.id as string;
   const t = useTranslations('reports');
   const tCommon = useTranslations('common');
+  const rangeTip = useScoreRangeTip();
 
   const [report, setReport] = useState<Report | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadFailed, setLoadFailed] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const [downloading, setDownloading] = useState(false);
+  // The white label kit the report is shown and downloaded with (null: none);
+  // undefined until it is read, or when it couldn't be.
+  const [branding, setBranding] = useState<ReportBranding | null | undefined>(undefined);
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setLoadFailed(false);
+    setBranding(undefined);
     getReport(id)
       .then((r) => {
-        if (!cancelled) setReport(r);
+        if (cancelled) return;
+        setReport(r);
+        if (!r) return;
+        void getReportBranding(r.brandId)
+          .catch(() => BRANDING_FAILED)
+          .then((read) => {
+            if (!cancelled && read.ok) setBranding(read.branding);
+          });
       })
       .catch((err) => {
         console.error('Failed to load report:', err);
@@ -109,6 +182,27 @@ export default function ReportDetailPage() {
       cancelled = true;
     };
   }, [id, attempt]);
+
+  // Chat's side panel sees the page (the owner's plan of 2026-11-16, step 9's detail pages): the
+  // saved report it holds open by its id, and the days it covers. Its sections are a snapshot:
+  // get_report reads them whole, so no row is sent.
+  const tChatRange = useTranslations('chatPanel.range');
+  const period = report && {
+    from: report.dateFrom.slice(0, 10),
+    to: report.dateTo.slice(0, 10),
+  };
+  useChatPageContext(
+    report && period && report.id === id && !loading
+      ? {
+          pageName: report.title,
+          dateRange: {
+            ...period,
+            label: rangeChipLabel('custom', period, (key, values) => tChatRange(key, values)),
+          },
+          view: { open: { ref: id, label: report.title } },
+        }
+      : null,
+  );
 
   if (loading) {
     return (
@@ -169,6 +263,8 @@ export default function ReportDetailPage() {
   const hasTopicVisibilityRate = Boolean(
     payload.topicPerformance?.some((tp) => typeof tp.visibilityRate === 'number'),
   );
+  // The Site Audit score in points; older reports stored it on a 0–1 scale.
+  const auditScore = payload.auditScore ? auditScoreView(payload.auditScore) : null;
 
   // Render a true vector PDF from the saved payload with @react-pdf/renderer
   // (selectable text, exact layout — no screenshot artifacts). The renderer
@@ -177,21 +273,29 @@ export default function ReportDetailPage() {
   const handleDownloadPdf = async () => {
     setDownloading(true);
     try {
-      const [{ pdf }, { ReportPdfDocument }] = await Promise.all([
-        import('@react-pdf/renderer'),
+      // A kit that couldn't be read is read again: a PDF in Ansvisor's look
+      // must not go to an agency's client by mistake.
+      let kit = branding;
+      if (kit === undefined) {
+        const read = await getReportBranding(report.brandId).catch(() => BRANDING_FAILED);
+        if (!read.ok) {
+          toast.error(t('brandingFailed'));
+          return;
+        }
+        kit = read.branding;
+        setBranding(kit);
+      }
+      const [{ reportPdf }, logo, clientLogo] = await Promise.all([
         import('./_report-pdf'),
+        pdfImage(kit?.logo ?? null),
+        pdfImage(kit?.clientLogo ?? null),
       ]);
-      const blob = await pdf(<ReportPdfDocument report={report} />).toBlob();
+      const blob = await reportPdf(report, kit && { ...kit, logo, clientLogo });
 
-      const slug =
-        payload.brandName
-          .toLowerCase()
-          .replace(/[^a-z0-9]+/g, '-')
-          .replace(/(^-|-$)/g, '') || 'brand';
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `ansvisor_${slug}_report_${report.dateTo.slice(0, 10)}.pdf`;
+      a.download = reportFileName(kit, payload.brandName, report.dateTo);
       a.click();
       URL.revokeObjectURL(url);
     } catch (err) {
@@ -205,7 +309,7 @@ export default function ReportDetailPage() {
   return (
     <div className="space-y-6">
       <HeaderWithAiUsage>
-        <div className="flex items-center justify-between">
+        <div className="flex items-start justify-between gap-4">
           <div className="space-y-1">
             <Link
               href="/dashboard/reports"
@@ -238,6 +342,8 @@ export default function ReportDetailPage() {
       {/* Everything below renders from the immutable saved payload; the
           container id is the future PDF capture root. */}
       <div id="report-root" className="space-y-6">
+        {branding && <ReportCover branding={branding} brandName={payload.brandName} />}
+
         {/* A section that could not be gathered is named here rather than
             silently absent — otherwise the report reads as though the brand
             had no data for it. */}
@@ -703,6 +809,119 @@ export default function ReportDetailPage() {
           </Card>
         )}
 
+        {payload.aiPipeline && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-baseline gap-2 text-base">
+                {t('aiPipeline.title')}
+                <span className="text-xs font-normal text-muted-foreground">
+                  {t('aiPipeline.from')}
+                </span>
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                {[
+                  {
+                    label: t('aiPipeline.contacts'),
+                    value: formatNumber(payload.aiPipeline.totals.contacts),
+                    change: percentChange(
+                      payload.aiPipeline.totals.contacts,
+                      payload.aiPipeline.totals.contactsPrev,
+                    ),
+                  },
+                  {
+                    label: t('aiPipeline.deals'),
+                    value: formatNumber(payload.aiPipeline.totals.deals),
+                    change: null,
+                  },
+                  {
+                    label: t('aiPipeline.openPipeline'),
+                    value: formatMoney(
+                      payload.aiPipeline.totals.openPipeline,
+                      payload.aiPipeline.currency,
+                    ),
+                    change: null,
+                  },
+                  {
+                    label: t('aiPipeline.wonRevenue'),
+                    value: formatMoney(
+                      payload.aiPipeline.totals.wonRevenue,
+                      payload.aiPipeline.currency,
+                    ),
+                    change: percentChange(
+                      payload.aiPipeline.totals.wonRevenue,
+                      payload.aiPipeline.totals.wonRevenuePrev,
+                    ),
+                  },
+                ].map((kpi) => (
+                  <div key={kpi.label}>
+                    <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+                      {kpi.label}
+                    </p>
+                    <div className="mt-1 flex items-baseline gap-2">
+                      <span className="text-2xl font-bold tabular-nums">{kpi.value}</span>
+                      <Delta value={kpi.change} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="grid gap-6 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+                    {t('aiPipeline.byEngine')}
+                  </p>
+                  {payload.aiPipeline.byEngine.length === 0 ? (
+                    <p className="text-sm text-muted-foreground">{t('noData')}</p>
+                  ) : (
+                    payload.aiPipeline.byEngine.map((e) => (
+                      <div key={e.source} className="flex items-center justify-between text-sm">
+                        <span className="truncate">{getPlatformName(e.source)}</span>
+                        <span className="font-medium tabular-nums">
+                          {t('aiPipeline.engineLine', {
+                            contacts: e.contacts,
+                            revenue: formatMoney(e.wonRevenue, payload.aiPipeline!.currency),
+                          })}
+                        </span>
+                      </div>
+                    ))
+                  )}
+                </div>
+                <div className="space-y-2">
+                  <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+                    {t('aiPipeline.topPages')}
+                  </p>
+                  {payload.aiPipeline.byPage.length === 0 ? (
+                    <p className="text-sm text-muted-foreground">{t('noData')}</p>
+                  ) : (
+                    payload.aiPipeline.byPage.map((p) => (
+                      <div key={p.page} className="flex items-center justify-between gap-3 text-sm">
+                        <span className="min-w-0 truncate text-muted-foreground">{p.page}</span>
+                        <span className="shrink-0 font-medium tabular-nums">
+                          {formatMoney(p.wonRevenue, payload.aiPipeline!.currency)}
+                        </span>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+              {payload.aiPipeline.hubspotNative.contacts > 0 && (
+                <p className="text-xs text-muted-foreground">
+                  {t('aiPipeline.native', {
+                    contacts: payload.aiPipeline.hubspotNative.contacts,
+                    deals: payload.aiPipeline.hubspotNative.deals,
+                    revenue: formatMoney(
+                      payload.aiPipeline.hubspotNative.wonRevenue,
+                      payload.aiPipeline.currency,
+                    ),
+                  })}
+                </p>
+              )}
+              <p className="text-xs text-muted-foreground">{t('aiPipeline.rule')}</p>
+            </CardContent>
+          </Card>
+        )}
+
         {payload.shoppingVisibility && (
           <Card>
             <CardHeader>
@@ -746,30 +965,32 @@ export default function ReportDetailPage() {
           </Card>
         )}
 
-        {payload.auditScore && (
+        {payload.auditScore && auditScore && (
           <Card>
             <CardHeader>
               <CardTitle className="text-base">{t('auditScore')}</CardTitle>
             </CardHeader>
             <CardContent className="flex items-center gap-6">
               <div className="flex items-baseline gap-2">
-                <span className="text-3xl font-bold">{payload.auditScore.totalScore ?? '—'}</span>
-                {payload.auditScore.totalScore !== null &&
-                  payload.auditScore.previousScore !== null && (
-                    <Delta
-                      value={
-                        Math.round(
-                          (payload.auditScore.totalScore - payload.auditScore.previousScore) * 10,
-                        ) / 10
-                      }
-                    />
-                  )}
+                <span className="text-3xl font-bold">{auditScore.score}</span>
+                {auditScore.range && (
+                  <ScoreRangeMark
+                    range={auditScore.range}
+                    spoken={false}
+                    className="text-sm tabular-nums"
+                  />
+                )}
+                {auditScore.change !== null && <Delta value={auditScore.change} unit="" />}
               </div>
               <div className="min-w-0">
                 <p className="truncate text-sm font-medium">{payload.auditScore.url}</p>
                 <p className="text-xs text-muted-foreground">
                   {t('auditedOn')} {formatDate(payload.auditScore.auditedAt)}
                 </p>
+                {/* What "± 2" means, written out as the audit report does. */}
+                {auditScore.range && (
+                  <p className="text-xs text-muted-foreground">{rangeTip(auditScore.range)}</p>
+                )}
               </div>
             </CardContent>
           </Card>

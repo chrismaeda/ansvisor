@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import rateLimit from 'express-rate-limit';
-import { verifiedBotConnection, verifiedUserId } from './verified-tokens.js';
+import { webhookSecretsMatch } from '../lib/webhook-secret.js';
+import { verifiedActingUserId, verifiedBotConnection, verifiedUserId } from './verified-tokens.js';
 
 /**
  * Anonymous bucket key. IPv4 (including v4-mapped IPv6) keys on the exact
@@ -33,20 +34,57 @@ export function anonymousIpKey(ip) {
  * too (it isn't verified yet) — one request per token per half hour, noise.
  * Rotating IPs to evade the anonymous limit remains an infra-level concern
  * (WAF/CDN), same as before this limiter existed.
+ *
+ * An internal request acting as a member (acting-user.js) counts in that
+ * member's bucket, once the member has been checked: the web's triggered
+ * Chat runs share the limits of the person they run for.
  */
 export function apiLimiterKey(req) {
-  const userId = verifiedUserId(req.headers.authorization);
+  const userId = verifiedCaller(req);
   if (userId) return 'user:' + userId;
   return anonymousIpKey(req.ip);
 }
 
-// General API rate limit, per verified user (per IP otherwise)
+/** The verified person a request comes from, by their token or the member it acts for. */
+function verifiedCaller(req) {
+  const { authorization } = req.headers;
+  return (
+    verifiedActingUserId(authorization, req.headers['x-acting-user']) ??
+    verifiedUserId(authorization)
+  );
+}
+
+/**
+ * The web's Chat engine's budget calls and page reads, its model menu and its
+ * pages' Quality reads (routes/internal-chat-budget.js, internal-chat-pages.js,
+ * internal-chat-models.js, internal-chat-quality.js).
+ */
+const CHAT_BUDGET_PATH = /^\/api\/internal\/chat\/(budget|pages|models|quality)(\/|$)/;
+
+/**
+ * Whether a request is the web's Chat engine holding or settling a model
+ * step on the AI budget, with the internal secret (CRON_SECRET, compared in
+ * constant time). Every Chat step makes two of them, and on Vercel the web's
+ * calls come from a few shared addresses, so the API's per-IP bucket would
+ * stop Chat for every workspace at once. Only this path, and only with the
+ * secret: any other request, or this path without it, is counted as before.
+ */
+export function isInternalChatBudgetCall(req) {
+  if (!CHAT_BUDGET_PATH.test(`${req.baseUrl ?? ''}${req.path ?? ''}`)) return false;
+  const auth = req.headers?.authorization;
+  if (typeof auth !== 'string' || !auth.startsWith('Bearer ')) return false;
+  return webhookSecretsMatch(process.env.CRON_SECRET, auth.slice('Bearer '.length));
+}
+
+// General API rate limit, per verified user (per IP otherwise). The Chat
+// engine's budget calls, with the internal secret, aren't counted.
 export const apiLimiter = rateLimit({
+  skip: isInternalChatBudgetCall,
   windowMs: 15 * 60 * 1000,
   // A verified user's bucket only needs to absorb their own burst (several
   // tabs polling tracking status every 15s plus normal navigation).
   // Unverified traffic keeps the tighter IP limit.
-  max: (req) => (verifiedUserId(req.headers.authorization) ? 1000 : 250),
+  max: (req) => (verifiedCaller(req) ? 1000 : 250),
   keyGenerator: apiLimiterKey,
   standardHeaders: true,
   legacyHeaders: false,
@@ -145,6 +183,20 @@ export const catalogLimiter = rateLimit({
   },
 });
 
+// An access log uploaded for the AI bot report (#2170): each reads a file of
+// up to 20,000 lines and checks its bots' addresses, so a member's are few.
+export const botUploadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  keyGenerator: apiLimiterKey,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: 'Too many requests, please try again later.',
+  },
+});
+
 // A catalog category's page set by hand, or put back to its match (shopping
 // path, 00350): a person goes down the table a row at a time, so a bucket
 // of its own, wider than the syncs'. Reading the table takes the API's.
@@ -176,11 +228,56 @@ export const shoppingPathLimiter = rateLimit({
   },
 });
 
+// A draft's Site Audit estimate (customer priorities item 9): the editor
+// reads it again each time typing pauses, and each reading parses the whole
+// page and runs the audit's checks on it, so a bucket of its own.
+export const auditEstimateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  keyGenerator: apiLimiterKey,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: 'Too many requests, please try again later.',
+  },
+});
+
 // A brand's CMS connection (Send to CMS, #1331): each call reaches Webflow
 // through Composio, so a member's are few.
 export const cmsLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 60,
+  keyGenerator: apiLimiterKey,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: 'Too many requests, please try again later.',
+  },
+});
+
+// A brand's Slack (#2139): connecting, listing channels and test messages
+// each reach Slack through Composio, so a member's are few.
+export const slackLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  keyGenerator: apiLimiterKey,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: 'Too many requests, please try again later.',
+  },
+});
+
+// The Library's checks whether pages sent to a CMS were published there:
+// four each time it opens, answered from a two-minute memory per brand. A
+// bucket of their own, so opening the Library never uses up a member's
+// cmsLimiter, and connecting a CMS stays open to them.
+export const cmsStatusLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 180,
   keyGenerator: apiLimiterKey,
   standardHeaders: true,
   legacyHeaders: false,
@@ -204,10 +301,47 @@ export const webhookTestLimiter = rateLimit({
   },
 });
 
+// AI Traffic's Check again: one read of the brand's home page each.
+export const snippetCheckLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  keyGenerator: apiLimiterKey,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: 'Too many requests, please try again later.',
+  },
+});
+
 export const brandFactsLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 30,
   keyGenerator: apiLimiterKey,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: 'Too many requests, please try again later.',
+  },
+});
+
+/** A brand's bucket for prompts from Business Hub's discovery topics. */
+export function businessHubTopicsKey(req) {
+  return 'business-hub-topics:' + req.params.brandId;
+}
+
+// Prompts from ChatGPT Business Hub's discovery topics (Business Hub plan,
+// PR 6): one model call each, not charged to the AI budget, so 10 an hour
+// per brand, whoever asks. A refusal (off, a role, a brand without topics,
+// a bad body) isn't counted, so nobody can use up a brand's bucket without
+// generating anything; a failed generation is, since its model calls ran.
+export const businessHubTopicsLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  keyGenerator: businessHubTopicsKey,
+  skipFailedRequests: true,
+  requestWasSuccessful: (_req, res) => res.statusCode < 400 || res.statusCode >= 500,
   standardHeaders: true,
   legacyHeaders: false,
   message: {

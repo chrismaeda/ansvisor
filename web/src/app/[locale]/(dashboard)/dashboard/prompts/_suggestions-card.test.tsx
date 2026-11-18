@@ -18,15 +18,35 @@ const actions = vi.hoisted(() => ({
   refreshPromptSuggestions: vi.fn(),
   acceptSuggestion: vi.fn(),
   dismissSuggestion: vi.fn(),
+  dismissSuggestions: vi.fn(),
   trackSuggestions: vi.fn(),
+  suggestPromptsFromBusinessHub: vi.fn(),
 }));
 vi.mock('@/lib/actions/prompt-suggestions', () => actions);
+
+// The Business Hub dialog's quota line.
+const quota = vi.hoisted(() => ({ getLocationQuota: vi.fn() }));
+vi.mock('@/lib/actions/prompt', () => quota);
+// Generate by topic's picker reads the brand's topics; its own tests are in _topic-prompts.test.
+const topicActions = vi.hoisted(() => ({ getTopics: vi.fn(async () => []) }));
+vi.mock('@/lib/actions/topic', () => topicActions);
 
 const toast = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn(), info: vi.fn() }));
 vi.mock('sonner', () => ({ toast }));
 
 vi.mock('@/i18n/navigation', () => ({
   Link: ({ children, ...props }: React.ComponentProps<'a'>) => <a {...props}>{children}</a>,
+  useRouter: () => ({ push: vi.fn() }),
+}));
+
+// The viewer's role: an admin unless a test says otherwise.
+const viewer = vi.hoisted(() => ({ role: 'admin' as string }));
+vi.mock('@/hooks/use-user-role', () => ({
+  useUserRole: () => ({
+    role: viewer.role,
+    canManage: viewer.role === 'admin' || viewer.role === 'manager',
+    canAdmin: viewer.role === 'admin',
+  }),
 }));
 
 const suggestion = (n: number): PromptSuggestion => ({
@@ -55,9 +75,11 @@ const onAccepted = vi.fn();
 let isLocked = false;
 const openUpgrade = vi.fn();
 
-async function render(count: number, planId: 'starter' | 'growth' = 'starter') {
+async function render(count: number, onAddTopic?: () => void) {
   actions.getPromptSuggestions.mockResolvedValue({
+    ok: true,
     suggestions: Array.from({ length: count }, (_, i) => suggestion(i + 1)),
+    stale: false,
   });
   await act(async () => {
     root.render(
@@ -68,8 +90,8 @@ async function render(count: number, planId: 'starter' | 'growth' = 'starter') {
           <SuggestionsCard
             brandId="b1"
             onAccepted={onAccepted}
+            onAddTopic={onAddTopic}
             sourceStates={null}
-            planId={planId}
             limitActions={<button type="button">Upgrade plan</button>}
           />
         </UpgradeDialogContext.Provider>
@@ -94,6 +116,7 @@ beforeEach(() => {
   root = createRoot(container);
   vi.clearAllMocks();
   isLocked = false;
+  viewer.role = 'admin';
 });
 
 afterEach(() => {
@@ -141,65 +164,6 @@ describe('SuggestionsCard — Add All', () => {
     expect(toast.success).toHaveBeenCalledWith('30 prompts added to your tracked list');
   });
 
-  it('keeps the rest and says how to make room when the plan limit is reached', async () => {
-    await render(25);
-    actions.trackSuggestions.mockResolvedValue({
-      trackedIds: ids(1, 10),
-      skippedIds: [],
-      error: 'Your Starter plan allows up to 50 active prompt locations…',
-      code: 'plan_limit',
-    } satisfies TrackSuggestionsResult);
-
-    await clickAddAll();
-
-    expect(rows()).toHaveLength(15);
-    expect(rows()[0].textContent).toContain('Prompt 11');
-    expect(toast.success).toHaveBeenCalledWith('10 prompts added to your tracked list');
-    expect(toast.error).not.toHaveBeenCalled();
-    const note = container.querySelector('[role="alert"]')!;
-    expect(note.textContent).toContain("15 suggestions couldn't be added");
-    expect(note.textContent).toContain(
-      "10 were added before your plan's prompt limit was reached.",
-    );
-    expect(note.textContent).toContain(
-      'Upgrade your plan, or pause 15 prompts in Tracked Prompts first and try again.',
-    );
-    expect(note.querySelector('a[href="/dashboard/prompts/tracked"]')?.textContent).toBe(
-      'Go to Tracked Prompts',
-    );
-    // The page's own Upgrade / Contact us buttons.
-    expect([...note.querySelectorAll('button')].map((b) => b.textContent)).toContain(
-      'Upgrade plan',
-    );
-  });
-
-  it('stops after the batch that reached the limit', async () => {
-    await render(30, 'growth');
-    actions.trackSuggestions.mockResolvedValue({
-      trackedIds: [],
-      skippedIds: ['s1'],
-      error: 'limit',
-      code: 'plan_limit',
-    } satisfies TrackSuggestionsResult);
-
-    await clickAddAll();
-
-    expect(actions.trackSuggestions).toHaveBeenCalledOnce();
-    expect(onAccepted).not.toHaveBeenCalled();
-    // The skipped one was handled elsewhere: it leaves, the other 29 stay.
-    expect(rows()).toHaveLength(29);
-    const note = container.querySelector('[role="alert"]')!;
-    expect(note.textContent).toContain("29 suggestions couldn't be added");
-    expect(note.textContent).toContain(
-      "Your plan's prompt limit is reached. Contact us to raise your limit, or pause 29 prompts",
-    );
-
-    await act(async () => {
-      (note.querySelector('button[aria-label="Close"]') as HTMLButtonElement).click();
-    });
-    expect(container.querySelector('[role="alert"]')).toBeNull();
-  });
-
   it('reports any other failure as an error and keeps what was not added', async () => {
     await render(3);
     actions.trackSuggestions.mockResolvedValue({
@@ -231,20 +195,99 @@ describe('SuggestionsCard — Add All', () => {
   });
 });
 
+describe('SuggestionsCard — Clear All', () => {
+  // Suggestions from Search Console and Analytics stay hidden for 30 days once dismissed.
+  const measured = (n: number, source: 'gsc' | 'ga'): PromptSuggestion => ({
+    ...suggestion(n),
+    source,
+  });
+
+  async function renderList(list: PromptSuggestion[]) {
+    actions.getPromptSuggestions.mockResolvedValue({ ok: true, suggestions: list, stale: false });
+    await act(async () => {
+      root.render(
+        <NextIntlClientProvider locale="en" messages={messages} timeZone="UTC">
+          <UpgradeDialogContext.Provider
+            value={{ isLocked, reason: 'ended', adminName: null, openUpgrade }}
+          >
+            <SuggestionsCard brandId="b1" onAccepted={onAccepted} sourceStates={null} />
+          </UpgradeDialogContext.Provider>
+        </NextIntlClientProvider>,
+      );
+    });
+  }
+  const button = (label: string, root: ParentNode = container) =>
+    [...root.querySelectorAll('button')].find((b) => b.textContent === label);
+  const dialog = () => document.body.querySelector('[role="dialog"]');
+  async function click(target: HTMLButtonElement | undefined) {
+    await act(async () => {
+      target!.click();
+    });
+  }
+
+  it('asks first, with how many it dismisses and how many come from Search Console or Analytics', async () => {
+    await renderList([suggestion(1), measured(2, 'gsc'), suggestion(3), measured(4, 'ga')]);
+    await click(button('Clear All'));
+    expect(dialog()?.textContent).toContain('4 suggestions listed will be dismissed.');
+    expect(dialog()?.textContent).toContain(
+      '2 of them come from Search Console or Analytics: once dismissed, they stay hidden for 30 days.',
+    );
+    expect(actions.dismissSuggestions).not.toHaveBeenCalled();
+  });
+
+  it('changes nothing when cancelled', async () => {
+    await renderList([measured(1, 'gsc'), suggestion(2)]);
+    await click(button('Clear All'));
+    await click(button('Cancel', dialog()!));
+    expect(actions.dismissSuggestions).not.toHaveBeenCalled();
+    expect(rows()).toHaveLength(2);
+    expect(toast.info).not.toHaveBeenCalled();
+  });
+
+  it('clears a list of only Search Console and Analytics suggestions once confirmed', async () => {
+    actions.dismissSuggestions.mockResolvedValue({ ok: true, dismissed: ['s1', 's2'], failed: [] });
+    await renderList([measured(1, 'gsc'), measured(2, 'ga')]);
+    await click(button('Clear All'));
+    expect(dialog()?.textContent).toContain('2 suggestions listed will be dismissed.');
+    expect(dialog()?.textContent).toContain('2 of them come from Search Console or Analytics');
+    await click(button('Clear all', dialog()!));
+    expect(actions.dismissSuggestions).toHaveBeenCalledWith(['s1', 's2']);
+    expect(rows()).toHaveLength(0);
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it("says nothing of Search Console when none is listed, and brings back what couldn't be dismissed", async () => {
+    actions.dismissSuggestions.mockResolvedValue({ ok: true, dismissed: ['s1'], failed: ['s2'] });
+    await renderList([suggestion(1), suggestion(2)]);
+    await click(button('Clear All'));
+    expect(dialog()?.textContent).not.toContain('Search Console');
+    await click(button('Clear all', dialog()!));
+    expect([...rows()].map((r) => r.textContent).join()).toContain('Prompt 2');
+    expect(rows()).toHaveLength(1);
+    expect(toast.error).toHaveBeenCalledWith("1 suggestion couldn't be dismissed. Try again.");
+  });
+
+  it('puts every one back when the dismiss could not run', async () => {
+    actions.dismissSuggestions.mockResolvedValue({ ok: false, failure: 'failed' });
+    await renderList([suggestion(1), measured(2, 'gsc')]);
+    await click(button('Clear All'));
+    await click(button('Clear all', dialog()!));
+    expect(rows()).toHaveLength(2);
+    expect(toast.error).toHaveBeenCalledWith("Couldn't clear the suggestions. Try again.");
+  });
+});
+
 describe('SuggestionsCard — estimated volume', () => {
   it("shows an AI's guess as a grey range, never a bare number", async () => {
     actions.getPromptSuggestions.mockResolvedValue({
+      ok: true,
       suggestions: [{ ...suggestion(1), estVolume: 1200 }],
+      stale: false,
     });
     await act(async () => {
       root.render(
         <NextIntlClientProvider locale="en" messages={messages} timeZone="UTC">
-          <SuggestionsCard
-            brandId="b1"
-            onAccepted={onAccepted}
-            sourceStates={null}
-            planId="growth"
-          />
+          <SuggestionsCard brandId="b1" onAccepted={onAccepted} sourceStates={null} />
         </NextIntlClientProvider>,
       );
     });
@@ -292,6 +335,193 @@ describe('SuggestionsCard on a read-only workspace (plan not active)', () => {
   });
 });
 
+describe('SuggestionsCard on a brand without topics', () => {
+  const button = (name: string) =>
+    [...container.querySelectorAll<HTMLButtonElement>('button')].find(
+      (b) => b.textContent === name || b.getAttribute('aria-label') === name,
+    )!;
+  // The dialog renders in a portal, outside the card.
+  const askedForTopic = () => document.body.textContent?.includes('Add a topic first') ?? false;
+  const addTopicHref = () =>
+    [...document.body.querySelectorAll('a')]
+      .find((a) => a.textContent === 'Add a topic')
+      ?.getAttribute('href');
+  const noTopics = {
+    error: 'Add a topic first: prompts are grouped under topics.',
+    code: 'no_topics',
+  };
+
+  it('asks for a topic first when Generate Suggestions finds none, and opens Add Topic in place', async () => {
+    actions.refreshPromptSuggestions.mockResolvedValue({ ok: false, failure: 'no_topics' });
+    const onAddTopic = vi.fn();
+    await render(0, onAddTopic);
+    await act(async () => button('Generate Suggestions').click());
+    expect(askedForTopic()).toBe(true);
+    expect(toast.error).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
+    // On the Prompts page a button, not a link: the page switches to its Topics tab.
+    const addTopic = [...document.body.querySelectorAll('button')].find(
+      (b) => b.textContent === 'Add a topic',
+    )!;
+    await act(async () => addTopic.click());
+    expect(onAddTopic).toHaveBeenCalledTimes(1);
+    expect(askedForTopic()).toBe(false);
+  });
+
+  it('links to the Topics tab when no page gives a way in', async () => {
+    actions.refreshPromptSuggestions.mockResolvedValue({ ok: false, failure: 'no_topics' });
+    await render(0);
+    await act(async () => button('Generate Suggestions').click());
+    expect(addTopicHref()).toBe('/dashboard/prompts/topics?new=1');
+  });
+
+  it('asks for a topic first when New finds none, and keeps the list', async () => {
+    actions.refreshPromptSuggestions.mockResolvedValue({ ok: false, failure: 'no_topics' });
+    await render(2);
+    await act(async () => button('New').click());
+    expect(askedForTopic()).toBe(true);
+    expect(rows()).toHaveLength(2);
+  });
+
+  it('asks for a topic first when adding a suggestion finds none, and keeps it listed', async () => {
+    actions.acceptSuggestion.mockResolvedValue(noTopics);
+    await render(2);
+    await act(async () => button('Add to tracked prompts').click());
+    expect(askedForTopic()).toBe(true);
+    expect(rows()).toHaveLength(2);
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it('asks for a topic first when Add All finds none', async () => {
+    actions.trackSuggestions.mockResolvedValue({ trackedIds: [], skippedIds: [], ...noTopics });
+    await render(3);
+    await clickAddAll();
+    expect(askedForTopic()).toBe(true);
+    expect(rows()).toHaveLength(3);
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it('generates as before once the brand has a topic', async () => {
+    actions.refreshPromptSuggestions.mockResolvedValue({ ok: true, suggestions: [suggestion(7)] });
+    await render(0);
+    await act(async () => button('Generate Suggestions').click());
+    expect(rows()).toHaveLength(1);
+    expect(askedForTopic()).toBe(false);
+    expect(toast.success).toHaveBeenCalledWith('Suggestions refreshed');
+  });
+});
+
+/**
+ * A failed generation says why in plain words (apiFailure), never the
+ * message production hides: a used-up allowance, a read-only workspace or
+ * the demo brand (the upgrade dialog), a role refusal or an outage.
+ */
+describe('SuggestionsCard — a failed generation', () => {
+  const generate = async () => {
+    await render(0);
+    const button = [...container.querySelectorAll('button')].find(
+      (b) => b.textContent === 'Generate Suggestions',
+    )!;
+    await act(async () => button.click());
+  };
+
+  it("says this month's allowance is used up", async () => {
+    actions.refreshPromptSuggestions.mockResolvedValue({
+      ok: false,
+      failure: 'limit',
+      retryable: false,
+    });
+    await generate();
+    expect(toast.error).toHaveBeenCalledWith(
+      "You've used this month's allowance. Upgrade, or wait until it resets.",
+      expect.objectContaining({ action: expect.objectContaining({ label: 'Upgrade' }) }),
+    );
+  });
+
+  it('opens the upgrade dialog for a read-only workspace or the demo brand', async () => {
+    actions.refreshPromptSuggestions.mockResolvedValue({
+      ok: false,
+      failure: 'subscription',
+      retryable: false,
+    });
+    await generate();
+    expect(openUpgrade).toHaveBeenCalled();
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it('says something went wrong for a refusal or an outage, and when the request itself fails', async () => {
+    actions.refreshPromptSuggestions.mockResolvedValue({
+      ok: false,
+      failure: 'failed',
+      retryable: true,
+    });
+    await generate();
+    expect(toast.error).toHaveBeenLastCalledWith('Something went wrong. Try again.', {});
+
+    act(() => root.unmount());
+    root = createRoot(container);
+    actions.refreshPromptSuggestions.mockRejectedValue(new Error('masked in production'));
+    await generate();
+    expect(toast.error).toHaveBeenLastCalledWith('Something went wrong. Try again.', {});
+    expect(toast.error).not.toHaveBeenCalledWith('masked in production');
+  });
+});
+
+describe('SuggestionsCard by role', () => {
+  const labels = () =>
+    [...container.querySelectorAll('button')].map(
+      (b) => b.getAttribute('aria-label') ?? b.textContent,
+    );
+
+  it('shows an analyst Dismiss and Clear All, but no way to add a prompt', async () => {
+    viewer.role = 'analyst';
+    await render(2);
+    expect(labels()).not.toContain('New');
+    expect(labels()).not.toContain('Add All');
+    expect(labels()).not.toContain('Add to tracked prompts');
+    expect(labels()).toContain('Clear All');
+    expect(labels().filter((l) => l === 'Dismiss suggestion')).toHaveLength(2);
+  });
+
+  it('leaves an agency partner the list to read, without adding or dismissing', async () => {
+    viewer.role = 'agency_partner';
+    await render(2);
+    expect(rows()).toHaveLength(2);
+    for (const label of ['Add All', 'Clear All', 'Add to tracked prompts', 'Dismiss suggestion']) {
+      expect(labels(), label).not.toContain(label);
+    }
+  });
+
+  it('tells an analyst who generates suggestions, instead of Generate Suggestions', async () => {
+    viewer.role = 'analyst';
+    await render(0);
+    expect(labels()).not.toContain('Generate Suggestions');
+    expect(container.textContent).toContain(
+      'Ask an admin or a manager to generate prompt suggestions.',
+    );
+  });
+
+  it('offers a manager Generate Suggestions on an empty list', async () => {
+    viewer.role = 'manager';
+    await render(0);
+    expect(labels()).toContain('Generate Suggestions');
+  });
+
+  it('shows a manager every action', async () => {
+    viewer.role = 'manager';
+    await render(1);
+    for (const label of [
+      'New',
+      'Add All',
+      'Clear All',
+      'Add to tracked prompts',
+      'Dismiss suggestion',
+    ]) {
+      expect(labels(), label).toContain(label);
+    }
+  });
+});
+
 describe('SuggestionsCard — shopping questions from the catalog (ECOM-003)', () => {
   const fromCatalog: PromptSuggestion = {
     ...suggestion(2),
@@ -307,9 +537,31 @@ describe('SuggestionsCard — shopping questions from the catalog (ECOM-003)', (
     },
   };
 
-  async function show(search = '') {
+  // A buyer question about one of the catalog's top products (AC plan P-8).
+  const fromProduct: PromptSuggestion = {
+    ...suggestion(3),
+    suggestedText: 'Atmos AG 65 vs Deuter Aircontact for a week-long trek',
+    topicName: 'Hiking backpacks',
+    estVolume: 900,
+    source: 'catalog',
+    sourceData: {
+      product: 'Atmos AG 65',
+      productId: '7a1c2b9e-1111-4c3d-8e9f-000000000001',
+      productType: 'Backpack',
+      category: 'Bags > Hiking backpacks',
+      categoryId: '7a1c2b9e-2222-4c3d-8e9f-000000000002',
+      cardPrompts: 4,
+      orders: 12,
+    },
+  };
+
+  async function show(search = '', extra: PromptSuggestion[] = []) {
     window.history.replaceState(null, '', `/dashboard/prompts${search}`);
-    actions.getPromptSuggestions.mockResolvedValue({ suggestions: [suggestion(1), fromCatalog] });
+    actions.getPromptSuggestions.mockResolvedValue({
+      ok: true,
+      suggestions: [suggestion(1), fromCatalog, ...extra],
+      stale: false,
+    });
     await act(async () => {
       root.render(
         <NextIntlClientProvider locale="en" messages={messages} timeZone="UTC">
@@ -335,5 +587,401 @@ describe('SuggestionsCard — shopping questions from the catalog (ECOM-003)', (
       expect.stringContaining('best hiking backpacks under $150'),
     ]);
     expect(container.textContent).toContain('Shopping');
+  });
+
+  it('shows the category a shopping question came from on its row', async () => {
+    await show();
+    const shopping = rows()[1];
+    // Read by its attribute: the DOM's selector parser takes a ">" in one as a combinator.
+    const chip = [...shopping.querySelectorAll('[title]')].find(
+      (el) => el.getAttribute('title') === 'Category from your catalog: Bags > Hiking backpacks',
+    );
+    expect(chip?.textContent).toBe('Bags > Hiking backpacks');
+  });
+
+  it('shows the product a buyer question is about, with its topic and estimated volume', async () => {
+    await show('', [fromProduct]);
+    const product = rows()[2];
+    const chip = product.querySelector('[title="Product from your catalog: Atmos AG 65"]');
+    expect(chip?.textContent).toBe('Atmos AG 65');
+    expect(product.textContent).toContain('Hiking backpacks');
+    expect(product.textContent).toContain('/mo');
+    expect(product.textContent).toContain('Your catalog');
+    // Its category isn't shown as well: the product says more.
+    expect(product.querySelector('[title^="Category from your catalog"]')).toBeNull();
+  });
+
+  it('lists a product’s questions among the shopping ones', async () => {
+    await show('?source=shopping', [fromProduct]);
+    expect([...rows()].map((li) => li.textContent)).toEqual([
+      expect.stringContaining('best hiking backpacks under $150'),
+      expect.stringContaining('Atmos AG 65 vs Deuter Aircontact'),
+    ]);
+  });
+});
+
+describe('SuggestionsCard — a failed read', () => {
+  async function mount() {
+    await act(async () => {
+      root.render(
+        <NextIntlClientProvider locale="en" messages={messages} timeZone="UTC">
+          <SuggestionsCard brandId="b1" onAccepted={onAccepted} sourceStates={null} />
+        </NextIntlClientProvider>,
+      );
+    });
+  }
+  const retryButton = () =>
+    [...container.querySelectorAll('button')].find((b) => b.textContent === 'Retry');
+
+  afterEach(() => vi.useRealTimers());
+
+  it('tries once more by itself when the API did not answer, and lists what comes back', async () => {
+    vi.useFakeTimers();
+    actions.getPromptSuggestions
+      .mockResolvedValueOnce({ ok: false, failure: 'failed', retryable: true })
+      .mockResolvedValueOnce({ ok: true, suggestions: [suggestion(1)], stale: false });
+    await mount();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1500);
+    });
+    expect(actions.getPromptSuggestions).toHaveBeenCalledTimes(2);
+    expect(rows()).toHaveLength(1);
+    expect(container.textContent).not.toContain("Couldn't load suggestions");
+  });
+
+  it("says the API is not answering in plain words, never React's hidden message, and Retry reads again", async () => {
+    vi.useFakeTimers();
+    actions.getPromptSuggestions.mockResolvedValue({
+      ok: false,
+      failure: 'failed',
+      retryable: true,
+    });
+    await mount();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1500);
+    });
+    expect(actions.getPromptSuggestions).toHaveBeenCalledTimes(2);
+    expect(container.textContent).toContain("Couldn't load suggestions");
+    expect(container.textContent).toContain("Ansvisor isn't answering right now.");
+    expect(container.textContent).not.toContain('Minified React error');
+
+    actions.getPromptSuggestions.mockResolvedValue({
+      ok: true,
+      suggestions: [suggestion(1), suggestion(2)],
+      stale: false,
+    });
+    await act(async () => {
+      retryButton()!.click();
+    });
+    expect(rows()).toHaveLength(2);
+  });
+
+  it('says why when trying again would not help, without retrying by itself', async () => {
+    actions.getPromptSuggestions.mockResolvedValue({
+      ok: false,
+      failure: 'workspace',
+      retryable: false,
+    });
+    await mount();
+    expect(actions.getPromptSuggestions).toHaveBeenCalledTimes(1);
+    expect(container.textContent).toContain("This brand isn't in your workspace.");
+    expect(retryButton()).toBeDefined();
+  });
+
+  it('reads a server action that threw on its way as no answer', async () => {
+    vi.useFakeTimers();
+    actions.getPromptSuggestions.mockRejectedValue(new Error('Minified React error #441'));
+    await mount();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1500);
+    });
+    expect(container.textContent).toContain("Ansvisor isn't answering right now.");
+    expect(container.textContent).not.toContain('Minified React error');
+  });
+});
+
+describe('SuggestionsCard — ChatGPT Business Hub topics (Business Hub plan, PR 6)', () => {
+  const fromHub = (n: number, topic = 'office coffee subscriptions'): PromptSuggestion => ({
+    ...suggestion(n),
+    suggestedText: `Hub prompt ${n}`,
+    topicName: 'Coffee Subscriptions',
+    reason: `From ChatGPT Business Hub: real ChatGPT conversations citing your site are about “${topic}”.`,
+    source: 'business_hub',
+    sourceData: { topic, periodEnd: '2026-11-09', enteredAt: '2026-11-11T09:00:00.000Z' },
+  });
+  const button = (name: string) =>
+    [...document.body.querySelectorAll<HTMLButtonElement>('button')].find(
+      (b) => b.textContent === name,
+    );
+  const dialogOpen = () =>
+    document.body.textContent?.includes('Suggest prompts from ChatGPT Business Hub') ?? false;
+
+  async function show({
+    search = '',
+    list = [suggestion(1), fromHub(2)],
+    businessHub = true,
+  }: { search?: string; list?: PromptSuggestion[]; businessHub?: boolean } = {}) {
+    window.history.replaceState(null, '', `/dashboard/prompts${search}`);
+    actions.getPromptSuggestions.mockResolvedValue({
+      ok: true,
+      suggestions: list,
+      stale: false,
+      businessHub,
+    });
+    // A fresh card each time, as on opening the page: the link is read on mount.
+    mounts += 1;
+    await act(async () => {
+      root.render(
+        <NextIntlClientProvider locale="en" messages={messages} timeZone="UTC">
+          <SuggestionsCard key={mounts} brandId="b1" onAccepted={onAccepted} sourceStates={null} />
+        </NextIntlClientProvider>,
+      );
+    });
+  }
+  let mounts = 0;
+
+  function type(input: HTMLInputElement, value: string) {
+    const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!;
+    setValue.call(input, value);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+
+  beforeEach(() => {
+    quota.getLocationQuota.mockResolvedValue({
+      maxPrompts: 50,
+      used: 47,
+      planId: 'starter',
+      planName: 'Starter',
+    });
+  });
+  afterEach(() => window.history.replaceState(null, '', '/'));
+
+  it('offers From ChatGPT Business Hub to admins and managers, only while it is on', async () => {
+    await show();
+    expect(button('From ChatGPT Business Hub')).toBeDefined();
+
+    await show({ businessHub: false });
+    expect(button('From ChatGPT Business Hub')).toBeUndefined();
+
+    viewer.role = 'analyst';
+    await show();
+    expect(button('From ChatGPT Business Hub')).toBeUndefined();
+  });
+
+  it('offers it on an empty list too', async () => {
+    await show({ list: [] });
+    expect(button('Generate Suggestions')).toBeDefined();
+    expect(button('From ChatGPT Business Hub')).toBeDefined();
+  });
+
+  it('marks a Business Hub suggestion with its badge, beside Ansvisor Agents', async () => {
+    await show();
+    const [plain, hub] = [...rows()];
+    expect(plain.textContent).not.toContain('ChatGPT Business Hub');
+    expect(hub.textContent).toContain('ChatGPT Business Hub');
+    expect(hub.textContent).toContain('Ansvisor Agents');
+  });
+
+  it('lists only the Business Hub ones under their filter, and never under Ansvisor Agents only', async () => {
+    await show({ search: '?source=business_hub' });
+    expect([...rows()].map((li) => li.textContent)).toEqual([
+      expect.stringContaining('Hub prompt 2'),
+    ]);
+
+    await show({ search: '?source=agents' });
+    expect([...rows()].map((li) => li.textContent)).toEqual([expect.stringContaining('Prompt 1')]);
+  });
+
+  it('opens the dialog from ?source=business_hub&hub=1, with how many more prompts the plan tracks', async () => {
+    await show({ search: '?source=business_hub&hub=1' });
+    expect(dialogOpen()).toBe(true);
+    expect(document.body.textContent).toContain('You can track 3 more prompts on your plan.');
+    expect(document.body.querySelectorAll('input[id^="business-hub-topic-"]')).toHaveLength(5);
+  });
+
+  it('does not open it from the link for an analyst', async () => {
+    viewer.role = 'analyst';
+    await show({ search: '?source=business_hub&hub=1' });
+    expect(dialogOpen()).toBe(false);
+  });
+
+  it('sends the topics given, says what it did, and lists the new ones under their filter', async () => {
+    actions.suggestPromptsFromBusinessHub.mockResolvedValue({
+      ok: true,
+      result: {
+        added: 2,
+        alreadyTracked: 1,
+        alreadySuggested: 0,
+        topics: [
+          { topic: 'decaf beans', added: 2, matchedTopic: null },
+          { topic: 'office coffee', added: 0, matchedTopic: 'Coffee Subscriptions' },
+        ],
+        suggestions: [fromHub(8, 'decaf beans'), fromHub(9, 'decaf beans')],
+      },
+    });
+    await show();
+    await act(async () => button('From ChatGPT Business Hub')!.click());
+    const inputs = document.body.querySelectorAll<HTMLInputElement>(
+      'input[id^="business-hub-topic-"]',
+    );
+    await act(async () => {
+      type(inputs[0], ' decaf beans ');
+      type(inputs[2], 'office coffee');
+    });
+    await act(async () => button('Suggest prompts')!.click());
+
+    expect(actions.suggestPromptsFromBusinessHub).toHaveBeenCalledWith('b1', [
+      'decaf beans',
+      'office coffee',
+    ]);
+    expect(document.body.textContent).toContain(
+      '2 new suggestions, listed under ChatGPT Business Hub',
+    );
+    expect(document.body.textContent).toContain(
+      'Left out: 1 already tracked, 0 already suggested.',
+    );
+    expect(document.body.textContent).toContain('2 prompts, new topic');
+    expect(document.body.textContent).toContain('nothing new under Coffee Subscriptions');
+    expect([...rows()].map((li) => li.textContent)).toEqual([
+      expect.stringContaining('Hub prompt 8'),
+      expect.stringContaining('Hub prompt 9'),
+      expect.stringContaining('Hub prompt 2'),
+    ]);
+  });
+
+  it('sends nothing without a topic', async () => {
+    await show();
+    await act(async () => button('From ChatGPT Business Hub')!.click());
+    expect(button('Suggest prompts')!.disabled).toBe(true);
+    expect(actions.suggestPromptsFromBusinessHub).not.toHaveBeenCalled();
+  });
+
+  it('asks for a topic first on a brand without one', async () => {
+    actions.suggestPromptsFromBusinessHub.mockResolvedValue({ ok: false, failure: 'no_topics' });
+    await show();
+    await act(async () => button('From ChatGPT Business Hub')!.click());
+    const [first] = document.body.querySelectorAll<HTMLInputElement>(
+      'input[id^="business-hub-topic-"]',
+    );
+    await act(async () => type(first, 'decaf beans'));
+    await act(async () => button('Suggest prompts')!.click());
+    expect(dialogOpen()).toBe(false);
+    expect(document.body.textContent).toContain('Add a topic first');
+  });
+});
+
+/**
+ * A suggestion's text can be edited before it is added (moved from the
+ * brand's Manage prompts page): the pencil opens an input, Enter keeps the
+ * change and Esc drops it; + and Add All then save the edited text. Generate
+ * by topic opens from the card, for admins and managers.
+ */
+describe('SuggestionsCard — editing before adding', () => {
+  const button = (name: string) =>
+    [...document.querySelectorAll<HTMLButtonElement>('button')].find(
+      (b) => b.textContent === name || b.getAttribute('aria-label') === name,
+    );
+  const rowText = (n: number) => rows()[n].querySelector('p')!.textContent;
+  function type(input: HTMLInputElement, value: string) {
+    const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!;
+    setValue.call(input, value);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  async function edit(n: number, text: string, key: 'Enter' | 'Escape' = 'Enter') {
+    await act(async () => button(`Edit “Prompt ${n}” before adding`)!.click());
+    const input = container.querySelector<HTMLInputElement>('li input')!;
+    expect(document.activeElement).toBe(input);
+    expect(input.value).toBe(`Prompt ${n}`);
+    await act(async () => type(input, text));
+    await act(async () => {
+      if (key === 'Enter') input.form!.requestSubmit();
+      else input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    });
+  }
+
+  it('keeps an edited text, and + adds it as edited', async () => {
+    await render(2);
+    await edit(1, '  Prompt one,   better  ');
+    expect(container.querySelector('li input')).toBeNull();
+    expect(rowText(0)).toBe('Prompt one, betterEdited');
+    actions.acceptSuggestion.mockResolvedValue({ promptId: 'p1' });
+    await act(async () =>
+      rows()[0].querySelector<HTMLButtonElement>('[aria-label="Add to tracked prompts"]')!.click(),
+    );
+    expect(actions.acceptSuggestion).toHaveBeenCalledExactlyOnceWith('s1', {
+      text: 'Prompt one, better',
+    });
+  });
+
+  it('drops the change on Esc, and + adds the suggestion as written', async () => {
+    await render(1);
+    await edit(1, 'Something else', 'Escape');
+    expect(container.querySelector('li input')).toBeNull();
+    expect(rowText(0)).toBe('Prompt 1');
+    actions.acceptSuggestion.mockResolvedValue({ promptId: 'p1' });
+    await act(async () => button('Add to tracked prompts')!.click());
+    expect(actions.acceptSuggestion).toHaveBeenCalledExactlyOnceWith('s1');
+  });
+
+  it('won’t keep an empty text', async () => {
+    await render(1);
+    await act(async () => button('Edit “Prompt 1” before adding')!.click());
+    const input = container.querySelector<HTMLInputElement>('li input')!;
+    await act(async () => type(input, '   '));
+    expect(button('Keep this text')!.disabled).toBe(true);
+    await act(async () => input.form!.requestSubmit());
+    expect(container.querySelector('li input')).not.toBeNull();
+  });
+
+  it('Add All adds the edited ones as edited and the rest as written', async () => {
+    await render(3);
+    await edit(2, 'Prompt two, edited');
+    actions.trackSuggestions.mockResolvedValue({ trackedIds: ids(1, 3), skippedIds: [] });
+    await clickAddAll();
+    expect(actions.trackSuggestions).toHaveBeenCalledExactlyOnceWith(ids(1, 3), {
+      texts: { s2: 'Prompt two, edited' },
+    });
+  });
+
+  it('finds an edited suggestion by its new words', async () => {
+    await render(2);
+    await edit(1, 'decaf beans delivered');
+    const search = container.querySelector<HTMLInputElement>(
+      'input[placeholder="Search prompts…"]',
+    )!;
+    await act(async () => type(search, 'decaf'));
+    expect(rows()).toHaveLength(1);
+  });
+
+  it('gives no pencil to those who can’t add prompts', async () => {
+    viewer.role = 'analyst';
+    await render(2);
+    expect(button('Edit “Prompt 1” before adding')).toBeUndefined();
+    expect(button('By topic')).toBeUndefined();
+    viewer.role = 'member';
+    await render(2);
+    expect(button('Edit “Prompt 1” before adding')).toBeUndefined();
+  });
+
+  it('opens Generate by topic from the card and from an empty list', async () => {
+    await render(2);
+    await act(async () => button('By topic')!.click());
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain(
+      'Generate prompts by topic',
+    );
+    expect(topicActions.getTopics).toHaveBeenCalledWith('b1');
+
+    act(() => root.unmount());
+    root = createRoot(container);
+    await render(0);
+    expect(button('Generate by topic')).toBeDefined();
+  });
+
+  it('opens the upgrade dialog from By topic on a read-only workspace', async () => {
+    isLocked = true;
+    await render(2);
+    await act(async () => button('By topic')!.click());
+    expect(openUpgrade).toHaveBeenCalledWith('Generating prompts needs a plan');
+    expect(topicActions.getTopics).not.toHaveBeenCalled();
   });
 });

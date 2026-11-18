@@ -9,6 +9,7 @@
 
 import logger from './logger.js';
 import { stripEntityMarkup } from './entity-markup.js';
+import { googleLocationFor, parseLocation } from './locations.js';
 
 export const CLORO_API = 'https://api.cloro.dev';
 
@@ -17,11 +18,44 @@ export const SCRAPER_TASK_TYPES = {
   'chatgpt-shopping': 'CHATGPT',
   'google-aio': 'GOOGLE',
   'google-aimode': 'AIMODE',
-  'copilot-web': 'COPILOT',
+  // Microsoft Copilot is asked through Bing AI Mode (bing.com/copilotsearch):
+  // Cloro dropped its COPILOT task when copilot.microsoft.com started
+  // blocking logged-out sessions (2026-11-06), and BING_AIMODE is the same
+  // Copilot answer on Bing. The platform id stays `copilot-web`, so saved
+  // prompts and past results carry on.
+  'copilot-web': 'BING_AIMODE',
   'grok-web': 'GROK',
-  'perplexity-web': 'PERPLEXITY',
   'gemini-web': 'GEMINI',
 };
+
+/**
+ * Platforms Cloro cannot currently deliver, dropped before anything is
+ * submitted.
+ *
+ * Grok started answering every task with a 500 on 2026-08-18. Leaving it in
+ * the run would submit a paid task per prompt per region, hold the drain open
+ * waiting for results that never arrive, and record nothing — so the platform
+ * is removed up front rather than failing task by task.
+ *
+ * Deliberately a run-time filter and nothing else. Dropping Grok from the
+ * engine picker would also drop it from `ALL_SCRAPERS`, which
+ * `filterByPlan` and `alignPromptsToPlanForOrg` use as the allow-set when
+ * writing prompts — so every prompt edit and every plan change would quietly
+ * strip the stored id, and restoring Grok would need a data repair rather
+ * than a revert. Empty this list when Cloro reports Grok healthy again and
+ * every prompt that still lists it resumes on the next run.
+ *
+ * Perplexity is no longer offered: it blocks logged-out sessions, and Cloro
+ * rejects its tasks (400 MODEL_UNAVAILABLE). Prompts saved with it keep the
+ * id, so the tracking worker skips it (runnablePlatforms), and the prompt's
+ * other engines still run. Copilot, paused for the same reason on
+ * 2026-11-06, runs again through Bing AI Mode (SCRAPER_TASK_TYPES).
+ *
+ * A paused platform's answers stop, so the daily pulse's outage guard and the
+ * health report's fan-out check leave it out: its volume falling to none is
+ * the pause, not an incident.
+ */
+export const UNAVAILABLE_PLATFORMS = ['grok-web', 'perplexity-web'];
 
 const DEFAULT_MAX_WAIT_MS = 30 * 60 * 1000; // 30 minutes
 const DEFAULT_POLL_INTERVAL_MS = 10000; // 10 seconds
@@ -32,17 +66,22 @@ function getApiKey() {
   return key;
 }
 
-export function buildRequestBody(promptText, scraperId, region, state, location) {
+/**
+ * The task payload Cloro gets. `opts.legacy` asks ChatGPT for its fan-out
+ * through its legacy desktop interface; the caller decides when
+ * (chatgpt-fanout.js), and only `chatgpt-web` takes it.
+ */
+export function buildRequestBody(promptText, scraperId, region, state, location, opts = {}) {
   const country = region || 'US';
-  // A city (PROMPT-015d): Google's canonical name, which the Google
-  // endpoints take as `location` beside the country. Only they get it.
+  // A city (PROMPT-015d) or a US state: Google's canonical name
+  // (googleLocationFor), which the Google endpoints take as `location` beside
+  // the country. Only they get it.
   const locationField = location ? { location } : {};
 
   // State-level geo-targeting (#554): the AI endpoints accept a USPS state
   // code alongside country US and route through an in-state proxy. Google
-  // AIO / AI Mode use location/uule for sub-country targeting instead and
-  // must never receive it — their branches below skip this spread, and since
-  // #691 the caller never even submits a per-state task for them.
+  // AIO / AI Mode ask from a state through `location` instead and must never
+  // receive `state` too: their branches below skip this spread.
   const stateField = country === 'US' && state ? { state } : {};
 
   if (scraperId === 'chatgpt-shopping') {
@@ -73,6 +112,22 @@ export function buildRequestBody(promptText, scraperId, region, state, location)
     };
   }
 
+  if (scraperId === 'copilot-web') {
+    // Bing AI Mode takes only these fields (its `include` rejects any other
+    // key, so no searchQueries or rawResponse); a US state is a +2 credit
+    // add-on like on the other AI endpoints. It returns no fan-out and no
+    // product cards.
+    return {
+      prompt: promptText,
+      country,
+      ...stateField,
+      include: {
+        html: false,
+        markdown: true,
+      },
+    };
+  }
+
   if (scraperId === 'google-aimode') {
     return {
       prompt: promptText,
@@ -85,20 +140,26 @@ export function buildRequestBody(promptText, scraperId, region, state, location)
     };
   }
 
+  // ChatGPT's legacy desktop interface still carries the query text its
+  // default one dropped. Cloro calls it best-effort and temporary.
+  const chatgptFanout = scraperId === 'chatgpt-web' && opts.legacy === true;
+
   return {
     prompt: promptText,
     country,
     ...stateField,
+    ...(chatgptFanout ? { legacy: true } : {}),
     include: {
       html: false,
       markdown: true,
       rawResponse: false,
-      // Opt in to the observed query fan-out (#332), which Copilot and
-      // Perplexity populate; the health report's fan-out section flags one
-      // that stops. Not on ChatGPT: since 2026-09-30 its default (mobile-web)
-      // interface carries no query text, so the field came back empty on
-      // every answer while the add-on still cost +2 credits a task (#1119).
-      ...(scraperId === 'chatgpt-web' ? {} : { searchQueries: true }),
+      // Opt in to the observed query fan-out (#332); the health report's
+      // fan-out section flags a platform whose share drops. Not on ChatGPT's
+      // default task: since 2026-09-30 its
+      // default (mobile-web) interface carries no query text, so the field
+      // came back empty on every answer while the add-on still cost +2
+      // credits a task (#1119). Only its legacy task asks.
+      ...(scraperId !== 'chatgpt-web' || chatgptFanout ? { searchQueries: true } : {}),
     },
   };
 }
@@ -241,6 +302,21 @@ export function parseScraperResponse(result, scraperId) {
     };
   }
 
+  if (scraperId === 'copilot-web') {
+    // Bing AI Mode nests its answer under `result`, like Google AI Mode. The
+    // markdown keeps the headings, tables and citation links the plain `text`
+    // drops. The model stays `copilot-web`, as on the answers before the
+    // switch, so the platform reads as one series.
+    const bing = result.result || result;
+    return {
+      text: stripEntityMarkup(bing.markdown || bing.text || ''),
+      citations: toCitations(bing.sources),
+      model: 'copilot-web',
+      shopping_cards: [],
+      search_queries: [],
+    };
+  }
+
   const text = stripEntityMarkup(result.markdown || result.text || '');
   const model = result.model || scraperId;
   const citations = toCitations(result.sources);
@@ -264,17 +340,24 @@ export function parseScraperResponse(result, scraperId) {
  * @param {string} promptText
  * @param {string} scraperId
  * @param {string} [region]
- * @param {{ webhookUrl?: string, state?: string, location?: string }} [opts] - `state` is the
+ * @param {{ webhookUrl?: string, state?: string, location?: string, legacy?: boolean }} [opts] - `state` is the
  *   USPS code of the location this task targets (#554, per-prompt since
- *   #691); only forwarded on US AI-endpoint tasks. `location` is a city's
- *   Google canonical name (PROMPT-015d), forwarded on Google tasks only.
- * @returns {Promise<{ taskId: string, scraperId: string }>}
+ *   #691); only forwarded on US AI-endpoint tasks. `location` is a city's or
+ *   a US state's Google canonical name (googleLocationFor), forwarded on
+ *   Google tasks only. `legacy` asks a `chatgpt-web` task for its fan-out
+ *   (chatgpt-fanout.js).
+ * @returns {Promise<{ taskId: string, scraperId: string, legacy: boolean }>} `legacy`: the
+ *   task went to ChatGPT's legacy interface.
+ * @throws {Error} with the HTTP `status` when Cloro answered the submission
+ *   with an error; none when the request never got an answer.
  */
 export async function submitScraperTask(promptText, scraperId, region, opts = {}) {
   const taskType = SCRAPER_TASK_TYPES[scraperId];
   if (!taskType) throw new Error(`Unknown scraper: ${scraperId}`);
 
-  const payload = buildRequestBody(promptText, scraperId, region, opts.state, opts.location);
+  const payload = buildRequestBody(promptText, scraperId, region, opts.state, opts.location, {
+    legacy: opts.legacy,
+  });
 
   logger.info(
     {
@@ -283,6 +366,7 @@ export async function submitScraperTask(promptText, scraperId, region, opts = {}
       region: region || 'US',
       state: payload.state,
       location: payload.location,
+      legacy: payload.legacy,
     },
     'submitting cloro scraper task',
   );
@@ -307,7 +391,10 @@ export async function submitScraperTask(promptText, scraperId, region, opts = {}
       { scraperId, status: res.status, body: errorBody.slice(0, 300) },
       'cloro submit failed',
     );
-    throw new Error(`Cloro async submit error ${res.status}: ${errorBody.slice(0, 300)}`);
+    throw Object.assign(
+      new Error(`Cloro async submit error ${res.status}: ${errorBody.slice(0, 300)}`),
+      { status: res.status },
+    );
   }
 
   const data = await res.json();
@@ -321,7 +408,66 @@ export async function submitScraperTask(promptText, scraperId, region, opts = {}
   }
 
   logger.debug({ taskId: data.task.id, taskType, scraperId }, 'cloro task submitted');
-  return { taskId: data.task.id, scraperId };
+  return { taskId: data.task.id, scraperId, legacy: payload.legacy === true };
+}
+
+/** A ChatGPT task sent to the legacy interface, which may go again without it. */
+export function isLegacyChatgptTask({ scraperId, legacy }) {
+  return scraperId === 'chatgpt-web' && legacy === true;
+}
+
+/**
+ * Cloro turned the request itself down (400, 422), so the same task without
+ * `legacy` can still be taken. Nothing else counts: a network error or a
+ * timeout may have created the task already, and a second one would be
+ * billed twice; 429, 5xx, 401 and 402 would fail the second one the same way.
+ */
+export function refusedRequest(err) {
+  return err?.status === 400 || err?.status === 422;
+}
+
+/**
+ * Submit one prompt's task for one tracked location code. Targeting comes
+ * from the prompt's own location, not from the brand's single state column
+ * (#691): different prompts can target different places, and a brand-wide
+ * override would silently win over them.
+ *
+ * A `legacy` task (chatgpt-fanout.js) that Cloro refuses goes again without
+ * it, since Cloro calls that interface temporary: the day's answer is still
+ * tracked. The result says which one was sent.
+ *
+ * @param {{ promptText: string, scraperId: string, region: string|null, legacy?: boolean, webhookUrl?: string, promptId?: string }} task
+ * @returns {Promise<{ taskId: string, scraperId: string, legacy: boolean }>}
+ */
+export async function submitPromptTask({
+  promptText,
+  scraperId,
+  region,
+  legacy = false,
+  webhookUrl,
+  promptId,
+}) {
+  // Google's engines take a city or a US state as `location`, the AI
+  // endpoints a state as `state`; buildRequestBody gives each its own.
+  const { country, state } = parseLocation(region);
+  const submit = (withLegacy) =>
+    submitScraperTask(promptText, scraperId, country, {
+      webhookUrl,
+      state,
+      location: googleLocationFor(region),
+      legacy: withLegacy,
+    });
+  if (!legacy) return submit(false);
+  try {
+    return await submit(true);
+  } catch (err) {
+    if (!refusedRequest(err)) throw err;
+    logger.warn(
+      { err, scraperId, promptId, status: err.status },
+      'cloro refused the chatgpt fan-out task; submitting it without fan-out',
+    );
+    return submit(false);
+  }
 }
 
 /**
@@ -366,7 +512,11 @@ export async function pollScraperResult(taskId, scraperId, opts = {}) {
     if (status === 'FAILED') {
       const errMsg = data.response?.error || data.task?.failedReason || 'Unknown failure';
       logger.error({ taskId, scraperId, pollCount, reason: errMsg }, 'cloro task failed');
-      throw new Error(`Cloro task ${taskId} failed: ${errMsg}`);
+      // `taskFailed`: Cloro took the task and gave up on it, which a legacy
+      // ChatGPT task answers by going again without legacy.
+      throw Object.assign(new Error(`Cloro task ${taskId} failed: ${errMsg}`), {
+        taskFailed: true,
+      });
     }
 
     if (pollCount === 1 || pollCount % 5 === 0) {

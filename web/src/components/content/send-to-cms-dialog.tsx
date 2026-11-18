@@ -55,6 +55,7 @@ export function SendDialog({
   html,
   sourceUrl,
   author,
+  reviewer,
   teamByline,
   byline,
   onFillNow,
@@ -68,6 +69,8 @@ export function SendDialog({
   html: string;
   sourceUrl: string | null;
   author: ContentAuthor | null;
+  /** The qualified reviewer, distinct from the page author. */
+  reviewer: ContentAuthor | null;
   /** The brand's team in the page's language (teamName); empty while the authors aren't read. */
   teamByline: string;
   /** The byline line the brand puts in the content, or null. */
@@ -83,8 +86,8 @@ export function SendDialog({
   const { openUpgrade } = useUpgradeGate();
   const format = useFormatter();
   const page = useMemo(
-    () => pageFields({ title, html, sourceUrl, author, teamByline }),
-    [title, html, sourceUrl, author, teamByline],
+    () => pageFields({ title, html, sourceUrl, author, reviewer, teamByline }),
+    [title, html, sourceUrl, author, reviewer, teamByline],
   );
   const placeholders = useMemo(
     () => exportPlaceholders(html) + titlePlaceholders(title, html),
@@ -114,6 +117,8 @@ export function SendDialog({
     webflow,
     wordpress,
     framer,
+    wix,
+    hubspot,
     target,
     pick,
     sent: keepTarget,
@@ -124,6 +129,8 @@ export function SendDialog({
   const collection = webflow?.ready ? webflow.collection || t('target.webflow.collection') : '';
   const site = wordpress?.ready ? wordpress.site : '';
   const framerCollection = framer?.ready ? framer.collection || t('target.framer.collection') : '';
+  const wixSite = wix?.ready ? wix.site : '';
+  const hubspotBlog = hubspot?.ready ? hubspot.blog : '';
 
   useEffect(() => {
     let cancelled = false;
@@ -171,7 +178,7 @@ export function SendDialog({
     setProblem(null);
     const result = await sendPagesToCms(
       brandId,
-      [cmsPage({ draftId, title, html, fields, page, byline })],
+      [cmsPage({ draftId, title, html, fields, page, byline, reviewer })],
       target,
     );
     setSending(false);
@@ -244,6 +251,14 @@ export function SendDialog({
       toast.success(delivery?.updated ? t('sentFramerUpdated') : t('sentFramer'), {
         description: notes.length ? notes.join(' ') : undefined,
       });
+    } else if (target === 'hubspot') {
+      toast.success(delivery?.updated ? t('sentHubspotUpdated') : t('sentHubspot'));
+    } else if (target === 'wix') {
+      // Images don't go to Wix (only its Media Manager's show).
+      const images = delivery?.changed?.images ?? 0;
+      toast.success(delivery?.updated ? t('sentWixUpdated') : t('sentWix'), {
+        description: images ? t('wixImages', { images }) : undefined,
+      });
     } else {
       toast.success(t('sent'));
     }
@@ -257,6 +272,8 @@ export function SendDialog({
         webflow: 'errors.webflowFailed',
         wordpress: 'errors.wordpressFailed',
         framer: 'errors.framerFailed',
+        wix: 'errors.wixFailed',
+        hubspot: 'errors.hubspotFailed',
         webhook: 'errors.webhookFailed',
       } as const;
       return t(failed[shown.target], { reason: shown.failed });
@@ -266,16 +283,31 @@ export function SendDialog({
       return tFailure(code);
     }
     // No CMS ready sent the page to the webhook: what to fix is the one connected.
-    if (code === 'no_webhook' && !webflow?.ready && !wordpress?.ready && !framer?.ready) {
+    if (
+      code === 'no_webhook' &&
+      !webflow?.ready &&
+      !wordpress?.ready &&
+      !framer?.ready &&
+      !wix?.ready &&
+      !hubspot?.ready
+    ) {
       if (webflow) return t('errors.no_webhookWebflow');
       if (wordpress) return t('errors.no_webhookWordPress');
       if (framer) return t('errors.no_webhookFramer');
+      if (wix) return t('errors.no_webhookWix');
+      if (hubspot) return t('errors.no_webhookHubspot');
     }
     if (code === 'in_progress' && shown.target === 'wordpress') {
       return t('errors.in_progressWordPress');
     }
     if (code === 'in_progress' && shown.target === 'framer') {
       return t('errors.in_progressFramer');
+    }
+    if (code === 'in_progress' && shown.target === 'wix') {
+      return t('errors.in_progressWix');
+    }
+    if (code === 'in_progress' && shown.target === 'hubspot') {
+      return t('errors.in_progressHubspot');
     }
     // The server names the path ("pages.0.slug"); the field is its last part.
     if (code === 'invalid' && field) {
@@ -304,16 +336,22 @@ export function SendDialog({
                   ? t('descriptionWordPress', { site })
                   : target === 'framer'
                     ? t('descriptionFramer', { collection: framerCollection })
-                    : t('description')}
+                    : target === 'wix'
+                      ? t('descriptionWix', { site: wixSite })
+                      : target === 'hubspot'
+                        ? t('descriptionHubspot', { blog: hubspotBlog })
+                        : t('description')}
           </DialogDescription>
         </DialogHeader>
 
-        {(webflow || wordpress || framer) && target && (
+        {(webflow || wordpress || framer || wix || hubspot) && target && (
           <CmsTargetPicker
             value={target}
             webflow={webflow}
             wordpress={wordpress}
             framer={framer}
+            wix={wix}
+            hubspot={hubspot}
             disabled={sending}
             onChange={(next) => {
               pick(next);
@@ -359,6 +397,16 @@ export function SendDialog({
             <p className="text-xs font-medium text-muted-foreground">{t('fields.title')}</p>
             <p className="text-sm [overflow-wrap:anywhere]">{title.trim() || '—'}</p>
           </div>
+          <div className="space-y-1">
+            <p className="text-xs font-medium text-muted-foreground">{t('fields.author')}</p>
+            <p className="text-sm [overflow-wrap:anywhere]">{page.author || '—'}</p>
+          </div>
+          {page.reviewer && (
+            <div className="space-y-1">
+              <p className="text-xs font-medium text-muted-foreground">{t('fields.reviewer')}</p>
+              <p className="text-sm [overflow-wrap:anywhere]">{page.reviewer}</p>
+            </div>
+          )}
           <div className="space-y-1">
             <Label htmlFor="cms-slug">{t('fields.slug')}</Label>
             <Input
@@ -431,7 +479,11 @@ export function SendDialog({
                     ? `lastWordPress.${last.status}`
                     : last.target === 'framer'
                       ? `lastFramer.${last.status}`
-                      : `last.${last.status}`,
+                      : last.target === 'wix'
+                        ? `lastWix.${last.status}`
+                        : last.target === 'hubspot'
+                          ? `lastHubspot.${last.status}`
+                          : `last.${last.status}`,
                 {
                   when: format.dateTime(new Date(last.at), {
                     dateStyle: 'medium',

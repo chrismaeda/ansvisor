@@ -20,7 +20,9 @@ import {
   type SignalFigure,
   type WhereValue,
 } from '@/lib/signals/detail';
+import { languageName } from '@/lib/audit/reading-evidence';
 import { cn } from '@/lib/utils';
+import { actionCodeNo } from '@/lib/action-center/action-ref';
 import { ActionStatusBadge } from './action-table';
 
 /**
@@ -52,6 +54,13 @@ function More({ shown, total }: { shown: number; total: number }) {
 // already says, are left out.
 const EVIDENCE_KEYS = [
   'aiBotsMentioned',
+  'wafBlockedBots',
+  // The no-JS check's (SA-009).
+  'hiddenPercent',
+  'hiddenWords',
+  'mainWords',
+  'hiddenText',
+  'readAs',
   'ageDays',
   'newest',
   'dateSignals',
@@ -68,8 +77,29 @@ const EVIDENCE_KEYS = [
   'label',
   'description',
   'note',
+  // Readability's and first person's, in the page's language (signals/readability.js, eeat.js).
+  'language',
+  'formula',
+  'readingScore',
+  'wordsPerSentence',
+  'syllablesPerWord',
+  'lettersPerWord',
+  'wordsPerParagraph',
+  'mobileLinesPerParagraph',
+  'firstPersonSentences',
+  'sentences',
 ] as const;
-const HIDDEN_EVIDENCE = new Set(['model', 'blocked', 'blockedBots']);
+// The live bot test's per-bot rows and its own request (SA-008) are the
+// report's to show; the bots it found blocked are named.
+const HIDDEN_EVIDENCE = new Set([
+  'model',
+  'blocked',
+  'blockedBots',
+  'bots',
+  'control',
+  'liveTest',
+  'compared',
+]);
 
 /**
  * An audit check's evidence as a line: "Age in days: 412 · Newest date:
@@ -79,13 +109,24 @@ const HIDDEN_EVIDENCE = new Set(['model', 'blocked', 'blockedBots']);
 function describeEvidence(
   evidence: Record<string, unknown>,
   t: ReturnType<typeof useTranslations>,
+  tFormula: ReturnType<typeof useTranslations<'contentEditor.editor.quality.formulas'>>,
 ): string {
   const show = (key: string, value: unknown): string | null => {
     if (value === null || value === undefined || value === '') return null;
+    // A language by its name, a reading formula as the editor names it.
+    if (key === 'language' && typeof value === 'string') return languageName(value);
+    if (key === 'readAs' && typeof value === 'string') return crawlerName(value);
+    if (key === 'formula' && typeof value === 'string' && tFormula.has(value)) {
+      return tFormula(value as Parameters<typeof tFormula>[0]);
+    }
     if (Array.isArray(value)) {
       const items = value.filter((v) => typeof v === 'string' || typeof v === 'number');
       if (items.length === 0) return null;
-      return items.map((v) => (key === 'aiBotsMentioned' ? crawlerName(String(v)) : v)).join(', ');
+      return items
+        .map((v) =>
+          key === 'aiBotsMentioned' || key === 'wafBlockedBots' ? crawlerName(String(v)) : v,
+        )
+        .join(', ');
     }
     if (typeof value === 'boolean')
       return value ? t('drawer.checkEvidence.yes') : t('drawer.checkEvidence.no');
@@ -108,6 +149,9 @@ function describeEvidence(
 
 function WhereValueView({ value }: { value: WhereValue }) {
   const t = useTranslations('actionCenter.signalsPage');
+  const tFormula = useTranslations('contentEditor.editor.quality.formulas');
+  // A competitor's page events read as the Competitors page's timeline says them.
+  const tTimeline = useTranslations('competitors.timeline');
   const format = useFormatter();
   switch (value.type) {
     case 'text':
@@ -322,7 +366,7 @@ function WhereValueView({ value }: { value: WhereValue }) {
             <li key={page}>
               <span className="break-all">{page}</span>
               {issues.map((issue) => {
-                const found = describeEvidence(issue.evidence, t);
+                const found = describeEvidence(issue.evidence, t, tFormula);
                 return (
                   <span key={issue.check} className="block text-xs text-muted-foreground">
                     <span className="font-medium text-foreground">{issue.label}</span>
@@ -395,6 +439,56 @@ function WhereValueView({ value }: { value: WhereValue }) {
             </li>
           ))}
         </ul>
+      );
+    case 'pageEvents':
+      return (
+        <div className="space-y-1.5">
+          {value.items.length === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              {t('drawer.pageEvents.none', { days: value.days })}
+            </p>
+          ) : (
+            <ul className="space-y-1">
+              {value.items.map((event) => {
+                const checks = (list: { label: string }[]) => list.map((c) => c.label).join(', ');
+                const what =
+                  event.kind === 'first_cited'
+                    ? [tTimeline('firstCited')]
+                    : [
+                        tTimeline('changed'),
+                        event.gained.length > 0 &&
+                          tTimeline('gained', { checks: checks(event.gained) }),
+                        event.lost.length > 0 && tTimeline('lost', { checks: checks(event.lost) }),
+                        event.gained.length + event.lost.length === 0 && tTimeline('changedWords'),
+                      ];
+                return (
+                  <li key={`${event.kind}-${event.url}-${event.at}`}>
+                    <span className="break-all">
+                      {event.url.replace(/^https?:\/\/(www\.)?/i, '').replace(/\/$/, '')}
+                    </span>
+                    <span className="block text-xs text-muted-foreground">
+                      {[
+                        format.dateTime(new Date(event.at), { month: 'short', day: 'numeric' }),
+                        ...what,
+                      ]
+                        .filter(Boolean)
+                        .join(' · ')}
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+          {value.competitorId && (
+            <Link
+              href={`/dashboard/competitors?competitor=${value.competitorId}`}
+              className="inline-flex items-center gap-0.5 text-xs font-medium underline-offset-2 hover:underline"
+            >
+              {t('drawer.pageEvents.timeline')}
+              <ArrowUpRight className="h-3 w-3" />
+            </Link>
+          )}
+        </div>
       );
     case 'citations':
       return (
@@ -733,7 +827,7 @@ export function SignalEvidenceBlock({ signal, brandId }: { signal: Signal; brand
                   >
                     <span className="inline-flex min-w-0 items-start gap-1 font-medium">
                       {t('actionLabel', {
-                        no: action.actionNo,
+                        no: actionCodeNo(action),
                         title: actionTexts(action, tActions).title,
                       })}
                       <ArrowUpRight className="mt-px h-3 w-3 shrink-0" />

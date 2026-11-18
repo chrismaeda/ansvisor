@@ -55,6 +55,7 @@ import {
 } from '@/components/content/opportunity-basket';
 import { opportunityDocument, opportunityToMarkdown } from '@/lib/content/opportunity-markdown';
 import { useOpportunityVolume } from '@/hooks/use-opportunity-volume';
+import type { QuestionVolume } from '@/lib/content/question-volume';
 import {
   opportunityCsv,
   opportunityDocx,
@@ -64,6 +65,7 @@ import {
 } from '@/lib/content/opportunity-export';
 import { BYTE_ORDER_MARK } from '@/lib/action-center/export';
 import { saveBlob } from '@/lib/download';
+import { exportAuthor, exportFileWord } from '@/lib/white-label/export-name';
 import { canWriteOpportunity, opportunityStart } from '@/lib/content/opportunity-start';
 import { contentEditorPath } from '@/lib/content/drafts';
 import { siteTypeOf } from '@/lib/content/page-types';
@@ -75,10 +77,12 @@ import { isNoPlan } from '@/lib/billing/no-plan';
 import { useBrandStore } from '@/stores/use-brand-store';
 import { OpportunityActions } from '@/components/content/opportunity-actions';
 import { NewContentDialog, type DialogPreset } from '@/components/content/new-content-dialog';
+import { WriteThisDialog } from '@/components/content/write-this-dialog';
 import { useAssetTypeLabel } from '@/hooks/use-asset-type-label';
 import { toast } from 'sonner';
 import { suggestedDate } from '@/lib/suggested-date';
 import { formatNumber } from '@/lib/format';
+import { actionCode } from '@/lib/action-center/action-ref';
 
 export const IMPACT_COLORS: Record<string, string> = {
   high: 'border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-400',
@@ -106,6 +110,40 @@ const INTENT_LABELS: Record<string, string> = {
   'problem-solving': 'Problem Solving',
   other: 'Other',
 };
+
+/**
+ * What the volume is of: the question the opportunity is shown with, one of
+ * its prompts, and for a long question, that it is read from head terms, with
+ * the measured phrase closest to its words.
+ */
+function QuestionVolumeNote({
+  question,
+  prompts,
+}: {
+  question: QuestionVolume | null;
+  prompts: number;
+}) {
+  const t = useTranslations('content.detail');
+  return (
+    <span className="block max-w-72 space-y-0.5 text-xs font-normal text-muted-foreground">
+      <span className="block">
+        {question
+          ? t('volumeOfQuestion', { question: question.question, count: prompts })
+          : t('volumeOfPrompts', { count: prompts })}
+      </span>
+      {question?.fromHeadTerms && (
+        <span className="block">
+          {question.closest
+            ? t.rich('volumeHeadTerms', {
+                phrase: question.closest.phrase,
+                range: () => <EstimateRange estimate={question.closest!.estimate} perMonth />,
+              })
+            : t('volumeHeadTermsOnly')}
+        </span>
+      )}
+    </span>
+  );
+}
 
 function StatCard({
   icon: Icon,
@@ -142,6 +180,7 @@ export function OpportunityDetail({
   inDrawer = false,
   onChanged,
   onPrioritized,
+  onOpportunity,
 }: {
   id: string;
   /** In the list's drawer: no back link, and the layout follows the drawer's width. */
@@ -153,6 +192,8 @@ export function OpportunityDetail({
    * rows' marks (they aren't read again on a refresh), so its menu agrees.
    */
   onPrioritized?: (id: string) => void;
+  /** Its own page: the opportunity as read, for Chat's side panel (the page sends it). */
+  onOpportunity?: (opportunity: ContentOpportunity) => void;
 }) {
   const t = useTranslations('content');
   const failureToast = useFailureToast();
@@ -163,15 +204,19 @@ export function OpportunityDetail({
   const { guard, isLocked } = useUpgradeGate();
   const tActions = useTranslations('readOnly.actions');
   const tReadOnly = useTranslations('readOnly');
+  const tManagers = useTranslations('managersOnly');
 
   const [opportunity, setOpportunity] = useState<ContentOpportunity | null>(null);
+  useEffect(() => {
+    if (opportunity) onOpportunity?.(opportunity);
+  }, [opportunity, onOpportunity]);
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
   const [generatingBrief, setGeneratingBrief] = useState(false);
   const [brief, setBrief] = useState<ContentBrief | null>(null);
   const [quota, setQuota] = useState<BriefQuota | null>(null);
   const [fanoutQueries, setFanoutQueries] = useState<FanoutSubQuery[]>([]);
-  const { basket, basketFailed, volume } = useOpportunityVolume(opportunity);
+  const { basket, basketFailed, volume, question, prompts } = useOpportunityVolume(opportunity);
   const router = useRouter();
   // Start's page types are the opportunity's brand's, which may not be the
   // active one (/dashboard/content/[id] opens any of the org's brands).
@@ -180,6 +225,8 @@ export function OpportunityDetail({
   );
   // Send to Editor: Start for this opportunity, over the panel.
   const [contentPreset, setContentPreset] = useState<DialogPreset | null>(null);
+  // Write this: the brief and the page in one go, over the panel.
+  const [writeThisOpen, setWriteThisOpen] = useState(false);
   // The draft being written for it, opened instead of starting another. A
   // failed read is not "no draft": it offers to check again.
   const [draft, setDraft] = useState<{
@@ -451,13 +498,14 @@ export function OpportunityDetail({
   const noPlan = isNoPlan(quota, isLocked);
   const quotaExhausted = quotaLimited && !noPlan && quota.remaining <= 0;
   const actionId = sd.actions?.all ?? Object.values(sd.actions ?? {})[0];
-  const canSendToWorkflow = !['dismissed', 'archived'].includes(opportunity.status);
+  // Sending to the webhook is for admins and managers, as the server allows it.
+  const canSendToWorkflow = canManage && !['dismissed', 'archived'].includes(opportunity.status);
 
   // Export (the user's spec): what Copy All Data copies, as a file.
   const handleExport = async (format: OpportunityExportFormat) => {
     const doc = opportunityDocument(opportunity, brief, fanoutQueries, assetTypeLabel, volume);
-    const fileName = opportunityExportFileName(doc, format);
     try {
+      const fileName = opportunityExportFileName(doc, format, await exportFileWord());
       if (format === 'csv') {
         saveBlob(
           new Blob([BYTE_ORDER_MARK, opportunityCsv(doc)], { type: 'text/csv;charset=utf-8;' }),
@@ -467,7 +515,7 @@ export function OpportunityDetail({
         const { default: writeXlsxFile } = await import('write-excel-file/browser');
         await writeXlsxFile(opportunityWorkbook(doc)).toFile(fileName);
       } else {
-        saveBlob(await opportunityDocx(doc), fileName);
+        saveBlob(await opportunityDocx(doc, await exportAuthor()), fileName);
       }
     } catch (err) {
       console.error('Export failed:', err);
@@ -495,7 +543,11 @@ export function OpportunityDetail({
             the drawer, which covers the Content page's header; there it
             leaves room for the drawer's close button (top-3 right-3, 28 px).
             The banner follows the whole header block. */}
-        <HeaderWithAiUsage banner={false} className={inDrawer ? 'pr-8' : undefined}>
+        <HeaderWithAiUsage
+          banner={false}
+          askChat={!inDrawer}
+          className={inDrawer ? 'pr-8' : undefined}
+        >
           <div className="flex items-start gap-3">
             {!inDrawer && (
               <Link href="/dashboard/content">
@@ -579,9 +631,10 @@ export function OpportunityDetail({
             generated: !!brief,
             generating: generatingBrief,
             blockedReason: quotaExhausted ? t('briefLimitReached') : null,
-            onGenerate: guard(() => void handleGenerateBrief(), {
-              action: tActions('generateBrief'),
-            }),
+            // Generating costs AI: admins and managers start it.
+            onGenerate: canManage
+              ? guard(() => void handleGenerateBrief(), { action: tActions('generateBrief') })
+              : null,
           }}
           content={{
             draftId:
@@ -590,6 +643,9 @@ export function OpportunityDetail({
             onRetry: retryDraft,
             canStart: canWriteOpportunity(opportunity),
             onStart: guard(() => setContentPreset(opportunityStart(opportunity)), {
+              action: tActions('createContent'),
+            }),
+            onWriteThis: guard(() => setWriteThisOpen(true), {
               action: tActions('createContent'),
             }),
             onOpenDraft: (draftId) => router.push(contentEditorPath(draftId)),
@@ -608,7 +664,7 @@ export function OpportunityDetail({
           // Another angle is written from a cluster or a prompt; a task sent
           // from the Action Center (AC-004) has neither.
           alternative={
-            opportunity.source !== 'action'
+            canManage && opportunity.source !== 'action'
               ? {
                   running: alternativeRunning,
                   onOpen: guard(() => setAlternativeOpen(true), {
@@ -638,8 +694,9 @@ export function OpportunityDetail({
               ? guard(() => void handleRestore(), { action: tActions('restoreOpportunities') })
               : undefined
           }
+          // Dismissing is for admins and managers, as the server allows it.
           onDismiss={
-            opportunity.status === 'new'
+            canManage && opportunity.status === 'new'
               ? guard(() => setDismissOpen(true), { action: tActions('dismissOpportunities') })
               : undefined
           }
@@ -660,6 +717,33 @@ export function OpportunityDetail({
                   after: Math.round((sd.reopened.visibilityAfter ?? 0) * 10) / 10,
                   now: Math.round(sd.reopened.visibility * 10) / 10,
                 })}
+          </p>
+        </div>
+      )}
+
+      {(sd.merged ?? []).length > 0 && (
+        <div className="flex items-start gap-2 rounded-md border bg-muted/40 px-4 py-3 text-xs">
+          <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          <p>
+            <span className="font-medium">
+              {t('sameQuestionMerged', { count: sd.merged?.length ?? 0 })}
+            </span>{' '}
+            <span className="text-muted-foreground">{t('sameQuestionMergedHint')}</span>
+          </p>
+        </div>
+      )}
+
+      {sd.mergedInto && (
+        <div className="flex items-start gap-2 rounded-md border bg-muted/40 px-4 py-3 text-xs">
+          <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          <p>
+            <span className="font-medium">{t('mergedInto')}</span>{' '}
+            <Link
+              href={`/dashboard/content?opportunity=${sd.mergedInto}`}
+              className="text-primary hover:underline"
+            >
+              {t('mergedIntoOpen')}
+            </Link>
           </p>
         </div>
       )}
@@ -730,17 +814,11 @@ export function OpportunityDetail({
                       ) : volume === null ? (
                         '—'
                       ) : (
-                        // The prompts' current estimates, summed (PROMPT-013).
+                        // Its question's estimate, one of its prompts (question-volume.ts).
                         <span className="flex flex-col items-start gap-1">
-                          <EstimateRange
-                            estimate={volume}
-                            kind={'count' in volume ? 'total' : 'prompt'}
-                            perMonth
-                          />
-                          <EstimateBadge
-                            estimate={volume}
-                            kind={'count' in volume ? 'total' : 'prompt'}
-                          />
+                          <EstimateRange estimate={volume} perMonth />
+                          <EstimateBadge estimate={volume} />
+                          <QuestionVolumeNote question={question} prompts={prompts} />
                         </span>
                       )
                     }
@@ -903,14 +981,18 @@ export function OpportunityDetail({
                     Generate an AI-powered content brief with a suggested title, outline, target
                     keywords, and competitor insights.
                   </p>
-                  <Button
-                    onClick={guard(handleGenerateBrief, { action: tActions('generateBrief') })}
-                    disabled={generatingBrief}
-                    className="gap-2"
-                  >
-                    {generatingBrief ? <LoadingDots /> : <Sparkles className="h-4 w-4" />}
-                    {generatingBrief ? 'Generating...' : 'Generate Content Brief'}
-                  </Button>
+                  {canManage ? (
+                    <Button
+                      onClick={guard(handleGenerateBrief, { action: tActions('generateBrief') })}
+                      disabled={generatingBrief}
+                      className="gap-2"
+                    >
+                      {generatingBrief ? <LoadingDots /> : <Sparkles className="h-4 w-4" />}
+                      {generatingBrief ? 'Generating...' : 'Generate Content Brief'}
+                    </Button>
+                  ) : (
+                    <p className="text-xs text-muted-foreground">{tManagers('generateBrief')}</p>
+                  )}
                   {quotaLimited && (
                     <p className="text-xs text-muted-foreground mt-3 tabular-nums">
                       {noPlan
@@ -981,6 +1063,12 @@ export function OpportunityDetail({
         siteType={siteTypeOf(opportunityBrand ?? {})}
         preset={contentPreset}
       />
+      <WriteThisDialog
+        // With a brief generated here meanwhile: its suggested title names the page.
+        opportunity={writeThisOpen ? { ...opportunity, brief: brief ?? opportunity.brief } : null}
+        onOpenChange={setWriteThisOpen}
+        siteType={siteTypeOf(opportunityBrand ?? {})}
+      />
     </div>
   );
 }
@@ -998,7 +1086,9 @@ function FromTaskCard({
     <Card>
       <CardHeader className="pb-2">
         <CardTitle className="text-sm font-medium">
-          {from.actionNo !== null ? t('title', { ref: `AC-${from.actionNo}` }) : t('titleNoRef')}
+          {from.actionNo !== null
+            ? t('title', { ref: actionCode({ ...from, actionNo: from.actionNo }) })
+            : t('titleNoRef')}
         </CardTitle>
       </CardHeader>
       <CardContent>

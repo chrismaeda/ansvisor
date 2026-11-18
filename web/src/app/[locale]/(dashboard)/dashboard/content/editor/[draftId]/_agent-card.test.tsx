@@ -5,7 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AgentRun } from '@/lib/content/agent-runs';
 import messages from '../../../../../../../../messages/en.json';
 import type { DraftSuggestion } from '@/lib/content/suggestions';
-import { AgentCard, rulesAfter, type CardRules } from './_agent-card';
+import { ChatAgenticProvider } from '@/components/providers/chat-agentic-provider';
+import { AgentCard, AgentCardSkeleton, rulesAfter, type CardRules } from './_agent-card';
 
 vi.mock('@/i18n/navigation', () => ({
   Link: ({ href, children, ...props }: { href: string; children: React.ReactNode }) => (
@@ -113,15 +114,35 @@ describe('AgentCard', () => {
       suggestion(),
       suggestion({ id: 's2', reason: 'add a summary', ruleKeys: ['summary'] }),
     ]);
-    expect(container.textContent).toContain('Content Agent has 2 suggestions for you');
-    expect(container.textContent).toContain(
-      'Remove an AI trace (rule) · +1 more · Rules 9 → 11 of 14',
+    // One line (the owner's layout, 2026-11-14): the count, then what they change, truncating.
+    const card = container.querySelector('[role="region"]')!;
+    const [count, line] = card.querySelectorAll<HTMLElement>('.min-w-0.flex-1 > div > span');
+    expect(count.textContent).toBe('2 suggestions');
+    expect(line.textContent).toBe('Remove an AI trace (rule), +1 more · 9 → 11/14 rules');
+    // What the ellipsis cuts, whole on hover.
+    expect(line.querySelector('.truncate')!.getAttribute('title')).toBe(
+      'Remove an AI trace (rule), +1 more · 9 → 11/14 rules',
     );
+    expect(card.className).toContain('py-2');
     expect(buttons()).toEqual(['Review', 'Reject all', 'Accept all']);
     await click('Review');
     expect(handlers.onReview).toHaveBeenCalled();
     await click('Accept all');
     expect(handlers.onAcceptAll).toHaveBeenCalled();
+  });
+
+  it('keeps its place while the batch is read: its tile, two lines and its buttons, in grey', async () => {
+    await render([suggestion()]);
+    const card = container.querySelector('[role="region"]')!.className;
+    await act(async () => root.render(<AgentCardSkeleton />));
+    const skeleton = container.querySelector('[data-slot="agent-card-skeleton"]')!;
+    expect(skeleton.getAttribute('aria-hidden')).toBe('true');
+    // The card's own box, so it is as high: the 40 px tile in the same padding.
+    expect(skeleton.className).toBe(`${card} animate-pulse motion-reduce:animate-none`);
+    const [tile, lines, actions] = skeleton.children;
+    expect(tile.className).toContain('h-10 w-10');
+    expect(lines.children).toHaveLength(2);
+    expect(actions.children).toHaveLength(3);
   });
 
   it('once all are reviewed, says what was accepted and runs the agent again', async () => {
@@ -130,10 +151,10 @@ describe('AgentCard', () => {
       suggestion({ id: 's2', status: 'rejected' }),
     ]);
     expect(container.textContent).toContain('All suggestions reviewed');
-    expect(container.textContent).toContain('1 accepted · Rules 9 of 14 · 5 still open');
-    expect(buttons().slice(0, 2)).toEqual(['Undo all', 'Run Agent']);
+    expect(container.textContent).toContain('1 accepted · 9/14 rules · 5 still open');
+    expect(buttons().slice(0, 2)).toEqual(['Undo all', 'Fix open rules']);
     expect(container.querySelector('button[aria-label="Close"]')).not.toBeNull();
-    await click('Run Agent');
+    await click('Fix open rules');
     expect(handlers.onRun).toHaveBeenCalled();
   });
 
@@ -230,6 +251,51 @@ describe('AgentCard', () => {
     expect(buttons()).toEqual(['Compare', 'Reject', 'Accept']);
   });
 
+  it('works under Chat’s avatar and says the page can be left, with the new Chat on only', async () => {
+    const working = (chatOn: boolean, onServer = true) =>
+      act(async () => {
+        root.render(
+          <NextIntlClientProvider locale="en" messages={messages}>
+            <ChatAgenticProvider enabled={chatOn}>
+              <AgentCard
+                suggestions={[]}
+                rules={rules}
+                busy={false}
+                working
+                onServer={onServer}
+                {...handlers}
+              />
+            </ChatAgenticProvider>
+          </NextIntlClientProvider>,
+        );
+      });
+    await working(true);
+    expect(container.querySelector('[data-slot="agent-avatar"]')?.getAttribute('data-state')).toBe(
+      'working',
+    );
+    expect(container.textContent).toContain("You can leave this page. I'll keep going.");
+    // Still in the browser (the brief's prompts and sources): leaving would lose it.
+    await working(true, false);
+    expect(container.querySelector('[data-slot="agent-avatar"]')).not.toBeNull();
+    expect(container.textContent).not.toContain('You can leave this page');
+    // Chat off: the card as it was.
+    await working(false);
+    expect(container.querySelector('[data-slot="agent-avatar"]')).toBeNull();
+    expect(container.textContent).not.toContain('You can leave this page');
+  });
+
+  it('says a rewrite taken left rules open that were met, beside Undo (B2)', async () => {
+    const page = suggestion({ kind: 'page', status: 'accepted', beforeHtml: '<h1>Old</h1>' });
+    await render([page], false, { rewriteDropped: 2 });
+    expect(container.textContent).toContain('Rewrite left 2 rules open that were met');
+    await click('Undo');
+    expect(handlers.onDecidePage).toHaveBeenCalledWith('open');
+    // None dropped: the rules still open, as before.
+    await render([page], false);
+    expect(container.textContent).not.toContain('Rewrite left');
+    expect(container.textContent).toContain('5 rules still open');
+  });
+
   it('says how many placeholders the result leaves to fill', async () => {
     const page = suggestion({
       kind: 'page',
@@ -240,7 +306,9 @@ describe('AgentCard', () => {
     });
     await render([page], false);
     // Two new: the one the page had isn't the run's.
-    expect(container.textContent).toContain('answered each heading first · 2 placeholders to fill');
+    expect(container.textContent).toContain(
+      'answered each heading first · 2 facts need your input',
+    );
     // A list the agent wrote without paragraphs in its items: read by their words.
     await render(
       [
@@ -254,7 +322,7 @@ describe('AgentCard', () => {
       ],
       false,
     );
-    expect(container.textContent).toContain('kept the list · 1 placeholder to fill');
+    expect(container.textContent).toContain('kept the list · 1 fact needs your input');
     await render(
       [
         suggestion({ afterText: 'look at [figure, source]' }),
@@ -262,7 +330,7 @@ describe('AgentCard', () => {
       ],
       false,
     );
-    expect(container.textContent).toContain('1 placeholder to fill');
+    expect(container.textContent).toContain('1 fact needs your input');
   });
 
   it('reads a rewrite against the Length, not the agent’s say, and says what it kept', async () => {
@@ -316,16 +384,31 @@ describe('AgentCard', () => {
     expect(container.textContent).not.toContain('All suggestions reviewed');
   });
 
+  it('says a run whose answer was lost is still finishing, never that it failed', async () => {
+    await render([], true, { stillFinishing: true });
+    expect(container.textContent).toContain('Still finishing…');
+    expect(container.textContent).not.toContain('Content Agent is working');
+    await render([suggestion({ status: 'accepted' })], false, { stillFinishing: true });
+    expect(container.textContent).toContain('Still finishing…');
+    expect(container.textContent).toContain('may still land');
+    expect(container.textContent).not.toContain("couldn't finish");
+  });
+
   it('reads the gain from the page with the changes in, and names a rule they would break', async () => {
     await render([suggestion()], false, {
-      rules: { ...rules, after: { now: 9, met: 8, breaks: 'Internal links' } },
+      rules: { ...rules, after: { now: 9, met: 8, breaks: 'Internal links', broken: 1 } },
     });
-    expect(container.textContent).toContain('Rules 9 → 8 of 14 · would break Internal links');
+    expect(container.textContent).toContain('9 → 8/14 rules');
+    // On the one line, an icon and a count, named on hover and to a screen reader.
+    const breaks = container.querySelector('[data-slot="agent-card-breaks"]')!;
+    expect(breaks.textContent).toBe('1 rule');
+    expect(breaks.getAttribute('aria-label')).toBe('Would break Internal links');
+    expect(breaks.getAttribute('title')).toBe('Would break Internal links');
     // Counted from the page as it is now, not a read a beat behind it.
     await render([suggestion()], false, {
       rules: { ...rules, met: 7, after: { now: 9, met: 10, breaks: null } },
     });
-    expect(container.textContent).toContain('Rules 9 → 10 of 14');
+    expect(container.textContent).toContain('9 → 10/14 rules');
     // A whole page rewritten: its count beside its characters.
     await render(
       [
@@ -340,7 +423,46 @@ describe('AgentCard', () => {
       { rules: { ...rules, after: { now: 9, met: 8, breaks: 'FAQ' } } },
     );
     expect(container.textContent).toContain(
-      'answered each heading first · Rules 9 → 8 of 14 · would break FAQ',
+      'answered each heading first · 9 → 8/14 rules · would break FAQ',
+    );
+  });
+
+  it('keeps one line however long the reason, only the reason cut short, never under the buttons (the owner, 2026-11-14)', async () => {
+    const reason = `shorten intro to one sentence, dropping the unsourced statistic${' and more'.repeat(30)}`;
+    const names = 'Max sentence length and Outbound links to trusted sources (anchor text)';
+    const batch = [suggestion({ reason, actionId: 'act-429', actionNo: 429 })];
+    const withBreaks = { ...rules, after: { now: 12, met: 10, breaks: names, broken: 2 } };
+    await render(batch, false, { rules: withBreaks, actionInHeader: 'act-429' });
+    const row = container.querySelector('[role="region"] .overflow-hidden')!;
+    const [title, text] = [...row.children];
+    expect(title.textContent).toBe('1 suggestion');
+    expect(title.className).toContain('shrink-0');
+    // One run of text shrinks, the reason and the rules in it, cut short at its end.
+    const [run, breaks] = [...text.children];
+    expect(run.className.split(' ')).toEqual(expect.arrayContaining(['min-w-0', 'truncate']));
+    expect(run.textContent).toContain('Shorten intro to one sentence');
+    expect(run.textContent).toContain('12 → 10/14 rules');
+    // What the ellipsis cuts, on hover.
+    expect(run.getAttribute('title')).toBe(`S${reason.slice(1)} · 12 → 10/14 rules`);
+    // The warning: an icon and a count that don't shrink, the rules named on hover.
+    expect(breaks.getAttribute('data-slot')).toBe('agent-card-breaks');
+    expect(breaks.className).toContain('shrink-0');
+    expect(breaks.textContent).toBe('2 rules');
+    expect(breaks.getAttribute('aria-label')).toBe(`Would break ${names}`);
+    expect(text.children).toHaveLength(2);
+    // The header's chip links the action: the card doesn't again.
+    expect(container.textContent).not.toContain('from Action AC-429');
+    // The buttons keep their size, beside or under the text.
+    const actions = container.querySelector('button')!.parentElement!;
+    expect(actions.className).toContain('shrink-0');
+    expect(buttons()).toEqual(['Review', 'Reject all', 'Accept all']);
+
+    // An action the header doesn't link: in the run of text, cut short with it.
+    await render(batch, false, { rules: withBreaks, actionInHeader: null });
+    const link = container.querySelector<HTMLAnchorElement>('a[href*="action-center"]')!;
+    expect(link.textContent).toBe('from Action AC-429');
+    expect(link.closest('.truncate')).toBe(
+      container.querySelector('[role="region"] .overflow-hidden')!.children[1].children[0],
     );
   });
 
@@ -540,7 +662,7 @@ describe('AgentCard', () => {
       );
     });
     const run = [...container.querySelectorAll('button')].find(
-      (b) => b.textContent === 'Run Agent',
+      (b) => b.textContent === 'Fix open rules',
     )!;
     expect(run.disabled).toBe(true);
     expect(run.title).toBe('');

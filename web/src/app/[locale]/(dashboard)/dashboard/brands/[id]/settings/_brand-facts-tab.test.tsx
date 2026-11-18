@@ -10,21 +10,28 @@ import { UpgradeDialogContext } from '@/components/providers/upgrade-gate';
 const getBrandFacts = vi.fn();
 const readBrandFactsAgain = vi.fn();
 const setBrandFactStatus = vi.fn();
+const setBrandFactScope = vi.fn();
 vi.mock('@/lib/actions/brand-facts', () => ({
   getBrandFacts: (...args: unknown[]) => getBrandFacts(...args),
   readBrandFactsAgain: (...args: unknown[]) => readBrandFactsAgain(...args),
   setBrandFactStatus: (...args: unknown[]) => setBrandFactStatus(...args),
+  setBrandFactScope: (...args: unknown[]) => setBrandFactScope(...args),
 }));
 const toast = vi.hoisted(() => ({ error: vi.fn(), success: vi.fn() }));
 vi.mock('sonner', () => ({ toast }));
+// An admin or a manager unless a test says otherwise.
+const viewer = vi.hoisted(() => ({ canManage: true }));
+vi.mock('@/hooks/use-user-role', () => ({
+  useUserRole: () => ({ canManage: viewer.canManage }),
+}));
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT =
   true;
 
 /**
  * Brand settings › Brand facts (Quality CE-047): the facts read from the
- * brand's own site, each approved or rejected by a member, with where it
- * was read and what it would replace.
+ * brand's own site, each approved or rejected by an admin or a manager
+ * (2026-11-03), with where it was read and what it would replace.
  */
 
 const NOW = Date.parse('2026-10-24T12:00:00Z');
@@ -121,11 +128,13 @@ const section = (label: string) =>
   )!;
 
 beforeEach(() => {
+  viewer.canManage = true;
   vi.useFakeTimers({ toFake: ['Date'] });
   vi.setSystemTime(NOW);
   getBrandFacts.mockReset().mockResolvedValue(READ);
   readBrandFactsAgain.mockReset();
   setBrandFactStatus.mockReset();
+  setBrandFactScope.mockReset();
   toast.error.mockReset();
   container = document.createElement('div');
   document.body.append(container);
@@ -167,7 +176,7 @@ describe('BrandFactsTab', () => {
     expect(container.textContent).toContain('About page: turned our reader away');
   });
 
-  it('approves a fact as the member, in the list at once, dropping the gone one it replaces', async () => {
+  it('approves a fact as the admin or manager, in the list at once, dropping the gone one it replaces', async () => {
     const gone = fact({ id: 'f0', status: 'approved', gone: true, quote: '$59 per month' });
     getBrandFacts.mockResolvedValue({ ...READ, facts: [...READ.facts, gone] });
     await render();
@@ -180,6 +189,33 @@ describe('BrandFactsTab', () => {
     const approved = section('Approved');
     expect(approved.textContent).toContain('Pro · $49 / month');
     expect(approved.textContent).not.toContain('$59 per month');
+  });
+
+  it('groups facts by where they hold, the whole brand’s first, and sets a fact’s place', async () => {
+    const scoped = fact({ id: 'f5', status: 'approved', quote: '₺150', scope: 'Bozcaada' });
+    getBrandFacts.mockResolvedValue({ ...READ, facts: [...READ.facts, scoped] });
+    await render();
+    const headings = [...section('Approved').querySelectorAll('h5')].map((h) => h.textContent);
+    expect(headings).toEqual(['Whole brand', 'Bozcaada']);
+    setBrandFactScope.mockResolvedValue({ id: 'f2', scope: 'Bozcaada' });
+    await act(async () => button('Applies to', section('Approved'))!.click());
+    const input = container.querySelector('input')!;
+    expect(input.getAttribute('aria-label')).toBe('Destination, operator or route');
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(
+        input,
+        'bozcaada',
+      );
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await act(async () => button('Save')!.click());
+    expect(setBrandFactScope).toHaveBeenCalledWith('f2', 'bozcaada');
+    // The list as kept now, its groups too.
+    expect(getBrandFacts).toHaveBeenCalledTimes(2);
+    setBrandFactScope.mockResolvedValue({ error: 'duplicate' });
+    await act(async () => button('Applies to', section('Approved'))!.click());
+    await act(async () => button('Save')!.click());
+    expect(toast.error).toHaveBeenCalledWith('This fact is already kept for that place.');
   });
 
   it('reviews nothing on a read-only workspace: Approve opens the upgrade dialog', async () => {
@@ -227,6 +263,19 @@ describe('BrandFactsTab', () => {
     expect(readBrandFactsAgain).toHaveBeenCalledWith('b1');
     expect(container.textContent).toContain("This month's AI usage is used up");
     expect(container.textContent).toContain('No facts were found on your site yet.');
+  });
+
+  it('shows an analyst or an agency partner the facts, without Approve, Reject or Read again', async () => {
+    viewer.canManage = false;
+    vi.setSystemTime(Date.parse('2026-10-24T12:10:00Z'));
+    await render();
+    expect(section('To approve (1)').textContent).toContain('Pro · $49 / month');
+    for (const label of ['Approve', 'Reject', 'Read again']) {
+      expect(button(label), label).toBeUndefined();
+    }
+    expect(container.textContent).toContain(
+      'Ask an admin or a manager to approve or reject these facts, or to read your site again.',
+    );
   });
 
   it('says when the API has them off', async () => {

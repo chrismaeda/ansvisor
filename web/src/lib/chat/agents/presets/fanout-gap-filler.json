@@ -1,0 +1,22 @@
+{
+  "id": "fanout-gap-filler",
+  "goal": "content",
+  "businessTypes": [],
+  "industries": [],
+  "roles": [],
+  "skills": [
+    "fanout",
+    "answerfirst"
+  ],
+  "triggers": [
+    {
+      "kind": "schedule",
+      "repeat": "MO",
+      "time": "09:00"
+    }
+  ],
+  "mode": "auto",
+  "connections": [],
+  "status": "ready",
+  "needs": []
+}

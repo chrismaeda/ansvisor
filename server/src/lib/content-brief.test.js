@@ -48,7 +48,9 @@ class NoObjectGeneratedError extends Error {
     return err instanceof NoObjectGeneratedError;
   }
 }
-vi.mock('ai', () => ({
+// The real schema helpers: a Claude call's schema is built with them (structured-output.js).
+vi.mock('ai', async (importOriginal) => ({
+  ...(await importOriginal()),
   generateObject: (...args) => generateObject(...args),
   NoObjectGeneratedError,
 }));
@@ -82,12 +84,16 @@ const {
   SYSTEM_PROMPT_V2,
   briefGuard,
   buildBriefPrompt,
+  briefFit,
   mapOutline,
   outlineSchema,
   outlineSchemaV2,
   briefForWriter,
   briefNumbered,
   briefRules,
+  contentBriefModelId,
+  contentReadModelId,
+  contentWriteModelId,
   rebuildDraftBrief,
   rebuildSources,
 } = await import('./content-brief.js');
@@ -163,10 +169,60 @@ beforeEach(() => {
     usage: { inputTokens: 1000, outputTokens: 500 },
   });
   reserveAiBudget.mockReset().mockImplementation(realGuard.reserveAiBudget);
+  // The models as a server without an Anthropic key picks them, whatever the shell has.
+  vi.stubEnv('ANTHROPIC_API_KEY', '');
+  vi.stubEnv('CONTENT_READ_MODEL', '');
+  vi.stubEnv('CONTENT_WRITE_MODEL', '');
+});
+afterEach(() => vi.unstubAllEnvs());
+
+const GEMINI = 'google/gemini-3-flash-preview';
+const HAIKU = 'anthropic/claude-haiku-5-5';
+const SONNET = 'anthropic/claude-sonnet-5-5';
+
+describe("the Content Editor's models", () => {
+  const ids = () => ({
+    read: contentReadModelId(),
+    write: contentWriteModelId(),
+    improve: contentBriefModelId(),
+  });
+
+  it('stay on the model they had, the Improve tab’s, without an Anthropic key', () => {
+    vi.stubEnv('IMPROVE_SUGGESTION_MODEL', '');
+    vi.stubEnv('DEFAULT_SUGGESTION_MODEL', '');
+    expect(ids()).toEqual({ read: GEMINI, write: GEMINI, improve: GEMINI });
+    vi.stubEnv('IMPROVE_SUGGESTION_MODEL', 'openai/gpt-5-mini');
+    expect(ids()).toEqual({
+      read: 'openai/gpt-5-mini',
+      write: 'openai/gpt-5-mini',
+      improve: 'openai/gpt-5-mini',
+    });
+  });
+
+  it('read with Claude Haiku and write with Claude Sonnet with an Anthropic key; Improve keeps its own', () => {
+    vi.stubEnv('ANTHROPIC_API_KEY', 'test-key');
+    vi.stubEnv('IMPROVE_SUGGESTION_MODEL', GEMINI);
+    expect(ids()).toEqual({ read: HAIKU, write: SONNET, improve: GEMINI });
+  });
+
+  it('take CONTENT_READ_MODEL and CONTENT_WRITE_MODEL first, with the key or without it', () => {
+    vi.stubEnv('CONTENT_READ_MODEL', 'google/gemini-3-flash');
+    vi.stubEnv('CONTENT_WRITE_MODEL', 'openai/gpt-5-mini');
+    const set = { read: 'google/gemini-3-flash', write: 'openai/gpt-5-mini' };
+    expect(ids()).toMatchObject(set);
+    vi.stubEnv('ANTHROPIC_API_KEY', 'test-key');
+    expect(ids()).toMatchObject(set);
+  });
+
+  it('read with the fallback a caller gives when there is no key', () => {
+    expect(contentReadModelId(() => 'openai/gpt-5-mini')).toBe('openai/gpt-5-mini');
+    vi.stubEnv('ANTHROPIC_API_KEY', 'test-key');
+    expect(contentReadModelId(() => 'openai/gpt-5-mini')).toBe(HAIKU);
+  });
 });
 
 describe('rebuildDraftBrief', () => {
-  it('puts a number, name or quote its sources don\u2019t have as a placeholder, as the writer would', async () => {
+  it('takes out a number its sources don\u2019t have, and puts a name or quote as a placeholder', async () => {
     const year = new Date().getUTCFullYear();
     generateObject.mockResolvedValue({
       object: {
@@ -191,15 +247,21 @@ describe('rebuildDraftBrief', () => {
       usage: { inputTokens: 1000, outputTokens: 500 },
     });
 
-    const brief = await rebuildDraftBrief({ draftId: DRAFT, brandId: BRAND, sources: sources() });
+    const brief = await rebuildDraftBrief({
+      draftId: DRAFT,
+      brandId: BRAND,
+      sources: sources({ length: 50_000 }),
+    });
 
-    expect(brief.goal).toBe(`Win ${NUMBER_PLACEHOLDER} of home baristas`);
+    // A figure no source has goes with its sentence: nobody is left one to find.
+    expect(brief.goal).toBe('');
+    expect(JSON.stringify(brief)).not.toContain(NUMBER_PLACEHOLDER);
     // A lone digit is a count, as on a page.
     expect(brief.audience).toBe('Home baristas who drink 4 cups a day');
     expect(brief.outline).toEqual([
       {
-        // A heading's number as a page's: "$500" is the prompt's.
-        heading: `The ${NUMBER_PLACEHOLDER} best espresso machines under $500`,
+        // A heading's number as a page's: "$500" is the prompt's; 12 goes on its own.
+        heading: 'The best espresso machines under $500',
         keyPoints: [
           `${NAME_PLACEHOLDER} recommends a flat burr`,
           `${QUOTE_PLACEHOLDER} says the owner`,
@@ -221,16 +283,40 @@ describe('rebuildDraftBrief', () => {
     });
   });
 
+  it('writes the brief with Claude Haiku with an Anthropic key: structured output, a token cap, no sampling', async () => {
+    vi.stubEnv('ANTHROPIC_API_KEY', 'test-key');
+    await rebuildDraftBrief({ draftId: DRAFT, brandId: BRAND, sources: sources() });
+
+    expect(reserveAiBudget).toHaveBeenCalledWith('o1', {
+      feature: 'content',
+      modelId: HAIKU,
+      draftId: DRAFT,
+    });
+    const call = generateObject.mock.calls[0][0];
+    expect(call.model).toBe(`model:${HAIKU}`);
+    expect(call.maxOutputTokens).toBe(16_000);
+    expect(call.providerOptions).toEqual({ anthropic: { structuredOutputMode: 'outputFormat' } });
+    for (const key of ['temperature', 'topP', 'topK']) expect(call).not.toHaveProperty(key);
+    // A schema Claude takes: none of the keywords it turns away.
+    expect(call.schema.jsonSchema).toMatchObject({ type: 'object', additionalProperties: false });
+    expect(JSON.stringify(call.schema.jsonSchema)).not.toMatch(
+      /"(\$schema|maxItems|maxLength|minLength|minimum|maximum)"/,
+    );
+  });
+
   it('writes the brief from the kept sources, charges AI usage, and saves it on the draft', async () => {
     const brief = await rebuildDraftBrief({ draftId: DRAFT, brandId: BRAND, sources: sources() });
 
     expect(reserveAiBudget).toHaveBeenCalledWith('o1', {
       feature: 'content',
-      modelId: 'google/gemini-3-flash-preview',
+      modelId: GEMINI,
       draftId: DRAFT,
     });
     const call = generateObject.mock.calls[0][0];
-    expect(call.model).toBe('model:google/gemini-3-flash-preview');
+    expect(call.model).toBe(`model:${GEMINI}`);
+    // Another provider's call is sent as it was: no token cap, no provider options.
+    expect(call).not.toHaveProperty('maxOutputTokens');
+    expect(call).not.toHaveProperty('providerOptions');
     expect(call.prompt).toContain('- Best espresso machines under $500?');
     expect(call.prompt).toContain(
       '"Best espresso machine under 500" (perplexity-web, copilot-web)',
@@ -291,6 +377,20 @@ describe('rebuildDraftBrief', () => {
       ['in', 'id', [PROMPT]],
       ['eq', 'prompt_sets.brand_id', BRAND],
     ]);
+  });
+
+  /** What the cited pages have (learning C2), read with their length, kept on the brief. */
+  it('keeps what the cited pages have beside their length', async () => {
+    const features = { pages: 2, checks: [{ key: 'faq-schema', label: 'FAQ schema', pages: 2 }] };
+    citedPagesLength.mockResolvedValue({ characters: 4300, pages: 2, features });
+    const brief = await rebuildDraftBrief({ draftId: DRAFT, brandId: BRAND, sources: sources() });
+    expect(brief.citedLength).toEqual({ characters: 4300, pages: 2 });
+    expect(brief.citedFeatures).toEqual(features);
+
+    citedPagesLength.mockResolvedValue(null);
+    const none = await rebuildDraftBrief({ draftId: DRAFT, brandId: BRAND, sources: sources() });
+    expect(none.citedLength).toBeNull();
+    expect(none).not.toHaveProperty('citedFeatures');
   });
 
   it('refuses a draft of another brand before any model call', async () => {
@@ -364,7 +464,11 @@ describe('rebuildDraftBrief', () => {
       },
       usage: { inputTokens: 1000, outputTokens: 500 },
     });
-    const brief = await rebuildDraftBrief({ draftId: DRAFT, brandId: BRAND, sources: sources() });
+    const brief = await rebuildDraftBrief({
+      draftId: DRAFT,
+      brandId: BRAND,
+      sources: sources({ length: 50_000 }),
+    });
     expect(brief.goal).toHaveLength(500);
     // The empty heading went; the rest is capped at 12 sections.
     expect(brief.outline).toHaveLength(12);
@@ -424,6 +528,77 @@ describe('rebuildDraftBrief', () => {
   });
 });
 
+describe('briefFit (editor UX review 2026-11-03, decision b)', () => {
+  afterEach(() => {
+    delete process.env.CONTENT_BRIEF_RULES;
+  });
+
+  it('plans no more sections and key points than the Length holds', () => {
+    // 800 characters (up to 960): two short sections, two points each.
+    expect(briefFit(800)).toEqual({ sections: 2, keyPoints: 2 });
+    expect(briefFit(3000)).toEqual({ sections: 8, keyPoints: 3 });
+    // A range: its top.
+    expect(briefFit(5000, { min: 4500, max: 5500 })).toEqual({ sections: 12, keyPoints: 8 });
+    expect(briefFit(50_000)).toEqual({ sections: 12, keyPoints: 8 });
+    // Never none.
+    expect(briefFit(100)).toEqual({ sections: 1, keyPoints: 2 });
+  });
+
+  it('asks the model for that many, and keeps no more of what it answers', async () => {
+    // The ask is version 2's: version 1's words stay as its eval baseline has them.
+    process.env.CONTENT_BRIEF_RULES = 'true';
+    const prompt = buildBriefPrompt({
+      brand: { name: 'Acme', language: 'en' },
+      draft: { title: 'Office coffee', page_type: null, method: 'create', source_url: null },
+      prompts: [],
+      sources: sources({ length: 800 }),
+    });
+    expect(prompt).toContain(
+      "Length: about 800 characters. Fit the page to it: at most 2 H2 sections, each with up to 2 key points. Leave out what doesn't fit rather than go past it.",
+    );
+    expect(
+      buildBriefPrompt({
+        brand: { name: 'Acme', language: 'en' },
+        draft: { title: 'Office coffee', page_type: null, method: 'create', source_url: null },
+        prompts: [],
+        sources: sources({ length: 5000, lengthBand: { min: 4500, max: 5500 } }),
+      }),
+    ).toContain(
+      'Length: between 4500 and 5500 characters, about 5000. Fit the page to it: at most 12 H2 sections',
+    );
+    delete process.env.CONTENT_BRIEF_RULES;
+    expect(
+      buildBriefPrompt({
+        brand: { name: 'Acme', language: 'en' },
+        draft: { title: 'Office coffee', page_type: null, method: 'create', source_url: null },
+        prompts: [],
+        sources: sources({ length: 800 }),
+      }),
+    ).toContain('Length: about 800 characters.\n');
+    generateObject.mockResolvedValue({
+      object: {
+        goal: 'Win office searches',
+        audience: 'Office managers',
+        outline: Array.from({ length: 5 }, (_, i) => ({
+          heading: `Section ${String.fromCharCode(97 + i)}`,
+          keyPoints: ['one', 'two', 'three', 'four'],
+          fanout: null,
+          platform: null,
+        })),
+        keywords: [],
+      },
+      usage: { inputTokens: 1000, outputTokens: 500 },
+    });
+    const brief = await rebuildDraftBrief({
+      draftId: DRAFT,
+      brandId: BRAND,
+      sources: sources({ length: 800 }),
+    });
+    expect(brief.outline.map((s) => s.heading)).toEqual(['Section a', 'Section b']);
+    expect(brief.outline.every((s) => s.keyPoints.length === 2)).toBe(true);
+  });
+});
+
 describe('rebuildSources', () => {
   it('cuts long text and drops empty items rather than refusing the rebuild', () => {
     const parsed = rebuildSources.parse(
@@ -442,6 +617,17 @@ describe('rebuildSources', () => {
   it('brings the length into the range a rebuild takes', () => {
     expect(rebuildSources.parse(sources({ length: 50 })).length).toBe(100);
     expect(rebuildSources.parse(sources({ length: 60_000 })).length).toBe(50_000);
+  });
+
+  it('keeps a Length range the person set, and drops one that doesn’t read (editor test 2026-11-03)', () => {
+    const band = (lengthBand) => rebuildSources.parse(sources({ length: 5000, lengthBand }));
+    expect(band({ min: 4500, max: 5500 }).lengthBand).toEqual({ min: 4500, max: 5500 });
+    expect(band(undefined).lengthBand).toBeUndefined();
+    expect(band({ min: 5500, max: 4500 }).lengthBand).toBeUndefined();
+    expect(band({ min: 0, max: 4500 }).lengthBand).toBeUndefined();
+    expect(band('4500-5500').lengthBand).toBeUndefined();
+    // The rest of the request stands.
+    expect(band({ min: 5500, max: 4500 }).length).toBe(5000);
   });
 });
 
@@ -484,11 +670,11 @@ describe('the brief guard', () => {
     }
   });
 
-  it('puts what it adds as a placeholder, and drops a keyword that adds one', () => {
+  it('takes out a figure it adds with its sentence, a person as a placeholder, and drops a keyword that adds one', () => {
     const guard = guardFor();
-    expect(guard.text('Prices rose 40% in 2021')).toBe(
-      `Prices rose ${NUMBER_PLACEHOLDER} in ${NUMBER_PLACEHOLDER}`,
-    );
+    expect(guard.text('Prices rose 40% in 2021')).toBe('');
+    expect(guard.text('Prices rose 40% in 2021. Compare the plans.')).toBe('Compare the plans.');
+    expect(guard.heading('Prices in 2021, plan by plan')).toBe('Prices in, plan by plan');
     expect(guard.heading('Why CEO Grace Hopper chose Acme')).toBe(
       'Why CEO Grace Hopper chose Acme',
     );
@@ -519,9 +705,7 @@ describe('the brief guard', () => {
   it('reads Turkish percentages as the writer does', () => {
     const guard = guardFor({ prompts: ['Espresso makinelerinde %25 indirim var mı?'] });
     expect(guard.text('%25 indirimi anlat')).toBe('%25 indirimi anlat');
-    expect(guard.text('Satışlar yüzde 40 arttı')).toBe(
-      `Satışlar yüzde ${NUMBER_PLACEHOLDER} arttı`,
-    );
+    expect(guard.text('Satışlar yüzde 40 arttı')).toBe('');
   });
 });
 
@@ -702,10 +886,8 @@ describe('the brief rules (2026), behind CONTENT_BRIEF_RULES', () => {
     expect(brief.version).toBe(2);
     const [section, second] = brief.outline;
     expect(section.fanout).toBe('Best espresso machine under 500');
-    // Its numbers out of the words; the rule's number kept, one of its own a placeholder.
-    expect(section.answer).toBe(
-      'Say that [figure, source] of buyers pick a single boiler, in 60 words.',
-    );
+    // A figure of its own takes its sentence with it: the answer had no other.
+    expect(section.answer).toBeNull();
     // A format the web doesn't know: none; one it knows, as it lists it.
     expect(section.format).toBeNull();
     expect(second).toMatchObject({
@@ -720,10 +902,11 @@ describe('the brief rules (2026), behind CONTENT_BRIEF_RULES', () => {
     };
     expect(section.facts).toEqual([
       { claim: 'Average price of a machine', sourceType: 'statistic', source: page },
-      // A number the data doesn't have, a source it doesn't list.
-      { claim: '[figure, source] of baristas say so', sourceType: 'study', source: null },
+      // A number the data doesn't have: the claim goes, and with it the fact.
       { claim: 'Average price of a machine', sourceType: 'statistic', source: page },
       { claim: 'Average price of a machine', sourceType: 'statistic', source: null },
+      // So the last one fits under the cap.
+      { claim: 'Average price of a machine', sourceType: 'statistic', source: page },
     ]);
     expect(section.facts.length).toBeLessThanOrEqual(BRIEF_V2_LIMITS.facts);
   });
@@ -806,8 +989,8 @@ describe('the brief rules (2026), behind CONTENT_BRIEF_RULES', () => {
     const brief = await rebuildDraftBrief({ draftId: DRAFT, brandId: BRAND, sources: sources() });
     expect(brief).toMatchObject({
       version: 2,
-      // Guarded and cut as the rest: a figure it wasn't given is a placeholder, its number goes.
-      tldr: `Say which machine wins for ${NUMBER_PLACEHOLDER} of home baristas.`,
+      // Guarded and cut as the rest: a figure it wasn't given goes with its sentence.
+      tldr: null,
       angle: 'Our own side-by-side pull tests.',
       // Kinds the web knows, read by key; none left empty.
       proof: [
@@ -1121,10 +1304,8 @@ describe('the brief rules (2026), behind CONTENT_BRIEF_RULES', () => {
       sources: sources(),
       rules: RULES,
     });
-    expect(brief.outline[0].keyPoints).toEqual([
-      'Price bands (S1)',
-      `Answer in ${NUMBER_PLACEHOLDER} words`,
-    ]);
+    // Without the rules, their 60 is no number it was given: the key point goes.
+    expect(brief.outline[0].keyPoints).toEqual(['Price bands (S1)']);
   });
 
   it('fits the brief under the column’s 64 KB: sources go first, then facts', async () => {
@@ -1199,7 +1380,11 @@ describe('the brief rules (2026), behind CONTENT_BRIEF_RULES', () => {
       },
       usage: { inputTokens: 10, outputTokens: 5 },
     });
-    const brief = await rebuildDraftBrief({ draftId: DRAFT, brandId: BRAND, sources: sources() });
+    const brief = await rebuildDraftBrief({
+      draftId: DRAFT,
+      brandId: BRAND,
+      sources: sources({ length: 50_000 }),
+    });
     expect(Buffer.byteLength(JSON.stringify(brief))).toBeLessThan(64_000);
     expect(brief.links).toBeNull();
     expect(brief.leftOut).toEqual(['home espresso grinder']);
@@ -1269,7 +1454,11 @@ describe('the brief rules (2026), behind CONTENT_BRIEF_RULES', () => {
       },
       usage: { inputTokens: 10, outputTokens: 5 },
     });
-    const brief = await rebuildDraftBrief({ draftId: DRAFT, brandId: BRAND, sources: sources() });
+    const brief = await rebuildDraftBrief({
+      draftId: DRAFT,
+      brandId: BRAND,
+      sources: sources({ length: 50_000 }),
+    });
     expect(Buffer.byteLength(JSON.stringify(brief))).toBeLessThan(64_000);
     expect(brief.outline).toHaveLength(12);
     expect(brief.outline.every((s) => s.facts.length === 0)).toBe(true);
@@ -1380,11 +1569,13 @@ describe('briefForWriter', () => {
     );
     // A table the writer can't make is a comparison set out point by point.
     expect(text).toContain('show as a comparison, the same points for each option in turn');
-    expect(text).toContain('(study, a placeholder until a source is found)');
+    // A fact the brief has no source for is looked up (content-research.js), never a placeholder.
+    expect(text).toContain('(study, look it up with {{find: …}})');
     expect(text).toContain('(statistic, from Your input "Forecast error by month")');
     expect(text).toContain(
-      'Proof to gather (write it only from Your input; else a placeholder): data:',
+      'Proof to gather (write it only from Your input; else {{ask: …}}): data:',
     );
+    expect(text).not.toContain('placeholder');
     expect(text).toContain(
       `Keep to one topic; these searches are for another page: ${sample.leftOut[0]}`,
     );

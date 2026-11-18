@@ -6,11 +6,14 @@ import { logger } from './logger.js';
 import { PageFetchError } from './safe-fetch.js';
 import { brandSiteType, rulesLanguage, untouchedRules } from './content-language.js';
 import { postJson } from './safe-post.js';
-import { isWebflowConfigured } from './composio.js';
+import { isHubspotConfigured, isWebflowConfigured } from './composio.js';
 import { credentialsConfigured } from './catalog/credentials.js';
 import { sendToWebflow } from './cms/webflow-delivery.js';
 import { sendToWordPress } from './cms/wordpress-delivery.js';
 import { sendToFramer } from './cms/framer-delivery.js';
+import { sendToWix } from './cms/wix-delivery.js';
+import { brandPlanHasHubspot, sendToHubspot } from './cms/hubspot-delivery.js';
+import { hubspotConnection } from './hubspot/connection.js';
 
 /**
  * Send to CMS, phase 1 (#1331): an admin or manager sends Content Editor
@@ -29,8 +32,9 @@ import { sendToFramer } from './cms/framer-delivery.js';
  *
  * Phase 2: a page can go to the brand's Webflow collection instead (00283,
  * cms/webflow-delivery.js), as a draft item, to its WordPress site (00294,
- * cms/wordpress-delivery.js), as a draft post, or to its Framer collection
- * (00295, cms/framer-delivery.js), as a draft item, under the same cap,
+ * cms/wordpress-delivery.js), as a draft post, to its Framer collection
+ * (00295, cms/framer-delivery.js), as a draft item, or to its Wix site's
+ * Blog (00372, cms/wix-delivery.js), as a draft post, under the same cap,
  * batches and delivery rows; a delivery says where it went (`target`).
  */
 
@@ -59,6 +63,7 @@ export const deliveryPage = z.object({
   metaDescription: z.string().trim().max(500).default(''),
   html: z.string().min(1).max(MAX_HTML_CHARS),
   author: z.string().trim().max(200).nullable().default(null),
+  reviewer: z.string().trim().max(200).nullable().default(null),
   featuredImage: z
     .object({ src: z.url({ protocol: /^https$/ }).max(2048), alt: z.string().max(500) })
     .nullable()
@@ -67,15 +72,17 @@ export const deliveryPage = z.object({
 
 /**
  * Where pages go: the brand's webhook (phase 1), its Webflow collection, its
- * WordPress site or its Framer collection (phase 2).
+ * WordPress site, its Framer collection or its Wix site's Blog (phase 2).
  */
-const DELIVERY_TARGETS = ['webhook', 'webflow', 'wordpress', 'framer'];
+const DELIVERY_TARGETS = ['webhook', 'webflow', 'wordpress', 'framer', 'wix', 'hubspot'];
 
 export const sendInput = z.object({
   // guid, not uuid: brand ids aren't all RFC 4122 versions (seeded ones).
   brandId: z.guid(),
   pages: z.array(deliveryPage).min(1).max(PAGES_PER_SEND),
   target: z.enum(DELIVERY_TARGETS).default('webhook'),
+  // The agent run whose card the person sent it from (Chat's click, 00480); checked before it is kept.
+  viaAgentRunId: z.guid().optional(),
 });
 
 /** A send that can't go, with the code the web names to the person. */
@@ -84,7 +91,10 @@ export class DeliveryError extends Error {
    * @param {'no_webhook'|'webhook_not_subscribed'|'webflow_not_configured'|'no_webflow'|
    *   'webflow_refused'|'webflow_not_ready'|'wordpress_not_configured'|'no_wordpress'|
    *   'wordpress_refused'|'framer_not_configured'|'no_framer'|'framer_refused'|
-   *   'framer_not_ready'|'in_progress'|'not_found'|'daily_limit'} code
+   *   'framer_not_ready'|'wix_not_configured'|'no_wix'|'wix_refused'|'in_progress'|
+   *   'not_found'|'daily_limit'|'framer_site_publish'|'live_item'|'publish_refused'|
+   *   'hubspot_not_configured'|'no_hubspot'|'hubspot_plan'|'hubspot_refused'|'hubspot_no_consent'|
+   *   'hubspot_not_ready'} code
    */
   constructor(code, message, status) {
     super(message);
@@ -204,6 +214,7 @@ export function contentPackage({ delivery, page, brand, html, jsonLd, callback =
       html,
       jsonLd: jsonLd ?? jsonLdOf(html),
       author: page.author,
+      reviewer: page.reviewer,
       featuredImage: page.featuredImage,
       method: page.method ?? null,
       sourceUrl: page.sourceUrl ?? null,
@@ -334,12 +345,95 @@ async function framerFor(brandId) {
   return data;
 }
 
+/** The brand's Wix connection, its API key kept by the API (00372). */
+async function wixFor(brandId) {
+  if (!credentialsConfigured()) {
+    throw new DeliveryError('wix_not_configured', 'Wix is not set up on this server.', 503);
+  }
+  const { data, error } = await supabaseAdmin
+    .from('brand_cms_connections')
+    .select('id, brand_id, status, site_id, account, updated_at')
+    .eq('brand_id', brandId)
+    .eq('provider', 'wix')
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  if (!data) {
+    throw new DeliveryError('no_wix', 'Connect Wix in Settings › Integrations.', 409);
+  }
+  if (data.status === 'auth_failed') {
+    throw new DeliveryError(
+      'wix_refused',
+      'Wix refused the API key. Connect it again in Settings › Integrations.',
+      409,
+    );
+  }
+  return data;
+}
+
+/**
+ * The brand's HubSpot (#2140; 00522), ready to take pages as draft blog
+ * posts: connected (per brand, brand_integrations), the plan's
+ * crm_integrations, consent to send pages as drafts, and a blog picked.
+ */
+async function hubspotFor(brandId) {
+  if (!isHubspotConfigured()) {
+    throw new DeliveryError('hubspot_not_configured', 'HubSpot is not set up on this server.', 503);
+  }
+  const connection = await hubspotConnection(brandId);
+  if (!connection) {
+    throw new DeliveryError('no_hubspot', 'Connect HubSpot in Settings › Integrations.', 409);
+  }
+  if (!(await brandPlanHasHubspot(brandId))) {
+    throw new DeliveryError('hubspot_plan', 'HubSpot comes with the Growth plan.', 403);
+  }
+  if (!connection.connected) {
+    throw new DeliveryError(
+      'hubspot_refused',
+      'HubSpot refused the sign-in. Connect it again in Settings › Integrations.',
+      409,
+    );
+  }
+  const { consent, blog } = connection.settings;
+  if (!consent.pages) {
+    throw new DeliveryError(
+      'hubspot_no_consent',
+      'Allow sending pages as drafts on the HubSpot card in Settings › Integrations.',
+      409,
+    );
+  }
+  if (!blog?.id) {
+    throw new DeliveryError(
+      'hubspot_not_ready',
+      'Pick the HubSpot blog pages go to in Settings › Integrations.',
+      409,
+    );
+  }
+  return {
+    accountId: connection.accountId,
+    composioAccountId: connection.composioAccountId,
+    blogId: blog.id,
+  };
+}
+
 /** A CMS a page goes to itself, not through the webhook: its connection, and how a page is sent. */
 const NATIVE = {
   webflow: { label: 'Webflow', connect: webflowFor, send: sendToWebflow },
   wordpress: { label: 'WordPress', connect: wordpressFor, send: sendToWordPress },
   framer: { label: 'Framer', connect: framerFor, send: sendToFramer },
+  wix: { label: 'Wix', connect: wixFor, send: sendToWix },
+  hubspot: { label: 'HubSpot', connect: hubspotFor, send: sendToHubspot },
 };
+
+/**
+ * The brand's connection to a CMS a page goes to itself, as a send reads it
+ * (lib/cms-publish.js publishes on it). DeliveryError when it isn't set up,
+ * connected or working.
+ */
+export function cmsConnectionFor(brandId, target) {
+  const native = NATIVE[target];
+  if (!native) throw new DeliveryError('not_found', 'This CMS isn’t one a page is sent to.', 404);
+  return native.connect(brandId);
+}
 
 async function brandFor(brandId) {
   const [{ data: brand }, { data: domains }] = await Promise.all([
@@ -547,12 +641,43 @@ async function myRuleSets(orgId, siteType, drafts) {
 }
 
 /**
+ * The agent run a person's send came from (Chat's click on a card in the
+ * run's chat, 00480), when it is the workspace's run on this brand: the
+ * click comes through a server action any member's session can call, so
+ * the id is checked, never taken as said. Null otherwise, and the send goes
+ * on naming none. Never throws: a read that fails is logged.
+ */
+async function viaRunOf(orgId, brandId, viaAgentRunId) {
+  if (!viaAgentRunId) return null;
+  const { data, error } = await supabaseAdmin
+    .from('chat_agent_runs')
+    .select('id')
+    .eq('id', viaAgentRunId)
+    .eq('organization_id', orgId)
+    .eq('brand_id', brandId)
+    .maybeSingle();
+  if (error) {
+    logger.warn({ err: error }, '[content-delivery] agent run of the send not read');
+    return null;
+  }
+  if (!data)
+    logger.warn('[content-delivery] a send named an agent run of another workspace or brand');
+  return data?.id ?? null;
+}
+
+/**
  * Sends pages of one brand: checks they are the brand's (not archived), that
  * a webhook takes the event (or the brand's Webflow or Framer collection is
  * ready, or its WordPress site connected, for those targets), reserves them against the day's cap (those past
  * it don't go), keeps each page's slug and meta on its draft, then sends
  * them. One page is sent before this returns; more go on in the background,
  * so a CMS isn't sent 25 posts at once.
+ *
+ * `agentRunId`: the agent run that sends on its own (00444), kept on each
+ * delivery; `userId` is then the person the run acts as.
+ * `viaAgentRunId`: the agent run whose card `userId` sent the pages from
+ * (Chat's click, 00480), kept on each delivery once it is the workspace's
+ * run on this brand (viaRunOf); never beside `agentRunId`.
  *
  * @returns {Promise<{ batchId: string|null, deliveries: object[], skipped: number }>}
  *   deliveries: the sent one (one page) or the queued ones (more); skipped:
@@ -564,6 +689,8 @@ export async function sendContentPages({
   userId,
   pages: asked,
   target = 'webhook',
+  agentRunId = null,
+  viaAgentRunId = null,
 }) {
   // A page named twice goes once.
   const byId = new Map(asked.map((p) => [p.draftId, p]));
@@ -614,6 +741,23 @@ export async function sendContentPages({
       `This workspace has sent ${DAILY_DELIVERIES} pages in the last 24 hours. Try again later.`,
       429,
     );
+  }
+  // On its own, or from a card a person clicked in the run's chat (00480): never both.
+  const via = agentRunId ? null : await viaRunOf(orgId, brandId, viaAgentRunId);
+  const run = agentRunId ? { agent_run_id: agentRunId } : via ? { via_agent_run_id: via } : null;
+  if (run) {
+    // Before it goes: the Library and the ship event read who sent it from the row.
+    // Not kept, it still goes: an agent's go-live step names the delivery too.
+    const { error: agentError } = await supabaseAdmin
+      .from('content_draft_deliveries')
+      .update(run)
+      .in(
+        'id',
+        rows.map((row) => row.id),
+      );
+    if (agentError) {
+      logger.warn({ err: agentError }, '[content-delivery] agent run not kept on the send');
+    }
   }
 
   // The reserved pages, in the order they go; their slug and meta stay on the draft.

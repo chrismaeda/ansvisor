@@ -8,6 +8,7 @@ Thank you for your interest in contributing to Ansvisor! This guide will help yo
 - **Feature requests** — have an idea? Start a discussion or open an issue.
 - **Code contributions** — fix a bug or implement a feature via pull request.
 - **Store connectors** — bring a store's or marketplace's products into the catalog; see [CONNECTORS.md](CONNECTORS.md).
+- **Integrations** — a CMS target for Send to CMS, an AI bot log source, a data read or an export; see [Adding an integration](docs/contributing/adding-an-integration.md).
 - **Documentation** — improve guides, fix typos, add examples.
 
 ## Prerequisites
@@ -24,6 +25,7 @@ ansvisor/
 ├── web/                 # Next.js 16 frontend (TypeScript)
 ├── server/              # Express backend (Node.js ESM)
 ├── supabase/            # Database migrations and config
+├── help/                # Product Help articles Chat answers from (help/README.md)
 ├── scripts/             # Version management tooling
 ├── docker-compose.yml   # Containerized deployment
 ├── CHANGELOG.md
@@ -164,14 +166,29 @@ We follow [GitHub Flow](https://docs.github.com/en/get-started/using-github/gith
    migration, and the other half is applying it to the hosted database. You do
    not need to do anything about the label yourself.
 
-5. Push and open a pull request against `main`.
+   If the migration adds a table with a `brand_id`, say what the
+   [demo brand](docs/guides/demo-brand.mdx) shows for it: build its rows in a
+   module under `server/src/lib/demo/`, or list it in `SKIPPED` in
+   `server/src/lib/demo/coverage.js` with the reason. `coverage.test.js` fails
+   until you do. A change to what the demo's data looks like (a module's rows,
+   or a column a page reads from them) also bumps `DEMO_VERSION` in
+   `server/src/lib/demo/index.js`, so every demo brand is rebuilt on its next
+   visit.
 
-6. In your PR description, include:
+5. If your change alters what a user sees or does, add or update its Help
+   article under `help/` in the same pull request ("Help article updated"):
+   one article per page, feature, setting and main task, in the format of
+   [help/README.md](help/README.md). `yarn test` (run from `web/`) checks
+   the format. A new article starts as `approved: false`.
+
+6. Push and open a pull request against `main`.
+
+7. In your PR description, include:
    - **What** changed and **why**
    - **How to test** the change
    - Screenshots if there are UI changes
 
-7. Wait for review, address feedback, and your PR will be merged.
+8. Wait for review, address feedback, and your PR will be merged.
 
 ### Checking for schema drift
 
@@ -238,6 +255,14 @@ fix(web): correct chart rendering on mobile
 - Zod for runtime validation
 - Follow existing patterns in `src/`
 
+### Roles
+
+A workspace has four roles: admin, manager, analyst and agency partner. Daily work, such as the Action Center, writing in the Content Editor and running a Site Audit, is every member's. Settings, connections, deletes, and anything that spends the plan's AI allowance or paid data are for admins and managers.
+
+- A new server write route (`POST`, `PUT`, `PATCH` or `DELETE`, mounted in `server/src/routes/index.js`) checks the caller's role with `assertRole` or `allowRole` from `src/lib/access.js`. If it is open to every member, add it to `OPEN` in `src/routes/write-roles.test.js` with the reason. `npm test` fails until it does one or the other.
+- Hide in the web what the server refuses: `useUserRole()` gives `canManage`.
+- Say who can do it in the feature's Help article.
+
 ### General
 
 - Follow the conventions already present in the codebase
@@ -260,6 +285,8 @@ npm run version:bump -- major   # 0.1.0 → 1.0.0
 Do not edit version numbers in `package.json` files manually.
 
 ## Reporting Issues
+
+**Security vulnerabilities:** don't open a public issue; report them privately as described in [SECURITY.md](SECURITY.md).
 
 When opening an issue, please include:
 

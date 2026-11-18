@@ -1,8 +1,8 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { useFormatter, useTranslations } from 'next-intl';
-import { ChevronDown, Info, Sparkles } from 'lucide-react';
+import { ChevronDown, Database, Info, Sparkles } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
   DropdownMenu,
@@ -37,8 +37,11 @@ import {
   RULE_GROUPS,
   notForAgentMessage,
   openRulesForAgent,
-  lengthBand,
+  lengthRangeValue,
+  lengthSpan,
   lengthOutOfReach,
+  notCheckedHere,
+  phrasesFound,
   rewriteAdvice,
   splitRules,
   type ActiveRule,
@@ -47,12 +50,29 @@ import {
   type TextRule,
 } from '@/lib/content/rules';
 import { listed } from '@/lib/content/shopping-check';
-import { formatNumber } from '@/lib/format';
+import { agentFixable } from '@/lib/content/tried-rules';
+import { ruleStatusDetail, ruleStatusText } from '@/lib/content/rule-words';
 import { cn } from '@/lib/utils';
 import { useUserRole } from '@/hooks/use-user-role';
 import { RunCard } from './_run-card';
-import { WorkingDots } from './_working-dots';
 import type { DraftRulesState } from './_use-draft-rules';
+import { BrandRulesBox } from './_brand-rules-box';
+
+/** Rules set apart whose reason is said under them, beyond their badge. */
+const NOT_CHECKED_WORDS = new Set(['needsFeed', 'noSizes', 'needsSpecs']);
+
+/** Why a rule isn't checked on this page, and what would change that. */
+interface RuleWhy {
+  text: string;
+  action?: { label: string; run: () => void };
+}
+
+/** A rule's action in the list of rules that are the person's: a link-like button. */
+const YOURS =
+  'shrink-0 font-medium underline-offset-2 hover:underline focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none disabled:opacity-50';
+
+/** Rules whose Fix rewrites only the phrases found: AI traces, the brand's banned phrases. */
+const FIX_PHRASES = new Set(['aiTraces', 'brandBanned']);
 
 /** Rules with an explanation on hover (spec §10). */
 const HINTED = new Set([
@@ -63,6 +83,7 @@ const HINTED = new Set([
   'internalLinks',
   'outboundLinks',
   'aiTraces',
+  'brandBanned',
   'whoFor',
   'first40Words',
   'feedMatch',
@@ -90,6 +111,12 @@ export interface AgentFix {
   blocked: string | null;
   /** Open rules no run can close here: held by what the page keeps (openRulesForAgent). */
   held?: ReadonlySet<string>;
+  /** Open rules a Fix was sent and couldn't close (tried-rules.ts): the person's to decide. */
+  tried?: ReadonlySet<string>;
+  /** Ask again: a tried rule's mark cleared, and Fix run for it alone. */
+  askAgain?: (key: string) => void;
+  /** Change the page: the page focused, at the rule's spot where it has one. */
+  showInPage?: (key: string) => void;
 }
 
 /** Rewrite the whole page to these rules, as the editor runs it: one suggestion. */
@@ -155,8 +182,8 @@ function RunAgentButton({
         if (mode === 'rewrite') onMode('fix');
       }}
     >
-      {running && <WorkingDots className="ml-0" />}
-      {running ? t('working') : mode === 'rewrite' ? t('rewriteLabel') : t('label')}
+      {/* The agent card says it's working, alone (editor UX review 2026-11-03). */}
+      {mode === 'rewrite' ? t('rewriteLabel') : t('label')}
     </Button>
   );
   if (!split) return main;
@@ -226,6 +253,9 @@ export function RulesTab({
   pageRewrite,
   dataLine,
   onOpenSources,
+  brandRules,
+  onChangeType,
+  focusRequest,
 }: {
   state: DraftRulesState;
   siteType: SiteType;
@@ -239,6 +269,12 @@ export function RulesTab({
    * gets them; none while the sources are read, or when the draft has prompts.
    */
   onOpenSources?: () => void;
+  /** The brand's rules from Settings › Content (00450), shown read-only above the page's own. */
+  brandRules?: { rules: string[]; brandName: string };
+  /** Opens the header's page type menu: Set page type, on another type's rule. */
+  onChangeType?: () => void;
+  /** A rule whose value to focus, from Next's Ask for fewer: each new `n` once. */
+  focusRequest?: { key: string; n: number } | null;
 }) {
   const t = useTranslations('contentEditor.editor.rules');
   const tSuggestions = useTranslations('contentEditor.editor.suggestions');
@@ -263,6 +299,7 @@ export function RulesTab({
 
   // Rewrite the page whole when small edits can't get there.
   const held = agentFix?.held ?? NO_HELD;
+  const tried = agentFix?.tried ?? NO_HELD;
   const advice = pageRewrite ? rewriteAdvice(state.rules, pageRewrite.reach, held) : null;
   // A Length the rewrite can't reach: said with a Length it can, never recommended.
   const outOfReach = pageRewrite
@@ -275,23 +312,46 @@ export function RulesTab({
     !!outOfReach &&
     !!cited &&
     cited.count > 0 &&
-    (pageRewrite?.reach ?? NO_REACH).floor - cited.chars <= lengthBand(outOfReach.target).max;
-  // The rules the page doesn't meet now, in the tab's order, and those the agent fixes.
+    (pageRewrite?.reach ?? NO_REACH).floor - cited.chars <= outOfReach.max;
+  // The rules the page doesn't meet now, in the tab's order; those the agent
+  // can still fix (agentFixable, as Next counts them), and the person's.
   const open = state.rules.filter(({ rule, status }) => rule.on && status.state === 'bad');
-  const { forAgent, notForAgent, held: heldOpen } = openRulesForAgent(state.rules, undefined, held);
+  const { notForAgent, held: heldOpen } = openRulesForAgent(state.rules, undefined, held);
+  const { fixable: forAgent, yours } = agentFixable(state.rules, { held, tried });
   const fixable = forAgent.length;
   // Run Agent's choice: the safe default, or the whole page (▾) while it is offered.
   const [picked, setPicked] = useState<RunMode>('fix');
   const mode: RunMode = picked === 'rewrite' && pageRewrite ? 'rewrite' : 'fix';
-  const runner = mode === 'rewrite' ? pageRewrite : agentFix;
+  const runner = fixable === 0 ? agentFix : mode === 'rewrite' ? pageRewrite : agentFix;
   // Why Run Agent can't run its choice now, said under the card.
   const blocked =
     runner?.blocked ??
-    (mode === 'fix' && fixable === 0
+    (fixable === 0
       ? notForAgent.length === 0 && heldOpen.length > 0
         ? t(heldMessage(heldOpen))
-        : tSuggestions(notForAgentMessage(notForAgent))
+        : notForAgent.length > 0
+          ? tSuggestions(notForAgentMessage(notForAgent))
+          : null
       : null);
+  // Change the rule: its value focused where it is (its switch, for one with none).
+  const fields = useRef<HTMLFieldSetElement>(null);
+  const focusRule = (key: string) => {
+    const name = t(`names.${key}`);
+    const all = [...(fields.current?.querySelectorAll<HTMLElement>('[aria-label]') ?? [])];
+    const field = [t('value', { name }), t('lengthMin', { name }), t('toggle', { name })]
+      .map((label) => all.find((el) => el.getAttribute('aria-label') === label))
+      .find(Boolean);
+    field?.scrollIntoView?.({ block: 'center' });
+    field?.focus();
+  };
+  useEffect(() => {
+    if (!focusRequest) return;
+    // Once the panel shows Rules: its tab opens after this.
+    const timer = setTimeout(() => focusRule(focusRequest.key));
+    return () => clearTimeout(timer);
+    // Each new request once.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusRequest?.n]);
 
   // A draft on My rules for a type the workspace has none for (its type
   // changed, or My rules couldn't be read) shows Ansvisor's set for it.
@@ -301,10 +361,22 @@ export function RulesTab({
       : 'default';
   const setName =
     items.find((item) => item.value === `${source}:${state.setType}`)?.label ?? t('pickSet');
+  // Another type's rule says so and offers the page type menu; a few others say why.
+  const notCheckedWhy = (status: RuleStatus): RuleWhy | undefined => {
+    const code = status.state === 'info' ? status.code : '';
+    if (code === 'otherType' && state.setType) {
+      return {
+        text: t('notChecked.otherType', { set: state.setType, type: tTypes(state.setType) }),
+        action: onChangeType && { label: t('notChecked.setPageType'), run: onChangeType },
+      };
+    }
+    return NOT_CHECKED_WORDS.has(code) ? { text: t(`notChecked.${code}`) } : undefined;
+  };
 
   return (
     // Nothing changes before My rules are read: a change would leave them out.
     <fieldset
+      ref={fields}
       disabled={!state.ready}
       aria-busy={!state.ready}
       className="m-0 min-w-0 space-y-4 border-0 p-0 text-sm"
@@ -327,7 +399,8 @@ export function RulesTab({
               : undefined
           }
           action={
-            open.length > 0 &&
+            // Nothing left the agent can fix: what's open is the person's, listed below.
+            fixable > 0 &&
             runner && (
               <RunAgentButton
                 mode={mode}
@@ -347,22 +420,79 @@ export function RulesTab({
           info={t.rich(pageRewrite ? 'run.info' : 'run.infoFix', {
             b: (chunks) => <b>{chunks}</b>,
           })}
-          data={dataLine}
+          data={
+            (dataLine || advice) && (
+              <div className="space-y-2 rounded-xl border bg-muted/30 px-3 py-2.5">
+                {dataLine && (
+                  <div className="flex gap-2">
+                    <Database
+                      aria-hidden
+                      className="mt-0.5 h-3 w-3 shrink-0 text-muted-foreground"
+                    />
+                    <div className="min-w-0 flex-1">{dataLine}</div>
+                  </div>
+                )}
+                {advice && (
+                  <p className="flex gap-2 text-xs" role="note">
+                    <Sparkles
+                      aria-hidden
+                      className="mt-0.5 h-3 w-3 shrink-0 text-muted-foreground"
+                    />
+                    <span className="min-w-0 flex-1">
+                      {advice.reason === 'length'
+                        ? t('rewriteAdvice.length', {
+                            count: advice.count,
+                            target: advice.target,
+                            percent: advice.percent,
+                          })
+                        : t('rewriteAdvice.open', { count: advice.count })}
+                    </span>
+                  </p>
+                )}
+              </div>
+            )
+          }
           blocked={open.length > 0 ? blocked : null}
         >
-          {advice && (
-            <p className="flex gap-1.5 text-xs" role="note">
-              <Sparkles aria-hidden className="mt-0.5 h-3 w-3 shrink-0 text-muted-foreground" />
-              <span>
-                {advice.reason === 'length'
-                  ? t('rewriteAdvice.length', {
-                      count: advice.count,
-                      target: advice.target,
-                      percent: advice.percent,
-                    })
-                  : t('rewriteAdvice.open', { count: advice.count })}
-              </span>
-            </p>
+          {open.length > 0 && fixable === 0 && (
+            <div className="space-y-1.5 text-xs" data-slot="rules-yours">
+              <p className="font-medium">{t('yours.line', { count: yours.length })}</p>
+              <div role="list" className="divide-y rounded-lg border">
+                {yours.map(({ rule, status }) => (
+                  <div
+                    key={rule.key}
+                    role="listitem"
+                    className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-1.5"
+                  >
+                    <span className="min-w-0 flex-1">{t(`names.${rule.key}`)}</span>
+                    {/* A setting has no spot in the page. */}
+                    {agentFix?.showInPage &&
+                      !(status.state === 'bad' && status.code === 'notSet') && (
+                        <button
+                          type="button"
+                          className={YOURS}
+                          onClick={() => agentFix.showInPage!(rule.key)}
+                        >
+                          {t('yours.page')}
+                        </button>
+                      )}
+                    <button type="button" className={YOURS} onClick={() => focusRule(rule.key)}>
+                      {t('yours.rule')}
+                    </button>
+                    {agentFix?.askAgain && tried.has(rule.key) && (
+                      <button
+                        type="button"
+                        className={YOURS}
+                        disabled={agentFix.running || agentFix.blocked !== null}
+                        onClick={() => agentFix.askAgain!(rule.key)}
+                      >
+                        {t('yours.again')}
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
           )}
           {outOfReach && (
             <div className="flex gap-1.5 text-xs" role="note">
@@ -385,14 +515,6 @@ export function RulesTab({
                   )}
                 </p>
                 <div className="flex flex-wrap gap-1.5">
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="h-7 text-xs"
-                    onClick={() => state.change('length', { value: String(outOfReach.suggested) })}
-                  >
-                    {t('raiseLength', { suggested: outOfReach.suggested })}
-                  </Button>
                   {/* The quoted passages kept are what holds it: rewritten too, compared first. */}
                   {citedHold && (
                     <Button
@@ -405,6 +527,16 @@ export function RulesTab({
                       {t('rewriteCitedToo')}
                     </Button>
                   )}
+                  {/* The Length is the person's: raising it is the other way, second
+                      (editor UX review 2026-11-03, decision b). */}
+                  <Button
+                    size="sm"
+                    variant={citedHold ? 'ghost' : 'outline'}
+                    className="h-7 text-xs"
+                    onClick={() => state.change('length', { value: String(outOfReach.suggested) })}
+                  >
+                    {t('raiseLength', { suggested: outOfReach.suggested })}
+                  </Button>
                 </div>
                 {citedHold && <p className="text-muted-foreground">{t('rewriteCitedTooHint')}</p>}
               </div>
@@ -412,6 +544,8 @@ export function RulesTab({
           )}
         </RunCard>
       )}
+
+      {brandRules && <BrandRulesBox rules={brandRules.rules} brandName={brandRules.brandName} />}
 
       <div className="space-y-1.5">
         <span className="text-xs text-muted-foreground">{t('set')}</span>
@@ -442,41 +576,7 @@ export function RulesTab({
         </p>
       </div>
 
-      {RULE_GROUPS.map((group) => {
-        const rows = state.rules.filter((r) => r.rule.group === group);
-        if (!rows.length) return null;
-        return (
-          <section key={group} className="space-y-1.5">
-            <h4 className="text-xs font-medium text-muted-foreground">
-              {group === 'type' && state.setType
-                ? t('typeGroup', { type: tTypes(state.setType) })
-                : t(`groups.${group}`)}
-            </h4>
-            <ul className="divide-y rounded-lg border">
-              {rows.map(({ rule, status }) => (
-                <RuleRow
-                  key={rule.key}
-                  rule={rule}
-                  status={status}
-                  onChange={(change) => state.change(rule.key, change)}
-                  agentFix={rule.key === 'aiTraces' ? agentFix : undefined}
-                  onOpenSources={onOpenSources}
-                  merchantCenter={state.merchantCenter ?? false}
-                  note={
-                    rule.key === 'length' && state.lengthConflict
-                      ? t('lengthConflict', state.lengthConflict)
-                      : rule.key === 'sentence' && held.has('sentence') && status.state === 'bad'
-                        ? t('heldSentence')
-                        : rule.key === 'shopLinksLive'
-                          ? shoppingNote(t, status)
-                          : undefined
-                  }
-                />
-              ))}
-            </ul>
-          </section>
-        );
-      })}
+      <AddTextRules onAdd={state.addTextRules} />
 
       {state.textRules.length > 0 && (
         <section className="space-y-1.5">
@@ -494,7 +594,54 @@ export function RulesTab({
         </section>
       )}
 
-      <AddTextRules onAdd={state.addTextRules} />
+      {/* Rules this page can't meet go last, apart: never counted, never sent to the agent. */}
+      {[...RULE_GROUPS, 'notChecked' as const].map((group) => {
+        const rows = state.rules.filter(
+          ({ rule, status }) =>
+            (rule.on && notCheckedHere(status)) === (group === 'notChecked') &&
+            (group === 'notChecked' || rule.group === group),
+        );
+        if (!rows.length) return null;
+        return (
+          <section key={group} className="space-y-1.5">
+            <h4 className="text-xs font-medium text-muted-foreground">
+              {group === 'type' && state.setType
+                ? t('typeGroup', { type: tTypes(state.setType) })
+                : t(`groups.${group}`)}
+            </h4>
+            <ul className="divide-y rounded-lg border">
+              {rows.map(({ rule, status }) => (
+                <RuleRow
+                  key={rule.key}
+                  rule={rule}
+                  status={status}
+                  yours={tried.has(rule.key) || held.has(rule.key)}
+                  onChange={(change) => state.change(rule.key, change)}
+                  agentFix={FIX_PHRASES.has(rule.key) ? agentFix : undefined}
+                  onOpenSources={onOpenSources}
+                  merchantCenter={state.merchantCenter ?? false}
+                  why={group === 'notChecked' ? notCheckedWhy(status) : undefined}
+                  note={
+                    rule.key === 'length' && state.lengthConflict
+                      ? t('lengthConflict', state.lengthConflict)
+                      : // Said where the Length is set, not only in Run Agent's card
+                        // (editor test 2026-11-03: a Length set lower seemed ignored).
+                        rule.key === 'length' && outOfReach
+                        ? t('lengthOutOfReachNote', { least: outOfReach.least })
+                        : rule.key === 'sentence' && held.has('sentence') && status.state === 'bad'
+                          ? t('heldSentence')
+                          : tried.has(rule.key) && status.state === 'bad'
+                            ? t('triedNote')
+                            : rule.key === 'shopLinksLive'
+                              ? shoppingNote(t, status)
+                              : undefined
+                  }
+                />
+              ))}
+            </ul>
+          </section>
+        );
+      })}
 
       <div className="flex flex-wrap gap-2">
         {canManage && (
@@ -582,9 +729,13 @@ function shoppingNote(
   });
 }
 
-/** Write a rule, or paste many: each line becomes a rule (bullets and numbering taken off). */
+/**
+ * Write a rule, or paste many: each line becomes a rule (bullets and numbering
+ * taken off). Under its own small heading, as Rule set has (the owner, 2026-11-14).
+ */
 function AddTextRules({ onAdd }: { onAdd: (lines: string[]) => void }) {
   const t = useTranslations('contentEditor.editor.rules.text');
+  const headingId = useId();
   const [text, setText] = useState('');
   const [pasting, setPasting] = useState(false);
   const [pasted, setPasted] = useState('');
@@ -592,38 +743,43 @@ function AddTextRules({ onAdd }: { onAdd: (lines: string[]) => void }) {
   const pastedLines = splitRules(pasted);
 
   return (
-    <div className="space-y-1.5 rounded-lg border p-2">
-      <Textarea
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        placeholder={t('placeholder')}
-        aria-label={t('write')}
-        rows={2}
-        className="min-h-0 resize-none border-0 p-1 text-xs shadow-none focus-visible:ring-0"
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' && !e.shiftKey && lines.length) {
-            e.preventDefault();
-            onAdd(lines);
-            setText('');
-          }
-        }}
-      />
-      <div className="flex items-center gap-2">
-        <span className="min-w-0 flex-1 text-[11px] text-muted-foreground">{t('help')}</span>
-        <Button size="sm" variant="ghost" onClick={() => setPasting(true)}>
-          {t('pasteMany')}
-        </Button>
-        <Button
-          size="sm"
-          variant="outline"
-          disabled={!lines.length}
-          onClick={() => {
-            onAdd(lines);
-            setText('');
+    <div role="group" aria-labelledby={headingId} className="space-y-1.5">
+      <h4 id={headingId} className="text-xs text-muted-foreground">
+        {t('heading')}
+      </h4>
+      <div className="space-y-1.5 rounded-lg border p-2">
+        <Textarea
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder={t('placeholder')}
+          aria-label={t('write')}
+          rows={2}
+          className="min-h-0 resize-none border-0 p-1 text-xs shadow-none focus-visible:ring-0"
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !e.shiftKey && lines.length) {
+              e.preventDefault();
+              onAdd(lines);
+              setText('');
+            }
           }}
-        >
-          {t('add')}
-        </Button>
+        />
+        <div className="flex items-center gap-2">
+          <span className="min-w-0 flex-1 text-[11px] text-muted-foreground">{t('help')}</span>
+          <Button size="sm" variant="ghost" onClick={() => setPasting(true)}>
+            {t('pasteMany')}
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={!lines.length}
+            onClick={() => {
+              onAdd(lines);
+              setText('');
+            }}
+          >
+            {t('add')}
+          </Button>
+        </div>
       </div>
       <Dialog open={pasting} onOpenChange={setPasting}>
         <DialogContent className="sm:max-w-lg">
@@ -662,14 +818,21 @@ function AddTextRules({ onAdd }: { onAdd: (lines: string[]) => void }) {
 function RuleRow({
   rule,
   status,
+  yours = false,
   onChange,
   agentFix,
   onOpenSources,
   merchantCenter,
   note,
+  why,
 }: {
   rule: ActiveRule;
   status: RuleStatus;
+  /**
+   * Open, and the person's to decide: the agent tried it and couldn't close
+   * it, or no run can (held). Amber, not red (editor test 2026-11-03).
+   */
+  yours?: boolean;
   onChange: (change: { on?: boolean; value?: string }) => void;
   /** "Remove AI traces" offers Fix: the agent rewrites only those phrases. */
   agentFix?: AgentFix;
@@ -678,9 +841,16 @@ function RuleRow({
   merchantCenter: boolean;
   /** A warning under the rule: Length, when the other rules can't fit in it. */
   note?: string;
+  /** Set apart, "Not checked on this page": why, said under it. */
+  why?: RuleWhy;
 }) {
   const t = useTranslations('contentEditor.editor.rules');
   const name = t(`names.${rule.key}`);
+  // The fan-outs still to use, the most searched first: what to add (fanoutH2, fanoutFaq).
+  const left =
+    rule.on && status.state === 'bad' && 'missing' in status ? listed(status.missing ?? []) : null;
+  // The brand's banned phrases on the page, as it wrote them (brandBanned).
+  const phrases = rule.on ? listed(phrasesFound(status)) : null;
   return (
     <li className={cn('px-3 py-2', !rule.on && 'opacity-60')}>
       <div className="flex items-center gap-2">
@@ -704,7 +874,7 @@ function RuleRow({
         >
           {name}
         </span>
-        <StatusBadge on={rule.on} status={status} onOpenSources={onOpenSources} />
+        <StatusBadge on={rule.on} status={status} yours={yours} onOpenSources={onOpenSources} />
         {agentFix && rule.on && status.state === 'bad' && (
           <button
             type="button"
@@ -719,11 +889,45 @@ function RuleRow({
       </div>
       {rule.kind !== 'switch' && (
         <div className="mt-1 flex items-center gap-1 pl-9">
-          <RuleValue rule={rule} name={name} onCommit={(value) => onChange({ value })} />
+          {rule.key === 'length' ? (
+            <LengthValue rule={rule} name={name} onCommit={(value) => onChange({ value })} />
+          ) : (
+            <RuleValue rule={rule} name={name} onCommit={(value) => onChange({ value })} />
+          )}
         </div>
       )}
       {note && rule.on && (
         <p className="mt-1 pl-9 text-[11px] text-amber-700 dark:text-amber-400">{note}</p>
+      )}
+      {why && (
+        <p className="mt-1 pl-9 text-[11px] text-muted-foreground">
+          {why.text}
+          {why.action && (
+            <>
+              {' '}
+              <button
+                type="button"
+                onClick={why.action.run}
+                className="font-medium text-foreground underline-offset-2 hover:underline"
+              >
+                {why.action.label}
+              </button>
+            </>
+          )}
+        </p>
+      )}
+      {left && left.shown.length > 0 && (
+        <p className="mt-1 pl-9 text-[11px] text-muted-foreground [overflow-wrap:anywhere]">
+          {t('fanoutsLeft', { list: left.shown.map((f) => `“${f}”`).join(', '), more: left.more })}
+        </p>
+      )}
+      {phrases && phrases.shown.length > 0 && (
+        <p className="mt-1 pl-9 text-[11px] text-muted-foreground [overflow-wrap:anywhere]">
+          {t('bannedFound', {
+            list: phrases.shown.map((p) => `“${p}”`).join(', '),
+            more: phrases.more,
+          })}
+        </p>
       )}
     </li>
   );
@@ -789,39 +993,97 @@ function RuleValue({
   );
 }
 
-/** How a rule reads now, as its badge says it ("✓", "3 found", "Missing"). */
-export function ruleStatusText(
-  t: (key: string, values?: Record<string, number>) => string,
-  status: RuleStatus,
-): string {
-  if (status.state === 'ok') return '✓';
-  if (status.code === 'partOf') return t('partOf', { count: status.count, of: status.of });
-  if (status.code === 'current') return formatNumber(status.count);
-  if ('count' in status) return t(status.code, { count: status.count });
-  return t(status.code);
+/**
+ * Length as a range (editor test 2026-11-03): the least and the most
+ * characters the page may have, the band around one number shown as such
+ * until the person sets their own. Changed once focus leaves both fields,
+ * or Enter is pressed; kept as "4500-5500" (lengthRangeValue).
+ */
+function LengthValue({
+  rule,
+  name,
+  onCommit,
+}: {
+  rule: ActiveRule;
+  name: string;
+  onCommit: (value: string) => void;
+}) {
+  const t = useTranslations('contentEditor.editor.rules');
+  const span = lengthSpan(rule.current);
+  const now = { min: span ? String(span.min) : '', max: span ? String(span.max) : '' };
+  const [text, setText] = useState<{ min: string; max: string } | null>(null);
+  const shown = text ?? now;
+  const commit = () => {
+    const typed = text;
+    setText(null);
+    if (!typed) return;
+    const read = (value: string) => {
+      const digits = value.replace(/[\s.,]/g, '');
+      return /^\d{1,6}$/.test(digits) && Number(digits) > 0 ? Number(digits) : null;
+    };
+    const min = read(typed.min);
+    const max = read(typed.max);
+    // A bound left empty or not a number: the Length stays as it was.
+    if (min === null || max === null) return;
+    if (span && Math.min(min, max) === span.min && Math.max(min, max) === span.max) return;
+    onCommit(lengthRangeValue(min, max));
+  };
+  const field = (bound: 'min' | 'max') => (
+    <input
+      value={shown[bound]}
+      inputMode="numeric"
+      aria-label={t(bound === 'min' ? 'lengthMin' : 'lengthMax', { name })}
+      maxLength={9}
+      onFocus={() => setText((prev) => prev ?? now)}
+      onChange={(e) => {
+        const value = e.target.value;
+        setText((prev) => ({ ...(prev ?? now), [bound]: value }));
+      }}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') commit();
+        if (e.key === 'Escape') setText(null);
+      }}
+      className={cn(
+        'h-6 w-14 rounded-md border bg-background px-1.5 text-right text-xs tabular-nums outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
+        rule.changed && 'border-primary/50',
+      )}
+    />
+  );
+  return (
+    <span
+      className="flex shrink-0 items-center gap-1"
+      // Left as a whole: moving from one field to the other changes nothing yet.
+      onBlur={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) commit();
+      }}
+    >
+      {field('min')}
+      <span aria-hidden className="text-[11px] text-muted-foreground">
+        –
+      </span>
+      {field('max')}
+      {rule.unit && (
+        <span className="text-[11px] whitespace-nowrap text-muted-foreground">
+          {t(`units.${rule.unit}`)}
+        </span>
+      )}
+    </span>
+  );
 }
 
-/**
- * The same in full, for the badge's hover and what the agent is told: a
- * length out of its band with the band ("15,921 characters, over 2,400–3,600").
- */
-export function ruleStatusDetail(
-  t: (key: string, values?: Record<string, number>) => string,
-  status: RuleStatus,
-): string {
-  if (status.state === 'bad' && (status.code === 'short' || status.code === 'long')) {
-    return t(`${status.code}Detail`, { count: status.count, min: status.min, max: status.max });
-  }
-  return ruleStatusText(t, status);
-}
+// The badge's words live with the rules, so Chat's check_draft_rules says them too.
+export { ruleStatusDetail, ruleStatusText };
 
 function StatusBadge({
   on,
   status,
+  yours = false,
   onOpenSources,
 }: {
   on: boolean;
   status: RuleStatus;
+  /** Open and the person's to decide: amber, not red as the agent's still to fix. */
+  yours?: boolean;
   onOpenSources?: () => void;
 }) {
   const t = useTranslations('contentEditor.editor.rules.status');
@@ -850,7 +1112,12 @@ function StatusBadge({
       className={cn(
         'w-20 shrink-0 truncate text-right text-[11px] font-medium',
         status.state === 'ok' && 'text-emerald-600 dark:text-emerald-400',
-        status.state === 'bad' && 'text-amber-600 dark:text-amber-400',
+        // Red only for what blocks (editor UX review 2026-11-03): an open rule
+        // is amber; one the agent tried, or no run can close, a chip with its note.
+        status.state === 'bad' &&
+          (yours
+            ? 'rounded-md bg-amber-50 px-1 text-amber-700 dark:bg-amber-950 dark:text-amber-300'
+            : 'text-amber-600 dark:text-amber-400'),
         status.state === 'info' && 'font-normal text-muted-foreground',
       )}
     >

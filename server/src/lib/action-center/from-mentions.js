@@ -16,11 +16,21 @@ import { createHash } from 'node:crypto';
 import supabaseAdmin from '../../config/supabase.js';
 import { resolveBrandSources } from './sources.js';
 import { planTasks } from './tasks/plan.js';
+import { brandNoOf } from './action-code.js';
 
 export const MENTION_ACTION_KIND = 'mention_review';
 
 const ACTIVE = ['new', 'in_progress', 'on_hold'];
 const KPI_KEYS = ['mentions', 'ai_visibility', 'positive_sentiment'];
+
+/**
+ * Its success metrics, its aim first (validate.js judges it by the first):
+ * answers sent with negative ones in them are Protect work, to turn how the
+ * brand is spoken of (learning D1); others, to be named more.
+ */
+export function mentionKpiKeys(negative) {
+  return negative > 0 ? ['positive_sentiment', 'mentions', 'ai_visibility'] : KPI_KEYS;
+}
 /** At most a page of the Mentions table at once. */
 export const MAX_MENTIONS = 100;
 /** The answers quoted on the action. */
@@ -108,7 +118,7 @@ export async function sendMentionsToActionCenter(brandId, { resultIds, excerpts 
   const openAction = async () => {
     const { data } = await supabaseAdmin
       .from('actions')
-      .select('id, action_no')
+      .select('id, action_no, brand_no')
       .eq('brand_id', brandId)
       .eq('dedup_key', dedupKey)
       .in('status', ACTIVE)
@@ -116,7 +126,13 @@ export async function sendMentionsToActionCenter(brandId, { resultIds, excerpts 
     return data;
   };
   const open = await openAction();
-  if (open) return { actionId: open.id, actionNo: Number(open.action_no), created: false };
+  if (open)
+    return {
+      actionId: open.id,
+      actionNo: Number(open.action_no),
+      ...brandNoOf(open),
+      created: false,
+    };
 
   const prompts = new Map();
   for (const a of answers) {
@@ -163,18 +179,23 @@ export async function sendMentionsToActionCenter(brandId, { resultIds, excerpts 
       definition_version: 1,
       impact,
       payload,
-      kpi_keys: KPI_KEYS,
+      kpi_keys: mentionKpiKeys(negative),
       baseline: mentionBaseline(answers),
       dedup_key: dedupKey,
     })
-    .select('id, action_no')
+    .select('id, action_no, brand_no')
     .single();
   if (error) {
     // Two sends at once: the other one opened it (the open-action dedup index, 00084).
     if (error.code === '23505') {
       const winner = await openAction();
       if (winner) {
-        return { actionId: winner.id, actionNo: Number(winner.action_no), created: false };
+        return {
+          actionId: winner.id,
+          actionNo: Number(winner.action_no),
+          ...brandNoOf(winner),
+          created: false,
+        };
       }
     }
     throw new Error(error.message);
@@ -194,6 +215,7 @@ export async function sendMentionsToActionCenter(brandId, { resultIds, excerpts 
       mode: item.mode,
       permission: item.permission,
       depends_on: item.dependsOn,
+      title: item.title,
       title_params: item.titleParams,
       details: item.details,
       status: 'todo',
@@ -213,5 +235,10 @@ export async function sendMentionsToActionCenter(brandId, { resultIds, excerpts 
     },
   });
 
-  return { actionId: action.id, actionNo: Number(action.action_no), created: true };
+  return {
+    actionId: action.id,
+    actionNo: Number(action.action_no),
+    ...brandNoOf(action),
+    created: true,
+  };
 }

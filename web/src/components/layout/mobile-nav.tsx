@@ -8,9 +8,18 @@ import { BrandSwitcher } from '@/components/layout/brand-switcher';
 import {
   activeChildHref,
   childLinkHref,
+  dashboardNavBadge,
   getDashboardNavLabel,
+  isNavItemActive,
+  navItemHref,
   shouldShowDashboardNavItem,
+  visibleNavChildren,
 } from '@/lib/dashboard-navigation';
+import { brandVisibilityTabOf, isEcommerceBrand } from '@/lib/brand-visibility';
+import { BrandVisibilityTabLink } from '@/components/brand-visibility/tabs';
+import { useChatAgentic } from '@/components/providers/chat-agentic-provider';
+import { useAdsEnabled } from '@/components/providers/ads-provider';
+import { NewPill } from '@/components/agentic/new-pill';
 import { useFeatureGate } from '@/hooks/use-feature-gate';
 import { useAgentKeyStatus } from '@/hooks/use-agent-key-status';
 import { siteConfig } from '@/config/site';
@@ -21,8 +30,11 @@ import { Sheet, SheetContent, SheetTrigger } from '@/components/ui/sheet';
 import { UserProfileNavItem } from '@/components/layout/user-profile-nav-item';
 import { ThemeToggle } from '@/components/layout/theme-toggle';
 import { useHiddenMenuSections } from '@/components/providers/menu-access-provider';
+import { menuSectionOf } from '@/lib/menu-access';
+import { NEW_RESULTS_ITEM } from '@/lib/menu-dots';
+import { MenuDot, NewResultsWords, useMenuDots } from '@/components/layout/menu-dots';
 import { useBrandStore } from '@/stores/use-brand-store';
-import { Crown, ExternalLink, Menu, MessageSquareHeart, MessageSquareText } from 'lucide-react';
+import { Crown, Menu } from 'lucide-react';
 import Image from 'next/image';
 import { useTheme } from 'next-themes';
 
@@ -31,14 +43,22 @@ export function MobileNav() {
   const pathname = usePathname();
   const t = useTranslations('nav');
   const { canUse, requiredPlanFor, isCloud } = useFeatureGate();
+  const chatAgentic = useChatAgentic();
+  // Ads only with Ads on (ADS_ENABLED), as the sidebar has it.
+  const ads = useAdsEnabled();
+  const nav = dashboardNav;
   // Probe once per session — shares the module-level cache with sidebar.tsx
   // so at most one network request is made even when both components mount.
-  const agentKeyStatus = useAgentKeyStatus(isCloud);
-  const agentKeyMissing = isCloud && agentKeyStatus === 'missing';
-  const activeBrandId = useBrandStore((s) => s.activeBrandId);
+  // None with the new Chat on: that one runs on the plan's AI limit.
+  const agentKeyStatus = useAgentKeyStatus(isCloud && !chatAgentic);
+  const agentKeyMissing = isCloud && !chatAgentic && agentKeyStatus === 'missing';
+  const chatSetUp = agentKeyMissing ? t('chatSetUp') : null;
   const activeBrand = useBrandStore((s) => s.brands.find((b) => b.id === s.activeBrandId) ?? null);
-  const brandPrefs = { shoppingModeEnabled: !!activeBrand?.shoppingModeEnabled };
+  const brandPrefs = { ecommerce: isEcommerceBrand(activeBrand) };
+  const childGates = { brandPrefs, canUse, chatAgentic };
   const hiddenSections = useHiddenMenuSections();
+  // The menu's dots and the Action Center's count, as the sidebar shows them.
+  const dots = useMenuDots(nav);
   const { resolvedTheme } = useTheme();
   const [mounted, setMounted] = useState(false);
   // Hydration guard — see sidebar.tsx for the rationale; the two
@@ -82,41 +102,32 @@ export function MobileNav() {
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto">
           <nav className="space-y-0.5 p-3">
-            {/* The brand's prompts: the Prompts section, off the menu with it. */}
-            {activeBrandId && !hiddenSections.has('prompts') && (
-              <Link
-                href={`/dashboard/brands/${activeBrandId}/prompts`}
-                onClick={() => setOpen(false)}
-              >
-                <span
-                  className={cn(
-                    'flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors',
-                    pathname.includes(`/brands/${activeBrandId}/prompts`)
-                      ? 'bg-primary/10 text-primary'
-                      : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground',
-                  )}
-                >
-                  <MessageSquareText className="h-4 w-4 shrink-0" />
-                  {t('prompts')}
-                </span>
-              </Link>
-            )}
-            {dashboardNav.flatMap((group) =>
+            {/* The brand's prompts are managed on the Prompts page, which the
+                menu's own Prompts item opens, as the sidebar has it. */}
+            {nav.flatMap((group) =>
               group.items.map((item) => {
-                if (!shouldShowDashboardNavItem(item, brandPrefs, hiddenSections)) {
+                if (
+                  !shouldShowDashboardNavItem(
+                    item,
+                    brandPrefs,
+                    hiddenSections,
+                    chatAgentic,
+                    canUse,
+                    ads,
+                  )
+                ) {
                   return null;
                 }
 
-                const isActive =
-                  item.href === '/dashboard'
-                    ? pathname === '/dashboard'
-                    : pathname.startsWith(item.href);
+                const href = navItemHref(item, chatAgentic);
+                const isActive = isNavItemActive(item, pathname, href);
                 const label = getDashboardNavLabel(item.title, t);
+                // The entries this person's menu shows (menu access).
+                const children = visibleNavChildren(item, hiddenSections, childGates);
 
-                // Dynamic badge override: show "Set up" on the Agent item
-                // when the org has no provider key for Chat (cloud only).
-                const effectiveBadge =
-                  item.href === '/dashboard/agent' && agentKeyMissing ? 'Set up' : item.badge;
+                // Chat's own badge: "Set up" when the org has no provider key for
+                // it (cloud only, never with the new Chat on).
+                const effectiveBadge = dashboardNavBadge(item, { chatAgentic, chatSetUp });
 
                 const isLocked =
                   isCloud && item.requiredFeature != null && !canUse(item.requiredFeature);
@@ -140,8 +151,28 @@ export function MobileNav() {
                   );
                 }
 
+                // An entry whose own section is hidden opens its first shown child,
+                // as the desktop menu does (Visibility with Overview off → Mentions).
+                const ownSection = menuSectionOf(item.href);
+                const linkHref =
+                  children.length > 0 && ownSection && hiddenSections.has(ownSection)
+                    ? children[0].href
+                    : href;
+
+                // Every submenu shows here: an item's own dot is for one
+                // without (AI Referral Traffic), or Visibility's, in words too.
+                const itemDot = dots.itemDot(item);
+                const words = itemDot?.colour === 'green' && item.href === NEW_RESULTS_ITEM;
+                const dot = children.length === 0 || words ? itemDot : null;
                 const link = (
-                  <Link key={item.href} href={item.href} onClick={() => setOpen(false)}>
+                  <Link
+                    key={item.href}
+                    href={linkHref}
+                    onClick={() => {
+                      if (dot) dots.clicked(dot, false);
+                      setOpen(false);
+                    }}
+                  >
                     <span
                       className={cn(
                         'flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors',
@@ -151,7 +182,9 @@ export function MobileNav() {
                       )}
                     >
                       <item.icon className="h-4 w-4 shrink-0" />
-                      <span className="flex-1">{label}</span>
+                      <span className={dot ? undefined : 'flex-1'}>{label}</span>
+                      {dot && <MenuDot dot={dot} className="mr-auto" />}
+                      {words && <NewResultsWords />}
                       {effectiveBadge && (
                         <Badge
                           variant="secondary"
@@ -160,22 +193,26 @@ export function MobileNav() {
                           {effectiveBadge}
                         </Badge>
                       )}
+                      {item.newPill && <NewPill />}
                     </span>
                   </Link>
                 );
-                if (!item.children?.length) return link;
-                // A submenu (Prompts, Content), always shown on mobile.
-                const currentChild = activeChildHref(item.children, pathname);
+                if (children.length === 0) return link;
+                // A submenu (the Action Center, Prompts, Brand Visibility,
+                // Content), always shown on mobile.
+                const currentChild = activeChildHref(children, pathname);
                 return (
                   <div key={item.href}>
                     {link}
                     <div className="ml-7 border-l pl-2">
-                      {item.children.map((child) => (
-                        <Link
-                          key={child.href}
-                          href={childLinkHref(child, pathname)}
-                          onClick={() => setOpen(false)}
-                        >
+                      {children.map((child) => {
+                        const tab = brandVisibilityTabOf(child.href);
+                        const childDot = dots.dotOf(child.href);
+                        const onChildClick = () => {
+                          if (childDot) dots.clicked(childDot, false);
+                          setOpen(false);
+                        };
+                        const childBody = (
                           <span
                             className={cn(
                               'flex items-center gap-2 rounded-md px-3 py-1.5 text-sm transition-colors',
@@ -185,6 +222,7 @@ export function MobileNav() {
                             )}
                           >
                             {getDashboardNavLabel(child.title, t)}
+                            {childDot && <MenuDot dot={childDot} />}
                             {child.badge && (
                               <Badge
                                 variant="secondary"
@@ -194,8 +232,23 @@ export function MobileNav() {
                               </Badge>
                             )}
                           </span>
-                        </Link>
-                      ))}
+                        );
+                        // Brand Visibility's tabs keep the date range, engine,
+                        // country and topic, as its tab bar does.
+                        return tab ? (
+                          <BrandVisibilityTabLink key={child.href} tab={tab} onClick={onChildClick}>
+                            {childBody}
+                          </BrandVisibilityTabLink>
+                        ) : (
+                          <Link
+                            key={child.href}
+                            href={childLinkHref(child, pathname)}
+                            onClick={onChildClick}
+                          >
+                            {childBody}
+                          </Link>
+                        );
+                      })}
                     </div>
                   </div>
                 );
@@ -204,17 +257,6 @@ export function MobileNav() {
           </nav>
         </div>
         <div className="border-t p-2">
-          <a
-            href={siteConfig.links.feedback}
-            target="_blank"
-            rel="noopener noreferrer"
-            onClick={() => setOpen(false)}
-            className="mb-1 flex items-center gap-3 rounded-md px-2 py-1.5 text-[13px] font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
-          >
-            <MessageSquareHeart className="h-4 w-4 shrink-0" />
-            <span className="flex-1 truncate">{t('feedback')}</span>
-            <ExternalLink className="h-3 w-3 shrink-0 opacity-60" />
-          </a>
           <UserProfileNavItem onClick={() => setOpen(false)} />
         </div>
       </SheetContent>

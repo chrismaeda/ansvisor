@@ -28,6 +28,13 @@ vi.mock('@/components/action-center/action-center-tabs', () => ({
   ActionCenterTabs: () => null,
 }));
 vi.mock('@/components/action-center/history-table', () => ({ HistoryTable: () => null }));
+vi.mock('@/i18n/navigation', () => ({
+  Link: ({ href, children, ...rest }: { href: string; children: React.ReactNode }) => (
+    <a href={href} {...rest}>
+      {children}
+    </a>
+  ),
+}));
 vi.mock('@/components/action-center/history-drawer', () => ({ HistoryDrawer: () => null }));
 vi.mock('@/components/action-center/scorecard-table', () => ({ ScorecardTable: () => null }));
 
@@ -39,12 +46,23 @@ vi.mock('@/lib/actions/action-history', () => ({ getActionHistory }));
 vi.mock('@/lib/actions/action-scorecard', () => ({ getActionScorecard }));
 
 import ActionCenterHistoryPage from './page';
+import { ChatPageSetterContext } from '@/components/chat/panel/chat-panel-context';
 
 let container: HTMLDivElement;
 let root: Root;
 
 beforeEach(() => {
-  getActionHistory.mockResolvedValue([{ id: 'a1', status: 'completed', outcome: 'improved' }]);
+  getActionHistory.mockResolvedValue([
+    {
+      id: 'a1',
+      actionNo: 648,
+      brandNo: 3,
+      kind: 'recover_lost_citations',
+      payload: {},
+      status: 'completed',
+      outcome: 'improved',
+    },
+  ]);
   getActionScorecard.mockResolvedValue([]);
   container = document.createElement('div');
   document.body.append(container);
@@ -107,5 +125,125 @@ describe('History range', () => {
     await act(async () => button('range.7d').click());
     await act(async () => button('view.actions').click());
     expect(daysAsked(getActionHistory)).toBe(7);
+  });
+});
+
+describe('History scorecard by play (AC plan P-4)', () => {
+  it('reads the scorecard by kind, or by play once picked, and keeps it in the URL', async () => {
+    await renderAt('/?view=scorecard');
+    expect(getActionScorecard.mock.calls.at(-1)?.[1]).toMatchObject({ by: 'kind' });
+    expect(button('scorecard.by.kind').getAttribute('aria-pressed')).toBe('true');
+
+    await act(async () => button('scorecard.by.play').click());
+    expect(getActionScorecard.mock.calls.at(-1)?.[1]).toMatchObject({ by: 'play' });
+    await act(() => new Promise((resolve) => setTimeout(resolve, 350)));
+    expect(window.location.search).toBe('?view=scorecard&by=play');
+  });
+
+  it('opens on the play the URL names, and offers no grouping on the Actions list', async () => {
+    await renderAt('/?view=scorecard&by=play');
+    expect(getActionScorecard.mock.calls.at(-1)?.[1]).toMatchObject({ by: 'play' });
+    await act(async () => button('view.actions').click());
+    expect(() => button('scorecard.by.play')).toThrow();
+  });
+});
+
+describe('History’s views and KPIs', () => {
+  it('are Actions, Scorecard and KPIs, a link to its page, and still switch in place', async () => {
+    await renderAt('/');
+    const group = container.querySelector('[role="group"][aria-label="view.label"]')!;
+    expect([...group.querySelectorAll('button, a')].map((v) => v.textContent)).toEqual([
+      'view.actions',
+      'view.scorecard',
+      'view.kpis',
+    ]);
+    expect(group.querySelector('a')?.getAttribute('href')).toBe('/dashboard/action-center/kpis');
+    await act(async () => button('view.scorecard').click());
+    expect(daysAsked(getActionScorecard)).toBe(90);
+    // One switch on the page.
+    const named = (text: string) =>
+      [...container.querySelectorAll('button')].filter((b) => b.textContent === text);
+    expect(named('view.actions')).toHaveLength(1);
+    expect(named('view.scorecard')).toHaveLength(1);
+  });
+
+  it('keep KPIs in reach when there is no history yet', async () => {
+    getActionHistory.mockResolvedValue([]);
+    await renderAt('/');
+    expect(container.textContent).toContain('empty.title');
+    expect(container.querySelector('a[href="/dashboard/action-center/kpis"]')).not.toBeNull();
+  });
+});
+
+describe("what Chat's side panel sees (the owner's plan, step 9)", () => {
+  const seen = async (url: string) => {
+    const setPage = vi.fn();
+    window.history.replaceState(null, '', url);
+    await act(async () => {
+      root.render(
+        <ChatPageSetterContext.Provider value={setPage}>
+          <ActionCenterHistoryPage />
+        </ChatPageSetterContext.Provider>,
+      );
+    });
+    return setPage.mock.lastCall![0];
+  };
+
+  it('sends its range and, once read, the actions on this page by code with how many', async () => {
+    const page = await seen('/');
+    expect(page).toMatchObject({
+      pageName: 'title',
+      dateRange: { from: '30d', to: null },
+      filters: [],
+    });
+    // The default sort (newest first, as the read lists) isn't sent.
+    expect(page.view).toEqual({
+      tab: 'actions',
+      rows: [{ ref: 'AC-03', label: expect.any(String) }],
+      total: 1,
+    });
+  });
+
+  it('sends its filters as the read names them, the sort picked and the search', async () => {
+    const page = await seen(
+      '/?status=completed&type=recover&priority=high&source=gsc&sort=oldest&q=AC-99&range=all',
+    );
+    expect(page.dateRange).toMatchObject({ from: 'all', to: null });
+    expect(page.filters.map((f: { key: string; value: string }) => [f.key, f.value])).toEqual([
+      ['status', 'completed'],
+      // History's Type is the action's category.
+      ['category', 'recover'],
+      ['priority', 'high'],
+      ['source', 'gsc'],
+    ]);
+    expect(page.view).toEqual({
+      tab: 'actions',
+      sort: { key: 'oldest', dir: 'asc' },
+      search: 'AC-99',
+      rows: [],
+      total: 0,
+    });
+  });
+
+  it('sends no rows while it reads', async () => {
+    getActionHistory.mockReturnValue(new Promise(() => {}));
+    expect((await seen('/')).view).toEqual({ tab: 'actions' });
+  });
+
+  it('sends the Scorecard by kind of action, no filters, and none by play', async () => {
+    getActionScorecard.mockResolvedValue([{ kind: 'citation_gap', completed: 2 }]);
+    const page = await seen('/?view=scorecard&status=completed');
+    expect(page.filters).toEqual([]);
+    expect(page.dateRange).toMatchObject({ from: '90d' });
+    expect(page.view).toEqual({
+      tab: 'scorecard',
+      rows: [{ ref: 'citation_gap', label: expect.any(String) }],
+      total: 1,
+    });
+    // By play (opened anew on it): no read takes a play.
+    act(() => root.unmount());
+    root = createRoot(container);
+    getActionScorecard.mockResolvedValue([{ kind: 'comparison_page', completed: 1 }]);
+    expect((await seen('/?view=scorecard&by=play')).view).toEqual({ tab: 'scorecard' });
   });
 });

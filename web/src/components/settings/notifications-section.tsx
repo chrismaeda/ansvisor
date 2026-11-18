@@ -126,7 +126,7 @@ export function NotificationsSection() {
           <p className="text-sm text-muted-foreground">{t('pulseNoBrands')}</p>
         ) : (
           brands.map((brand) => (
-            <div key={brand.brandId} className="space-y-3 rounded-md border p-4">
+            <div key={brand.brandId} className="space-y-3 rounded-md border bg-card p-4">
               <div className="flex items-center justify-between gap-3">
                 <p className="text-sm font-medium">{brand.brandName}</p>
                 <Select
@@ -142,7 +142,7 @@ export function NotificationsSection() {
                   disabled={!canManage}
                 >
                   <SelectTrigger size="sm" className="w-44">
-                    <SelectValue />
+                    <SelectValue>{t(`pulseFrequency_${brand.frequency}`)}</SelectValue>
                   </SelectTrigger>
                   <SelectContent>
                     {FREQUENCIES.map((freq) => (
@@ -153,6 +153,9 @@ export function NotificationsSection() {
                   </SelectContent>
                 </Select>
               </div>
+              {brand.frequency === 'notable' && (
+                <p className="text-xs text-muted-foreground">{t('pulseFrequency_notableNote')}</p>
+              )}
               <div className="space-y-1.5">
                 <Label htmlFor={`pulse-recipients-${brand.brandId}`}>{t('pulseRecipients')}</Label>
                 <Input

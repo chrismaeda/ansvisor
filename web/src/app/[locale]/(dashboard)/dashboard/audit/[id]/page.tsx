@@ -6,6 +6,7 @@ import { useTranslations } from 'next-intl';
 import { toast } from 'sonner';
 import { Loader2, ArrowLeft, Trash2, RefreshCw, AlertCircle, ListChecks } from 'lucide-react';
 import { Link, useRouter } from '@/i18n/navigation';
+import { useRecentAudit } from '@/components/audit/use-recent-audit';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import {
@@ -25,20 +26,26 @@ import {
   sendAuditToActionCenter,
   type AuditResult,
 } from '@/lib/actions/audits';
-import { AuditReport } from '@/components/audit/audit-report';
+import { AuditReport, CATEGORY_META } from '@/components/audit/audit-report';
+import { useChatPageContext } from '@/components/chat/panel/chat-panel-context';
+import { viewRows } from '@/lib/chat/page-view';
 import { failingChecks } from '@/lib/audit/failing-checks';
+import { actionCodeNo } from '@/lib/action-center/action-ref';
 import { HeaderWithAiUsage } from '@/components/ai-usage/ai-usage-meter';
 import { useUpgradeGate } from '@/components/providers/upgrade-gate';
+import { useUserRole } from '@/hooks/use-user-role';
 
 export default function AuditDetailPage() {
   const params = useParams();
   const id = params.id as string;
   const t = useTranslations('audit');
   const router = useRouter();
+  const { askOne } = useRecentAudit();
   const tFailed = t('failed');
   // A read-only workspace (plan not active): Re-audit and Delete open the
   // upgrade dialog instead (Delete without its confirm).
   const { guard, isLocked, openUpgrade } = useUpgradeGate();
+  const { canManage } = useUserRole();
   const tActions = useTranslations('readOnly.actions');
 
   const [audit, setAudit] = useState<AuditResult | null>(null);
@@ -133,6 +140,39 @@ export default function AuditDetailPage() {
     }
   };
 
+  // Chat's side panel sees the page (the owner's plan of 2026-11-16, step 9's detail pages): the
+  // report it holds open by its id, named by the page it audits, and once complete the checks it
+  // fails or warns on, in the report's order, by their keys.
+  const tChatPanel = useTranslations('chatPanel');
+  const shown = audit?.id === id ? audit : null;
+  useChatPageContext(
+    shown
+      ? {
+          pageName: tChatPanel('pageNames.siteAuditReport'),
+          view: {
+            open: { ref: id, label: shown.finalUrl || shown.url },
+            ...(shown.status === 'completed'
+              ? {
+                  rows: viewRows(
+                    CATEGORY_META.flatMap((category) =>
+                      shown.signals.filter(
+                        (s) =>
+                          s.category === category.key &&
+                          (s.status === 'fail' || s.status === 'warn'),
+                      ),
+                    ),
+                    (s) => ({
+                      ref: s.key,
+                      label: `${s.label} (${s.status === 'fail' ? 'failed' : 'warning'})`,
+                    }),
+                  ),
+                }
+              : {}),
+          },
+        }
+      : null,
+  );
+
   // The page and the checks it fails, sent to the Action Center as one Fix action (learning D2).
   const [sendingToAction, setSendingToAction] = useState(false);
   const failing = failingChecks(audit?.signals ?? []);
@@ -172,7 +212,7 @@ export default function AuditDetailPage() {
         toast.success(t('sendToAction.sent'), {
           id: toastId,
           description: t('sendToAction.sentDescription', {
-            number: result.actionNo,
+            number: actionCodeNo(result),
             count: failing,
           }),
           duration: 10_000,
@@ -181,7 +221,7 @@ export default function AuditDetailPage() {
       } else {
         toast.info(t('sendToAction.alreadySent'), {
           id: toastId,
-          description: t('sendToAction.alreadySentDescription', { number: result.actionNo }),
+          description: t('sendToAction.alreadySentDescription', { number: actionCodeNo(result) }),
           duration: 10_000,
           action: open,
         });
@@ -196,19 +236,30 @@ export default function AuditDetailPage() {
     }
   };
 
-  // Re-run the audit on the same URL → navigate to the new audit's detail page.
-  const handleRefresh = async () => {
-    if (!audit) return;
+  // Re-run the audit on the same URL → navigate to the new audit's detail
+  // page (the page's own when one runs already). An audit finished minutes
+  // ago asks first: Open it or Audit again.
+  const rerun = async (brandId: string, url: string, force = false) => {
     setRerunning(true);
 
     try {
-      const started = await runAudit(audit.brandId, audit.url);
-      router.push(`/dashboard/audit/${started.id}`);
+      const started = force
+        ? await runAudit(brandId, url, { force: true })
+        : await runAudit(brandId, url);
+      if (started.recent) {
+        askOne(started.recent, () => void rerun(brandId, url, true));
+        return;
+      }
+      router.push(`/dashboard/audit/${started.audit.id}`);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : tFailed);
     } finally {
       setRerunning(false);
     }
+  };
+  const handleRefresh = async () => {
+    if (!audit) return;
+    await rerun(audit.brandId, audit.url);
   };
 
   return (
@@ -226,7 +277,6 @@ export default function AuditDetailPage() {
               {audit.status === 'completed' && failing > 0 && (
                 <Button
                   variant="outline"
-                  size="sm"
                   className="mr-1 gap-1.5"
                   disabled={sendingToAction}
                   onClick={() => void handleSendToAction()}
@@ -253,38 +303,41 @@ export default function AuditDetailPage() {
                   <RefreshCw className="h-3.5 w-3.5" />
                 )}
               </Button>
-              <Dialog
-                onOpenChange={(open, details) => {
-                  if (!open || !isLocked) return;
-                  details.cancel();
-                  openUpgrade(tActions('deleteAudits'));
-                }}
-              >
-                <DialogTrigger
-                  render={
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="h-8 w-8 text-muted-foreground hover:text-destructive"
-                      aria-label={t('deleteAudit')}
-                    />
-                  }
+              {/* Deleting an audit: admins and managers (2026-11-03). */}
+              {canManage && (
+                <Dialog
+                  onOpenChange={(open, details) => {
+                    if (!open || !isLocked) return;
+                    details.cancel();
+                    openUpgrade(tActions('deleteAudits'));
+                  }}
                 >
-                  <Trash2 className="h-3.5 w-3.5" />
-                </DialogTrigger>
-                <DialogContent className="sm:max-w-sm">
-                  <DialogHeader>
-                    <DialogTitle>{t('deleteAudit')}</DialogTitle>
-                    <DialogDescription>{t('deleteConfirm')}</DialogDescription>
-                  </DialogHeader>
-                  <DialogFooter>
-                    <DialogClose render={<Button variant="outline" />}>{t('cancel')}</DialogClose>
-                    <DialogClose render={<Button variant="destructive" onClick={handleDelete} />}>
-                      {t('deleteAudit')}
-                    </DialogClose>
-                  </DialogFooter>
-                </DialogContent>
-              </Dialog>
+                  <DialogTrigger
+                    render={
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-8 w-8 text-muted-foreground hover:text-destructive"
+                        aria-label={t('deleteAudit')}
+                      />
+                    }
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </DialogTrigger>
+                  <DialogContent className="sm:max-w-sm">
+                    <DialogHeader>
+                      <DialogTitle>{t('deleteAudit')}</DialogTitle>
+                      <DialogDescription>{t('deleteConfirm')}</DialogDescription>
+                    </DialogHeader>
+                    <DialogFooter>
+                      <DialogClose render={<Button variant="outline" />}>{t('cancel')}</DialogClose>
+                      <DialogClose render={<Button variant="destructive" onClick={handleDelete} />}>
+                        {t('deleteAudit')}
+                      </DialogClose>
+                    </DialogFooter>
+                  </DialogContent>
+                </Dialog>
+              )}
             </div>
           )}
         </div>

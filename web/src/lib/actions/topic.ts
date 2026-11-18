@@ -1,11 +1,14 @@
 'use server';
 
 import { createClient } from '@/lib/supabase/server';
+import { dbClient } from '@/lib/supabase/scoped';
 import { computeAiVisibilityScore } from '@/lib/visibility-score';
 import { API_BASE_URL } from '@/config/api';
 import type { Topic } from '@/types';
 import { DAY_MS, topicTrendDays, type TopicsWindow } from '@/lib/topic-trend';
 import { assertWritable } from '@/lib/subscription-guard';
+import { MANAGER_ROLES } from '@/lib/mcp/role-gate';
+import { isManager } from '@/lib/session-role';
 import { TOPIC_NAME_CHARS, topicNameFits } from '@/lib/topic-names';
 
 export type { TopicsWindow } from '@/lib/topic-trend';
@@ -28,7 +31,7 @@ function assertTopicNames(names: string[]) {
 }
 
 export async function createTopics(brandId: string, names: string[]): Promise<Topic[]> {
-  await assertWritable({ onboarding: true });
+  await assertWritable({ onboarding: true, brandId });
   assertTopicNames(names);
   const supabase = await createClient();
 
@@ -84,7 +87,7 @@ export async function getTopicById(brandId: string, topicId: string): Promise<To
 }
 
 export async function createTopic(brandId: string, name: string): Promise<Topic> {
-  await assertWritable();
+  await assertWritable({ brandId });
   assertTopicNames([name]);
   const supabase = await createClient();
 
@@ -96,6 +99,151 @@ export async function createTopic(brandId: string, name: string): Promise<Topic>
 
   if (error) throw new Error(error.message);
   return mapTopicRow(data as Record<string, unknown>);
+}
+
+export type BrandTopicResult =
+  | { ok: true; topic: Topic }
+  | {
+      ok: false;
+      reason: 'forbidden_role' | 'not_found' | 'duplicate' | 'invalid' | 'failed';
+      message: string;
+    };
+
+/** A topic name as two are compared: case and spacing aside (the natural key, CHAT-20 §11c). */
+const topicKey = (name: string) => name.trim().replace(/\s+/g, ' ').toLowerCase();
+
+/** A name a topic may take: 1 to TOPIC_NAME_CHARS characters, trimmed; else the refusal. */
+function topicNameOf(name: string): { name: string } | BrandTopicResult {
+  const trimmed = name.trim().replace(/\s+/g, ' ');
+  return trimmed && topicNameFits(trimmed)
+    ? { name: trimmed }
+    : {
+        ok: false,
+        reason: 'invalid',
+        message: `Topic names are 1 to ${TOPIC_NAME_CHARS} characters.`,
+      };
+}
+
+/** The brand's active topic by that name, but `except`; null when it has none. */
+async function sameNamedTopic(
+  supabase: Awaited<ReturnType<typeof createClient>>,
+  brandId: string,
+  name: string,
+  except?: string,
+): Promise<{ name: string } | null> {
+  const { data, error } = await supabase
+    .from('topics')
+    .select('id, name')
+    .eq('brand_id', brandId)
+    .eq('is_active', true);
+  if (error) throw new Error(error.message);
+  const same = (data ?? []).find(
+    (row) => row.id !== except && topicKey(row.name as string) === topicKey(name),
+  );
+  return same ? { name: same.name as string } : null;
+}
+
+const forbidden = (what: string): BrandTopicResult => ({
+  ok: false,
+  reason: 'forbidden_role',
+  message: `Only an admin or a manager can ${what} topics.`,
+});
+
+/**
+ * Add a topic to a brand unless it has an active one by that name, case and
+ * spacing aside: Chat's add_topic (CHAT-20 §9 row 25, its natural key).
+ * Admins and Managers, checked here as the policy does (00382). Through
+ * createTopic, as the Topics tab adds one. Errors come back as values (#427).
+ */
+export async function addBrandTopic(brandId: string, name: string): Promise<BrandTopicResult> {
+  try {
+    await assertWritable({ brandId });
+    return await addOneTopic(brandId, name);
+  } catch (err) {
+    console.error('Failed to add a topic from Chat:', err);
+    return { ok: false, reason: 'failed', message: 'The topic couldn’t be added. Try again.' };
+  }
+}
+
+async function addOneTopic(brandId: string, name: string): Promise<BrandTopicResult> {
+  const supabase = await createClient();
+  if (!(await isManager(supabase))) return forbidden('add');
+  const named = topicNameOf(name);
+  if (!('name' in named)) return named;
+  try {
+    const same = await sameNamedTopic(supabase, brandId, named.name);
+    if (same) {
+      return {
+        ok: false,
+        reason: 'duplicate',
+        message: `The brand already has the topic “${same.name}”.`,
+      };
+    }
+    return { ok: true, topic: await createTopic(brandId, named.name) };
+  } catch (err) {
+    return {
+      ok: false,
+      reason: 'failed',
+      message: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+/**
+ * Rename one of a brand's active topics: Chat's rename_topic (CHAT-20 §9
+ * row 25). Admins and Managers, checked here; a name another of the brand's
+ * active topics has is refused, as is its own name. Through updateTopic, as
+ * the Topics tab renames one. Errors come back as values (#427).
+ */
+export async function renameBrandTopic(topicId: string, name: string): Promise<BrandTopicResult> {
+  try {
+    await assertWritable();
+    return await renameOneTopic(topicId, name);
+  } catch (err) {
+    console.error('Failed to rename a topic from Chat:', err);
+    return { ok: false, reason: 'failed', message: 'The topic couldn’t be renamed. Try again.' };
+  }
+}
+
+async function renameOneTopic(topicId: string, name: string): Promise<BrandTopicResult> {
+  const supabase = await createClient();
+  if (!(await isManager(supabase))) return forbidden('rename');
+  const named = topicNameOf(name);
+  if (!('name' in named)) return named;
+  try {
+    const { data: topic, error } = await supabase
+      .from('topics')
+      .select('id, brand_id, name')
+      .eq('id', topicId)
+      .eq('is_active', true)
+      .maybeSingle();
+    if (error) throw new Error(error.message);
+    if (!topic) {
+      return { ok: false, reason: 'not_found', message: "That topic isn't one of this brand's." };
+    }
+    if (topic.name === named.name) {
+      return {
+        ok: false,
+        reason: 'invalid',
+        message: `The topic is already called “${named.name}”.`,
+      };
+    }
+    const same = await sameNamedTopic(supabase, topic.brand_id as string, named.name, topicId);
+    if (same) {
+      return {
+        ok: false,
+        reason: 'duplicate',
+        message: `The brand already has the topic “${same.name}”.`,
+      };
+    }
+    return { ok: true, topic: await updateTopic(topicId, named.name) };
+  } catch (err) {
+    return {
+      ok: false,
+      reason: 'failed',
+      message: err instanceof Error ? err.message : String(err),
+    };
+  }
 }
 
 export async function updateTopic(topicId: string, name: string): Promise<Topic> {
@@ -284,7 +432,8 @@ export async function getTopicsOverview(
   brandId: string,
   window?: TopicsWindow,
 ): Promise<TopicOverviewSummary> {
-  const supabase = await createClient();
+  // dbClient: the person's own client; Chat's read runs it with the service role (asService).
+  const supabase = await dbClient();
 
   // Only the sparkline's day keys are built here now; every window boundary
   // is resolved inside the aggregate, from the database's clock.
@@ -441,9 +590,29 @@ export async function getTopicsOverview(
   return { topics: rows, unassignedPromptCount, trendDays };
 }
 
+/**
+ * Deletes a topic for an admin or a manager. Its prompts stay, with their
+ * results: prompts.topic_id is ON DELETE SET NULL, so they become prompts
+ * without a topic. The topics table's row rules let every member write, so
+ * the role is checked here.
+ */
 export async function deleteTopic(topicId: string): Promise<void> {
   await assertWritable();
   const supabase = await createClient();
+
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) throw new Error('Unauthorized');
+  const { data: profile, error: profileErr } = await supabase
+    .from('profiles')
+    .select('role')
+    .eq('id', user.id)
+    .maybeSingle();
+  if (profileErr) throw new Error(profileErr.message);
+  if (!MANAGER_ROLES.some((role) => role === profile?.role)) {
+    throw new Error('Only an admin or a manager can delete topics.');
+  }
 
   // Fetch topic to get name and brand_id
   const { data: topic, error: fetchErr } = await supabase
@@ -484,7 +653,7 @@ export async function sendTopicOpportunityToActionCenter(
   topicId: string,
   suggestionIds: string[],
 ): Promise<
-  | { actionId: string; actionNo: number; created: boolean }
+  | { actionId: string; actionNo: number; brandNo?: number | null; created: boolean }
   // 'stale': none of the suggestions is still open in the topic (409).
   | { error: string; code?: 'stale' }
 > {

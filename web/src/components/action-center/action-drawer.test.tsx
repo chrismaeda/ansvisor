@@ -8,6 +8,7 @@ import { parseTaskDetails } from '@/lib/action-center/task-details';
 import { promptVolumeEstimate } from '@/lib/volume-estimate';
 import messages from '../../../messages/en.json';
 import { UpgradeDialogContext } from '@/components/providers/upgrade-gate';
+import { RoleContext, type TeamRole } from '@/components/providers/role-provider';
 
 /**
  * Status, assignee and due date sit right under the drawer's header, ahead of
@@ -32,6 +33,8 @@ const drafts = vi.hoisted(() => ({ getActionDrafts: vi.fn(), startDraftFromActio
 const taskCheck = vi.hoisted(() => ({ checkActionTask: vi.fn() }));
 vi.mock('@/i18n/navigation', () => ({
   useRouter: () => ({ push }),
+  // Start now's Chat opens beside the action (AC plan P-3).
+  usePathname: () => '/dashboard/action-center/actions',
   Link: ({ href, children, ...rest }: { href: string; children: React.ReactNode }) => (
     <a href={href} {...rest}>
       {children}
@@ -42,8 +45,15 @@ vi.mock('@/lib/actions/action-center', () => server);
 vi.mock('@/lib/actions/content-drafts', () => drafts);
 vi.mock('@/lib/actions/action-task-check', () => taskCheck);
 vi.mock('sonner', () => ({ toast }));
+// The brand has an active webhook (AC-004).
+const taskSend = vi.hoisted(() => ({
+  hasActiveWebhook: vi.fn(async () => true),
+  sendActionTask: vi.fn(),
+}));
+vi.mock('@/lib/actions/action-task-send', () => taskSend);
 
 const { ActionDrawer } = await import('./action-drawer');
+const { BUSINESS_HUB_URL } = await import('@/lib/business-hub/links');
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT =
   true;
@@ -92,22 +102,28 @@ afterEach(() => {
   container.remove();
 });
 
-async function renderDrawer(shown: ActionItem = action, isLocked = false) {
+async function renderDrawer(
+  shown: ActionItem = action,
+  isLocked = false,
+  role: TeamRole = 'analyst',
+) {
   await act(async () => {
     root.render(
       <NextIntlClientProvider locale="en" messages={messages} timeZone="UTC">
-        <UpgradeDialogContext.Provider
-          value={{ isLocked, reason: 'ended', adminName: null, openUpgrade }}
-        >
-          <ActionDrawer
-            brandId="b1"
-            action={shown}
-            members={[]}
-            onOpenChange={() => {}}
-            onChanged={onChanged}
-            onPatched={onPatched}
-          />
-        </UpgradeDialogContext.Provider>
+        <RoleContext.Provider value={{ role }}>
+          <UpgradeDialogContext.Provider
+            value={{ isLocked, reason: 'ended', adminName: null, openUpgrade }}
+          >
+            <ActionDrawer
+              brandId="b1"
+              action={shown}
+              members={[]}
+              onOpenChange={() => {}}
+              onChanged={onChanged}
+              onPatched={onPatched}
+            />
+          </UpgradeDialogContext.Provider>
+        </RoleContext.Provider>
       </NextIntlClientProvider>,
     );
   });
@@ -136,6 +152,32 @@ describe('ActionDrawer', () => {
     expect(drawer.querySelector<HTMLInputElement>('#action-drawer-due-date')!.value).toBe(
       '2026-11-01',
     );
+  });
+
+  it('names the action’s number in the top row, its full label kept for hover and screen readers (W2-17)', async () => {
+    await renderDrawer();
+    const drawer = document.body.querySelector('[role="dialog"]')!;
+    const id = drawer.querySelector<HTMLElement>('[title^="Action ID"]')!;
+    expect(id.title).toBe(`Action ID: AC-${action.actionNo}`);
+    expect(id.textContent).toBe(`Action ID: AC-${action.actionNo}`);
+    // Only the label gives way, and only beside Run agent.
+    const label = id.firstElementChild as HTMLElement;
+    expect(label.textContent).toBe('Action ID: ');
+    expect(label.className).toBe('group-has-[[data-run-agent]]/top:sr-only');
+    expect(id.closest('.group\\/top')).not.toBeNull();
+  });
+
+  // The owner's ask (14 Nov): each brand numbers its actions from AC-01 (00534).
+  it('names its brand code, and the old code it had as "Previously", small and muted', async () => {
+    await renderDrawer({ ...action, actionNo: 648, brandNo: 3 });
+    const drawer = document.body.querySelector('[role="dialog"]')!;
+    expect(drawer.querySelector<HTMLElement>('[title^="Action ID"]')!.title).toBe(
+      'Action ID: AC-03',
+    );
+    const previous = [...drawer.querySelectorAll('span')].find(
+      (el) => el.textContent === 'Previously AC-648',
+    );
+    expect(previous?.className).toContain('text-muted-foreground');
   });
 
   it("gives the Why the demand of a signal's prompt the action didn't keep", async () => {
@@ -306,6 +348,134 @@ describe('ActionDrawer', () => {
     });
   });
 
+  /** What Chat attached and where it came from (CHAT-09 §D–E). */
+  describe('from Chat', () => {
+    const button = (name: string) =>
+      [...document.querySelectorAll<HTMLButtonElement>('button')].find(
+        (b) => b.textContent?.trim() === name || b.textContent?.startsWith(`${name} (`),
+      )!;
+    const attached = (fileId: string) => ({
+      fileId,
+      title: `File ${fileId}`,
+      type: 'document',
+      attachedAt: '2026-10-30T09:00:00Z',
+      attachedBy: 'Cihan',
+      href: `/api/chat/files/${fileId}`,
+      draft: false,
+    });
+
+    it('names how many files Chat attached to a task, for a screen reader too', async () => {
+      server.getActionDetail.mockResolvedValue({
+        ...emptyDetail,
+        tasks: [
+          {
+            id: 't1',
+            position: 1,
+            status: 'todo',
+            taskKey: null,
+            title: 'Add a FAQ to /pricing',
+            titleParams: {},
+            dependsOn: [],
+            details: null,
+            attachments: [attached('f1'), attached('f2')],
+          },
+        ],
+      });
+      await renderDrawer();
+      await act(async () => button('Tasks').click());
+      const clip = document.body.querySelector('[role="img"]')!;
+      expect(clip.getAttribute('aria-label')).toBe('2 files attached from Chat');
+      expect(clip.textContent).toBe('2');
+    });
+
+    it('links its chat only for a reader who may open it', async () => {
+      const sent = {
+        ...action,
+        kind: 'chat_finding',
+        payload: {
+          source: 'chat',
+          title: 'Win back /pricing',
+          why: 'Lost 6 citations.',
+          conversationId: 'c1',
+          entities: { pages: ['https://acme.example/pricing'], platforms: ['google-aio'] },
+        },
+      } as ActionItem;
+      server.getActionDetail.mockResolvedValue({ ...emptyDetail, chatHref: null });
+      await renderDrawer(sent);
+      const dialog = () => document.body.querySelector('[role="dialog"]')!;
+      expect(dialog().textContent).toContain('Chat');
+      expect(dialog().textContent).toContain('Google AI Overviews');
+      expect(dialog().textContent).not.toContain('Open the chat');
+      server.getActionDetail.mockResolvedValue({ ...emptyDetail, chatHref: '/dashboard/chat/c1' });
+      act(() => root.unmount());
+      root = createRoot(container);
+      await renderDrawer(sent);
+      const link = [...dialog().querySelectorAll('a')].find(
+        (a) => a.textContent === 'Open the chat',
+      );
+      expect(link?.getAttribute('href')).toBe('/dashboard/chat/c1');
+    });
+  });
+
+  describe('ChatGPT Business Hub', () => {
+    const setup = {
+      ...action,
+      kind: 'business_hub_setup',
+      category: 'growth',
+      impact: 'medium',
+      signalCount: 0,
+      payload: {
+        source: 'business_hub',
+        variant: 'open',
+        region: 'US',
+        evidence: { answers: 120, named: 34, cited: 9 },
+        targetEntity: 'platforms',
+        targetCount: 1,
+      },
+    } as ActionItem;
+    const tab = (name: string) =>
+      [...document.querySelectorAll<HTMLButtonElement>('button')].find(
+        (b) => b.textContent?.trim() === name,
+      )!;
+
+    it('opens Business Hub from its block, with the answers it was raised from as its Why', async () => {
+      await renderDrawer(setup);
+      const dialog = document.body.querySelector('[role="dialog"]')!;
+      expect(dialog.textContent).toContain('Set up your ChatGPT Business Hub profile');
+      expect(dialog.textContent).toContain(
+        'ChatGPT named you in 34 of 120 tracked answers in the last 30 days; your site was cited in 9.',
+      );
+      const open = [...dialog.querySelectorAll('a')].find(
+        (a) => a.textContent === 'Open Business Hub',
+      );
+      expect(open?.getAttribute('href')).toBe(BUSINESS_HUB_URL);
+      expect(dialog.textContent).toContain("There's no Business Hub API");
+      expect(dialog.textContent).not.toContain('0 signals');
+    });
+
+    it('shows the weekly reminder with Business Hub’s block, and why it has no signals', async () => {
+      await renderDrawer({
+        ...setup,
+        kind: 'business_hub_numbers',
+        impact: 'low',
+        payload: { source: 'business_hub', lastEnd: '2026-11-03', lastDays: 7 },
+      } as ActionItem);
+      const dialog = () => document.body.querySelector('[role="dialog"]')!;
+      expect(dialog().textContent).toContain("Enter this week's ChatGPT Business Hub numbers");
+      expect(dialog().textContent).toContain('Saving the numbers completes this reminder.');
+      await act(async () => tab('Signals').click());
+      expect(dialog().textContent).toContain('This reminder opens each week');
+    });
+
+    it('says why it has no signals', async () => {
+      await renderDrawer(setup);
+      await act(async () => tab('Signals').click());
+      expect(document.body.querySelector('[role="dialog"]')!.textContent).toContain(
+        'This action comes from your tracked ChatGPT answers',
+      );
+    });
+  });
+
   describe('How we check (AC-010)', () => {
     const lastCheck = { at: '2026-10-20T00:00:00Z', passed: false, missing: ['not_changed'] };
     const task = (taskKey: string, title: string) => ({
@@ -387,11 +557,86 @@ describe('ActionDrawer', () => {
       await openTask('Optimize the page');
 
       await act(async () => button('Optimize page')!.click());
-      expect(drafts.startDraftFromAction).toHaveBeenCalledWith('b1', 'a1', 't1', {
-        page: PRICING,
-        title: expect.any(String),
-      });
+      expect(drafts.startDraftFromAction).toHaveBeenCalledWith(
+        'b1',
+        'a1',
+        't1',
+        expect.objectContaining({ page: PRICING, title: expect.any(String) }),
+      );
       expect(push).toHaveBeenCalledWith('/dashboard/content/editor/d-new');
+    });
+
+    it('offers Start now at the top of Overview, for an open action whose work is writing (AC plan P-3)', async () => {
+      server.getActionDetail.mockResolvedValue({
+        ...emptyDetail,
+        tasks: [task('t1', 'optimize_content', 'Optimize the page')],
+      });
+      drafts.getActionDrafts.mockResolvedValue([]);
+      drafts.startDraftFromAction.mockResolvedValue({
+        draftId: 'd-new',
+        created: true,
+        importFailed: false,
+      });
+      await renderDrawer({ ...action, payload: { pages: [PRICING] } });
+      const block = document.querySelector('section[aria-label="Start now"]');
+      expect(block?.textContent).toContain('Opens /pricing as a draft');
+      await act(async () => button('Content Editor')!.click());
+      expect(drafts.startDraftFromAction).toHaveBeenCalledWith(
+        'b1',
+        'a1',
+        't1',
+        expect.objectContaining({ page: PRICING, title: expect.any(String) }),
+      );
+      // A new draft's brief is built as it opens.
+      expect(push).toHaveBeenCalledWith('/dashboard/content/editor/d-new?brief=build');
+
+      // Not for a closed action, nor one whose work isn't writing.
+      await renderDrawer({
+        ...action,
+        id: 'a2',
+        status: 'completed',
+        payload: { pages: [PRICING] },
+      });
+      expect(document.querySelector('section[aria-label="Start now"]')).toBeNull();
+      server.getActionDetail.mockResolvedValue({
+        ...emptyDetail,
+        tasks: [task('t1', 'prepare_outreach', 'Prepare outreach')],
+      });
+      await renderDrawer({ ...action, id: 'a3' });
+      expect(document.querySelector('section[aria-label="Start now"]')).toBeNull();
+    });
+
+    it('says what to do for the kind of site, why, and what else is worth doing (AC plan P-2)', async () => {
+      server.getActionDetail.mockResolvedValue({
+        ...emptyDetail,
+        tasks: [task('t1', 'create_content_draft', 'Write the page')],
+      });
+      drafts.getActionDrafts.mockResolvedValue([]);
+      await renderDrawer({
+        ...action,
+        kind: 'create_content_for_topics',
+        payload: {
+          play: {
+            version: 1,
+            id: 'best_of',
+            assetType: 'best_of',
+            siteType: 'ecommerce',
+            reasons: [{ kind: 'intent', intents: ['best-top'], prompts: 6, of: 14, share: 0.52 }],
+            supporting: [{ id: 'guide', assetType: 'guide', prompts: 3, of: 14, share: 0.2 }],
+          },
+        },
+      });
+      const section = document.querySelector<HTMLElement>(
+        'section[aria-label="What to do for an online store"]',
+      )!;
+      expect(section.textContent).toContain('Write a best-of list');
+      expect(section.textContent).toContain(
+        '6 of 14 prompts ask for the best options: 52% of their estimated AI searches.',
+      );
+      expect(section.textContent).toContain('Also worth doing here');
+      expect(section.textContent).toContain('Write a how-to guide · 20% of the AI searches');
+      // Start now writes the play's page, inside it.
+      expect(section.querySelector('section[aria-label="Start now"]')).not.toBeNull();
     });
 
     it('starts no draft on a read-only workspace: Optimize page opens the upgrade dialog', async () => {
@@ -510,5 +755,20 @@ describe('ActionDrawer Check now (AC-010)', () => {
     await act(async () => button('Check now')!.click());
     expect(openUpgrade).toHaveBeenCalledExactlyOnceWith('Checking a task needs a plan');
     expect(taskCheck.checkActionTask).not.toHaveBeenCalled();
+  });
+
+  // The webhook sets off an outside workflow: admins and managers (2026-11-03).
+  it('offers Send to webhook to an admin or a manager only, on a brand that has one', async () => {
+    server.getActionDetail.mockResolvedValue({ ...emptyDetail, tasks: [checked] });
+    await renderDrawer(action, false, 'manager');
+    await openTask();
+    expect(button('Send to webhook')).toBeDefined();
+
+    act(() => root.unmount());
+    root = createRoot(container);
+    await renderDrawer(action, false, 'analyst');
+    await openTask();
+    expect(button('Check now')).toBeDefined();
+    expect(button('Send to webhook')).toBeUndefined();
   });
 });

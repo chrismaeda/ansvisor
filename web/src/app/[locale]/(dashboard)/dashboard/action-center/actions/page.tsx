@@ -17,35 +17,43 @@ import {
   X,
 } from 'lucide-react';
 import { useBrandStore } from '@/stores/use-brand-store';
+import { useChatPageContext } from '@/components/chat/panel/chat-panel-context';
+import type { ChatPageFilter } from '@/lib/chat/page-context';
+import { viewRows } from '@/lib/chat/page-view';
 import { useUserRole } from '@/hooks/use-user-role';
-import { useUpgradeGate } from '@/components/providers/upgrade-gate';
+import { markPageSeen } from '@/lib/actions/user-brand-state';
+import { actionSeenKey } from '@/lib/user-brand-state';
+import { onFirstRunFinished } from '@/hooks/use-first-run';
 import type { Brand } from '@/types';
 import {
   deleteAction,
   getActions,
   getActionsAffected,
+  keepActionRelevant,
   updateActionStatus,
   type ActionItem,
 } from '@/lib/actions/action-center';
-import { listMembers, type TeamMember } from '@/lib/actions/team';
-import {
-  getGettingStarted,
-  skipGettingStarted,
-  startGettingStarted,
-} from '@/lib/actions/getting-started';
-import type { GettingStartedStatus, GettingStartedStep } from '@/lib/getting-started/steps';
+import { listBrandMembers, type TeamMember } from '@/lib/actions/team';
 import { readUrlChoice, readUrlParam, writeUrlParams } from '@/lib/url-state';
+import { actionCode, matchesActionCode } from '@/lib/action-center/action-ref';
 import {
   ACTION_CATEGORIES,
-  ACTION_SORTS,
   ACTION_STATUSES,
   FROM_PRODUCTS_KINDS,
   OPEN_ACTION_STATUSES,
   type ActionCategory,
   type ActionDismissReason,
-  type ActionSort,
   type ActionStatus,
 } from '@/lib/action-center/registry';
+import {
+  ACTION_SORTS,
+  ACTION_SORT_CHOICES,
+  DEFAULT_ACTION_SORT,
+  actionViewSort,
+  compareActions,
+  parseActionSort,
+  type ActionSort,
+} from '@/lib/action-center/sort';
 import {
   actionContextTags,
   actionTexts,
@@ -56,28 +64,17 @@ import {
   PRIORITY_LEVELS,
   comparePriority,
   highestPriorityLevel,
+  isStale,
   topActionIds,
   type PriorityLevel,
 } from '@/lib/action-center/priority';
 import { ActionCenterTabs } from '@/components/action-center/action-center-tabs';
 import { ActionTable } from '@/components/action-center/action-table';
 import { ActionDrawer } from '@/components/action-center/action-drawer';
-import {
-  GettingStartedTable,
-  readyWhenKey,
-} from '@/components/getting-started/getting-started-table';
-import { GettingStartedSummaryCard } from '@/components/getting-started/summary-card';
-import { GettingStartedStepCard } from '@/components/getting-started/step-card';
+import { useStartNow } from '@/components/action-center/start-now';
+import { getStartNowWork } from '@/lib/actions/content-drafts';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import {
   Select,
@@ -90,9 +87,14 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { cn } from '@/lib/utils';
 import { BYTE_ORDER_MARK, actionListCsv } from '@/lib/action-center/export';
 import { saveBlob } from '@/lib/download';
+import { exportFileName } from '@/lib/white-label/export-name';
 import { HeaderWithAiUsage } from '@/components/ai-usage/ai-usage-meter';
 
 const isOpen = (action: ActionItem) => OPEN_ACTION_STATUSES.includes(action.status);
+
+/** The Status filter: a status, or Stale (New with no one on it for a month, 00432). */
+type StatusChoice = ActionStatus | 'all' | 'stale';
+const STATUS_CHOICES: StatusChoice[] = ['all', ...ACTION_STATUSES, 'stale'];
 
 /**
  * What each summary card counts, one predicate per card.
@@ -113,28 +115,31 @@ const CARD_FILTERS = {
 /** Top Actions is the five highest-priority open actions (AC-006), not a predicate. */
 type CardFocus = keyof typeof CARD_FILTERS | 'top';
 
-/**
- * Getting started (AC-ALT2 §4) is a category of its own while a brand runs
- * it: its steps, not generated actions, so it lists them in its own table.
- */
-const GETTING_STARTED = 'getting_started';
-type CategoryChoice = ActionCategory | 'all' | typeof GETTING_STARTED;
+type CategoryChoice = ActionCategory | 'all';
 
-/** URL params that ask for the actions themselves, not Getting started. */
-const ACTIONS_PARAMS = [
-  'category',
-  'action',
-  'priority',
-  'status',
-  'assignee',
-  'q',
-  'sort',
-  'from',
-];
+/**
+ * How long after the first run finishes the list is read once more: the
+ * brand's first signal pass starts when the run stamps, and writes the first
+ * actions within a minute or so.
+ */
+const FIRST_SIGNALS_MS = 90_000;
 
 export default function ActionCenterActionsPage() {
   const brand = useBrandStore((s) => s.getActiveBrand());
+  const brands = useBrandStore((s) => s.brands);
+  const setActiveBrand = useBrandStore((s) => s.setActiveBrand);
   const t = useTranslations('actionCenter.actionsPage');
+
+  // A link to an action on another brand (Chat's Open in Actions, actions/[id]) names
+  // its brand: switch to it once, when it's one of the person's, so its drawer opens.
+  // A brand picked afterwards stays picked.
+  const brandFromUrl = useRef(false);
+  useEffect(() => {
+    if (brandFromUrl.current || brands.length === 0) return;
+    brandFromUrl.current = true;
+    const named = new URLSearchParams(window.location.search).get('brand');
+    if (named && brands.some((b) => b.id === named)) setActiveBrand(named);
+  }, [brands, setActiveBrand]);
 
   return (
     <div className="space-y-6">
@@ -154,17 +159,14 @@ export default function ActionCenterActionsPage() {
   );
 }
 
-/** The page's title, with Getting started's Start or Skip on the right. */
-function ActionsHeader({ action }: { action?: React.ReactNode }) {
+/** The page's title. */
+function ActionsHeader() {
   const t = useTranslations('actionCenter.actionsPage');
   return (
     <HeaderWithAiUsage>
-      <div className="flex flex-wrap items-start justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight">{t('title')}</h1>
-          <p className="mt-1 text-sm text-muted-foreground">{t('subtitle')}</p>
-        </div>
-        {action}
+      <div>
+        <h1 className="text-2xl font-bold tracking-tight">{t('title')}</h1>
+        <p className="mt-1 text-sm text-muted-foreground">{t('subtitle')}</p>
       </div>
     </HeaderWithAiUsage>
   );
@@ -175,14 +177,10 @@ function ActionsContent({ brand }: { brand: Brand }) {
   const common = useTranslations('common');
   const tTexts = useTranslations('actionCenter.actionTexts');
   const tCategories = useTranslations('actionCenter.actionCategories');
+  const tChat = useTranslations('chatPanel.suggest');
   const tStarted = useTranslations('actionCenter.gettingStarted');
 
   const [actions, setActions] = useState<ActionItem[] | null>(null);
-  // Null for a brand that doesn't run Getting started, or when it can't be
-  // read: the page is then exactly as without it.
-  const [gettingStarted, setGettingStarted] = useState<GettingStartedStatus | null>(null);
-  // The step whose card is open.
-  const [stepKey, setStepKey] = useState<string | null>(null);
   const [members, setMembers] = useState<TeamMember[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [loadFailed, setLoadFailed] = useState(false);
@@ -191,9 +189,10 @@ function ActionsContent({ brand }: { brand: Brand }) {
   // "From Products" (ECOM-013): only what Product Visibility sent, beside the category.
   const [fromProducts, setFromProducts] = useState(false);
   const [priority, setPriority] = useState<PriorityLevel | 'all'>('all');
-  const [status, setStatus] = useState<ActionStatus | 'all'>('all');
+  const [status, setStatus] = useState<StatusChoice>('all');
   const [assignee, setAssignee] = useState<string>('all');
-  const [sort, setSort] = useState<ActionSort>('priority');
+  // Most recently updated first, by the date the list shows (Updated).
+  const [sort, setSort] = useState<ActionSort>(DEFAULT_ACTION_SORT);
   const [search, setSearch] = useState('');
   const [isExporting, setIsExporting] = useState(false);
   const { canManage } = useUserRole();
@@ -213,25 +212,15 @@ function ActionsContent({ brand }: { brand: Brand }) {
   // Filters, sort and search live in the URL (#896) so a refresh keeps them
   // and a filtered view can be shared. Read after mount; defaults stay out.
   const [urlRead, setUrlRead] = useState(false);
-  // A category from the URL is kept, and so is a link to an action or a
-  // filtered list (Create action, a signal, the history drawer, an export):
-  // the actions were asked for. Without any, Getting started opens first.
-  const categoryChosen = useRef(false);
   useEffect(() => {
-    categoryChosen.current = ACTIONS_PARAMS.some((name) => readUrlParam(name) !== '');
-    setCategory(
-      readUrlChoice<CategoryChoice>(
-        'category',
-        ['all', ...ACTION_CATEGORIES, GETTING_STARTED],
-        'all',
-      ),
-    );
+    setCategory(readUrlChoice<CategoryChoice>('category', ['all', ...ACTION_CATEGORIES], 'all'));
     setPriority(
       readUrlChoice<PriorityLevel | 'all'>('priority', ['all', ...PRIORITY_LEVELS], 'all'),
     );
-    setStatus(readUrlChoice<ActionStatus | 'all'>('status', ['all', ...ACTION_STATUSES], 'all'));
+    setStatus(readUrlChoice<StatusChoice>('status', STATUS_CHOICES, 'all'));
     setAssignee(readUrlParam('assignee') || 'all');
-    setSort(readUrlChoice<ActionSort>('sort', ACTION_SORTS, 'priority'));
+    // An old link's ?sort=newest lands on the one date sort.
+    setSort(parseActionSort(readUrlParam('sort')));
     setSearch(readUrlParam('q'));
     setFromProducts(readUrlParam('from') === 'products');
     setUrlRead(true);
@@ -257,7 +246,7 @@ function ActionsContent({ brand }: { brand: Brand }) {
             priority: 'all',
             status: 'all',
             assignee: 'all',
-            sort: 'priority',
+            sort: DEFAULT_ACTION_SORT,
             from: 'all',
           },
         ),
@@ -280,16 +269,30 @@ function ActionsContent({ brand }: { brand: Brand }) {
     window.history.replaceState(null, '', window.location.pathname + (query ? `?${query}` : ''));
   };
 
+  // Opening an action clears its green dot: here at once, and for the next
+  // read (nav_seen's action:<id>). Written on the demo brand too: it is the
+  // person's own UI state.
+  useEffect(() => {
+    if (!selectedId) return;
+    const at = new Date().toISOString();
+    setActions(
+      (list) =>
+        list?.map((action) =>
+          action.id === selectedId && action.dotFacts
+            ? { ...action, dotFacts: { ...action.dotFacts, seenAt: at } }
+            : action,
+        ) ?? null,
+    );
+    markPageSeen(brand.id, actionSeenKey(selectedId)).catch(() => {
+      // Offline: it clears here; the next read brings it back.
+    });
+  }, [selectedId, brand.id]);
+
   const load = useCallback(async () => {
     setLoadFailed(false);
     try {
-      // Together, so the page doesn't show its empty state and then the steps.
-      const [list, started] = await Promise.all([
-        getActions(brand.id),
-        getGettingStarted(brand.id).catch(() => null),
-      ]);
-      setActions(list);
-      if (started) setGettingStarted(started);
+      // The set-up steps are Today's card ("Finish setting up"): Actions lists actions only.
+      setActions(await getActions(brand.id));
     } catch {
       setLoadFailed(true);
     } finally {
@@ -297,56 +300,22 @@ function ActionsContent({ brand }: { brand: Brand }) {
     }
   }, [brand.id]);
 
-  const startedActive = gettingStarted?.active ?? false;
-
-  // Getting started opens first while it runs, unless the URL named a category.
+  // The brand's first tracking run, once it's done: the first actions are
+  // read again now, and once more when the first signal pass has had time
+  // to write them.
   useEffect(() => {
-    if (!urlRead || !gettingStarted || categoryChosen.current) return;
-    categoryChosen.current = true;
-    if (gettingStarted.active) setCategory(GETTING_STARTED);
-  }, [urlRead, gettingStarted]);
-  useEffect(() => {
-    if (gettingStarted && !gettingStarted.active && category === GETTING_STARTED) {
-      setCategory('all');
-    }
-  }, [gettingStarted, category]);
-
-  const refreshSteps = useCallback(() => {
-    getGettingStarted(brand.id)
-      .then((started) => {
-        if (started && mounted.current) setGettingStarted(started);
-      })
-      .catch(() => {});
-  }, [brand.id]);
-
-  // A step is done in another tab (its page opens in one): read the steps
-  // again when this tab is back in front.
-  useEffect(() => {
-    if (!startedActive) return;
-    // focus and visibilitychange both fire on the way back: read once.
-    let last = 0;
-    const refresh = () => {
-      if (document.visibilityState !== 'visible' || Date.now() - last < 1_000) return;
-      last = Date.now();
-      refreshSteps();
-    };
-    window.addEventListener('focus', refresh);
-    document.addEventListener('visibilitychange', refresh);
+    let later: ReturnType<typeof setTimeout> | undefined;
+    const stop = onFirstRunFinished((finished) => {
+      if (finished !== brand.id) return;
+      void load();
+      clearTimeout(later);
+      later = setTimeout(() => void load(), FIRST_SIGNALS_MS);
+    });
     return () => {
-      window.removeEventListener('focus', refresh);
-      document.removeEventListener('visibilitychange', refresh);
+      stop();
+      clearTimeout(later);
     };
-  }, [startedActive, refreshSteps]);
-
-  // A step opens its card; one still waiting for its data says when it opens.
-  const openStep = (step: GettingStartedStep) => {
-    if (step.state === 'waiting') {
-      toast(tStarted('opensWhenReady', { when: tStarted(`readyWhen.${readyWhenKey(step)}`) }));
-      return;
-    }
-    setStepKey(step.key);
-  };
-  const closeStep = useCallback(() => setStepKey(null), []);
+  }, [brand.id, load]);
 
   // A change made in the drawer, shown in its row at once: reading the whole
   // list again after each one held the drawer for seconds.
@@ -358,10 +327,11 @@ function ActionsContent({ brand }: { brand: Brand }) {
 
   useEffect(() => {
     void load();
-    listMembers()
+    // The people who can see this brand: the drawer assigns only them.
+    listBrandMembers(brand.id)
       .then(setMembers)
       .catch(() => setMembers([]));
-  }, [load]);
+  }, [load, brand.id]);
 
   // An assignee from the URL who is no longer on the team falls back to all.
   useEffect(() => {
@@ -404,9 +374,26 @@ function ActionsContent({ brand }: { brand: Brand }) {
       () => updateActionStatus(brand.id, action.id, next, reason),
       t('rowMenu.statusChanged', { status: t(`status.${next}`) }),
     );
+  const keepAction = (action: ActionItem) =>
+    void runRowChange(action, () => keepActionRelevant(brand.id, action.id), t('stale.kept'));
   const removeAction = (action: ActionItem) => {
     if (selectedId === action.id) selectAction(null);
     void runRowChange(action, () => deleteAction(action.id), t('rowMenu.deleted'));
+  };
+  // Start in Content Editor (AC-ACTION-PLAN spec §10): the action's writing
+  // work read first, as its drawer's Start now has it, then started there.
+  const startNow = useStartNow(brand.id);
+  const startFromRow = async (action: ActionItem) => {
+    const read = await getStartNowWork(brand.id, action.id).catch(() => null);
+    if (!read) {
+      toast.error(t('startNow.failed'));
+      return;
+    }
+    await startNow.start(
+      { id: action.id, actionNo: action.actionNo, title: actionTexts(action, tTexts).title },
+      read.work,
+      read.drafts,
+    );
   };
 
   const selected = useMemo(
@@ -422,17 +409,17 @@ function ActionsContent({ brand }: { brand: Brand }) {
     const filtered = (actions ?? []).filter((action) => {
       if (focus === 'top' ? !topIds.has(action.id) : focus && !CARD_FILTERS[focus](action))
         return false;
-      // Getting started's steps aren't actions: with its table not shown, all.
-      if (category !== 'all' && category !== GETTING_STARTED && action.category !== category)
-        return false;
+      if (category !== 'all' && action.category !== category) return false;
       if (fromProducts && !FROM_PRODUCTS_KINDS.includes(action.kind)) return false;
       if (priority !== 'all' && action.priorityLevel !== priority) return false;
-      if (status !== 'all' && action.status !== status) return false;
+      if (status === 'stale' ? !isStale(action) : status !== 'all' && action.status !== status)
+        return false;
       if (assignee !== 'all') {
         if (assignee === 'unassigned' ? action.assignee !== null : action.assignee?.id !== assignee)
           return false;
       }
-      if (needle) {
+      // "AC-251", "ac-251" or "251" finds the action Chat names by its code.
+      if (needle && !matchesActionCode(action, needle)) {
         const texts = actionTexts(action, tTexts);
         const tags = actionContextTags(action, t).join(' ');
         if (!`${texts.title} ${texts.description} ${tags}`.toLowerCase().includes(needle))
@@ -440,18 +427,7 @@ function ActionsContent({ brand }: { brand: Brand }) {
       }
       return true;
     });
-    return filtered.sort((a, b) => {
-      switch (sort) {
-        case 'newest':
-          return b.createdAt.localeCompare(a.createdAt);
-        case 'due_date':
-          return (a.dueDate ?? '9999').localeCompare(b.dueDate ?? '9999');
-        case 'updated':
-          return b.updatedAt.localeCompare(a.updatedAt);
-        default:
-          return comparePriority(a, b);
-      }
-    });
+    return filtered.sort(compareActions(sort));
   }, [
     actions,
     topIds,
@@ -488,7 +464,7 @@ function ActionsContent({ brand }: { brand: Brand }) {
 
     const csv = actionListCsv(
       visible.map((action) => ({
-        number: action.actionNo,
+        number: actionCode(action),
         priorityScore: action.priorityScore,
         priorityLevel: action.priorityLevel ? t(`priority.levels.${action.priorityLevel}`) : '',
         title: actionTexts(action, tTexts).title,
@@ -507,7 +483,7 @@ function ActionsContent({ brand }: { brand: Brand }) {
     const slug = brand.slug ?? 'brand';
     saveBlob(
       new Blob([BYTE_ORDER_MARK, csv], { type: 'text/csv;charset=utf-8;' }),
-      `ansvisor_${slug}_actions_${date}.csv`,
+      await exportFileName(`${slug}_actions_${date}.csv`),
     );
   }, [brand.id, brand.slug, visible, tTexts, tCategories, t]);
 
@@ -552,142 +528,62 @@ function ActionsContent({ brand }: { brand: Brand }) {
     setSearch('');
   };
 
-  const showSteps = startedActive && gettingStarted !== null && category === GETTING_STARTED;
-  const openCard = showSteps ? gettingStarted.steps.find((s) => s.key === stepKey) : undefined;
-
-  // Getting started's Start and Skip (AC-ALT2 §5), for admins and managers:
-  // the people who can set the steps up. Start shows while it isn't running
-  // and the brand's setup is incomplete, or after a skip.
-  const [confirmingSkip, setConfirmingSkip] = useState(false);
-  const [switching, setSwitching] = useState(false);
-  // A read-only workspace (plan not active): Start and Skip open the upgrade
-  // dialog instead (Skip without its question), and a new brand's question
-  // doesn't open by itself: Start stays in the header for it.
-  const { guard, isLocked } = useUpgradeGate();
-  const tActions = useTranslations('readOnly.actions');
-  // The new brand's question, once answered or closed, stays closed for
-  // this visit, even when the answer couldn't be saved or read back: it
-  // never traps anyone on the page.
-  const [askClosed, setAskClosed] = useState(false);
-  const switchGettingStarted = async (
-    change: (brandId: string) => Promise<void>,
-    done: (started: GettingStartedStatus | null) => string,
-    failed: string,
-  ) => {
-    setSwitching(true);
-    setAskClosed(true);
-    try {
-      await change(brand.id);
-      const started = await getGettingStarted(brand.id).catch(() => null);
-      if (!mounted.current) return;
-      if (started) setGettingStarted(started);
-      setStepKey(null);
-      setFocus(null);
-      setCategory(started?.active ? GETTING_STARTED : 'all');
-      toast.success(done(started));
-    } catch {
-      toast.error(failed);
-    } finally {
-      setSwitching(false);
-    }
-  };
-  const start = (message: (started: GettingStartedStatus | null) => string) =>
-    void switchGettingStarted(startGettingStarted, message, tStarted('start.failed'));
-  const skip = (message: string) =>
-    void switchGettingStarted(skipGettingStarted, () => message, tStarted('skip.failed'));
-
-  const headerAction =
-    !canManage || !gettingStarted ? null : startedActive ? (
-      <Button
-        variant="outline"
-        size="sm"
-        disabled={switching}
-        onClick={guard(() => setConfirmingSkip(true), { action: tActions('skipGettingStarted') })}
-      >
-        {tStarted('skip.button')}
-      </Button>
-    ) : // A new brand's question, once closed, leaves Start in its place.
-    (
-        gettingStarted.asking
-          ? askClosed || isLocked
-          : gettingStarted.needsSetup || gettingStarted.skipped
-      ) ? (
-      <div className="flex flex-col items-end gap-1">
-        <Button
-          size="sm"
-          disabled={switching}
-          onClick={guard(() => start((s) => tStarted('start.started', { count: s?.done ?? 0 })), {
-            action: tActions('startGettingStarted'),
-          })}
-        >
-          <Sparkles className="h-3.5 w-3.5" />
-          {tStarted('start.button')}
-        </Button>
-        <span className="text-xs text-muted-foreground">{tStarted('start.hint')}</span>
-      </div>
-    ) : null;
-
-  // Header and tabs above every state of the page, with the dialogs; with a
-  // step's card open, the page makes room for it on wide screens.
+  // Header and tabs above every state of the page.
   const frame = (body: React.ReactNode) => (
-    <div className={cn('space-y-6', openCard && 'min-[1300px]:pr-[440px]')}>
-      <ActionsHeader action={headerAction} />
+    <div className="space-y-6">
+      <ActionsHeader />
       <ActionCenterTabs />
       {body}
-
-      <Dialog open={confirmingSkip} onOpenChange={setConfirmingSkip}>
-        <DialogContent className="sm:max-w-sm">
-          <DialogHeader>
-            <DialogTitle>{tStarted('skip.title')}</DialogTitle>
-            <DialogDescription>{tStarted('skip.body')}</DialogDescription>
-          </DialogHeader>
-          <p className="text-xs text-muted-foreground">{tStarted('skip.later')}</p>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => {
-                setConfirmingSkip(false);
-                skip(tStarted('skip.done'));
-              }}
-            >
-              {tStarted('skip.confirm')}
-            </Button>
-            <Button onClick={() => setConfirmingSkip(false)}>{tStarted('skip.keep')}</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      {/* A brand added beside others asks before running it. */}
-      <Dialog
-        open={canManage && Boolean(gettingStarted?.asking) && !askClosed && !isLocked}
-        onOpenChange={(open) => {
-          if (!open) setAskClosed(true);
-        }}
-      >
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle>{tStarted('secondBrand.title', { brand: brand.name })}</DialogTitle>
-            <DialogDescription>{tStarted('secondBrand.body')}</DialogDescription>
-          </DialogHeader>
-          <ul className="list-disc space-y-1 pl-5 text-sm">
-            <li>{tStarted('secondBrand.runLine', { brand: brand.name })}</li>
-            <li>{tStarted('secondBrand.skipLine')}</li>
-          </ul>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => skip(tStarted('secondBrand.skipped', { brand: brand.name }))}
-            >
-              {tStarted('secondBrand.skip')}
-            </Button>
-            <Button onClick={() => start(() => tStarted('secondBrand.ran', { brand: brand.name }))}>
-              {tStarted('secondBrand.run')}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      {startNow.confirm}
     </div>
   );
+
+  // Chat's side panel sees the page (W1-08): its filters, the top action,
+  // and the actions in view to ask about.
+  // The first of the Top actions, as the card ranks them: the list comes unordered.
+  const topAction = (actions ?? [])
+    .filter((action) => topIds.has(action.id))
+    .sort(comparePriority)[0];
+  const pageFilters: ChatPageFilter[] =
+    category !== 'all' ? [{ key: 'category', label: tCategories(category), value: category }] : [];
+  if (priority !== 'all') {
+    pageFilters.push({
+      key: 'priority',
+      label: t(`priority.levels.${priority}`),
+      value: priority,
+    });
+  }
+  if (status !== 'all')
+    pageFilters.push({ key: 'status', label: t(`status.${status}`), value: status });
+  useChatPageContext({
+    pageName: t('title'),
+    filters: pageFilters,
+    suggestions: [
+      ...(topAction ? [tChat('actionHow', { title: actionTexts(topAction, tTexts).title })] : []),
+      tChat('actionsImpact'),
+      tChat('actionsWeek'),
+    ],
+    referenceables: visible.slice(0, 5).map((action) => ({
+      type: 'task' as const,
+      id: action.id,
+      label: actionTexts(action, tTexts).title,
+    })),
+    // And what else it shows (the owner's plan, item 8): the sort, the search, and once read,
+    // the actions in view by the code the list shows, with how many it has.
+    view: {
+      sort: actionViewSort(sort),
+      ...(search.trim() ? { search: search.trim() } : {}),
+      ...(actions
+        ? {
+            rows: viewRows(visible, (action) => ({
+              ref: actionCode(action),
+              label: actionTexts(action, tTexts).title,
+            })),
+            total: visible.length,
+          }
+        : {}),
+    },
+  });
 
   if (isLoading) {
     return frame(
@@ -718,9 +614,9 @@ function ActionsContent({ brand }: { brand: Brand }) {
     );
   }
 
-  if (!actions?.length && !startedActive) {
+  if (!actions?.length) {
     return frame(
-      <div className="flex flex-col items-center justify-center rounded-lg border border-dashed py-20 text-center">
+      <div className="flex flex-col items-center justify-center rounded-lg border border-dashed py-20 text-center dark:border-white/20">
         <ListChecks className="h-8 w-8 text-muted-foreground" />
         <h2 className="mt-4 font-semibold">{t('empty.title')}</h2>
         <p className="mt-1 max-w-md text-sm text-muted-foreground">{t('empty.description')}</p>
@@ -731,15 +627,7 @@ function ActionsContent({ brand }: { brand: Brand }) {
   const list = actions ?? [];
   // Before the first signals, the cards that rank actions have nothing to say.
   const noActions = list.length === 0;
-  const showStepsCategory = () => {
-    setFocus(null);
-    setCategory(GETTING_STARTED);
-  };
-  // A card filters the actions, so it leaves Getting started's table.
-  const toggleFocus = (card: CardFocus) => {
-    if (category === GETTING_STARTED) setCategory('all');
-    setFocus(focus === card ? null : card);
-  };
+  const toggleFocus = (card: CardFocus) => setFocus(focus === card ? null : card);
   const rankCard = (card: 'top' | 'atRisk' | 'opportunities', value: number, sub: string) =>
     noActions
       ? { value: '—', sub: tStarted('firstSignals'), dim: true }
@@ -748,14 +636,6 @@ function ActionsContent({ brand }: { brand: Brand }) {
   return frame(
     <div className="space-y-4">
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
-        {startedActive && gettingStarted && (
-          <GettingStartedSummaryCard
-            done={gettingStarted.done}
-            total={gettingStarted.total}
-            isActive={category === GETTING_STARTED}
-            onClick={showStepsCategory}
-          />
-        )}
         {/* Each card toggles itself as the table's filter, so a count always
             has a way back to the rows it came from. */}
         <SummaryCard
@@ -781,35 +661,24 @@ function ActionsContent({ brand }: { brand: Brand }) {
           isActive={focus === 'inProgress'}
           onClick={() => toggleFocus('inProgress')}
         />
-        {/* Getting started takes the fifth place while it runs. */}
-        {!startedActive && (
-          <Card>
-            <CardContent className="p-4">
-              <div className="flex items-center gap-2">
-                <div className="flex h-7 w-7 items-center justify-center rounded-md border bg-muted/40">
-                  <TrendingUp className="h-3.5 w-3.5 text-muted-foreground" />
-                </div>
-                <p className="text-xs font-medium text-muted-foreground">{t('cards.priority')}</p>
+        <Card>
+          <CardContent className="p-4">
+            <div className="flex items-center gap-2">
+              <div className="flex h-7 w-7 items-center justify-center rounded-md border bg-muted/40">
+                <TrendingUp className="h-3.5 w-3.5 text-muted-foreground" />
               </div>
-              <p className="mt-2 text-2xl font-bold">
-                {summary.highest ? t(`priority.levels.${summary.highest}`) : '—'}
-              </p>
-              <p className="mt-0.5 text-xs text-muted-foreground">{t('cards.prioritySub')}</p>
-            </CardContent>
-          </Card>
-        )}
+              <p className="text-xs font-medium text-muted-foreground">{t('cards.priority')}</p>
+            </div>
+            <p className="mt-2 text-2xl font-bold">
+              {summary.highest ? t(`priority.levels.${summary.highest}`) : '—'}
+            </p>
+            <p className="mt-0.5 text-xs text-muted-foreground">{t('cards.prioritySub')}</p>
+          </CardContent>
+        </Card>
       </div>
 
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-2">
-          {startedActive && gettingStarted && (
-            <CategoryPill
-              label={tStarted('category')}
-              count={gettingStarted.total}
-              isActive={category === GETTING_STARTED}
-              onClick={showStepsCategory}
-            />
-          )}
           <CategoryPill
             label={t('allActions')}
             count={list.length}
@@ -836,107 +705,102 @@ function ActionsContent({ brand }: { brand: Brand }) {
             />
           )}
         </div>
-        {!showSteps && (
-          <Select
-            value={sort}
-            onValueChange={(v) => setSort((v ?? 'priority') as ActionSort)}
-            items={ACTION_SORTS.map((key) => ({ value: key, label: t(`sort.${key}`) }))}
-          >
-            <SelectTrigger className="h-8 w-44 text-xs">
-              <span className="text-muted-foreground">{t('sort.label')}:</span>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {ACTION_SORTS.map((key) => (
-                <SelectItem key={key} value={key}>
-                  {t(`sort.${key}`)}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        )}
+        {/* One choice per column; a header click turns it the other way round, and
+            the trigger names that too ("Least recently updated"). */}
+        <Select
+          value={sort}
+          onValueChange={(v) => setSort((v ?? DEFAULT_ACTION_SORT) as ActionSort)}
+          items={ACTION_SORTS.map((key) => ({ value: key, label: t(`sort.${key}`) }))}
+        >
+          <SelectTrigger className="h-8 min-w-44 text-xs">
+            <span className="text-muted-foreground">{t('sort.label')}:</span>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {ACTION_SORT_CHOICES.map((key) => (
+              <SelectItem key={key} value={key}>
+                {t(`sort.${key}`)}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
       </div>
 
-      {/* The filters, sort and export work on actions; Getting started's
-          steps are a fixed list. */}
-      {!showSteps && (
-        <div className="flex flex-wrap items-center gap-2">
-          <FilterSelect
-            label={t('filters.priority')}
-            value={priority}
-            onChange={(v) => setPriority(v as PriorityLevel | 'all')}
-            options={PRIORITY_LEVELS.map((v) => ({ value: v, label: t(`priority.levels.${v}`) }))}
-            allLabel={t('filters.all')}
-          />
-          <FilterSelect
-            label={t('filters.status')}
-            value={status}
-            onChange={(v) => setStatus(v as ActionStatus | 'all')}
-            options={ACTION_STATUSES.map((v) => ({ value: v, label: t(`status.${v}`) }))}
-            allLabel={t('filters.all')}
-          />
-          <FilterSelect
-            label={t('filters.assignee')}
-            value={assignee}
-            onChange={setAssignee}
-            options={[
-              { value: 'unassigned', label: t('filters.unassigned') },
-              ...members.map((member) => ({
-                value: member.userId,
-                label: memberLabel(member),
-              })),
-            ]}
-            allLabel={t('filters.all')}
-          />
-          <div className="relative">
-            <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder={t('filters.search')}
-              className="h-8 w-56 pl-8 text-xs"
-            />
-          </div>
-          {hasActiveFilters && (
-            <Button variant="ghost" size="sm" className="text-xs" onClick={clearFilters}>
-              <X className="h-3.5 w-3.5" />
-              {t('filters.clear')}
-            </Button>
-          )}
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className="ml-auto gap-2 text-xs"
-            onClick={handleExportCsv}
-            disabled={visible.length === 0 || isExporting}
-          >
-            {isExporting ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <Download className="h-3.5 w-3.5" />
-            )}
-            {common('exportCsv')}
-          </Button>
-        </div>
-      )}
-
-      {showSteps && gettingStarted ? (
-        <GettingStartedTable
-          steps={gettingStarted.steps}
-          members={members}
-          onSelect={openStep}
-          selectedKey={openCard?.key ?? null}
-          showNote={noActions}
+      <div className="flex flex-wrap items-center gap-2">
+        <FilterSelect
+          label={t('filters.priority')}
+          value={priority}
+          onChange={(v) => setPriority(v as PriorityLevel | 'all')}
+          options={PRIORITY_LEVELS.map((v) => ({ value: v, label: t(`priority.levels.${v}`) }))}
+          allLabel={t('filters.all')}
         />
-      ) : visible.length > 0 ? (
+        <FilterSelect
+          label={t('filters.status')}
+          value={status}
+          onChange={(v) => setStatus(v as StatusChoice)}
+          options={[...ACTION_STATUSES, 'stale' as const].map((v) => ({
+            value: v,
+            label: t(`status.${v}`),
+          }))}
+          allLabel={t('filters.all')}
+        />
+        <FilterSelect
+          label={t('filters.assignee')}
+          value={assignee}
+          onChange={setAssignee}
+          options={[
+            { value: 'unassigned', label: t('filters.unassigned') },
+            ...members.map((member) => ({
+              value: member.userId,
+              label: memberLabel(member),
+            })),
+          ]}
+          allLabel={t('filters.all')}
+        />
+        <div className="relative">
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder={t('filters.search')}
+            className="h-8 w-56 pl-8 text-xs"
+          />
+        </div>
+        {hasActiveFilters && (
+          <Button variant="ghost" size="sm" className="text-xs" onClick={clearFilters}>
+            <X className="h-3.5 w-3.5" />
+            {t('filters.clear')}
+          </Button>
+        )}
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="ml-auto gap-2 text-xs"
+          onClick={handleExportCsv}
+          disabled={visible.length === 0 || isExporting}
+        >
+          {isExporting ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          ) : (
+            <Download className="h-3.5 w-3.5" />
+          )}
+          {common('exportCsv')}
+        </Button>
+      </div>
+
+      {visible.length > 0 ? (
         <ActionTable
           actions={visible}
           onSelect={(action) => selectAction(action.id)}
           onStatusChange={changeStatus}
+          onKeep={keepAction}
           onDelete={removeAction}
+          onStartNow={(action) => void startFromRow(action)}
           canDelete={canManage}
           busyIds={busyIds}
+          sort={sort}
+          onSortChange={setSort}
         />
       ) : (
         <div className="flex flex-col items-center justify-center rounded-lg border border-dashed py-16 text-center">
@@ -945,21 +809,6 @@ function ActionsContent({ brand }: { brand: Brand }) {
             {t('filters.clear')}
           </Button>
         </div>
-      )}
-
-      {openCard && (
-        <GettingStartedStepCard
-          brandId={brand.id}
-          step={openCard}
-          members={members}
-          canManage={canManage}
-          onClose={closeStep}
-          onChanged={refreshSteps}
-          onReady={() => {
-            closeStep();
-            setCategory('all');
-          }}
-        />
       )}
 
       <ActionDrawer

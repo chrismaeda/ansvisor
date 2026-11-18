@@ -18,6 +18,7 @@ const actions = vi.hoisted(() => ({ setMemberMenu: vi.fn(), setMenuManager: vi.f
 vi.mock('@/lib/actions/menu-access', () => actions);
 
 const { MenuManagersCard, MenuPeopleCard, memberMenuWith } = await import('./menu-access-people');
+const { ChatAgenticProvider } = await import('@/components/providers/chat-agentic-provider');
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT =
   true;
@@ -90,11 +91,13 @@ function Cards() {
   );
 }
 
-async function render() {
+async function render(chatOn = false) {
   await act(async () => {
     root.render(
       <NextIntlClientProvider locale="en" messages={messages}>
-        <Cards />
+        <ChatAgenticProvider enabled={chatOn}>
+          <Cards />
+        </ChatAgenticProvider>
       </NextIntlClientProvider>,
     );
   });
@@ -170,12 +173,22 @@ describe('MenuPeopleCard', () => {
     expect(row('admin')).toBeNull();
     expect(row('deniz').textContent).toContain('Brand & PR');
     expect(row('deniz').textContent).toContain("Manager's menu");
-    // Manager's 9 sections narrowed to Brand & PR's: Action Center, Chat,
-    // Brand Visibility, Mentions, Citations, Reports.
-    expect(row('deniz').textContent).toContain('6 of 11 sections');
+    // Manager's 10 sections narrowed to Brand & PR's: Action Center, Chat,
+    // Brand Visibility, Competitors, Mentions, Citations, Reports.
+    expect(row('deniz').textContent).toContain('7 of 12 sections');
     expect(row('ece').textContent).toContain('Custom: +Audit');
-    expect(row('ece').textContent).toContain('10 of 11 sections');
+    expect(row('ece').textContent).toContain('11 of 12 sections');
     expect(row('mert').textContent).toContain('All sections');
+  });
+
+  // Agents, only with the new Chat on: in the count and the boxes then.
+  it('lists Agents only with the new Chat on', async () => {
+    await render(false);
+    await act(async () => buttonIn(row('mert'), 'Customize').click());
+    expect(
+      container.querySelector('[aria-label="Mert Aydın sees Agents · in Action Center"]'),
+    ).toBeNull();
+    expect(el('[aria-label="Mert Aydın sees Chat"]')).not.toBeNull();
   });
 
   it('saves a person’s exception as a box changes', async () => {
@@ -214,5 +227,26 @@ describe('MenuPeopleCard', () => {
     expect(onFailed).toHaveBeenCalled();
     expect(el('[aria-label="Mert Aydın sees Content"]').getAttribute('aria-checked')).toBe('false');
     expect(toast.error).toHaveBeenCalled();
+  });
+});
+
+describe('MenuPeopleCard and Agents', () => {
+  it('names Agent Center Agents · in Action Center, the same section counted the same', async () => {
+    await render(true);
+    expect(row('deniz').textContent).toContain('8 of 13 sections');
+    await act(async () => buttonIn(row('mert'), 'Customize').click());
+    expect(
+      el('[aria-label="Mert Aydın sees Agents · in Action Center"]').getAttribute('aria-checked'),
+    ).toBe('true');
+    expect(container.querySelector('[aria-label="Mert Aydın sees Agent Center"]')).toBeNull();
+    const boxes = [...row('mert').querySelectorAll('label')].map((l) => l.textContent);
+    expect(boxes[0]).toBe('Chat');
+    // The Action Center first in Execution, Agents right under it.
+    const at = boxes.indexOf('Action Centeralways on');
+    expect(boxes[at - 1]).toBe('AI Referral Traffic');
+    expect(boxes.slice(at, at + 2)).toEqual([
+      'Action Centeralways on',
+      'Agents · in Action Center',
+    ]);
   });
 });

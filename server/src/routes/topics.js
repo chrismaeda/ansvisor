@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { generateObject } from 'ai';
 import { z } from 'zod';
 import supabaseAdmin from '../config/supabase.js';
-import { assertBrandAccess } from '../lib/access.js';
+import { MANAGER_ROLES, assertBrandAccess, assertRole } from '../lib/access.js';
 import { requireFeature } from '../lib/plan-guard.js';
 import { boundedBrandSetup, boundedTopicName, brandSetupSchema } from '../lib/brand-setup-input.js';
 import { resolveModel } from '../lib/ai-provider.js';
@@ -12,6 +12,7 @@ import logger from '../lib/logger.js';
 import { getLanguageName } from '../lib/languages.js';
 import { sendTopicGapToActionCenter } from '../lib/action-center/from-topic-gap.js';
 import { sendTopicOpportunityToActionCenter } from '../lib/action-center/from-topic-opportunity.js';
+import { getCatalogTopicCandidates } from '../lib/catalog-suggestions.js';
 
 const router = Router();
 
@@ -210,6 +211,9 @@ IMPORTANT: Generate all topic names in ${langName}.`;
     .filter((topic) => topic.name);
 }
 
+/** Generating topic ideas costs AI: admins and managers start it (2026-10-29). */
+const SUGGEST_TOPICS_REFUSAL = 'Only admins and managers can generate topic suggestions.';
+
 /**
  * POST /api/topics/suggest
  * Body: { brandName, industry, description?, website?, language? }
@@ -222,6 +226,7 @@ router.post('/suggest', async (req, res) => {
       return res.status(400).json({ error: 'Invalid request', details: parsed.error.message });
     }
     const { brandName, industry, description, website, language } = parsed.data;
+    await assertRole(req.user.id, MANAGER_ROLES, SUGGEST_TOPICS_REFUSAL);
 
     const topics = await generateTopicIdeas({
       brandName,
@@ -232,6 +237,9 @@ router.post('/suggest', async (req, res) => {
     });
     return res.json({ topics });
   } catch (error) {
+    if (error.status) {
+      return res.status(error.status).json({ error: error.message, code: error.code });
+    }
     req.log.error({ err: error }, 'topic suggestion error');
     return res.status(500).json({
       error: 'Failed to generate topic suggestions',
@@ -268,6 +276,12 @@ router.get('/suggestions/:brandId', async (req, res) => {
  * Generates a fresh batch with the same flow onboarding uses, then persists
  * it — excluding topics the brand already tracks and names it previously
  * dismissed or added, so decided suggestions never reappear (#463).
+ *
+ * An online store's catalog adds its own, first and with no model call (AC
+ * plan P-8, spec §6.3): a category with products in stock that no topic
+ * covers yet, named by its own name, with that category in source_data
+ * (00525). Accepting one is the same as any idea: a topic of that name,
+ * which the category is then linked to by its words (topic-categories.js).
  */
 router.post(
   '/suggestions/:brandId/refresh',
@@ -276,6 +290,7 @@ router.post(
     try {
       const brandId = req.params.brandId;
       await assertBrandAccess(brandId, req.user.id);
+      await assertRole(req.user.id, MANAGER_ROLES, SUGGEST_TOPICS_REFUSAL);
 
       const { data: brand } = await supabaseAdmin
         .from('brands')
@@ -284,7 +299,7 @@ router.post(
         .single();
       if (!brand) return res.status(404).json({ error: 'Brand not found' });
 
-      const [{ data: primaryDomain }, signals] = await Promise.all([
+      const [{ data: primaryDomain }, signals, catalogTopics] = await Promise.all([
         supabaseAdmin
           .from('brand_domains')
           .select('domain')
@@ -293,6 +308,8 @@ router.post(
           .limit(1)
           .maybeSingle(),
         loadTopicSignals(brandId),
+        // [] without a catalog, or when every category has a topic.
+        getCatalogTopicCandidates(brandId),
       ]);
 
       const ideas = await generateTopicIdeas({
@@ -319,37 +336,69 @@ router.post(
       );
 
       const seen = new Set();
-      const fresh = ideas.filter((t) => {
-        const key = t.name.trim().toLowerCase();
-        if (!key || taken.has(key) || seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      });
+      const fresh = [...catalogTopics.map((t) => ({ ...t, source: 'catalog' })), ...ideas].filter(
+        (t) => {
+          const key = t.name.trim().toLowerCase();
+          if (!key || taken.has(key) || seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        },
+      );
 
       // Replace the undecided batch wholesale — same behavior as prompt
-      // suggestions refresh. Dismissed/added rows are never touched.
-      await supabaseAdmin
+      // suggestions refresh. Dismissed/added rows are never touched. The new
+      // rows go in first and the old ones are removed only then, so a failed
+      // insert leaves the list as it was rather than empty.
+      let inserted = [];
+      if (fresh.length) {
+        const insert = (withSource) =>
+          supabaseAdmin
+            .from('topic_suggestions')
+            .insert(
+              fresh.map((t) =>
+                t.source === 'catalog'
+                  ? {
+                      brand_id: brandId,
+                      name: t.name.trim(),
+                      source: 'catalog',
+                      ...(withSource && {
+                        source_data: {
+                          category: t.category,
+                          categoryId: t.categoryId,
+                          products: t.products,
+                          inStock: t.inStock,
+                        },
+                      }),
+                      status: 'new',
+                    }
+                  : { brand_id: brandId, name: t.name.trim(), source: 'llm', status: 'new' },
+              ),
+            )
+            .select();
+        let { data, error } = await insert(true);
+        // A database without 00525 has no topic_suggestions.source_data: the
+        // catalog's topics go in without their category rather than not at all.
+        if (
+          ['42703', 'PGRST204'].includes(error?.code) &&
+          String(error.message ?? '').includes('source_data')
+        ) {
+          req.log.warn({ err: error }, 'topic-suggestions refresh: no source_data column (00525)');
+          ({ data, error } = await insert(false));
+        }
+        if (error) throw error;
+        inserted = data ?? [];
+      }
+
+      let stale = supabaseAdmin
         .from('topic_suggestions')
         .delete()
         .eq('brand_id', brandId)
         .eq('status', 'new');
-
-      if (fresh.length === 0) {
-        return res.json({ suggestions: [] });
-      }
-
-      const { data: inserted, error } = await supabaseAdmin
-        .from('topic_suggestions')
-        .insert(
-          fresh.map((t) => ({
-            brand_id: brandId,
-            name: t.name.trim(),
-            source: 'llm',
-            status: 'new',
-          })),
-        )
-        .select();
-      if (error) throw error;
+      if (inserted.length)
+        stale = stale.not('id', 'in', `(${inserted.map((t) => t.id).join(',')})`);
+      const { error: staleError } = await stale;
+      if (staleError)
+        req.log.warn({ err: staleError }, 'topic-suggestions refresh: old batch not removed');
 
       return res.json({ suggestions: inserted });
     } catch (error) {
@@ -360,9 +409,14 @@ router.post(
   },
 );
 
+/** What a member without the role for a topic suggestion reads. */
+const TOPIC_SUGGESTION_ROLE_MESSAGE =
+  'Only admins and managers can accept or dismiss topic suggestions.';
+
 /**
  * POST /api/topics/suggestions/:id/dismiss
  * Marks a suggestion dismissed; its name is excluded from future refreshes.
+ * Admins and managers only, as the Topics page offers it.
  */
 router.post('/suggestions/:id/dismiss', async (req, res) => {
   try {
@@ -373,6 +427,7 @@ router.post('/suggestions/:id/dismiss', async (req, res) => {
       .single();
     if (!suggestion) return res.status(404).json({ error: 'Not found' });
     await assertBrandAccess(suggestion.brand_id, req.user.id);
+    await assertRole(req.user.id, MANAGER_ROLES, TOPIC_SUGGESTION_ROLE_MESSAGE);
 
     const { error } = await supabaseAdmin
       .from('topic_suggestions')
@@ -391,7 +446,8 @@ router.post('/suggestions/:id/dismiss', async (req, res) => {
  * POST /api/topics/suggestions/:id/accept
  * Body: { topicId } — the topic the web app just created via the singular
  * createTopic action. This only records the outcome; topic creation itself
- * happens RLS-checked in the web app.
+ * happens RLS-checked in the web app. Admins and managers only, as the
+ * Topics page offers it.
  */
 router.post('/suggestions/:id/accept', async (req, res) => {
   try {
@@ -406,6 +462,7 @@ router.post('/suggestions/:id/accept', async (req, res) => {
       .single();
     if (!suggestion) return res.status(404).json({ error: 'Not found' });
     await assertBrandAccess(suggestion.brand_id, req.user.id);
+    await assertRole(req.user.id, MANAGER_ROLES, TOPIC_SUGGESTION_ROLE_MESSAGE);
 
     const { error } = await supabaseAdmin
       .from('topic_suggestions')

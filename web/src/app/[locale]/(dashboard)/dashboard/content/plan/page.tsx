@@ -15,7 +15,7 @@ import {
   setPlanRowPriority,
   showPlanRow,
 } from '@/lib/actions/content-plan';
-import { listMembers, type TeamMember } from '@/lib/actions/team';
+import { listBrandMembers, type TeamMember } from '@/lib/actions/team';
 import { useUserRole } from '@/hooks/use-user-role';
 import { useUpgradeGate } from '@/components/providers/upgrade-gate';
 import { useRouter } from '@/i18n/navigation';
@@ -35,6 +35,9 @@ import {
 } from '@/lib/content/plan';
 import { formatNumber } from '@/lib/format';
 import { readUrlChoice, readUrlParam, writeUrlParams } from '@/lib/url-state';
+import { useChatPageContext } from '@/components/chat/panel/chat-panel-context';
+import { rangeChipLabel } from '@/lib/chat/page-context';
+import { viewRows } from '@/lib/chat/page-view';
 import { cn } from '@/lib/utils';
 import { useBrandStore } from '@/stores/use-brand-store';
 import { AssignDialog } from './_assign-dialog';
@@ -114,7 +117,9 @@ export default function ContentPlanPage() {
   // period still filter.
   const { guard, isLocked } = useUpgradeGate();
   const tActions = useTranslations('readOnly.actions');
-  const [members, setMembers] = useState<TeamMember[]>([]);
+  // The people who can see the brand, read for it: another brand's aren't offered.
+  const [team, setTeam] = useState<{ brandId: string; members: TeamMember[] } | null>(null);
+  const members = team && team.brandId === activeBrandId ? team.members : [];
   const [assigning, setAssigning] = useState<PlanRow | null>(null);
   const [showHidden, setShowHidden] = useState(false);
   // Another brand starts unfiltered: its cards and types are its own.
@@ -207,11 +212,12 @@ export default function ContentPlanPage() {
     setStarting(true);
   };
 
-  // The team, for assigning: read once, when first needed.
+  // The team, for assigning: read once per brand, when first needed.
   const loadMembers = () => {
-    if (members.length > 0) return;
-    listMembers()
-      .then(setMembers)
+    if (!activeBrandId || members.length > 0) return;
+    const brandId = activeBrandId;
+    listBrandMembers(brandId)
+      .then((list) => setTeam({ brandId, members: list }))
       .catch((err) => console.error('Failed to load the team:', err));
   };
 
@@ -284,6 +290,40 @@ export default function ContentPlanPage() {
     }
   };
 
+  // Chat's side panel sees the page (the owner's plan of 2026-11-16, step 9): its period, the
+  // card and page type picked, and once read its rows by opportunity id (a row with none by its
+  // page's address), in the plan's order, with how many.
+  const tChatRange = useTranslations('chatPanel.range');
+  const tPageTypes = useTranslations('contentEditor.pageTypes');
+  const chatRows = plan && !loading ? rowsFor(plan.rows, card, typeFilter) : null;
+  useChatPageContext(
+    activeBrandId && days !== null
+      ? {
+          pageName: t('title'),
+          dateRange: {
+            from: `${days}d`,
+            to: null,
+            label: rangeChipLabel(`${days}d`, {}, (key, values) => tChatRange(key, values)),
+          },
+          filters: [
+            ...(card ? [{ key: 'card', label: t(`cards.${card}.title`), value: card }] : []),
+            ...(typeFilter
+              ? [{ key: 'pageType', label: tPageTypes(typeFilter), value: typeFilter }]
+              : []),
+          ],
+          view: chatRows
+            ? {
+                rows: viewRows(chatRows, (row) => ({
+                  ref: row.opportunityId ?? row.page,
+                  label: row.title,
+                })),
+                total: chatRows.length,
+              }
+            : {},
+        }
+      : null,
+  );
+
   if (!activeBrandId) {
     return (
       <div className="flex min-h-[400px] items-center justify-center">
@@ -307,7 +347,7 @@ export default function ContentPlanPage() {
             <div
               role="group"
               aria-label={t('period')}
-              className="inline-flex rounded-lg border bg-muted/40 p-0.5"
+              className="inline-flex h-8 rounded-lg border bg-muted/40 p-0.5"
             >
               {PLAN_PERIODS.map((value) => (
                 <button
@@ -316,7 +356,7 @@ export default function ContentPlanPage() {
                   aria-pressed={days === value}
                   onClick={() => changeDays(value)}
                   className={cn(
-                    'rounded-md px-3 py-1 text-sm transition-colors',
+                    'rounded-md px-3 text-sm transition-colors',
                     days === value
                       ? 'bg-background font-medium shadow-sm'
                       : 'text-muted-foreground hover:text-foreground',

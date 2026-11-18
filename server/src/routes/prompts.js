@@ -2,9 +2,10 @@ import { Router } from 'express';
 import { NoObjectGeneratedError, generateObject } from 'ai';
 import { z } from 'zod';
 import supabaseAdmin from '../config/supabase.js';
+import { MANAGER_ROLES, allowRole, assertBrandAccess, assertRole } from '../lib/access.js';
 import { resolveModel } from '../lib/ai-provider.js';
 import { decide, isDeciderConfigured } from '../lib/decider.js';
-import { classifyQueryIntents } from '../lib/intent-extraction.js';
+import { classifyQueryIntents, normalizeIntentQuery } from '../lib/intent-extraction.js';
 import { promptsFromTopicsSchema } from '../lib/brand-setup-input.js';
 import { getLanguageName } from '../lib/languages.js';
 import {
@@ -19,7 +20,10 @@ import {
 import { withRetry } from '../lib/retry.js';
 import { getGscSuggestionCandidates } from '../lib/gsc-suggestions.js';
 import { getGaSuggestionCandidates } from '../lib/ga-suggestions.js';
-import { getCatalogSuggestionCandidates } from '../lib/catalog-suggestions.js';
+import {
+  getCatalogProductCandidates,
+  getCatalogSuggestionCandidates,
+} from '../lib/catalog-suggestions.js';
 import { suggestPromptsForPage } from '../lib/page-prompt-suggestions.js';
 import { UNTRACKED_QUERY_SCAN, untrackedGoogleQueries } from '../lib/untracked-queries.js';
 import { RELEVANCE_SCALE, ratingCostUsd, toRelevance } from '../lib/suggestion-relevance.js';
@@ -33,39 +37,36 @@ import {
   improveRangeKey,
   improveSchema,
   sanitizeSuggestions,
+  withPageChecks,
 } from '../lib/prompt-improve.js';
+import { storedFeatures } from '../lib/action-center/competitor-pages.js';
 import {
   liveImproveSends,
   loadImproveRounds,
   sendImproveToActionCenter,
 } from '../lib/action-center/from-prompt-improve.js';
 import { brandPromptKeys, demandResponse } from '../lib/prompt-demand.js';
+import { yearRule } from '../lib/current-year.js';
+import { businessHubEnabled } from '../lib/business-hub/flag.js';
+import {
+  BUSINESS_HUB_ATTEMPTS,
+  BUSINESS_HUB_SOURCE,
+  businessHubRows,
+  businessHubTopicsBody,
+  cleanTopics,
+  dismissedSince,
+  isExpiredBusinessHubRow,
+  isLiveBusinessHubRow,
+  topicPromptsRequest,
+  topicPromptsSchema,
+  topicPromptsSystem,
+} from '../lib/business-hub/topic-prompts.js';
+import { businessHubTopicsLimiter } from '../middleware/rate-limiter.js';
 
 const router = Router();
 
-async function assertBrandAccess(brandId, userId) {
-  const { data: brand } = await supabaseAdmin
-    .from('brands')
-    .select('id, name, description, organization_id, language')
-    .eq('id', brandId)
-    .single();
-  if (!brand) {
-    const err = new Error('Brand not found');
-    err.status = 404;
-    throw err;
-  }
-  const { data: profile } = await supabaseAdmin
-    .from('profiles')
-    .select('organization_id, role')
-    .eq('id', userId)
-    .single();
-  if (!profile || profile.organization_id !== brand.organization_id) {
-    const err = new Error('Unauthorized');
-    err.status = 403;
-    throw err;
-  }
-  return { brand, profile };
-}
+/** The brand's fields Improve reads, with its access check (lib/access.js). */
+const BRAND_COLUMNS = { columns: 'name, description, language' };
 
 async function loadSuggestionContext(brandId) {
   const [
@@ -156,6 +157,35 @@ async function loadSuggestionContext(brandId) {
   };
 }
 
+/** Prompts read to keep a suggestion from repeating one the brand has. */
+const BRAND_PROMPTS_READ = 1000;
+
+/** A prompt's text as two are compared: case, spacing and an ending "?" aside. */
+const promptKey = (text) =>
+  String(text ?? '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .replace(/[\s?.!]+$/, '')
+    .trim();
+
+/**
+ * The texts of the brand's prompts, paused ones too (up to
+ * BRAND_PROMPTS_READ): a suggestion repeating one is left out, and a catalog
+ * product one of them names isn't asked about. [] when they can't be read.
+ */
+async function brandPromptTexts(brandId, log) {
+  const { data, error } = await supabaseAdmin
+    .from('prompts')
+    .select('text, prompt_sets!inner(brand_id)')
+    .eq('prompt_sets.brand_id', brandId)
+    .limit(BRAND_PROMPTS_READ);
+  if (error) {
+    log.warn({ err: error }, 'prompt-suggestions refresh: tracked prompts not read');
+    return [];
+  }
+  return (data ?? []).map((row) => row.text).filter((text) => typeof text === 'string');
+}
+
 /**
  * Suggestions generated per refresh. The schema floor sits well below it: a
  * model that returns a few short of the target should still produce a list,
@@ -169,6 +199,8 @@ const MIN_SUGGESTIONS = 15;
 const MIN_FROM_SEARCH_CONSOLE = 10;
 const MIN_FROM_ANALYTICS = 6;
 const MIN_FROM_CATALOG = 5;
+// And a few buyer questions about its top products (AC plan P-8).
+const MIN_FROM_PRODUCTS = 3;
 
 const newSuggestionSchema = z.object({
   suggestions: z
@@ -220,6 +252,13 @@ const newSuggestionSchema = z.object({
           .optional()
           .describe(
             'ONLY when this suggestion was derived from one of the provided catalog categories: the EXACT category name, verbatim. Omit for all other suggestions.',
+          ),
+        sourceProduct: z
+          .string()
+          .max(1000)
+          .optional()
+          .describe(
+            'ONLY when this suggestion was derived from one of the provided top products: the EXACT product title, verbatim. Omit for all other suggestions.',
           ),
       }),
     )
@@ -293,7 +332,6 @@ async function settleRating(log, reservation, { modelId, attempts, usage }) {
 async function generateSuggestions(brandId, { orgId, log }) {
   const ctx = await loadSuggestionContext(brandId);
   const langName = getLanguageName(ctx.brand.language);
-  const currentYear = new Date().getFullYear();
 
   // Real Search Console demand (#648) — [] for brands without GSC, which
   // keeps every prompt block below byte-identical to the pre-GSC behavior.
@@ -310,17 +348,24 @@ async function generateSuggestions(brandId, { orgId, log }) {
 
   // What the brand sells (ECOM-003): its catalog's categories and price bands
   // — [] without a catalog, which keeps every prompt block below unchanged.
-  const catalogCandidates = await getCatalogSuggestionCandidates(brandId);
+  // Its top products (AC plan P-8) ride in the same call: best-selling or
+  // most shown on AI shopping cards, none a prompt of the brand already names.
+  const trackedTexts = await brandPromptTexts(brandId, log);
+  const [catalogCandidates, productCandidates] = await Promise.all([
+    getCatalogSuggestionCandidates(brandId),
+    getCatalogProductCandidates(brandId, { trackedTexts }),
+  ]);
 
   const promptModel = process.env.PROMPT_SUGGESTION_MODEL || 'google/gemini-3-flash-preview';
   const aiModel = resolveModel(promptModel);
   const reservation = await reserveRating(orgId, brandId, promptModel, log);
   const rate = reservation !== null;
 
-  const system = `You are an AEO (Answer Engine Optimization) strategist. You suggest NEW search prompts a brand should track in AI engines (ChatGPT, Perplexity, Gemini, Claude). Current year: ${currentYear}.
+  const system = `You are an AEO (Answer Engine Optimization) strategist. You suggest NEW search prompts a brand should track in AI engines (ChatGPT, Perplexity, Gemini, Claude).
 
 RULES:
 - Suggest ${SUGGESTIONS_PER_REFRESH} prompts that are NOT already tracked by this brand.
+${yearRule()}
 - Every suggestion must be distinct: no two may be rephrasings of the same question.
 - Each prompt: 30-100 chars, generic, no brand names, written in ${langName}.
 - Group each prompt under a short topic label (2-4 words). Reuse existing topic labels when they fit; otherwise create a clean new one.
@@ -347,6 +392,11 @@ RULES:
     catalogCandidates.length
       ? `
 - WHAT THE BRAND SELLS: a list of its product catalog's categories is provided, each with how many products it sells and their price band. Derive at least ${Math.min(MIN_FROM_CATALOG, catalogCandidates.length)} shopping suggestions from those categories: the questions a shopper asks an AI assistant before buying in the category — best-of, under a budget (use the category's price band and currency, written as a shopper writes it), for a use or a person, or which type to choose. Use the category's own words, not the brand's or a product's name. For each such suggestion set sourceCategory to the EXACT category name, verbatim. Never set sourceCategory on suggestions that did not come from that list, and never set it together with sourceQuery or sourcePage.`
+      : ''
+  }${
+    productCandidates.length
+      ? `
+- THE BRAND'S TOP PRODUCTS: a list of its best-selling products, or those AI shopping answers show most, is provided, each with its type and category. Derive at least ${Math.min(MIN_FROM_PRODUCTS, productCandidates.length)} buyer suggestions from those products: what a shopper asks an AI assistant before buying a product like it — the best product of its type for a use or a person ("best {product type} for {use}"), or, when shoppers know it by its model name, how it compares with a named rival ("{product} vs {rival product}"). Never use the brand's own name. For each such suggestion set sourceProduct to the EXACT product title as listed, verbatim. Never set sourceProduct on suggestions that did not come from that list, and never set it together with sourceQuery, sourcePage or sourceCategory.`
       : ''
   }`;
 
@@ -416,7 +466,25 @@ ${catalogCandidates
   )
   .join('\n')}`
     : ''
-}
+}${
+    productCandidates.length
+      ? `
+
+The brand's top products (in stock; best-selling or most shown on AI shopping cards, last 30 days), by category:
+${productCandidates
+  .slice()
+  .sort((a, b) => (a.category ?? '~').localeCompare(b.category ?? '~'))
+  .map((p) => {
+    const evidence = [
+      p.cardPrompts > 0 ? `shown on shopping cards for ${p.cardPrompts} tracked prompts` : null,
+      p.orders > 0 ? `${p.orders.toLocaleString('en-US')} orders` : null,
+      p.aiVisits > 0 ? `${p.aiVisits.toLocaleString('en-US')} AI visits` : null,
+    ].filter(Boolean);
+    return `  • "${p.product}"${p.category ? ` — in "${p.category}"` : ''}${p.productType ? `, type: ${p.productType}` : ''}${evidence.length ? `; ${evidence.join(', ')}` : ''}`;
+  })
+  .join('\n')}`
+      : ''
+  }
 
 Suggest the next ${SUGGESTIONS_PER_REFRESH} prompts this brand should start tracking, with topic, reason and a calibrated monthly AI search volume (estVolume).`;
 
@@ -440,7 +508,14 @@ Suggest the next ${SUGGESTIONS_PER_REFRESH} prompts this brand should start trac
       { attempts: REFRESH_ATTEMPTS, baseDelayMs: 500, label: 'suggestion-refresh' },
     );
     usage = callUsage;
-    return { suggestions: object.suggestions, gscCandidates, gaCandidates, catalogCandidates };
+    return {
+      suggestions: object.suggestions,
+      gscCandidates,
+      gaCandidates,
+      catalogCandidates,
+      productCandidates,
+      trackedTexts,
+    };
   } finally {
     if (rate) await settleRating(log, reservation, { modelId: promptModel, attempts, usage });
   }
@@ -465,23 +540,127 @@ async function findOrCreateTopic(brandId, topicName) {
   return created?.id ?? null;
 }
 
+/**
+ * Puts a refreshed batch in place of the brand's undecided suggestions
+ * (status 'new'), in the batch's order. The new rows go in first and the old
+ * ones are removed only then: a failed insert (a database without 00362
+ * turning down source 'catalog', say) leaves the list as it was rather than
+ * empty. A text the old batch already has is refreshed in its row, since a
+ * brand keeps one undecided suggestion per text
+ * (idx_prompt_suggestions_brand_text_active).
+ *
+ * Suggestions from ChatGPT Business Hub's topics (00527) stay their 30 days:
+ * a refresh never removes or rewrites one, a refreshed text one of them has
+ * is left out, and they are listed after the batch. One past its 30 days
+ * goes with the old batch.
+ */
+async function replaceNewSuggestions(brandId, generated, log) {
+  const { data: current, error: currentError } = await supabaseAdmin
+    .from('prompt_suggestions')
+    .select('*')
+    .eq('brand_id', brandId)
+    .eq('status', 'new');
+  if (currentError) throw currentError;
+  const textKey = (text) => text.toLowerCase();
+  const now = Date.now();
+  const kept = (current ?? []).filter((row) => isLiveBusinessHubRow(row, now));
+  const keptTexts = new Set(kept.map((row) => textKey(row.suggested_text)));
+  const replaceable = (current ?? []).filter((row) => !isLiveBusinessHubRow(row, now));
+  const rows = generated.filter((row) => !keptTexts.has(textKey(row.suggested_text)));
+  const currentByText = new Map(replaceable.map((row) => [textKey(row.suggested_text), row]));
+
+  const fresh = rows.filter((row) => !currentByText.has(textKey(row.suggested_text)));
+  let inserted = [];
+  if (fresh.length) {
+    const { data, error } = await supabaseAdmin.from('prompt_suggestions').insert(fresh).select();
+    if (error) throw error;
+    inserted = data ?? [];
+  }
+  const byText = new Map(inserted.map((row) => [textKey(row.suggested_text), row]));
+
+  // A repeated text takes the new reason, volume and expiry; its old row
+  // stays as it was if that update fails, and is left out once decided.
+  const generatedAt = new Date().toISOString();
+  for (const row of rows) {
+    const old = currentByText.get(textKey(row.suggested_text));
+    if (!old || byText.has(textKey(row.suggested_text))) continue;
+    const { data, error } = await supabaseAdmin
+      .from('prompt_suggestions')
+      .update({ ...row, generated_at: generatedAt })
+      .eq('id', old.id)
+      .eq('status', 'new')
+      .select()
+      .maybeSingle();
+    if (error) log.warn({ err: error, id: old.id }, 'prompt-suggestions refresh: kept an old row');
+    const refreshed = error ? old : data;
+    if (refreshed) byText.set(textKey(row.suggested_text), refreshed);
+  }
+
+  // Only then the rest of the old batch goes; one decided meanwhile stays.
+  const refreshed = new Set([...byText.values()].map((row) => row.id));
+  const stale = replaceable.filter((row) => !refreshed.has(row.id)).map((row) => row.id);
+  if (stale.length) {
+    const { error } = await supabaseAdmin
+      .from('prompt_suggestions')
+      .delete()
+      .in('id', stale)
+      .eq('status', 'new');
+    if (error) log.warn({ err: error }, 'prompt-suggestions refresh: old batch not removed');
+  }
+
+  return [
+    ...new Set(rows.map((row) => byText.get(textKey(row.suggested_text))).filter(Boolean)),
+    ...kept,
+  ];
+}
+
+/** Generating suggestions and Improve sets costs AI: admins and managers start it (2026-10-29). */
+const SUGGEST_PROMPTS_REFUSAL = 'Only admins and managers can generate prompt suggestions.';
+const IMPROVE_REFUSAL = 'Only admins and managers can use Improve.';
+
+/**
+ * Prompts are grouped under topics, so suggesting prompts for a brand with no
+ * topic yet is refused before anything is generated: the person adds a topic
+ * first. 409 with `no_topics`, which the web reads as its own failure.
+ */
+const NO_TOPICS_REFUSAL = 'Add a topic first: prompts are grouped under topics.';
+
+/** Whether the brand has an active topic, as the dashboard's topic lists read them. */
+async function brandHasTopics(brandId) {
+  const { data, error } = await supabaseAdmin
+    .from('topics')
+    .select('id')
+    .eq('brand_id', brandId)
+    .eq('is_active', true)
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return !!data;
+}
+
+function refuseNoTopics(res) {
+  return res.status(409).json({ error: NO_TOPICS_REFUSAL, code: 'no_topics' });
+}
+
 router.post(
   '/suggestions/:brandId/refresh',
   requireFeature('prompt_suggestions'),
   async (req, res) => {
     try {
       const { brand } = await assertBrandAccess(req.params.brandId, req.user.id);
-      const { suggestions, gscCandidates, gaCandidates, catalogCandidates } =
-        await generateSuggestions(req.params.brandId, {
-          orgId: brand.organization_id,
-          log: req.log,
-        });
-
-      await supabaseAdmin
-        .from('prompt_suggestions')
-        .delete()
-        .eq('brand_id', req.params.brandId)
-        .eq('status', 'new');
+      await assertRole(req.user.id, MANAGER_ROLES, SUGGEST_PROMPTS_REFUSAL);
+      if (!(await brandHasTopics(req.params.brandId))) return refuseNoTopics(res);
+      const {
+        suggestions,
+        gscCandidates,
+        gaCandidates,
+        catalogCandidates,
+        productCandidates,
+        trackedTexts,
+      } = await generateSuggestions(req.params.brandId, {
+        orgId: brand.organization_id,
+        log: req.log,
+      });
 
       const expiresAt = new Date(Date.now() + SUGGESTION_TTL_HOURS * 60 * 60 * 1000).toISOString();
 
@@ -496,9 +675,15 @@ router.post(
       const candidateByCategory = new Map(
         catalogCandidates.map((c) => [normalizeQuery(c.category), c]),
       );
+      const candidateByProduct = new Map(
+        productCandidates.map((c) => [normalizeQuery(c.product), c]),
+      );
+      // A suggestion repeating a prompt the brand has is no suggestion.
+      const tracked = new Set(trackedTexts.map(promptKey));
 
       const rows = [];
       for (const s of suggestions) {
+        if (tracked.has(promptKey(s.text))) continue;
         const topicId = await findOrCreateTopic(req.params.brandId, s.topic);
         const candidate = s.sourceQuery
           ? candidateByQuery.get(normalizeQuery(s.sourceQuery))
@@ -510,10 +695,15 @@ router.post(
           !candidate && s.sourcePage
             ? candidateByPage.get(normalizeQuery(s.sourcePage))
             : undefined;
-        // A category only when neither Google source claims it: both are
-        // measured demand, the catalog is what the brand sells.
+        // The catalog only when neither Google source claims it: both are
+        // measured demand, the catalog is what the brand sells. A product
+        // before its category: it says more of what the prompt is about.
+        const productCandidate =
+          !candidate && !gaCandidate && s.sourceProduct
+            ? candidateByProduct.get(normalizeQuery(s.sourceProduct))
+            : undefined;
         const catalogCandidate =
-          !candidate && !gaCandidate && s.sourceCategory
+          !candidate && !gaCandidate && !productCandidate && s.sourceCategory
             ? candidateByCategory.get(normalizeQuery(s.sourceCategory))
             : undefined;
         rows.push({
@@ -526,7 +716,13 @@ router.post(
           // estimate must cap out, not reject the whole generated batch.
           est_volume: Math.min(s.estVolume, 10_000_000),
           relevance: toRelevance(s.relevance),
-          source: candidate ? 'gsc' : gaCandidate ? 'ga' : catalogCandidate ? 'catalog' : 'llm',
+          source: candidate
+            ? 'gsc'
+            : gaCandidate
+              ? 'ga'
+              : catalogCandidate || productCandidate
+                ? 'catalog'
+                : 'llm',
           source_data: candidate
             ? {
                 query: candidate.query,
@@ -549,32 +745,40 @@ router.post(
                   aiPlatforms: gaCandidate.aiPlatforms,
                   pageTitle: gaCandidate.page?.title ?? null,
                 }
-              : catalogCandidate
+              : productCandidate
                 ? {
-                    category: catalogCandidate.category,
-                    products: catalogCandidate.products,
-                    priceLow: catalogCandidate.priceLow,
-                    priceHigh: catalogCandidate.priceHigh,
-                    priceUnder: catalogCandidate.priceUnder,
-                    currency: catalogCandidate.currency,
+                    product: productCandidate.product,
+                    productId: productCandidate.productId,
+                    productType: productCandidate.productType,
+                    category: productCandidate.category,
+                    categoryId: productCandidate.categoryId,
+                    cardPrompts: productCandidate.cardPrompts,
+                    orders: productCandidate.orders,
                   }
-                : null,
+                : catalogCandidate
+                  ? {
+                      category: catalogCandidate.category,
+                      categoryId: catalogCandidate.categoryId ?? null,
+                      products: catalogCandidate.products,
+                      priceLow: catalogCandidate.priceLow,
+                      priceHigh: catalogCandidate.priceHigh,
+                      priceUnder: catalogCandidate.priceUnder,
+                      currency: catalogCandidate.currency,
+                    }
+                  : null,
           status: 'new',
           expires_at: expiresAt,
         });
       }
 
-      const { data: inserted, error } = await supabaseAdmin
-        .from('prompt_suggestions')
-        .insert(rows)
-        .select();
-      if (error) throw error;
-
-      return res.json({ suggestions: inserted });
+      const suggestionsNow = await replaceNewSuggestions(req.params.brandId, rows, req.log);
+      return res.json({ suggestions: suggestionsNow });
     } catch (error) {
       const status = error.status || 500;
       req.log.error({ err: error }, 'prompt-suggestions refresh error');
-      return res.status(status).json({ error: error.message || 'Failed to generate suggestions' });
+      return res
+        .status(status)
+        .json({ error: error.message || 'Failed to generate suggestions', code: error.code });
     }
   },
 );
@@ -606,15 +810,165 @@ router.post(
         return res.status(400).json({ error: 'Invalid request', details: parsed.error.message });
       }
       await assertBrandAccess(req.params.brandId, req.user.id);
+      await assertRole(req.user.id, MANAGER_ROLES, SUGGEST_PROMPTS_REFUSAL);
+      if (!(await brandHasTopics(req.params.brandId))) return refuseNoTopics(res);
       const context = await loadSuggestionContext(req.params.brandId);
       const result = await suggestPromptsForPage(req.params.brandId, { ...parsed.data, context });
       return res.json(result);
     } catch (error) {
       const status = error.status || 500;
       req.log.error({ err: error }, 'page prompt suggestions error');
-      return res
-        .status(status)
-        .json({ error: error.message || 'Failed to suggest prompts for this page' });
+      return res.status(status).json({
+        error: error.message || 'Failed to suggest prompts for this page',
+        code: error.code,
+      });
+    }
+  },
+);
+
+/** Off: Business Hub's routes are not found until BUSINESS_HUB_ENABLED is "true". */
+function businessHubOnly(req, res, next) {
+  if (businessHubEnabled()) return next();
+  return res.status(404).json({ error: 'Not available', code: 'off' });
+}
+
+/**
+ * The model call for Business Hub's topics: one generateObject, with Refresh's
+ * model and at most two retries. Not charged to the AI budget, as Refresh
+ * isn't; the route's limiter and its roles bound it.
+ */
+async function writeTopicPrompts({ brand, topicNames, trackedTexts, topics }) {
+  const model = process.env.PROMPT_SUGGESTION_MODEL || 'google/gemini-3-flash-preview';
+  const { object } = await withRetry(
+    () =>
+      generateObject({
+        model: resolveModel(model),
+        schema: topicPromptsSchema,
+        system: topicPromptsSystem({ langName: getLanguageName(brand.language) }),
+        prompt: topicPromptsRequest({ brand, topicNames, trackedTexts, topics }),
+      }),
+    { attempts: BUSINESS_HUB_ATTEMPTS, baseDelayMs: 500, label: 'business-hub-topics' },
+  );
+  return object;
+}
+
+/** Inserts the rows; a text written meanwhile by a refresh (23505) leaves only that one out. */
+async function insertBusinessHubRows(rows) {
+  if (rows.length === 0) return [];
+  const { data, error } = await supabaseAdmin.from('prompt_suggestions').insert(rows).select();
+  if (!error) return data ?? [];
+  if (error.code !== '23505') throw error;
+  const inserted = [];
+  for (const row of rows) {
+    const one = await supabaseAdmin.from('prompt_suggestions').insert(row).select().maybeSingle();
+    if (one.error && one.error.code !== '23505') throw one.error;
+    if (one.data) inserted.push(one.data);
+  }
+  return inserted;
+}
+
+/**
+ * POST /api/prompts/suggestions/:brandId/business-hub
+ * Body: { topics: string[1..5], periodEnd?: 'YYYY-MM-DD' }
+ *
+ * Prompts from ChatGPT Business Hub's discovery topics (Business Hub plan,
+ * PR 6): two or three for each topic, in the brand's language, under the
+ * brand's topic that fits or the discovery topic itself. Written as prompt
+ * suggestions with source 'business_hub' (00527), kept 30 days. A prompt
+ * the brand tracks, or that is suggested already, is left out and counted.
+ * Admins and managers, as every suggestion generator; 10 an hour per brand.
+ */
+router.post(
+  '/suggestions/:brandId/business-hub',
+  businessHubOnly,
+  requireFeature('prompt_suggestions'),
+  businessHubTopicsLimiter,
+  async (req, res) => {
+    try {
+      const parsed = businessHubTopicsBody.safeParse(req.body ?? {});
+      const topics = parsed.success ? cleanTopics(parsed.data.topics) : [];
+      if (!parsed.success || topics.length === 0) {
+        return res.status(400).json({ error: 'Give one to five topics.', code: 'invalid' });
+      }
+      const brandId = req.params.brandId;
+      const { brand } = await assertBrandAccess(brandId, req.user.id, BRAND_COLUMNS);
+      await assertRole(req.user.id, MANAGER_ROLES, SUGGEST_PROMPTS_REFUSAL);
+      if (!(await brandHasTopics(brandId))) return refuseNoTopics(res);
+
+      const now = new Date();
+      // Ones past their 30 days go first, so their texts can be suggested again.
+      const { error: expiredError } = await supabaseAdmin
+        .from('prompt_suggestions')
+        .delete()
+        .eq('brand_id', brandId)
+        .eq('source', BUSINESS_HUB_SOURCE)
+        .eq('status', 'new')
+        .lt('expires_at', now.toISOString());
+      if (expiredError) req.log.warn({ err: expiredError }, 'business hub topics: expired kept');
+
+      const [topicsRead, pendingRead, dismissedRead, trackedTexts] = await Promise.all([
+        supabaseAdmin
+          .from('topics')
+          .select('id, name')
+          .eq('brand_id', brandId)
+          .eq('is_active', true)
+          .limit(200),
+        supabaseAdmin
+          .from('prompt_suggestions')
+          .select('suggested_text')
+          .eq('brand_id', brandId)
+          .eq('status', 'new')
+          .limit(1000),
+        supabaseAdmin
+          .from('prompt_suggestions')
+          .select('suggested_text')
+          .eq('brand_id', brandId)
+          .eq('source', BUSINESS_HUB_SOURCE)
+          .eq('status', 'dismissed')
+          .gte('updated_at', dismissedSince(now))
+          .limit(1000),
+        brandPromptTexts(brandId, req.log),
+      ]);
+      for (const read of [topicsRead, pendingRead, dismissedRead]) {
+        if (read.error) throw read.error;
+      }
+      const existingTopics = topicsRead.data ?? [];
+
+      const answer = await writeTopicPrompts({
+        brand,
+        topicNames: existingTopics.map((t) => t.name),
+        trackedTexts,
+        topics,
+      });
+      const result = businessHubRows({
+        answer,
+        topics,
+        brandId,
+        brandName: brand.name,
+        existingTopics,
+        trackedTexts,
+        pendingTexts: (pendingRead.data ?? []).map((r) => r.suggested_text),
+        dismissedTexts: (dismissedRead.data ?? []).map((r) => r.suggested_text),
+        periodEnd: parsed.data.periodEnd ?? null,
+        now,
+      });
+      const suggestions = await insertBusinessHubRows(result.rows);
+      // Fewer only when a refresh wrote one of the texts meanwhile: suggested already.
+      const addedTo = (topic) => suggestions.filter((r) => r.source_data?.topic === topic).length;
+      return res.json({
+        added: suggestions.length,
+        alreadyTracked: result.alreadyTracked,
+        alreadySuggested: result.alreadySuggested + result.rows.length - suggestions.length,
+        topics: result.topics.map((t) => ({ ...t, added: addedTo(t.topic) })),
+        suggestions,
+      });
+    } catch (error) {
+      const status = error.status || 500;
+      req.log.error({ err: error }, 'business hub topic prompts error');
+      return res.status(status).json({
+        error: status === 500 ? 'Failed to suggest prompts' : error.message,
+        code: error.code,
+      });
     }
   },
 );
@@ -630,15 +984,19 @@ router.get('/suggestions/:brandId', async (req, res) => {
       .order('generated_at', { ascending: false });
     if (error) throw error;
 
-    const stale = (data || []).every((r) => new Date(r.expires_at).getTime() < Date.now());
-    return res.json({
-      suggestions: data || [],
-      stale: data?.length === 0 || stale,
-    });
+    // A Business Hub suggestion past its 30 days is no longer listed; the
+    // others stay until a refresh replaces them, whatever their expiry.
+    const now = Date.now();
+    const suggestions = (data || []).filter((r) => !isExpiredBusinessHubRow(r, now));
+    const batch = suggestions.filter((r) => r.source !== BUSINESS_HUB_SOURCE);
+    const stale = batch.every((r) => new Date(r.expires_at).getTime() < now);
+    return res.json({ suggestions, stale: batch.length === 0 || stale });
   } catch (error) {
     const status = error.status || 500;
     req.log.error({ err: error }, 'prompt-suggestions list error');
-    return res.status(status).json({ error: error.message || 'Failed to load suggestions' });
+    return res
+      .status(status)
+      .json({ error: error.message || 'Failed to load suggestions', code: error.code });
   }
 });
 
@@ -674,9 +1032,14 @@ router.get('/untracked-queries/:brandId', async (req, res) => {
   } catch (error) {
     const status = error.status || 500;
     req.log.error({ err: error }, 'untracked queries error');
-    return res.status(status).json({ error: error.message || 'Failed to read Google queries' });
+    return res
+      .status(status)
+      .json({ error: error.message || 'Failed to read Google queries', code: error.code });
   }
 });
+
+/** Who may dismiss a prompt suggestion: every role but agency partners, as the table's update rule. */
+const DISMISS_SUGGESTION_ROLES = ['admin', 'manager', 'analyst'];
 
 router.post('/suggestions/:id/dismiss', async (req, res) => {
   try {
@@ -687,6 +1050,11 @@ router.post('/suggestions/:id/dismiss', async (req, res) => {
       .single();
     if (!suggestion) return res.status(404).json({ error: 'Not found' });
     await assertBrandAccess(suggestion.brand_id, req.user.id);
+    await assertRole(
+      req.user.id,
+      DISMISS_SUGGESTION_ROLES,
+      'Only admins, managers and analysts can dismiss prompt suggestions.',
+    );
 
     const { error } = await supabaseAdmin
       .from('prompt_suggestions')
@@ -697,7 +1065,9 @@ router.post('/suggestions/:id/dismiss', async (req, res) => {
   } catch (error) {
     const status = error.status || 500;
     req.log.error({ err: error }, 'prompt-suggestions dismiss error');
-    return res.status(status).json({ error: error.message || 'Failed to dismiss' });
+    return res
+      .status(status)
+      .json({ error: error.message || 'Failed to dismiss', code: error.code });
   }
 });
 
@@ -714,6 +1084,8 @@ router.post('/suggestions/:id/accept', async (req, res) => {
       .single();
     if (!suggestion) return res.status(404).json({ error: 'Not found' });
     await assertBrandAccess(suggestion.brand_id, req.user.id);
+    // The prompt itself is added by admins and managers only (the prompts table's rule).
+    await assertRole(req.user.id, MANAGER_ROLES, 'Only admins and managers can add prompts.');
 
     const { error } = await supabaseAdmin
       .from('prompt_suggestions')
@@ -728,7 +1100,9 @@ router.post('/suggestions/:id/accept', async (req, res) => {
   } catch (error) {
     const status = error.status || 500;
     req.log.error({ err: error }, 'prompt-suggestions accept error');
-    return res.status(status).json({ error: error.message || 'Failed to accept' });
+    return res
+      .status(status)
+      .json({ error: error.message || 'Failed to accept', code: error.code });
   }
 });
 
@@ -756,11 +1130,11 @@ const promptSuggestionSchema = z.object({
 });
 
 function getSystemPrompt(langName) {
-  const currentYear = new Date().getFullYear();
-  return `You are an AEO (Answer Engine Optimization) expert. Given brand information, generate exactly 10 search prompts that real users would type into AI search engines (ChatGPT, Perplexity, Gemini, Claude, etc.). Current year: ${currentYear}.
+  return `You are an AEO (Answer Engine Optimization) expert. Given brand information, generate exactly 10 search prompts that real users would type into AI search engines (ChatGPT, Perplexity, Gemini, Claude, etc.).
 
 CRITICAL RULES:
 - Do NOT use the brand name in prompts. These must be generic, high-volume industry queries.
+${yearRule()}
 - Each prompt MUST be between 30 and 100 characters long. Aim for 40-80 characters.
 - The goal is to measure whether the brand appears organically in AI responses when users search for general topics.
 - Think about what potential customers search BEFORE they know about any specific brand.
@@ -769,7 +1143,7 @@ CRITICAL RULES:
 Generate prompts like these (generic, no brand names):
 - "Best project management tools for remote teams"
 - "How to automate email marketing campaigns"
-- "Top CRM software for small businesses ${currentYear}"
+- "Top CRM software for small businesses"
 - "What is the best way to manage inventory for e-commerce"
 - "Free alternatives to enterprise automation platforms"
 
@@ -782,7 +1156,7 @@ Do NOT generate prompts like these (brand-specific, low value):
 Include a diverse mix of:
 - Industry best-of queries ("Best [category] tools", "Top [industry] software")
 - How-to queries related to the brand's domain ("How to [solve problem the brand solves]")
-- Comparison/listicle queries ("Top 10 [product category] in ${currentYear}")
+- Comparison/listicle queries ("Top 10 [product category]")
 - Use-case queries ("Best tool for [specific use case]")
 - Problem-solving queries ("How to fix/improve [pain point]")
 - Recommendation queries ("What [tool type] should I use for [scenario]")
@@ -806,6 +1180,7 @@ router.post('/suggest', requireFeature('prompt_suggestions'), async (req, res) =
     if (!brandName) {
       return res.status(400).json({ error: 'brandName is required' });
     }
+    await assertRole(req.user.id, MANAGER_ROLES, SUGGEST_PROMPTS_REFUSAL);
 
     const userPrompt = `Brand context (DO NOT use the brand name "${brandName}" in any prompt):
 Industry: ${industry || 'Not specified'}
@@ -832,6 +1207,9 @@ Based on this brand's industry and context, generate 10 short, generic search pr
 
     return res.json({ prompts: object.prompts });
   } catch (error) {
+    if (error.status) {
+      return res.status(error.status).json({ error: error.message, code: error.code });
+    }
     req.log.error({ err: error }, 'prompt suggestion error');
     return res.status(500).json({
       error: 'Failed to generate prompt suggestions',
@@ -860,6 +1238,8 @@ router.post('/from-topics', async (req, res) => {
     if (!parsed.success) {
       return res.status(400).json({ error: 'Invalid request', details: parsed.error.message });
     }
+    // A model writing prompts: admins and managers, who set brands up (2026-11-03).
+    if (!(await allowRole(res, req.user.id, MANAGER_ROLES, SUGGEST_PROMPTS_REFUSAL))) return;
     const { brandName, industry, description, topics, language } = parsed.data;
     const langName = getLanguageName(language);
 
@@ -875,11 +1255,12 @@ router.post('/from-topics', async (req, res) => {
         generateObject({
           model: aiModel,
           schema: topicPromptSchema,
-          system: `You are an AEO (Answer Engine Optimization) expert. Generate exactly 5 search prompts per topic that real users would type into AI search engines. Current year: ${new Date().getFullYear()}.
+          system: `You are an AEO (Answer Engine Optimization) expert. Generate exactly 5 search prompts per topic that real users would type into AI search engines.
 
 RULES:
 - Keep prompts SHORT and concise — between 30 and 100 characters. Aim for 40-80 characters.
-- Write them like real quick searches, e.g. "best CRM software for growing small businesses" or "top email marketing tools for startups in ${new Date().getFullYear()}".
+- Write them like real quick searches, e.g. "best CRM software for growing small businesses" or "top email marketing tools for startups".
+${yearRule()}
 - Do NOT use the brand name "${brandName}" in the prompts.
 - Each prompt should be relevant to the specific topic it belongs to.
 - Focus on queries where the brand could organically appear in AI-generated answers.
@@ -916,10 +1297,6 @@ const FANOUT_INTENT_MAX_QUERIES = 200;
 // Cache-lookup batch size — keeps each `.in('query', ...)` URL well under
 // PostgREST / proxy length limits even with long sub-queries.
 const FANOUT_INTENT_LOOKUP_CHUNK = 40;
-
-function normalizeIntentQuery(raw) {
-  return typeof raw === 'string' ? raw.replace(/\s+/g, ' ').trim().toLowerCase().slice(0, 512) : '';
-}
 
 router.post('/fanout-intents', async (req, res) => {
   try {
@@ -1011,7 +1388,7 @@ async function loadImprovePrompt(promptId, userId) {
     throw err;
   }
   const brandId = prompt.prompt_sets.brand_id;
-  const { brand } = await assertBrandAccess(brandId, userId);
+  const { brand } = await assertBrandAccess(brandId, userId, BRAND_COLUMNS);
   return { prompt, brand, brandId };
 }
 
@@ -1134,7 +1511,7 @@ router.get('/:promptId/improve', readImprove, async (req, res) => {
     req.log.error({ err: error }, 'prompt improve read error');
     return res
       .status(error.status || 500)
-      .json({ error: error.message || 'Failed to load suggestions' });
+      .json({ error: error.message || 'Failed to load suggestions', code: error.code });
   }
 });
 
@@ -1166,7 +1543,7 @@ router.get('/:promptId/demand', async (req, res) => {
     req.log.error({ err: error }, 'prompt demand read error');
     return res
       .status(error.status || 500)
-      .json({ error: error.status ? error.message : 'Failed to load demand' });
+      .json({ error: error.status ? error.message : 'Failed to load demand', code: error.code });
   }
 });
 
@@ -1176,6 +1553,7 @@ router.post('/:promptId/improve', requireFeature('prompt_improve'), async (req, 
     const range = parseImproveRange(req.body);
     const promptId = req.params.promptId;
     const { prompt, brand, brandId } = await loadImprovePrompt(promptId, req.user.id);
+    await assertRole(req.user.id, MANAGER_ROLES, IMPROVE_REFUSAL);
 
     const [
       rows,
@@ -1222,7 +1600,7 @@ router.post('/:promptId/improve', requireFeature('prompt_improve'), async (req, 
       : { data: [] };
     const responseById = new Map((responses ?? []).map((r) => [r.id, r.response]));
 
-    const withEvidence = actionable.map((p) => ({
+    const collected = actionable.map((p) => ({
       ...p,
       evidence: collectEvidence(evidenceByPlatform.get(p.id) ?? [], {
         brandName: brand.name,
@@ -1230,6 +1608,23 @@ router.post('/:promptId/improve', requireFeature('prompt_improve'), async (req, 
         competitors: competitors ?? [],
         latestResponse: responseById.get(byPlatform.get(p.id)[0].id),
       }),
+    }));
+    // What Site Audit's checks found on the cited pages, where Analyze
+    // competitor content read them lately (learning C2). None read: as before.
+    // A read that fails goes without them, said in the log.
+    const stored = await storedFeatures(
+      brandId,
+      collected.flatMap((p) => [
+        ...p.evidence.competitorUrls.map((u) => u.url),
+        ...p.evidence.brandPages.map((u) => u.url),
+      ]),
+    ).catch((err) => {
+      req.log.warn({ err, promptId }, 'prompt improve page checks read failed');
+      return new Map();
+    });
+    const withEvidence = collected.map((p) => ({
+      ...p,
+      evidence: withPageChecks(p.evidence, stored),
     }));
 
     const modelId = improveModelId();
@@ -1338,7 +1733,7 @@ router.post('/:promptId/improve', requireFeature('prompt_improve'), async (req, 
     req.log.error({ err: error }, 'prompt improve generate error');
     return res
       .status(error.status || 500)
-      .json({ error: error.message || 'Failed to generate suggestions' });
+      .json({ error: error.message || 'Failed to generate suggestions', code: error.code });
   }
 });
 
@@ -1394,6 +1789,8 @@ export async function sendImproveAction({ promptId, userId, body }) {
     throw err;
   }
   const { prompt, brandId } = await loadImprovePrompt(promptId, userId);
+  // The dashboard's Send Actions and an API key's create_improve_action alike.
+  await assertRole(userId, MANAGER_ROLES, IMPROVE_REFUSAL);
 
   const { data: set } = await supabaseAdmin
     .from('prompt_improve_suggestions')
@@ -1479,7 +1876,7 @@ router.post('/:promptId/improve/action', requireFeature('prompt_improve'), async
     req.log.error({ err: error }, 'prompt improve send error');
     return res
       .status(error.status || 500)
-      .json({ error: error.message || 'Failed to send to Action Center' });
+      .json({ error: error.message || 'Failed to send to Action Center', code: error.code });
   }
 });
 

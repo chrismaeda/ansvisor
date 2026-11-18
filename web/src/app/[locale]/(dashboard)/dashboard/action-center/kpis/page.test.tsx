@@ -58,6 +58,14 @@ vi.mock('@/components/action-center/action-center-tabs', () => ({
   ActionCenterTabs: () => null,
 }));
 
+vi.mock('@/i18n/navigation', () => ({
+  Link: ({ href, children, ...rest }: { href: string; children: React.ReactNode }) => (
+    <a href={href} {...rest}>
+      {children}
+    </a>
+  ),
+}));
+
 vi.mock('@/components/action-center/kpi-framework-drawer', () => ({
   KpiFrameworkDrawer: () => null,
 }));
@@ -71,6 +79,11 @@ vi.mock('sonner', () => ({
   },
 }));
 
+const { chatPage } = vi.hoisted(() => ({ chatPage: vi.fn() }));
+vi.mock('@/components/chat/panel/chat-panel-context', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  useChatPageContext: chatPage,
+}));
 import ActionCenterKpisPage from './page';
 
 beforeEach(() => {
@@ -263,5 +276,51 @@ describe('KPIs status filter', () => {
     expect(menu?.querySelectorAll('[role="menuitemcheckbox"]')).toHaveLength(4);
 
     await act(async () => root.unmount());
+  });
+});
+
+describe('KPIs, one of History’s views', () => {
+  it('shows KPIs current, the others linking back to History', async () => {
+    const { container, root } = await renderPage();
+    const group = container.querySelector('[role="group"][aria-label="view.label"]')!;
+    const views = [...group.children].map((v) => [
+      v.textContent,
+      v.getAttribute('href'),
+      v.getAttribute('aria-current'),
+    ]);
+    expect(views).toEqual([
+      ['view.actions', '/dashboard/action-center/history', null],
+      ['view.scorecard', '/dashboard/action-center/history?view=scorecard', null],
+      ['view.kpis', null, 'page'],
+    ]);
+    await act(async () => root.unmount());
+  });
+});
+
+describe("what Chat's side panel sees (the owner's plan, step 9)", () => {
+  it('sends its range, its filters and once read the KPIs listed by key, with how many', async () => {
+    getKpiSnapshots.mockResolvedValue({
+      configured: true,
+      kpis: [snapshot('ai_visibility'), snapshot('citations')],
+    });
+    await renderPage();
+    expect(chatPage.mock.lastCall![0]).toEqual({
+      pageName: 'title',
+      dateRange: { from: '30d', to: null, label: 'days' },
+      filters: [],
+      view: {
+        rows: [
+          { ref: 'ai_visibility', label: 'ai_visibility.name' },
+          { ref: 'citations', label: 'citations.name' },
+        ],
+        total: 2,
+      },
+    });
+  });
+
+  it('sends no rows while it reads', async () => {
+    getKpiSnapshots.mockReturnValue(new Promise(() => {}));
+    await renderPage();
+    expect(chatPage.mock.lastCall![0].view).toEqual({});
   });
 });

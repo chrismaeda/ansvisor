@@ -17,9 +17,10 @@ import {
 } from '@/components/ui/table';
 import { pct } from '@/components/audit/audit-report';
 import type { AuditOpportunity, ExcludedPage, OpportunityReason } from '@/lib/actions/audits';
+import type { PageToAudit } from './_audit-confirm-dialog';
 import { formatMonthDay, formatNumber } from '@/lib/format';
 import { cn } from '@/lib/utils';
-import { InfoTip } from '../insights/_kpi-cards';
+import { InfoTip } from '../(brand-visibility)/insights/_kpi-cards';
 
 /** A priority at or above this shows dark, as the mockup's high ones. */
 const HIGH_PRIORITY = 80;
@@ -54,6 +55,32 @@ export function opportunityAuditUrls(rows: AuditOpportunity[]): string[] {
   return [
     ...new Set(rows.flatMap((o) => (o.template ? o.template.toAudit : o.url ? [o.url] : []))),
   ];
+}
+
+/**
+ * The pages an audit of the rows starts, each once, with its last audit, as
+ * the confirm before a bulk audit lists them (customer priorities item 11):
+ * a template's pages with no audit yet, else the page.
+ */
+export function opportunityPagesToAudit(rows: AuditOpportunity[]): PageToAudit[] {
+  const seen = new Set<string>();
+  const once = (page: PageToAudit) => !seen.has(page.url) && !!seen.add(page.url);
+  const pathOf = (url: string) => {
+    try {
+      return new URL(url).pathname;
+    } catch {
+      return url;
+    }
+  };
+  return rows
+    .flatMap((o): PageToAudit[] =>
+      o.template
+        ? o.template.toAudit.map((url) => ({ url, path: pathOf(url), lastAuditAt: null }))
+        : o.url
+          ? [{ url: o.url, path: o.path, lastAuditAt: o.lastAudit?.at ?? null }]
+          : [],
+    )
+    .filter(once);
 }
 
 /** Rows shown at first, and added by Show more. */
@@ -122,7 +149,7 @@ function ExcludedList({
   onRestore,
 }: {
   excluded: ExcludedPage[];
-  onRestore: (urls: string[]) => void;
+  onRestore?: (urls: string[]) => void;
 }) {
   const t = useTranslations('audit.opportunities');
   const [open, setOpen] = useState(false);
@@ -146,18 +173,21 @@ function ExcludedList({
               <span className="min-w-0 flex-1 truncate text-foreground" title={page.url}>
                 {page.path}
               </span>
-              <Button
-                variant="ghost"
-                size="sm"
-                className="h-7 text-xs"
-                onClick={() => onRestore([page.url])}
-              >
-                {t('restore')}
-              </Button>
+              {onRestore && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={() => onRestore([page.url])}
+                >
+                  {t('restore')}
+                </Button>
+              )}
             </li>
           ))}
         </ul>
       )}
+      {open && !onRestore && <p className="mt-2">{t('prefsManagersOnly')}</p>}
     </div>
   );
 }
@@ -165,7 +195,10 @@ function ExcludedList({
 /**
  * The Opportunities inbox (SA-004): the brand's pages worth auditing, each
  * with why, pinned pages first. Pages not being audited can be selected for
- * the bulk bar (`toolbar`): Audit selected, Pin, Exclude.
+ * the bulk bar (`toolbar`): Audit selected, Pin, Exclude; `filters` sit
+ * above it. Without
+ * `onRestore` (a member who can't change them), excluded pages list without
+ * Restore.
  */
 export function OpportunitiesTable({
   opportunities,
@@ -174,6 +207,7 @@ export function OpportunitiesTable({
   selected,
   onSelect,
   onRestore,
+  filters,
   toolbar,
 }: {
   opportunities: AuditOpportunity[];
@@ -181,7 +215,9 @@ export function OpportunitiesTable({
   staleDays: number;
   selected: Set<string>;
   onSelect: (keys: string[], on: boolean) => void;
-  onRestore: (urls: string[]) => void;
+  onRestore?: (urls: string[]) => void;
+  /** Above the list, over the bulk bar: its filters (customer priorities item 11). */
+  filters?: ReactNode;
   toolbar?: ReactNode;
 }) {
   const t = useTranslations('audit.opportunities');
@@ -199,6 +235,7 @@ export function OpportunitiesTable({
           </p>
         ) : (
           <>
+            {filters}
             {toolbar}
             <Table>
               <TableHeader>

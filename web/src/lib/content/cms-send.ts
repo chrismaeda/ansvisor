@@ -2,6 +2,13 @@ import type { DraftPage } from '@/lib/actions/content-drafts';
 import type { AuthorsRead, ContentAuthor } from '@/lib/content/authors';
 import { publishableHtml } from '@/lib/content/clean-html';
 import {
+  articleSchemaInput,
+  schemaAuthor,
+  withArticleSchema,
+  type AddedArticleSchema,
+} from '@/lib/content/page-schema';
+import { qualityPhase } from '@/lib/content/quality';
+import {
   bylineText,
   exportPlaceholders,
   fragment,
@@ -11,6 +18,7 @@ import {
   withByline,
   withoutDangling,
   withoutLeadingH1,
+  withReviewerJsonLd,
   type PageFields,
 } from '@/lib/content/ready-to-publish';
 
@@ -19,8 +27,9 @@ import {
  * (POST /api/content-drafts/send) and sends to the brand's webhook. The HTML
  * is the page ready to paste (CE-057: publishableHtml, placeholders filled),
  * with the brand's byline line and without its H1, which the CMS's own title
- * field carries; slug and meta are filled from the page and what the person
- * changed wins.
+ * field carries, and an article's Article schema with its author unless the
+ * person left it out (00448); slug and meta are filled from the page and what
+ * the person changed wins.
  */
 
 export interface CmsPage {
@@ -31,6 +40,7 @@ export interface CmsPage {
   metaDescription: string;
   html: string;
   author: string | null;
+  reviewer: string | null;
   featuredImage: { src: string; alt: string } | null;
 }
 
@@ -140,6 +150,8 @@ export interface CmsSource {
   html: string;
   sourceUrl: string | null;
   author: ContentAuthor | null;
+  /** Qualified reviewer (CE-049), not the page author. */
+  reviewer: ContentAuthor | null;
   /**
    * The brand's team in the page's language, for the CMS's author field when
    * the page has no author (teamName); empty while the authors aren't read.
@@ -147,6 +159,8 @@ export interface CmsSource {
   teamByline: string;
   /** The byline line the brand puts in the content, or null. */
   byline: string | null;
+  /** The Article schema Ansvisor adds to the page as it goes (00448). */
+  schema: AddedArticleSchema;
 }
 
 /**
@@ -174,6 +188,7 @@ export function cmsSource({
 }): CmsSource {
   const language = page.language ?? brandLanguage;
   const author = authors?.authors.find((a) => a.id === page.authorId) ?? null;
+  const reviewer = authors?.authors.find((a) => a.id === page.reviewerId) ?? null;
   const inContent = authors?.brands.find((b) => b.id === brandId)?.bylineInContent ?? false;
   const confirmed = !author && page.authorConfirmed;
   return {
@@ -182,8 +197,26 @@ export function cmsSource({
     html: publishableHtml(page.bodyHtml),
     sourceUrl: page.sourceUrl,
     author,
+    reviewer,
     teamByline: authors && !confirmed ? teamName(language, brandName) : '',
     byline: inContent && !confirmed ? bylineText(language, author?.name ?? null, brandName) : null,
+    // As Before you publish shows it; Site trust isn't read here, so no pages of theirs.
+    schema: {
+      input: articleSchemaInput({
+        title: page.title,
+        author: schemaAuthor({
+          authorsOn: qualityPhase() >= 1,
+          authorsRead: authors !== null,
+          author,
+          confirmedReal: page.authorConfirmed,
+        }),
+        siteTrust: null,
+        brandName,
+        isNew: page.isNew,
+      }),
+      pageType: page.pageType,
+      leftOut: page.schemaLeftOut,
+    },
   };
 }
 
@@ -203,6 +236,7 @@ export function cmsPage({
   fields,
   page,
   byline,
+  reviewer = null,
 }: {
   draftId: string;
   title: string;
@@ -212,8 +246,10 @@ export function cmsPage({
   page: PageFields;
   /** The byline line the brand puts in the content, or null. */
   byline: string | null;
+  /** The selected qualified reviewer: its WebPage.reviewedBy once the page names them. */
+  reviewer?: ContentAuthor | null;
 }): CmsPage {
-  const withLine = byline ? withByline(html, byline) : html;
+  const withLine = withReviewerJsonLd(title, byline ? withByline(html, byline) : html, reviewer);
   const src = page.featuredImage;
   const image = src?.startsWith('https://') && src.length <= IMAGE_SRC_MAX ? src : null;
   return {
@@ -224,6 +260,7 @@ export function cmsPage({
     metaDescription: fields.metaDescription.trim(),
     html: withoutLeadingH1(withLine),
     author: page.author.trim().slice(0, AUTHOR_MAX) || null,
+    reviewer: page.reviewer.trim().slice(0, AUTHOR_MAX) || null,
     featuredImage: image ? { src: image, alt: altOf(html, image).slice(0, ALT_MAX) } : null,
   };
 }
@@ -265,7 +302,9 @@ export function bulkCmsItems(
   kept: ReadonlyMap<string, Partial<CmsFields>>,
 ): BulkItem[] {
   return sources.map((source) => {
-    const { draftId, title, html } = source;
+    const { draftId, title } = source;
+    // With the Article schema Ansvisor adds, as the editor sends it.
+    const html = withArticleSchema(source.html, source.schema);
     const page = pageFields(source);
     const fields = cmsFields(page, kept.get(draftId) ?? null);
     const problem =
@@ -276,7 +315,17 @@ export function bulkCmsItems(
       draftId,
       title,
       problem,
-      page: problem ? null : cmsPage({ draftId, title, html, fields, page, byline: source.byline }),
+      page: problem
+        ? null
+        : cmsPage({
+            draftId,
+            title,
+            html,
+            fields,
+            page,
+            byline: source.byline,
+            reviewer: source.reviewer,
+          }),
     };
   });
 }

@@ -4,7 +4,10 @@ import {
   promptLocationCount,
   summarizeLocationRows,
   locationLimitMessage,
+  placeNewPrompt,
   planBulkLocationChange,
+  promptsThatFit,
+  waitingPromptColumns,
 } from './prompt-locations';
 import { PLANS } from '@/config/plans';
 
@@ -34,6 +37,15 @@ describe('summarizeLocationRows', () => {
     expect(usage.total).toBe(4);
     expect(usage.byBrand.get('a')).toBe(3);
     expect(usage.byBrand.get('b')).toBe(1);
+  });
+
+  it("counts the brands the caller can't access in the total, but names none of them (00390)", () => {
+    const usage = summarizeLocationRows([
+      { brand_id: 'a', locations: 3 },
+      { brand_id: null, locations: 7 },
+    ]);
+    expect(usage.total).toBe(10);
+    expect([...usage.byBrand]).toEqual([['a', 3]]);
   });
 
   it('returns zero usage for no rows', () => {
@@ -182,6 +194,21 @@ describe('planBulkLocationChange', () => {
     expect(plan.changes[0].regions).toEqual(['DE']);
     expect(plan.delta).toBe(0);
   });
+
+  it('removes from many prompts with a long list of codes in time near its length', () => {
+    // A removal's codes aren't checked against the known locations.
+    const codes = Array.from({ length: 60_000 }, (_, i) => `X${i}`).concat('DE');
+    const prompts = Array.from({ length: 2_000 }, (_, i) => ({
+      id: `p${i}`,
+      regions: ['US', 'DE', 'US-CA', 'TR~ISTANBUL'],
+    }));
+    const started = performance.now();
+    const plan = planBulkLocationChange(prompts, 'remove', codes);
+    expect(performance.now() - started).toBeLessThan(500);
+    expect(plan.changes).toHaveLength(2_000);
+    expect(plan.changes[0].regions).toEqual(['US', 'US-CA', 'TR~ISTANBUL']);
+    expect(plan.delta).toBe(-2_000);
+  });
 });
 
 describe('planBulkLocationChange on paused prompts', () => {
@@ -196,5 +223,47 @@ describe('planBulkLocationChange on paused prompts', () => {
     );
     expect(plan.changes.map((c) => c.promptId)).toEqual(['a', 'b']);
     expect(plan.delta).toBe(1);
+  });
+});
+
+describe('waiting for a spot (Simplify PR 15)', () => {
+  it('tracks every prompt that fits, landing exactly on the cap included', () => {
+    expect(promptsThatFit(starter, 47, [1, 1, 1])).toBe(3);
+    expect(placeNewPrompt(starter, 49, 1)).toBe('track');
+  });
+
+  it('keeps the ones past the limit waiting, in the order given', () => {
+    expect(promptsThatFit(starter, 48, [1, 1, 1, 1])).toBe(2);
+    expect(placeNewPrompt(starter, 50, 1)).toBe('wait');
+  });
+
+  it('counts a prompt once per location it targets', () => {
+    expect(placeNewPrompt(starter, 48, 2)).toBe('track');
+    expect(placeNewPrompt(starter, 48, 3)).toBe('wait');
+    // A three-location prompt that doesn't fit stops the run: the
+    // one-location prompt after it waits too, as import_prompts does.
+    expect(promptsThatFit(starter, 48, [1, 3, 1])).toBe(1);
+  });
+
+  it('counts the whole organization, so a second brand waits when the first used the plan', () => {
+    // 50 locations used on another brand of the same organization.
+    expect(placeNewPrompt(starter, 50, 1)).toBe('wait');
+  });
+
+  it('never makes a prompt wait on an unlimited plan', () => {
+    expect(promptsThatFit(selfHosted, 10_000, [3, 3])).toBe(2);
+    expect(placeNewPrompt(enterprise, 10_000, 5)).toBe('track');
+  });
+
+  it('keeps an org already over its limit waiting, as it refused before', () => {
+    expect(placeNewPrompt(starter, 60, 1)).toBe('wait');
+    expect(promptsThatFit(starter, 60, [])).toBe(0);
+  });
+
+  it('saves a waiting prompt inactive, with the time it started waiting', () => {
+    expect(waitingPromptColumns(new Date('2026-11-11T10:00:00Z'))).toEqual({
+      is_active: false,
+      waiting_since: '2026-11-11T10:00:00.000Z',
+    });
   });
 });

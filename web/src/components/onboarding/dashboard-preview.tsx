@@ -15,6 +15,8 @@ import {
 import { getFaviconUrl } from '@/lib/favicon';
 import { cn } from '@/lib/utils';
 import { isDashboardHomeItem } from '@/config/home';
+import { useChatAgentic } from '@/components/providers/chat-agentic-provider';
+import { useAdsEnabled } from '@/components/providers/ads-provider';
 
 export interface DashboardPreviewCompetitor {
   name: string;
@@ -40,6 +42,9 @@ const MAX_ROWS = 6;
  * Purely presentational: it renders the real navigation from dashboardNav but
  * reads no plan, brand or tracking state, because none exists yet. Metrics are
  * placeholder bars, never numbers — nothing has been measured at this point.
+ * An item only the new Chat has is in it only with the new Chat on
+ * (CHAT_AGENTIC), and Ads only with Ads on (ADS_ENABLED), as in the menu
+ * the wizard leads to.
  */
 export function DashboardPreview({
   brandName,
@@ -49,6 +54,9 @@ export function DashboardPreview({
   competitors,
 }: DashboardPreviewProps) {
   const t = useTranslations('nav');
+  const tSetup = useTranslations('onboarding.setup');
+  const chatAgentic = useChatAgentic();
+  const ads = useAdsEnabled();
   const { resolvedTheme } = useTheme();
   const [mounted, setMounted] = useState(false);
   useEffect(() => {
@@ -93,7 +101,14 @@ export function DashboardPreview({
               <div className="space-y-0.5">
                 {group.items
                   .filter((item) =>
-                    shouldShowDashboardNavItem(item, { shoppingModeEnabled: false }),
+                    shouldShowDashboardNavItem(
+                      item,
+                      { ecommerce: false },
+                      new Set(),
+                      chatAgentic,
+                      undefined,
+                      ads,
+                    ),
                   )
                   .map((item) => (
                     <div
@@ -158,7 +173,7 @@ export function DashboardPreview({
             ))}
           </PreviewList>
 
-          <PreviewList title="Competitors" empty={!name}>
+          <PreviewList title={tSetup('competitorsTitle')} empty={!name}>
             {name && <Row label={name} icon={<BrandMark name={name} domain={domain} />} strong />}
             {shownCompetitors.map((c) => (
               <Row

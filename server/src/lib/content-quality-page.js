@@ -4,6 +4,7 @@ import * as cheerio from 'cheerio';
 import { z } from 'zod';
 import supabaseAdmin from '../config/supabase.js';
 import { resolveModel } from './ai-provider.js';
+import { CONTENT_READ_MAX_TOKENS } from './content-brief.js';
 import { SITE_TYPE_MEANINGS, SITE_TYPE_NAMES, pageTypeFormat } from './content-page-types.js';
 import {
   PAGE_READS_PER_DAY,
@@ -14,6 +15,7 @@ import { fold, ownText, paragraphHash, plain } from './content-quality-claims.js
 import { SOURCE_READS_PER_DAY, sourceClassModelId } from './content-source-class.js';
 import { logger } from './logger.js';
 import { PlanLimitError, reserveAiBudget } from './plan-guard.js';
+import { objectOptions } from './structured-output.js';
 
 /**
  * A page's visual proof spots and proof asks (Content Editor Quality spec
@@ -363,9 +365,12 @@ function proofKind(said, claim, siteType) {
   return /\p{N}/u.test(claim) ? 'number' : null;
 }
 
-/** Whether a page advises consumers on health, finance or law: B2C only. */
+/** The kinds of site that speak to consumers: a B2C service, a mobile app. */
+const CONSUMER_SITES = ['b2c', 'app'];
+
+/** Whether a page advises consumers on health, finance or law: B2C and mobile apps only. */
 const regulatedFor = (said, siteType) =>
-  siteType === 'b2c' && REGULATED.includes(word(said)) ? word(said) : null;
+  CONSUMER_SITES.includes(siteType) && REGULATED.includes(word(said)) ? word(said) : null;
 
 /** A text's words as the page has them, found folded: its own slice, or null. */
 function ownSlice(block, said, min, max) {
@@ -387,7 +392,7 @@ function ownSlice(block, said, min, max) {
  *     (proofKind), once, not inside another of its block's, MAX_PROOFS. A
  *     block that links out keeps its proofs: the editor checks them off
  *     while it does;
- *   * regulated only on a B2C page;
+ *   * regulated only on a B2C or mobile app page;
  *   * checks (CE-050), each found one in its block's own words: answer
  *     first only on the first paragraph under the H1 (past a byline or a
  *     date); recommends only on a page that chooses among options (not
@@ -578,7 +583,10 @@ const reading = new Map();
  * the day are made (PAGE_READS_PER_DAY, or its Quality calls left for
  * them), `paused` when the workspace's AI budget is spent.
  *
- * @param {{ orgId: string, draftId: string, html: string, siteType: string, pageType?: string|null, brandName?: string, facts?: string[], now?: number }} input
+ * `reserve`, when given, holds the model call in place of the workspace's
+ * Quality budget (chat-budget agentRunReserve: an agent run's own steps).
+ *
+ * @param {{ orgId: string, draftId: string, html: string, siteType: string, pageType?: string|null, brandName?: string, facts?: string[], now?: number, reserve?: Function|null }} input
  */
 export async function readPage({
   orgId,
@@ -589,6 +597,7 @@ export async function readPage({
   brandName = '',
   facts = [],
   now = Date.now(),
+  reserve = null,
 }) {
   const outline = pageOutline(html);
   const empty = {
@@ -650,6 +659,7 @@ export async function readPage({
         facts,
         day,
         now,
+        reserve,
       }).finally(() => reading.delete(draftId));
       under = { hash, row };
       reading.set(draftId, under);
@@ -682,20 +692,23 @@ async function readOnce({
   facts,
   day,
   now,
+  reserve = null,
 }) {
   const modelId = sourceClassModelId();
-  const budget = await reserveAiBudget(orgId, {
-    feature: 'quality',
-    modelId,
-    draftId,
-    holdUsd: PAGE_HOLD_USD,
-  });
+  const budget = reserve
+    ? await reserve({ modelId, holdUsd: PAGE_HOLD_USD })
+    : await reserveAiBudget(orgId, {
+        feature: 'quality',
+        modelId,
+        draftId,
+        holdUsd: PAGE_HOLD_USD,
+      });
   let read = { spots: [], proofs: [], regulated: null, checks: null };
   let missed = false;
   try {
     const generated = await generateObject({
       model: resolveModel(modelId),
-      schema: answerSchema,
+      ...objectOptions(modelId, answerSchema, { maxOutputTokens: CONTENT_READ_MAX_TOKENS }),
       system: SYSTEM_PROMPT,
       prompt: buildPagePrompt({ outline, siteType, pageType, brandName, facts }),
       abortSignal: AbortSignal.timeout(CALL_TIMEOUT_MS),

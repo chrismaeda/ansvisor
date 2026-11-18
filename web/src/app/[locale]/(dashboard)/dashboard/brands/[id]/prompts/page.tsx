@@ -41,6 +41,13 @@ import { MODEL_GROUPS, ALL_MODELS, SCRAPER_GROUPS, ALL_SCRAPERS } from '@/config
 import { usePlanContext } from '@/components/providers/plan-provider';
 import { useUserRole } from '@/hooks/use-user-role';
 import { useUpgradeGate } from '@/components/providers/upgrade-gate';
+import {
+  AddTopicLink,
+  TopicFirstNotice,
+  useTopicFirstDialog,
+} from '@/components/prompts/topic-first';
+import { useWaitingForSpotToast } from '@/components/prompts/waiting-for-spot';
+import { isNoTopics } from '@/lib/topics-required';
 import { PLANS } from '@/config/plans';
 import { saveTrackingJob } from '@/lib/tracking-job-store';
 import { useRouter } from '@/i18n/navigation';
@@ -97,6 +104,11 @@ export default function PromptsPage() {
   // the upgrade dialog instead.
   const { guard } = useUpgradeGate();
   const tActions = useTranslations('readOnly.actions');
+  // Prompts go under topics: with none, adding a prompt asks for a topic first,
+  // on this brand's own Topics page (the active brand may be another).
+  const addTopicHref = `/dashboard/brands/${brandId}/topics#add-topic`;
+  const topicFirst = useTopicFirstDialog({ href: addTopicHref });
+  const showWaiting = useWaitingForSpotToast();
   const allowedScraperIds = useMemo(() => {
     const allowed = PLANS[planId].limits.allowedScrapers;
     const ids = allowed ? [...allowed] : ALL_SCRAPERS.map((s) => s.id);
@@ -250,6 +262,8 @@ export default function PromptsPage() {
       const defaultModels = allowedModelIds;
 
       let targetSetId = promptSets[0]?.id;
+      // Saved waiting for a spot (the plan's locations were full).
+      let waiting = 0;
 
       if (!targetSetId) {
         const result = await savePromptSet({
@@ -267,6 +281,7 @@ export default function PromptsPage() {
           return;
         }
         targetSetId = result.promptSet.id;
+        waiting = result.waiting ?? 0;
       } else {
         const results = await Promise.all(
           activePrompts.map((p) =>
@@ -281,16 +296,20 @@ export default function PromptsPage() {
         );
         const failed = results.find((r) => 'error' in r);
         if (failed && 'error' in failed) {
-          toast.error(failed.error);
+          if (isNoTopics(failed)) topicFirst.show();
+          else toast.error(failed.error);
           // Some prompts may have saved before the failure — refresh so the
           // list reflects what actually landed.
           await loadData();
           return;
         }
+        waiting = results.filter((r) => 'waiting' in r && r.waiting).length;
       }
 
       setSuggestions([]);
-      toast.success(`Saved ${activePrompts.length} prompts`);
+      if (!showWaiting('brand_page', activePrompts.length - waiting, waiting)) {
+        toast.success(`Saved ${activePrompts.length} prompts`);
+      }
       await loadData();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to save prompts');
@@ -301,6 +320,10 @@ export default function PromptsPage() {
 
   const handleAddManualPrompt = async () => {
     if (!manualText.trim()) return;
+    if (topics.length === 0) {
+      topicFirst.show();
+      return;
+    }
 
     setIsAddingManual(true);
     try {
@@ -313,15 +336,18 @@ export default function PromptsPage() {
         models: manualModels,
       };
 
+      let waiting = false;
       if (existingSet) {
         const result = await addPromptToSet({
           promptSetId: existingSet.id,
           ...promptData,
         });
         if ('error' in result) {
-          toast.error(result.error);
+          if (isNoTopics(result)) topicFirst.show();
+          else toast.error(result.error);
           return;
         }
+        waiting = !!result.waiting;
       } else {
         const result = await savePromptSet({
           brandId,
@@ -332,12 +358,13 @@ export default function PromptsPage() {
           toast.error(result.error);
           return;
         }
+        waiting = !!result.waiting;
       }
 
       setManualText('');
       setManualModels(allowedModelIds);
       setManualScrapers(allowedScraperIds);
-      toast.success('Prompt added');
+      if (!showWaiting('brand_page', 0, waiting ? 1 : 0)) toast.success('Prompt added');
       await loadData();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to add prompt');
@@ -456,15 +483,6 @@ export default function PromptsPage() {
         bulkLocations,
       ),
     [allPrompts, bulkPromptIds, bulkAction, bulkLocations],
-  );
-
-  // Every engine the selection spans: the state-targeting caveat applies if
-  // any selected prompt runs a country-only engine.
-  const bulkSelectedPlatforms = useMemo(
-    () => [
-      ...new Set(allPrompts.filter((p) => bulkPromptIds.has(p.id)).flatMap((p) => p.platforms)),
-    ],
-    [allPrompts, bulkPromptIds],
   );
 
   const openBulkDialog = useCallback(() => {
@@ -682,9 +700,10 @@ export default function PromptsPage() {
                         </SelectContent>
                       </Select>
                     ) : (
-                      <p className="text-xs text-muted-foreground py-2">
-                        No topics defined yet. Add topics in brand settings.
-                      </p>
+                      <div className="space-y-2">
+                        <TopicFirstNotice />
+                        <AddTopicLink href={addTopicHref} />
+                      </div>
                     )}
                   </div>
 
@@ -873,9 +892,10 @@ export default function PromptsPage() {
                     )}
                   </div>
                 ) : (
-                  <p className="text-xs text-muted-foreground py-2">
-                    No topics defined yet. Add topics in brand settings first.
-                  </p>
+                  <div className="space-y-2">
+                    <TopicFirstNotice />
+                    <AddTopicLink href={addTopicHref} />
+                  </div>
                 )}
                 <Button
                   onClick={guard(handleGenerate, { action: tActions('generatePrompts') })}
@@ -968,27 +988,33 @@ export default function PromptsPage() {
           <div className="flex items-center justify-between">
             <h2 className="text-lg font-semibold">All Prompts ({allPrompts.length})</h2>
             <div className="flex items-center gap-2">
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={guard(openBulkDialog, { action: tActions('changeLocations') })}
-              >
-                <Globe className="mr-2 h-3.5 w-3.5" />
-                Locations
-              </Button>
-              <Button
-                size="sm"
-                variant={unanalyzedPrompts.length > 0 ? 'default' : 'outline'}
-                onClick={guard(openAnalyzeDialog, { action: tActions('analyzePrompts') })}
-              >
-                <Search className="mr-2 h-3.5 w-3.5" />
-                Analyze Prompts
-                {unanalyzedPrompts.length > 0 && (
-                  <Badge variant="secondary" className="ml-2 text-[10px]">
-                    {unanalyzedPrompts.length} new
-                  </Badge>
-                )}
-              </Button>
+              {/* Changing locations and tracking the prompts now are for admins and
+                  managers, as the database and the server allow them. */}
+              {canManage && (
+                <>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={guard(openBulkDialog, { action: tActions('changeLocations') })}
+                  >
+                    <Globe className="mr-2 h-3.5 w-3.5" />
+                    Locations
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant={unanalyzedPrompts.length > 0 ? 'default' : 'outline'}
+                    onClick={guard(openAnalyzeDialog, { action: tActions('analyzePrompts') })}
+                  >
+                    <Search className="mr-2 h-3.5 w-3.5" />
+                    Analyze Prompts
+                    {unanalyzedPrompts.length > 0 && (
+                      <Badge variant="secondary" className="ml-2 text-[10px]">
+                        {unanalyzedPrompts.length} new
+                      </Badge>
+                    )}
+                  </Button>
+                </>
+              )}
             </div>
           </div>
           <div className="space-y-2">
@@ -1196,7 +1222,6 @@ export default function PromptsPage() {
               allowEmpty
               label={bulkAction === 'add' ? 'Locations to add' : 'Locations to remove'}
               countNoun="selected"
-              platforms={bulkSelectedPlatforms}
             />
 
             <div>
@@ -1303,6 +1328,7 @@ export default function PromptsPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      {topicFirst.dialog}
     </div>
   );
 }

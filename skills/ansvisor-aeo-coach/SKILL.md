@@ -146,24 +146,54 @@ timestamps (`date_from` / `date_to`).
 - **`list_citations`** — which domains and URLs AI cites alongside the
   brand, classified by source type (news, review, owned, social, forum,
   competitor, you). Filter with `source_filter`: `all`, `owned`,
-  `competitor` or `external`.
+  `competitor` or `external`. `domains` or `urls` read the ones the
+  user names, in every source type, with the prompts citing each.
 - **`get_ai_traffic`** — visits referred by AI engines: per platform,
-  top landing pages, countries.
+  top landing pages, countries. Read `tracking` first: `not_detected`
+  (the tracking snippet isn't seen on the brand's site, so 0 visits
+  means nothing is measured yet: say so and point to installing it on
+  the AI Traffic page), `installed_quiet` (installed, no AI visit in
+  the last 7 days) or `active`.
 - **`list_reports`** — the brand's saved reports, newest first: `id`,
   `title`, `template`, `date_from` / `date_to` and `created_at`.
-  `limit` (default 50, max 100).
+  `limit` (default 50, max 100). `search` (title words) or `ids` read
+  the ones the user names.
 - **`get_report`** — one saved report in full, with its stored
   `payload`. It doesn't regenerate: the numbers are its own window's,
   as they were when it was made, so don't quote them as today's.
 
+**Customers and revenue from AI**
+
+Which pages and assistants bring customers, sign-ups, orders and
+revenue. Read `get_tracking_setup` first and lead with what is missing.
+When a read says `measured: false`, say "Not measured" with its
+`next_step` and `where` (a link), never 0. Give each currency on its
+own, never added to another. Lists page by `limit` / `offset`, with
+`total`, `next_offset` and `note`.
+
+- **`get_tracking_setup`** — what the brand set up to measure
+  customers from AI visits, each item with its state and, when
+  missing, its step.
+- **`get_ai_conversions`** — conversions from AI visits by type,
+  revenue per currency, by assistant, by label and by landing page.
+- **`get_ai_converting_pages`** — Google Analytics' top converting
+  pages from AI, and which topics' answers bring buyers.
+- **`get_ai_pipeline`** — HubSpot contacts, deals and revenue from AI
+  visits (Growth and above; `plan_limit` otherwise).
+- **`list_ai_visits`** — the AI visit log, newest first; `assistant`
+  and `search` narrow it.
+- **`get_prompt_conversions`** — prompts whose answers cite pages that
+  converted: an association, always with its `label`. Never say a
+  prompt brought a sale.
+
 **Mentions & sentiment**
 
-These take the Mentions page's filters: `date_from` / `date_to` (the
+These take the filters of Visibility's Mentions tab: `date_from` / `date_to` (the
 last 30 days when left out), `platform` (e.g. `gemini-web`), `region`,
 `topic_id` and `search` over the prompts' text. They read the stored
 answers; no LLM is called.
 
-- **`get_mentions_summary`** — the Overview: `current` and `previous`
+- **`get_mentions_summary`** — the Mentions tab's Summary view: `current` and `previous`
   times named, mentions, mention rate, prompts with mentions, average
   position and `sentiment` (counts, shares, `net`, `lowSample`);
   `changes` with their `basis`; the
@@ -192,11 +222,13 @@ answers; no LLM is called.
   coverage audits.
 - **`list_prompts`** — tracked prompts with text, topic, platforms,
   models, regions and active flag. Filters: `topic_id`, `is_active`,
-  `limit` (default 100, max 500).
+  `limit` (default 100, max 500). `search` (words of the prompt) or
+  `ids` read the ones the user names, active and paused.
 - **`get_prompt_performance`** — per-prompt visibility, mentions,
   citations and competitor score for a window. Sort with `sort_by`
   (`visibility`, `mentions`, `citations`, `appearances`) and `order`.
-  Use for "best / worst prompt this week?".
+  Use for "best / worst prompt this week?". `prompt_ids` reads the
+  prompts the user names, whatever their topic.
 - **`get_prompt_volumes`** — per-prompt search demand: Google volumes,
   `est_ai_volume` with its range (`est_ai_volume_low` / `_high`) and
   `volume_confidence`, and competition. Use to prioritise, quoting the
@@ -209,8 +241,10 @@ answers; no LLM is called.
   of the account: an active prompt uses one slot per location it
   targets, a paused one uses none, and resuming a paused prompt needs
   free slots like adding one. Slots left = `locationLimit −
-  locationsUsed` (never below 0). Use for "how many prompts can we
-  still add?".
+  locationsUsed` (never below 0). When `plan.ended` is true the
+  workspace's plan has ended: `plan` is the one it was on, `plan.cta`
+  is `choose_plan`, and **0 slots are left** whatever the limit says,
+  until a plan is chosen. Use for "how many prompts can we still add?".
 - **`list_topic_suggestions`** — pending AI topic suggestions.
   **`accept_topic_suggestion`** / **`dismiss_topic_suggestion`** act on
   one *(writes)*.
@@ -225,14 +259,18 @@ answers; no LLM is called.
   on the platforms and models of the brand's latest active prompt
   (ChatGPT when there is none) that the plan allows, in the brand's own
   location. It uses one prompt location: with none left it fails with
-  the plan-limit message *(write)*.
+  the plan-limit message *(write)*. Prompts are grouped under topics, so
+  a brand with **no topic yet** is refused: accept a topic first
+  (`accept_topic_suggestion`), or the user adds one in Ansvisor under
+  **Prompts → Topics**, then accept the prompt suggestion again.
 - **`dismiss_prompt_suggestion`** — hides one from future suggestion
   lists *(write)*.
 
 **Content & pages**
 
 - **`list_content_opportunities`** — content gaps ranked by opportunity
-  score. Filters: `status`, `impact`, `type`.
+  score. Filters: `status`, `impact`, `type`. `search` (title words) or
+  `ids` read the ones the user names, archived too.
 - **`get_content_opportunity`** — one gap in full, including an
   existing brief. Its `source_data.estAiVolume` is a kept estimate.
 - **`generate_content_brief`** — writes a fresh AI brief, overwriting
@@ -243,7 +281,12 @@ answers; no LLM is called.
   **`get_site_audit`** — page audit allowance, past audits, one audit's
   scores and fixes.
 - **`run_site_audit`** — audit a URL. Uses a monthly credit and runs
-  ~30s; poll `get_site_audit` *(write)*.
+  ~30s; poll `get_site_audit` *(write)*. A page with an audit already
+  running returns that audit (`alreadyRunning: true`) and uses no
+  credit. A page audited in the last 10 minutes returns status
+  `recently_audited` with that audit's id and starts nothing: read it
+  with `get_site_audit`, or ask the user and pass `force: true` to
+  audit it again (uses a credit).
 
 **Content Editor**
 
@@ -256,7 +299,8 @@ accepts it.
   `published`), `method` (`create` a new page, or `optimize` the live
   page at `source_url`), `page_type`, `author` (`user` or `agent`),
   `open_suggestions` (how many wait for review) and `editor_path`.
-  Filter: `status`.
+  Filter: `status`. `search` (title words) or `ids` read the ones the
+  user names, archived too.
 - **`get_content_draft`** — one draft: `body_html`, the page as
   numbered `passages` (`locked: true` = AI answers quote it today),
   `published_url` and `published_at` (where and since when the page is
@@ -346,9 +390,16 @@ accepts it.
   - `evidence`: when it was detected, and app paths to the answers
     behind it;
   - `used_by_actions`: the actions built on it.
+
+  `codes` (`S-07`) or `ids` read the signals the user names, in every
+  status and date.
 - **`list_action_history`** — closed actions with their measured
-  `outcome` (improved, no_meaningful_change, declined, not_measurable,
-  pending_measurement) and before/after `results`.
+  `outcome` (improved, mixed, no_meaningful_change, declined,
+  not_measurable, pending_measurement) and before/after `results`. An
+  action is read 7, 14 and 30 days after it closed: `reading_day` is the
+  day of the latest reading (7, 14 or 30; null before the first), and
+  `final` is true once day 30 is read. Until then the outcome is **a
+  reading so far**, not the result.
 - **`update_task_status`** — record that a task is `in_progress`,
   `completed`, `skipped` (with `skip_reason`) or `failed` *(write)*.
 - **`create_improve_action`** — send a prompt's Improve suggestions to
@@ -364,7 +415,8 @@ Tools marked *(write)* change the user's account, spend a credit or run
 an LLM. Call one **only** when the user asked for that specific change
 (this suggestion, this task, this URL) — never while exploring, never
 "to be helpful". Say what you are about to do in one line first. The
-change is logged under the API key's user.
+change is logged under the person the API key or the app's sign-in acts
+as.
 
 If a tool fails with `"code": "subscription_inactive"`, the workspace's
 plan has ended (trial over, plan cancelled or payment failed) and it is
@@ -372,6 +424,14 @@ read-only: `list_` and `get_` tools still work, every other tool is
 refused. Tell the user their plan has ended and that an admin can choose
 a plan (or update the payment method) in **Settings → Billing**. Don't
 retry, and don't try another write tool instead.
+
+If a tool fails with `"code": "plan_required"` (with `"required_plan":
+"growth"`), the workspace is on Starter or in its free trial: on those
+plans MCP reads, and changes, runs and anything that uses credits need
+the Growth plan or above. Tell the user that this needs Growth and that
+an admin can upgrade in **Settings → Billing**; keep answering with the
+`list_` and `get_` tools. Don't retry, and don't try another write tool
+instead.
 
 ## Core workflows
 
@@ -511,8 +571,12 @@ or any "do I have gaps" question:
    no limit (self-hosted, or an Enterprise account whose limit isn't
    set yet): skip the check. Otherwise, if none are left (or fewer than
    you'd suggest), say so: pausing low-value prompts frees their slots,
-   and `plan.cta` names the next step (`upgrade_growth`, `upgrade` or
-   `contact`).
+   and `plan.cta` names the next step (`upgrade_growth`, `upgrade`,
+   `contact`, or `choose_plan` when `plan.ended` is true: the plan has
+   ended, and nothing can be added until an admin chooses a plan in
+   **Settings → Billing**).
+7. A prompt always sits under a topic: on a brand with no topics,
+   suggest adding a topic before any prompt.
 
 ### 6. Prompt deep-dive
 
@@ -588,9 +652,11 @@ work:
 2. For each closed action, report the `outcome` and the before/after
    from `results` in one line. `pending_measurement` means the
    after-window is still open — say when to check back, don't judge
-   early.
+   early. Until `final` is true, say it is a reading so far ("day 14 of
+   30: improved so far") and that the final reading comes on day 30.
 3. Summarise: how many improved, how many didn't move, and what the
-   improved ones had in common.
+   improved ones had in common. Count readings so far apart from final
+   results.
 
 ### 10. Mentions & sentiment ("how is AI talking about us?")
 
@@ -646,7 +712,9 @@ When the user asks how AI describes the brand, why sentiment moved
 4. Act only on the suggestions the user names, after they confirm:
    `accept_prompt_suggestion` starts tracking one,
    `dismiss_prompt_suggestion` hides it *(writes)*. If an accept fails
-   with the plan-limit message, relay it as it is.
+   with the plan-limit message, relay it as it is. If it fails because
+   the brand has no topic yet, offer to accept a topic suggestion first
+   (`list_topic_suggestions`), then accept the prompt again.
 5. Report the prompts added (`prompt_text`).
 
 ### 12. Content Editor drafts ("what's waiting in the editor?")
@@ -706,8 +774,15 @@ When the user asks how AI describes the brand, why sentiment moved
   give its range and say so.
 - **Don't claim a citation count is good or bad in isolation.** It
   only matters relative to mentions (see scoring reference).
+- **Don't read 0 AI visits as no AI traffic.** When `get_ai_traffic`
+  says `tracking: "not_detected"`, nothing is measured yet: say the
+  tracking snippet isn't installed instead.
 - **Don't call a write tool to "check" something.** Read tools exist
   for every write; use them.
+- **Don't call something missing because a list didn't show it.** When
+  the user names a signal code, a prompt, a domain or page, an
+  opportunity, a draft or a report, read it by that first; one in
+  `not_found` gets a plain "not found", never the closest one.
 - **Don't recommend "improve SEO" — this is not SEO.** AEO is about
   being cited inside AI-generated answers. Recommendations should be
   about content structure (definition-first paragraphs, FAQ blocks,

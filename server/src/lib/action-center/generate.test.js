@@ -7,6 +7,9 @@ vi.mock('../../config/supabase.js', () => ({ default: { from: (...a) => from(...
 vi.mock('../logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
+// A store's topic with a live category page (AC plan P-7): none unless a test says.
+const categoryPageFor = vi.hoisted(() => vi.fn());
+vi.mock('./category-play.js', () => ({ categoryPageFor: (...a) => categoryPageFor(...a) }));
 
 import { generateActionsForBrand } from './generate.js';
 import { ENGINE_THRESHOLDS } from '../../config/action-engine.js';
@@ -34,6 +37,7 @@ function mockDb({
   candidates = [],
   promptVolumes = [],
   failActionUpdates = false,
+  brand = null,
 } = {}) {
   // `log` keeps the order of the writes across tables.
   const writes = { inserted: [], updated: [], upserted: [], log: [] };
@@ -57,6 +61,9 @@ function mockDb({
       limit: () => builder,
       range: () => builder,
       single: () => Promise.resolve(result()),
+      // The brand's Analytics sign-in (resolveBrandSources, 00470): none.
+      // The brand's kind of site, for the play: as a test gives it.
+      maybeSingle: () => Promise.resolve({ data: table === 'brands' ? brand : null, error: null }),
       insert: (payload) => {
         state.op = 'insert';
         state.payload = payload;
@@ -119,6 +126,7 @@ const daysAgo = (n) => new Date(NOW.getTime() - n * 86_400_000).toISOString();
 
 beforeEach(() => {
   from.mockReset();
+  categoryPageFor.mockReset().mockResolvedValue(null);
   vi.useFakeTimers();
   vi.setSystemTime(NOW);
 });
@@ -459,6 +467,22 @@ describe('the daily cap', () => {
     expect(writes.inserted.filter((w) => w.table === 'actions')).toHaveLength(1);
   });
 
+  /** A finding sent from Chat is a person's send, as Improve's or Content's: it counts. */
+  it('counts actions sent from Chat today, as any a person sent', async () => {
+    const fromChat = Array.from({ length: maxNewActionsPerDay - 1 }, (_, i) => ({
+      id: `chat-${i}`,
+      dedup_key: `chat_finding:fix:${i}`,
+      kind: 'chat_finding',
+      status: 'new',
+      created_at: NOW.toISOString(),
+    }));
+    mockDb({ signals: oneOfEachKind(), activeActions: fromChat });
+
+    const summary = await generateActionsForBrand(BRAND, { now: NOW, sources: ALL_SOURCES });
+
+    expect(summary.created).toBe(1);
+  });
+
   it('ignores actions raised on earlier days', async () => {
     const yesterday = Array.from({ length: maxNewActionsPerDay }, (_, i) => ({
       id: `old-${i}`,
@@ -574,6 +598,253 @@ describe('the task plan the action is created with', () => {
       expect.arrayContaining(['create_content_brief', 'create_content_draft']),
     );
     expect(taskRows(writes)).not.toContain('optimize_content');
+  });
+
+  it('opens the action with the prompts its work is about (AC plan P-3)', async () => {
+    const prompt = '11111111-1111-4111-8111-111111111111';
+    const writes = mockDb({
+      signals: [
+        signal({
+          kind: 'prompt_visibility_gap',
+          impact: 'medium',
+          payload: { targets: [{ id: prompt, label: 'a prompt', mapped: false }] },
+        }),
+      ],
+    });
+
+    await generateActionsForBrand(BRAND, { now: NOW, sources: ALL_SOURCES });
+
+    const action = writes.inserted.find((w) => w.table === 'actions').rows[0];
+    expect(action.payload.promptIds).toEqual([prompt]);
+    // No page is mapped to it in this brand: none is named.
+    expect(action.payload).not.toHaveProperty('pages');
+  });
+
+  it('opens G15 with the play its prompts pick (AC plan P-2)', async () => {
+    const a = '11111111-1111-4111-8111-111111111111';
+    const b = '22222222-2222-4222-8222-222222222222';
+    const writes = mockDb({
+      signals: [
+        signal({
+          kind: 'uncovered_demand',
+          impact: 'high',
+          payload: {
+            targets: [
+              { id: a, label: 'crm vs hubspot' },
+              { id: b, label: 'how to' },
+            ],
+          },
+        }),
+      ],
+      promptVolumes: [
+        { prompt_id: a, est_ai_volume: 900, intent: 'vs-review', fetched_at: NOW.toISOString() },
+        { prompt_id: b, est_ai_volume: 100, intent: 'how-to', fetched_at: NOW.toISOString() },
+      ],
+    });
+
+    await generateActionsForBrand(BRAND, {
+      now: NOW,
+      sources: new Set([...ALL_SOURCES, 'volumes']),
+    });
+
+    const action = writes.inserted.find((w) => w.table === 'actions').rows[0];
+    expect(action.kind).toBe('create_content_for_demand');
+    // No site type set and nothing pointing elsewhere: read as B2B.
+    expect(action.payload.play).toMatchObject({
+      id: 'comparison',
+      assetType: 'comparison',
+      siteType: 'b2b',
+      reasons: [{ kind: 'intent', prompts: 1, of: 2, share: 0.9 }],
+      supporting: [],
+    });
+  });
+
+  describe('a store’s topic action (G16, AC plan P-7)', () => {
+    const TOPIC = '33333333-3333-4333-8333-333333333333';
+    const topicSignal = () =>
+      signal({
+        kind: 'topic_uncovered',
+        impact: 'medium',
+        payload: { targets: [{ id: TOPIC, label: 'Cold brew' }], topicName: 'Cold brew' },
+      });
+
+    it('optimizes the topic’s live category page, its best sellers locked in', async () => {
+      categoryPageFor.mockResolvedValue({
+        category: {
+          id: 'c1',
+          name: 'Coffee > Cold Brew',
+          url: 'https://shop.example/collections/cold-brew',
+          inStock: 12,
+        },
+        products: ['p1', 'p2'],
+      });
+      const writes = mockDb({ signals: [topicSignal()], brand: { site_type: 'ecommerce' } });
+
+      await generateActionsForBrand(BRAND, {
+        now: NOW,
+        sources: new Set([...ALL_SOURCES, 'topics']),
+      });
+
+      expect(categoryPageFor).toHaveBeenCalledWith(BRAND, [TOPIC]);
+      const action = writes.inserted.find((w) => w.table === 'actions').rows[0];
+      expect(action.kind).toBe('create_content_for_topics');
+      expect(action.definition_version).toBe(2);
+      expect(action.payload).toMatchObject({
+        contentExists: true,
+        pages: ['https://shop.example/collections/cold-brew'],
+        products: ['p1', 'p2'],
+        play: {
+          id: 'category_page',
+          assetType: 'category_page',
+          siteType: 'ecommerce',
+          reasons: [
+            {
+              kind: 'category',
+              category: 'Coffee > Cold Brew',
+              page: 'https://shop.example/collections/cold-brew',
+              inStock: 12,
+            },
+          ],
+        },
+      });
+      expect(taskRows(writes)).toContain('optimize_content');
+      expect(taskRows(writes)).not.toContain('create_content_brief');
+    });
+
+    describe('a buying guide next to the live category page', () => {
+      const PAGE = 'https://shop.example/collections/cold-brew';
+      const found = (guideMissing) => ({
+        category: { id: 'c1', name: 'Coffee > Cold Brew', url: PAGE, inStock: 12 },
+        products: ['p1', 'p2'],
+        guideMissing,
+      });
+      const run = (over = {}) => {
+        const writes = mockDb({
+          signals: [topicSignal()],
+          brand: { site_type: 'ecommerce' },
+          ...over,
+        });
+        return generateActionsForBrand(BRAND, {
+          now: NOW,
+          sources: new Set([...ALL_SOURCES, 'topics']),
+        }).then((summary) => ({ summary, writes }));
+      };
+      const opened = (writes) => writes.inserted.find((w) => w.table === 'actions')?.rows[0];
+
+      it('is suggested when the topic has no guide yet, linking the page', async () => {
+        categoryPageFor.mockResolvedValue(found(true));
+        const { writes } = await run();
+        const action = opened(writes);
+        // The page is still optimized: its play, pages and plan as before.
+        expect(action.payload).toMatchObject({
+          contentExists: true,
+          pages: [PAGE],
+          products: ['p1', 'p2'],
+          play: { id: 'category_page', reasons: [{ kind: 'category', page: PAGE }] },
+        });
+        expect(action.payload.play.supporting).toEqual([
+          {
+            id: 'buying_guide',
+            assetType: 'buying_guide',
+            kind: 'category',
+            category: 'Coffee > Cold Brew',
+            linkTo: PAGE,
+          },
+        ]);
+        expect(taskRows(writes)).toContain('optimize_content');
+      });
+
+      it('is not when the topic has a guide, written or published', async () => {
+        categoryPageFor.mockResolvedValue(found(false));
+        const { writes } = await run();
+        expect(opened(writes).payload.play).toMatchObject({ id: 'category_page', supporting: [] });
+      });
+
+      it('comes only with an action the night opens: never beside an active one, nor while resting', async () => {
+        categoryPageFor.mockResolvedValue(found(true));
+        // The topic action is open already: its scope stays, nothing is suggested again.
+        const active = await run({
+          activeActions: [
+            {
+              id: 'a1',
+              dedup_key: 'create_content_for_topics',
+              status: 'in_progress',
+              kind: 'create_content_for_topics',
+              payload: {},
+            },
+          ],
+        });
+        expect(active.summary.created).toBe(0);
+        expect(opened(active.writes)).toBeUndefined();
+        // Its last cycle closed yesterday: it rests.
+        const resting = await run({
+          closedActions: [
+            {
+              dedup_key: 'create_content_for_topics',
+              completed_at: daysAgo(1),
+              updated_at: daysAgo(1),
+            },
+          ],
+        });
+        expect(resting.summary.resting).toBe(1);
+        expect(opened(resting.writes)).toBeUndefined();
+        expect(categoryPageFor).not.toHaveBeenCalled();
+      });
+    });
+
+    it('writes a buying guide when the topic’s category has products but no page (EC-1)', async () => {
+      categoryPageFor.mockResolvedValue({
+        category: { id: 'c2', name: 'Gifts', url: null, inStock: 4 },
+        products: ['p3'],
+      });
+      const writes = mockDb({ signals: [topicSignal()], brand: { site_type: 'ecommerce' } });
+      await generateActionsForBrand(BRAND, {
+        now: NOW,
+        sources: new Set([...ALL_SOURCES, 'topics']),
+      });
+      const action = writes.inserted.find((w) => w.table === 'actions').rows[0];
+      expect(action.payload).toMatchObject({
+        contentExists: false,
+        products: ['p3'],
+        play: { id: 'buying_guide', assetType: 'buying_guide' },
+      });
+      expect(action.payload).not.toHaveProperty('pages');
+      expect(taskRows(writes)).toEqual(
+        expect.arrayContaining(['create_content_brief', 'create_content_draft']),
+      );
+    });
+
+    it('writes a new page off a store, or without a category page', async () => {
+      const writes = mockDb({ signals: [topicSignal()], brand: { site_type: 'ecommerce' } });
+      await generateActionsForBrand(BRAND, {
+        now: NOW,
+        sources: new Set([...ALL_SOURCES, 'topics']),
+      });
+      expect(taskRows(writes)).toEqual(
+        expect.arrayContaining(['create_content_brief', 'create_content_draft']),
+      );
+      expect(taskRows(writes)).not.toContain('optimize_content');
+      expect(writes.inserted.find((w) => w.table === 'actions').rows[0].payload.contentExists).toBe(
+        false,
+      );
+
+      categoryPageFor.mockClear();
+      mockDb({ signals: [topicSignal()], brand: { site_type: 'b2b' } });
+      await generateActionsForBrand(BRAND, {
+        now: NOW,
+        sources: new Set([...ALL_SOURCES, 'topics']),
+      });
+      expect(categoryPageFor).not.toHaveBeenCalled();
+    });
+  });
+
+  it('opens other kinds without a play', async () => {
+    const writes = mockDb({ signals: [promptTargets(false)] });
+
+    await generateActionsForBrand(BRAND, { now: NOW, sources: ALL_SOURCES });
+
+    const action = writes.inserted.find((w) => w.table === 'actions').rows[0];
+    expect(action.payload).not.toHaveProperty('play');
   });
 
   /** Task Library acceptance test 5: no publishing integration does not block

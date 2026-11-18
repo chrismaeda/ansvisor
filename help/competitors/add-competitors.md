@@ -1,0 +1,74 @@
+---
+title: Add competitors to track
+route: /dashboard/competitors
+keywords: [add competitor, track competitors, suggest competitors, remove competitor, competitor domain, competitors page, competitor type]
+synonyms: [new competitor, follow a rival, competitor list, delete a competitor, where is the competitors page, find competitors, kind of competitor, competitor category, set type]
+plan: all
+updated: 2026-11-17
+last_checked: 2026-11-17
+owner: Cihan
+app_version: 0.3.0
+approved: true
+sources: [docs/guides/competitors.mdx, docs/guides/citations.mdx, docs/guides/add-your-first-brand.mdx]
+---
+Competitors are the brands Ansvisor compares with yours in AI answers to your tracked prompts. You add and remove them on the **Competitors** page, under **Analytics** in the sidebar, right after **Visibility**, and each one then appears in **Tracked Competitors** for a head-to-head comparison.
+
+## Open the Competitors page
+
+Open **Competitors** from the sidebar, or from **Visibility**:
+
+- **Head-to-Head** on the **Leaderboard** card;
+- a competitor's name on the Leaderboard, which opens the page with that competitor selected;
+- **Head-to-Head Comparison**, shown in the Leaderboard's place before a brand has competitors.
+
+The **Add at least 3 competitors** step of **Finish setting up**, on the Action Center's **Today** tab, opens it too.
+
+Only admins and managers add, suggest and remove competitors; other members see the list and the comparison.
+
+## Add a competitor
+
+Click **Add Competitor** and fill in:
+
+- **Name**: as AI answers write it, not the web address. Ansvisor looks for the name in every answer.
+- **Domain** (optional): Ansvisor also looks for the domain in answers, counts citations of the competitor's pages, and marks those pages **Competitor** on Visibility's **Citations** tab. The card that follows the competitor's pages over time needs it too.
+- **Type** (optional): what kind of competitor it is. See **Competitor types** below.
+
+Click **Add**.
+
+## Competitor types
+
+A type says what kind of competitor each one is, so you can filter and group your list by it. Pick **Direct competitor**, **Marketplace / aggregator**, **Publisher / review site** or **Other**, or choose **New type…** and name your own, such as a kind of company in your industry. A type you name is offered for your other competitors too.
+
+To set or change one, click the tag icon (**Set type for** the competitor) on its card in **Tracked Competitors**, or beside it on the **Competitors** tab of the brand's settings. Pick the type and click **Save**; **No type** clears it.
+
+A type is only a label: it doesn't change how Ansvisor finds the competitor in answers or scores it. Only admins and managers set types.
+
+## Suggest competitors
+
+**Suggest competitors** researches your brand on the web, from its website, region and language, and lists competitors with their domains. The ones you already track are left out.
+
+All suggestions come ticked: untick the ones you don't want and click **Add N competitors**. **Refresh suggestions** asks again. The brand needs a website first.
+
+## Add a competitor from Citations
+
+On Visibility's **Citations** tab, the **+** button (**Add as competitor**) on a cited domain that isn't yours or a tracked competitor's opens a dialog with a name taken from the domain. Edit the name and click **Add**. A cited URL's own page has **Add as competitor** too, which adds its domain.
+
+## When a new competitor is counted
+
+A competitor is counted in the answers tracked after you add it; earlier answers aren't counted again. Until an answer in the date range is measured for it, its card says **No data**.
+
+When a competitor is added, Ansvisor also reads back 90 days of your answers once, to find the first time AI cited one of its pages.
+
+## How many to track
+
+The set-up step asks for at least 3 competitors, and 5 to 20 give the clearest picture.
+
+AI answers to your prompts may name brands you've never heard of. They are the alternatives people see when you're not cited. Add the most-mentioned ones to your competitors to track them properly.
+
+## Remove a competitor
+
+Hover the competitor's card in **Tracked Competitors**, click the bin icon, then **Yes, remove competitor**. It's no longer tracked. Past results keep their numbers, but they can't be linked back to the competitor.
+
+## When the workspace is read-only
+
+On Ansvisor Cloud, while the workspace is read-only, **Add Competitor**, **Suggest competitors** and removing a competitor open the plan dialog instead.

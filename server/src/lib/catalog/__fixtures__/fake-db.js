@@ -1,9 +1,15 @@
 import { randomUUID } from 'node:crypto';
 
-/** A row's value at a column, or at a JSON path in it as PostgREST reads one (`shopping_path->>builtAt`). */
+/**
+ * A row's value at a column, at a JSON path in it as PostgREST reads one
+ * (`shopping_path->>builtAt`), or at an embedded table's column (`brands.is_demo`).
+ */
 function valueAt(row, column) {
   const at = column.indexOf('->>');
-  if (at < 0) return row[column];
+  if (at < 0) {
+    if (column in row || !column.includes('.')) return row[column];
+    return column.split('.').reduce((value, key) => value?.[key], row);
+  }
   const value = row[column.slice(0, at)]?.[column.slice(at + 3)];
   if (value == null) return null;
   return typeof value === 'string' ? value : JSON.stringify(value);
@@ -30,6 +36,7 @@ const CASCADES = {
     ['catalog_images', 'product_id'],
     ['catalog_product_categories', 'product_id'],
   ],
+  catalog_orders: [['catalog_order_items', 'order_id']],
 };
 
 /**
@@ -47,6 +54,7 @@ export function fakeDb({ maxRows = Infinity } = {}) {
   const writes = [];
   const uniqueKey = (table, row) => {
     if (table === 'catalog_categories') return `${row.brand_id}|${row.name}`;
+    if (table === 'catalog_order_items') return `${row.order_id}|${row.external_line_id}`;
     if (table === 'catalog_source_credentials') return row.source_id;
     if (table === 'catalog_category_pages') return `${row.brand_id}|${row.category}`;
     if (table === 'cloro_countries') return `${row.model}|${row.country}`;

@@ -61,6 +61,7 @@ const {
   changedRuns,
   checkKind,
   checkPage,
+  linkKey,
   pageAddress,
   runTaskCheck,
   similarity,
@@ -115,6 +116,7 @@ describe('checkKind', () => {
     expect(checkKind({ task_key: 'fix_structured_data', details: auto })).toBe('structuredData');
     expect(checkKind({ task_key: 'fix_crawler_access', details: auto })).toBe('crawlers');
     expect(checkKind({ task_key: 'optimize_content', details: auto })).toBe('changed');
+    expect(checkKind({ task_key: 'add_internal_links', details: auto })).toBe('links');
     expect(checkKind({ task_key: null, details: { ...auto, change: { after: 'New FAQ' } } })).toBe(
       'text',
     );
@@ -353,6 +355,52 @@ describe('checkPage', () => {
     expect(options).toMatchObject({ maxBytes: 512 * 1024, truncate: true });
     expect(options.types.test('application/octet-stream')).toBe(true);
     expect(options.types.test('')).toBe(true);
+  });
+
+  it('asks the bots a CDN or firewall refused again, and stays open while they are refused', async () => {
+    // The page as AnsvisorBot and robots.txt as fetchOf answers them; asked
+    // as a bot named in `answers` (its user-agent token), that bot's status.
+    const fetchAs = (pages, answers = {}) => {
+      const read = fetchOf(pages);
+      return vi.fn(async (url, opts = {}) => {
+        const token = Object.keys(answers).find((t) => opts.userAgent?.includes(`${t}/`));
+        const status = token ? answers[token] : null;
+        if (url === PAGE && status && status !== 200) {
+          throw Object.assign(new Error('http'), { code: 'http_error', status });
+        }
+        return read(url, opts);
+      });
+    };
+    const pages = { [PAGE]: html('x'), [ROBOTS]: 'User-agent: *\nAllow: /' };
+    const check = (fetch, wafBlockedBots = ['perplexitybot']) =>
+      checkPage('crawlers', PAGE, { fetch, wafBlockedBots });
+
+    // robots.txt lets every bot in, but the firewall still refuses PerplexityBot: open.
+    expect(await check(fetchAs(pages, { PerplexityBot: 403 }))).toEqual({
+      passed: false,
+      missing: ['crawlers_firewall'],
+    });
+    // The block lifted: passed.
+    const lifted = fetchAs(pages, { PerplexityBot: 200 });
+    expect(await check(lifted)).toEqual({ passed: true, missing: [] });
+    // The control and each of the five bots were asked, after the page and robots.txt.
+    expect(lifted.mock.calls.slice(2).map(([url]) => url)).toEqual(Array(6).fill(PAGE));
+    expect(lifted.mock.calls[3][1].userAgent).toContain('GPTBot/');
+    // A bot refused that the task wasn't raised for doesn't hold it.
+    expect(await check(fetchAs(pages, { ClaudeBot: 403 }))).toEqual({ passed: true, missing: [] });
+    // No answer either way (the server failing, asked to wait): nothing concluded…
+    expect(await check(fetchAs(pages, { PerplexityBot: 503 }))).toBeNull();
+    expect(await check(fetchAs(pages, { PerplexityBot: 429 }))).toBeNull();
+    // …unless something else is missing anyway.
+    expect(
+      await check(
+        fetchAs({ ...pages, [ROBOTS]: 'User-agent: GPTBot\nDisallow: /' }, { PerplexityBot: 503 }),
+      ),
+    ).toEqual({ passed: false, missing: ['crawlers_blocked'] });
+    // Raised for robots.txt alone: no bot is asked.
+    const robotsOnly = fetchAs(pages);
+    expect(await check(robotsOnly, [])).toEqual({ passed: true, missing: [] });
+    expect(robotsOnly).toHaveBeenCalledTimes(2);
   });
 
   it('keeps the first look, passes a page rewritten, never one that changed by itself', async () => {
@@ -782,6 +830,40 @@ describe('runTaskCheck', () => {
     ).toBe(true);
   });
 
+  it('keeps a crawler task raised for a firewall block open while the bot is still refused', async () => {
+    db.actions = {
+      targets: [
+        {
+          id: PAGE,
+          checks: ['ai-bot-access'],
+          issues: [
+            {
+              check: 'ai-bot-access',
+              evidence: { blockedBots: ['gptbot'], wafBlockedBots: ['perplexitybot'] },
+            },
+          ],
+        },
+      ],
+    };
+    const crawl = task({ task_key: 'fix_crawler_access' });
+    // robots.txt fixed, the firewall not: still open, the firewall named.
+    const refused = vi.fn(async (url, opts = {}) => {
+      if (url === ROBOTS) return { url, status: 200, html: 'User-agent: *\nAllow: /' };
+      if (opts.userAgent?.includes('PerplexityBot/')) {
+        throw Object.assign(new Error('http'), { code: 'http_error', status: 403 });
+      }
+      return { url, status: 200, html: html('x') };
+    });
+    const result = await runTaskCheck(crawl, action, { fetch: refused, now });
+    expect(result.autoCheck).toMatchObject({ passed: false, missing: ['crawlers_firewall'] });
+    expect(lastWrite().payload.status).toBeUndefined();
+    // The bot let in: completed.
+    const open = fetchOf({ [PAGE]: html('x'), [ROBOTS]: 'User-agent: *\nAllow: /' });
+    const fixed = await runTaskCheck(crawl, action, { fetch: open, now });
+    expect(fixed.autoCheck.passed).toBe(true);
+    expect(lastWrite().payload.status).toBe('completed');
+  });
+
   it('keeps what is missing on a task that fails, and its first look through a 404', async () => {
     const changed = task({
       task_key: 'optimize_content',
@@ -862,6 +944,232 @@ describe('runTaskCheck', () => {
     db.moved = true;
     expect(await runTaskCheck(task(), action, { fetch })).toEqual({ reason: 'changed' });
     expect(ops.some((op) => op.table === 'action_events')).toBe(false);
+  });
+});
+
+// An internal links task (AC plan P-10): its page links to the page it names, else the action's.
+describe('an internal links task', () => {
+  const BLOG = 'https://acme.example/blog/cold-brew';
+  const linking = (hrefs) =>
+    `<html><body><main><h1>Cold brew</h1><p>${FILLER} ${hrefs
+      .map((href) => `<a href="${href}">plans</a>`)
+      .join(' ')}</p></main></body></html>`;
+
+  it('keys a link by its host without www and its path, its query and slash aside', () => {
+    expect(linkKey('https://www.Acme.example/Pricing/?utm=x#plans')).toBe('acme.example/pricing');
+    expect(linkKey('mailto:hi@acme.example')).toBeNull();
+    expect(linkKey('not an address')).toBeNull();
+  });
+
+  it('passes when the page links to every page it names, relative or full, and says when one is missing', async () => {
+    const fetch = fetchOf({
+      [BLOG]: linking(['/pricing/?ref=blog', 'https://www.acme.example/demo']),
+    });
+    expect(
+      await checkPage('links', BLOG, {
+        linkTo: [PAGE, 'https://acme.example/demo'],
+        fetch,
+      }),
+    ).toEqual({ passed: true, missing: [] });
+    expect(
+      await checkPage('links', BLOG, {
+        linkTo: [PAGE, 'https://acme.example/contact'],
+        fetch: fetchOf({ [BLOG]: linking(['/pricing']) }),
+      }),
+    ).toEqual({ passed: false, missing: ['link_missing'] });
+    // An empty shell says nothing.
+    expect(
+      await checkPage('links', BLOG, { linkTo: [PAGE], fetch: fetchOf({ [BLOG]: '<p>x</p>' }) }),
+    ).toBeNull();
+  });
+
+  const task = (details) => ({
+    id: 't1',
+    action_id: 'a1',
+    task_key: 'add_internal_links',
+    title: null,
+    status: 'todo',
+    updated_at: '2026-10-26T10:00:00Z',
+    details: { check: 'auto', url: '/blog/cold-brew', ...details },
+  });
+  const now = new Date('2026-11-07T03:00:00Z');
+
+  it('checks the page it names (linkTo), completing the task once the link is there', async () => {
+    const fetch = fetchOf({ [BLOG]: linking(['/pricing']) });
+    const result = await runTaskCheck(
+      task({ linkTo: '/pricing' }),
+      { brand_id: 'b1' },
+      { fetch, now },
+    );
+    expect(result.autoCheck).toMatchObject({ url: BLOG, passed: true });
+    expect(ops.filter((op) => op.table === 'action_tasks').at(-1).payload.status).toBe('completed');
+  });
+
+  it('else the action’s pages, the task’s own page left out, and says when there is none', async () => {
+    db.actions = { pages: [BLOG, PAGE] };
+    const fetch = fetchOf({ [BLOG]: linking(['/']) });
+    const result = await runTaskCheck(task({}), { brand_id: 'b1' }, { fetch, now });
+    expect(result.autoCheck).toMatchObject({ passed: false, missing: ['link_missing'] });
+
+    ops = [];
+    db.actions = { pages: [BLOG] };
+    expect(await runTaskCheck(task({}), { brand_id: 'b1' }, { fetch, now })).toEqual({
+      reason: 'no_link_target',
+    });
+  });
+
+  it('says a task with no page for its links has no check, by what it lacks', async () => {
+    expect(
+      await runTaskCheck(
+        { ...task({}), details: { check: 'auto' } },
+        { brand_id: 'b1' },
+        { fetch: fetchOf({}), now },
+      ),
+    ).toEqual({ reason: 'no_link_source' });
+  });
+
+  describe('of a bridge links action, with its pairs (AC plan P-10)', () => {
+    const GUIDE = 'https://acme.example/guides/espresso';
+    const plan = (over = {}) => ({
+      ...task({}),
+      details: {
+        check: 'auto',
+        links: [
+          { url: BLOG, linkTo: PAGE, anchor: 'Pricing' },
+          { url: GUIDE, linkTo: 'https://acme.example/products/grinder', anchor: null },
+        ],
+        ...over,
+      },
+    });
+
+    it('is checked on its pairs, with no page of its own', () => {
+      expect(checkKind(plan())).toBe('linkPlan');
+      expect(checkKind(plan({ check: 'manual' }))).toBeNull();
+      expect(checkKind(plan({ links: [{ url: BLOG }] }))).toBeNull();
+    });
+
+    it('reads every source page for its link, and completes once each has it', async () => {
+      const fetch = fetchOf({
+        [BLOG]: linking(['/pricing']),
+        [GUIDE]: linking(['https://www.acme.example/products/grinder/']),
+      });
+      const result = await runTaskCheck(plan(), { brand_id: 'b1' }, { fetch, now });
+      expect(result.autoCheck).toEqual({
+        at: now.toISOString(),
+        triedAt: now.toISOString(),
+        url: BLOG,
+        passed: true,
+        missing: [],
+        links: [
+          { url: BLOG, linkTo: PAGE, passed: true },
+          { url: GUIDE, linkTo: 'https://acme.example/products/grinder', passed: true },
+        ],
+      });
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(ops.filter((op) => op.table === 'action_tasks').at(-1).payload.status).toBe(
+        'completed',
+      );
+      expect(ops.find((op) => op.table === 'action_events').payload).toMatchObject({
+        event: 'task_checked',
+        data: { taskId: 't1', task: 'add_internal_links' },
+      });
+    });
+
+    it('names the first page still missing its link, and stays open', async () => {
+      const fetch = fetchOf({ [BLOG]: linking(['/pricing']), [GUIDE]: linking(['/']) });
+      const result = await runTaskCheck(plan(), { brand_id: 'b1' }, { fetch, now });
+      expect(result.autoCheck).toMatchObject({
+        url: GUIDE,
+        passed: false,
+        missing: ['link_missing'],
+        links: [
+          { url: BLOG, passed: true },
+          { url: GUIDE, passed: false },
+        ],
+      });
+      expect(ops.some((op) => op.payload?.status === 'completed')).toBe(false);
+    });
+
+    it('keeps only the try when a page can’t be read, and holds a task reopened after it passed', async () => {
+      expect(
+        await runTaskCheck(
+          plan(),
+          { brand_id: 'b1' },
+          { fetch: fetchOf({ [BLOG]: linking(['/pricing']) }), now },
+        ),
+      ).toEqual({ reason: 'no_answer' });
+
+      ops = [];
+      const fetch = fetchOf({
+        [BLOG]: linking(['/pricing']),
+        [GUIDE]: linking(['/products/grinder']),
+      });
+      const reopened = plan({ autoCheck: { at: 'earlier', passed: true } });
+      const result = await runTaskCheck(reopened, { brand_id: 'b1' }, { fetch, now });
+      expect(result.autoCheck).toMatchObject({ passed: true, held: true });
+      expect(ops.some((op) => op.payload?.status === 'completed')).toBe(false);
+    });
+
+    it('never reads a page off the brand’s site', async () => {
+      const fetch = fetchOf({ [BLOG]: linking(['/pricing']) });
+      const result = await runTaskCheck(
+        plan({ links: [{ url: 'https://other.example/blog', linkTo: PAGE }] }),
+        { brand_id: 'b1' },
+        { fetch, now },
+      );
+      expect(result.autoCheck).toMatchObject({ passed: false, missing: ['off_site'] });
+      expect(fetch).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe('a canonical fix (AC plan P-11)', () => {
+  const tag = (href) =>
+    `<html><head><link rel="canonical" href="${href}"></head><body><main><h1>Pricing</h1><p>${FILLER}</p></main></body></html>`;
+
+  it('is checked on its page', () => {
+    expect(checkKind({ task_key: 'fix_canonical', details: { check: 'auto', url: PAGE } })).toBe(
+      'canonical',
+    );
+  });
+
+  it('passes when the tag points to the page itself, or a live page of the site', async () => {
+    expect(
+      await checkPage('canonical', PAGE, { fetch: fetchOf({ [PAGE]: tag('/pricing/') }) }),
+    ).toEqual({
+      passed: true,
+      missing: [],
+    });
+    const plans = 'https://acme.example/plans';
+    expect(
+      await checkPage('canonical', PAGE, {
+        fetch: fetchOf({ [PAGE]: tag('/plans'), [plans]: html('Plans') }),
+      }),
+    ).toEqual({ passed: true, missing: [] });
+  });
+
+  it('names what is still wrong: no tag, another site, a redirect; and says nothing when its target can’t be read', async () => {
+    expect(
+      await checkPage('canonical', PAGE, { fetch: fetchOf({ [PAGE]: html('Pricing') }) }),
+    ).toEqual({
+      passed: false,
+      missing: ['canonical_missing'],
+    });
+    expect(
+      await checkPage('canonical', PAGE, {
+        fetch: fetchOf({ [PAGE]: tag('https://other.example/x') }),
+      }),
+    ).toEqual({ passed: false, missing: ['canonical_other_host'] });
+    const old = 'https://acme.example/old-pricing';
+    expect(
+      await checkPage('canonical', PAGE, {
+        fetch: fetchOf({ [PAGE]: tag('/old-pricing'), [old]: { redirect: PAGE, html: html('x') } }),
+      }),
+    ).toEqual({ passed: false, missing: ['canonical_redirect'] });
+    // Its target times out: no answer.
+    expect(
+      await checkPage('canonical', PAGE, { fetch: fetchOf({ [PAGE]: tag('/gone') }) }),
+    ).toBeNull();
   });
 });
 
@@ -975,10 +1283,16 @@ describe('sweepTaskChecks', () => {
   it('reads only tasks it can check, the least recently tried first', async () => {
     await sweepTaskChecks({ fetch: fetchOf({}), now });
     const filters = reads.find((r) => r.table === 'action_tasks').filters;
-    expect(filters).toContainEqual(['not', 'details->>url', 'is', null]);
+    // On its page; or a bridge links task with its pairs (AC plan P-10).
     expect(filters).toContainEqual([
       'or',
-      expect.stringContaining('task_key.in.(publish_content,fix_broken_target'),
+      expect.stringContaining(
+        'and(details->>url.not.is.null,or(task_key.in.(publish_content,fix_broken_target',
+      ),
+    ]);
+    expect(filters).toContainEqual([
+      'or',
+      expect.stringContaining('and(task_key.eq.add_internal_links,details->links.not.is.null)'),
     ]);
     expect(filters).toContainEqual([
       'order',
@@ -987,6 +1301,8 @@ describe('sweepTaskChecks', () => {
     ]);
     // A held task (reopened after it passed) is left to the person.
     expect(filters).toContainEqual(['is', 'details->autoCheck->>held', null]);
+    // Never a demo brand's (00380): its tasks are sample data.
+    expect(filters).toContainEqual(['actions.brands.is_demo', false]);
   });
 
   it('checks at most SWEEP_PER_BRAND of one brand’s tasks a night, the others’ too', async () => {

@@ -2,6 +2,8 @@ import { BROWSER_API_BASE_URL } from '@/config/api';
 import { apiFailure } from '@/lib/api-failure';
 import { createClient } from '@/lib/supabase/client';
 import type { CmsFields, CmsPage } from '@/lib/content/cms-send';
+import { lastSend } from '@/lib/content/cms-status';
+import type { FirstAiCrawl } from '@/lib/content/first-ai-crawl';
 
 /**
  * Send to CMS from the browser (#1331), through the API's same-origin proxy:
@@ -11,9 +13,9 @@ import type { CmsFields, CmsPage } from '@/lib/content/cms-send';
 
 /**
  * Where pages go: the brand's webhook (phase 1), its Webflow collection, its
- * WordPress site or its Framer collection (phase 2).
+ * WordPress site, its Framer collection or its Wix site's Blog (phase 2).
  */
-export type CmsTarget = 'webhook' | 'webflow' | 'wordpress' | 'framer';
+export type CmsTarget = 'webhook' | 'webflow' | 'wordpress' | 'framer' | 'wix' | 'hubspot';
 
 /** Why a send didn't go, as the server names it. */
 export type CmsSendError =
@@ -35,6 +37,18 @@ export type CmsSendError =
   | 'no_framer'
   | 'framer_refused'
   | 'framer_not_ready'
+  // Wix (00372): not on this server, not connected, or its API key refused.
+  | 'wix_not_configured'
+  | 'no_wix'
+  | 'wix_refused'
+  // HubSpot (#2140, 00522): not on this server, not connected, not on the
+  // plan, its sign-in refused, sending pages not allowed, or no blog picked.
+  | 'hubspot_not_configured'
+  | 'no_hubspot'
+  | 'hubspot_plan'
+  | 'hubspot_refused'
+  | 'hubspot_no_consent'
+  | 'hubspot_not_ready'
   | 'in_progress'
   | 'daily_limit'
   | 'forbidden'
@@ -53,7 +67,8 @@ export type CmsSendError =
 export interface CmsDelivery {
   id: string;
   draftId: string;
-  status: 'queued' | 'sent' | 'failed' | 'published';
+  /** taken_down: a person took the published page down to a draft in its CMS (00460). */
+  status: 'queued' | 'sent' | 'failed' | 'published' | 'taken_down';
   /** What the webhook answered, when it did. */
   http_status?: number | null;
   /** Why it failed, as the server wrote it ("The webhook could not be reached"). */
@@ -71,6 +86,8 @@ export interface CmsDelivery {
    * the site's next publish.
    */
   live?: boolean;
+  /** Where it went live, for a page published from Chat (AUTONOMOUS-GO-LIVE PR 9). */
+  published_url?: string | null;
 }
 
 export type CmsSendResult =
@@ -93,6 +110,15 @@ const KNOWN: readonly CmsSendError[] = [
   'no_framer',
   'framer_refused',
   'framer_not_ready',
+  'wix_not_configured',
+  'no_wix',
+  'wix_refused',
+  'hubspot_not_configured',
+  'no_hubspot',
+  'hubspot_plan',
+  'hubspot_refused',
+  'hubspot_no_consent',
+  'hubspot_not_ready',
   'in_progress',
   'daily_limit',
   'forbidden',
@@ -153,7 +179,7 @@ export async function sendPagesToCms(
  */
 async function refreshPublished(
   brandId: string,
-  route: 'webflow-status' | 'wordpress-status' | 'framer-status',
+  route: 'webflow-status' | 'wordpress-status' | 'framer-status' | 'wix-status' | 'hubspot-status',
   label: string,
 ): Promise<string[]> {
   try {
@@ -190,6 +216,16 @@ export function refreshWordPressPublished(brandId: string): Promise<string[]> {
   return refreshPublished(brandId, 'wordpress-status', 'WordPress');
 }
 
+/** The brand's pages sent to its HubSpot blog as draft posts, published there since (00522). */
+export function refreshHubspotPublished(brandId: string): Promise<string[]> {
+  return refreshPublished(brandId, 'hubspot-status', 'HubSpot');
+}
+
+/** The brand's pages sent to Wix as draft posts, published there since (00372). */
+export function refreshWixPublished(brandId: string): Promise<string[]> {
+  return refreshPublished(brandId, 'wix-status', 'Wix');
+}
+
 /** The brand's pages sent to Framer as draft items, published there since (00295). */
 export function refreshFramerPublished(brandId: string): Promise<string[]> {
   return refreshPublished(brandId, 'framer-status', 'Framer');
@@ -209,40 +245,20 @@ export interface CmsStatus {
   httpStatus: number | null;
   error: string | null;
   publishedUrl: string | null;
+  /**
+   * An agent sent it on its own (AUTONOMOUS-GO-LIVE §6.4, 00444): its name,
+   * or null when it can't be read by the person; absent for a person's send.
+   */
+  agent?: { name: string | null };
+  /**
+   * A published page's first AI crawl (#2142), once read: whether the brand
+   * sends AI bot logs, and the first crawl, or null when none came yet.
+   */
+  firstAiCrawl?: { logs: boolean; crawl: FirstAiCrawl | null };
 }
 
 /** Ids a read takes: content_draft_last_deliveries (00262) reads up to 500. */
 const STATUS_IDS_PER_READ = 500;
-/**
- * A send still queued after this was left by a server that stopped mid-batch
- * (00262 closes it at the workspace's next send): it reads as interrupted,
- * so neither the Library nor the editor waits on it or says it is still
- * going. Read by the browser's clock: one 30 minutes fast would read a send
- * under way as interrupted, until its next read.
- */
-const INTERRUPTED_AFTER_MS = 30 * 60_000;
-
-/** A send as the Library and the editor read it: one left queued, as interrupted. */
-function lastSend(row: {
-  status: string;
-  created_at: string;
-  sent_at: string | null;
-  published_at: string | null;
-  error: string | null;
-  target?: string | null;
-}): { status: CmsDelivery['status']; target: CmsTarget; at: string; error: string | null } {
-  const interrupted =
-    row.status === 'queued' && Date.parse(row.created_at) < Date.now() - INTERRUPTED_AFTER_MS;
-  return {
-    status: interrupted ? 'failed' : (row.status as CmsDelivery['status']),
-    target:
-      row.target === 'webflow' || row.target === 'wordpress' || row.target === 'framer'
-        ? row.target
-        : 'webhook',
-    at: row.published_at ?? row.sent_at ?? row.created_at,
-    error: interrupted ? 'Not sent: interrupted' : row.error,
-  };
-}
 
 /**
  * Each draft's last send, for the Library's rows: one row a draft, however
@@ -259,6 +275,7 @@ export async function readCmsStatuses(draftIds: string[]): Promise<Map<string, C
     chunks.map((ids) => supabase.rpc('content_draft_last_deliveries', { p_draft_ids: ids })),
   );
   const statuses = new Map<string, CmsStatus>();
+  const byAgent = new Map<string, string>();
   for (const { data, error } of reads) {
     if (error) {
       console.error('Failed to read the pages’ sends:', error);
@@ -271,9 +288,54 @@ export async function readCmsStatuses(draftIds: string[]): Promise<Map<string, C
         httpStatus: row.http_status,
         publishedUrl: row.published_url,
       });
+      if (row.agent_run_id) byAgent.set(row.draft_id, row.agent_run_id);
+    }
+  }
+  if (byAgent.size > 0) {
+    const names = await agentNamesOf(supabase, [...new Set(byAgent.values())]);
+    for (const [draftId, runId] of byAgent) {
+      const status = statuses.get(draftId);
+      if (status) statuses.set(draftId, { ...status, agent: { name: names.get(runId) ?? null } });
     }
   }
   return statuses;
+}
+
+/**
+ * The agents of agent runs, by run, as the person may read them; a run or an
+ * agent they can't see is left out (the send then says "an agent").
+ */
+async function agentNamesOf(
+  supabase: ReturnType<typeof createClient>,
+  runIds: string[],
+): Promise<Map<string, string>> {
+  const names = new Map<string, string>();
+  const { data: runs, error } = await supabase
+    .from('chat_agent_runs')
+    .select('id, agent_id')
+    .in('id', runIds);
+  if (error) {
+    console.error('Failed to read who sent the pages:', error);
+    return names;
+  }
+  const agentIds = [
+    ...new Set((runs ?? []).map((run) => run.agent_id).filter((id): id is string => !!id)),
+  ];
+  if (agentIds.length === 0) return names;
+  const { data: agents, error: agentsError } = await supabase
+    .from('chat_agents')
+    .select('id, name')
+    .in('id', agentIds);
+  if (agentsError) {
+    console.error('Failed to read who sent the pages:', agentsError);
+    return names;
+  }
+  const nameOf = new Map((agents ?? []).map((agent) => [agent.id, agent.name]));
+  for (const run of runs ?? []) {
+    const name = run.agent_id ? nameOf.get(run.agent_id) : undefined;
+    if (name) names.set(run.id, name);
+  }
+  return names;
 }
 
 /** What a draft keeps of its sends: its slug and meta, where it went live, and its last send. */

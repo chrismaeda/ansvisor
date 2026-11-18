@@ -5,14 +5,37 @@ import { useTranslations } from 'next-intl';
 import { useRouter } from '@/i18n/navigation';
 import { createClient } from '@/lib/supabase/client';
 import { createBrand, markBrandAsEcommerce } from '@/lib/actions/brand';
+import { TopicAccordion } from '@/components/onboarding/topic-accordion';
 import { EcommerceNote } from '@/components/onboarding/ecommerce-note';
 import { createTopics, getTopics } from '@/lib/actions/topic';
-import { getPromptCapacity, savePromptSet } from '@/lib/actions/prompt';
+import { getPromptCapacity, getTrackedPromptCount, savePromptSet } from '@/lib/actions/prompt';
 import { triggerTrackingCheck } from '@/lib/actions/tracking';
 import { bootstrapBrandVolumes } from '@/lib/actions/volumes';
 import { addCompetitor, getCompetitors } from '@/lib/actions/competitor';
+import { finishSetupAfterPurchase } from '@/lib/actions/setup-after-purchase';
+import {
+  canManagePlan,
+  needsSetupAfterPurchase,
+  planLapsed,
+  readSetupProgress,
+  SETUP_BILLING_HREF,
+  setupDeferredCookie,
+  setupFlowProps,
+  setupLanding,
+} from '@/lib/onboarding/setup-after-purchase';
+import {
+  opensOnStartChoice,
+  startChoiceName,
+  startPositionProps,
+} from '@/lib/onboarding/start-choice';
+import { ensureOrganization, nameWorkspaceFromBrand } from '@/lib/onboarding/organization';
+import {
+  CONNECT_SITE_STEP,
+  connectSiteSnippet,
+  setupAfterPurchaseSteps,
+} from '@/lib/onboarding/connect-site';
+import { countPlanBrands } from '@/lib/plan-brand-count';
 import { getFaviconUrl } from '@/lib/favicon';
-import { slugify } from '@/lib/slug';
 import { addCompetitorChoice, mergeCompetitorSuggestions } from '@/lib/competitor-list';
 import { useBrandStore } from '@/stores/use-brand-store';
 import {
@@ -24,13 +47,33 @@ import {
   LANGUAGE_ITEMS,
 } from '@/config/prompt-options';
 import { ALL_MODELS, ALL_SCRAPERS } from '@/config/prompt-options';
-import { isCloud, PLANS, SUBSCRIBABLE_PLANS, getPlan, type PlanId } from '@/config/plans';
+import {
+  firstMonthOfferOn,
+  isCloud,
+  isSubscriptionActive,
+  SUBSCRIBABLE_PLANS,
+  getPlan,
+  toPlanId,
+  type PlanId,
+} from '@/config/plans';
+import { choicePeriod, type CheckoutMode } from '@/lib/billing/plan-purchase';
+import {
+  PlanDetailsToggle,
+  PlanStart,
+  PlanStartCard,
+  StartChoicePicker,
+  useFirstMonthOffer,
+  useStartChoice,
+  useStartCheckout,
+} from '@/components/billing/plan-start';
 import { setPersonProperties, track } from '@/lib/analytics';
 
-/** "What do you work on?" (menu access): once the brand is set up, before the plan. */
-const WORK_AREAS_STEP = 6;
-/** Choose a plan (cloud only): the last step. */
-const PLAN_STEP = 7;
+/**
+ * Choose how to start (cloud only): a new admin's first screen, the choice
+ * (lib/onboarding/start-choice.ts), with setup after buying; or the last
+ * step, right after the competitors, for a brand set up under the old order.
+ */
+const PLAN_STEP = 6;
 
 const ONBOARDING_STEP_NAMES: Record<number, string> = {
   1: 'brand_setup',
@@ -38,15 +81,13 @@ const ONBOARDING_STEP_NAMES: Record<number, string> = {
   3: 'topics',
   4: 'prompts',
   5: 'competitors',
-  [WORK_AREAS_STEP]: 'work_areas',
   [PLAN_STEP]: 'plan',
+  [CONNECT_SITE_STEP]: 'connect_site',
 };
 import type { Brand } from '@/types';
-import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Separator } from '@/components/ui/separator';
 import { Textarea } from '@/components/ui/textarea';
 import {
   Select,
@@ -55,28 +96,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu';
 import { toast } from 'sonner';
-import {
-  ArrowLeft,
-  Check,
-  ChevronDown,
-  ChevronRight,
-  Globe,
-  Loader2,
-  MoreHorizontal,
-  Plus,
-  Sparkles,
-  X,
-} from 'lucide-react';
+import { ArrowLeft, Check, Globe, Loader2, Plus, Sparkles, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import {
   BRAND_SETUP_LIMITS,
+  detectSiteType,
   suggestTopics,
   generatePromptsFromTopics,
   suggestCompetitors,
@@ -84,9 +109,19 @@ import {
   type SuggestFailure,
 } from '@/lib/ai-brand-setup';
 import { DashboardPreview } from '@/components/onboarding/dashboard-preview';
+import { ExploreDemoChoice, ExploreDemoLine } from '@/components/onboarding/explore-demo-card';
+import { ConnectSite } from '@/components/onboarding/connect-site';
+import { DemoSetupDialog } from '@/components/demo/demo-setup-dialog';
+import { useExploreDemo, usePreloadDemo } from '@/hooks/use-explore-demo';
+import { wantsDemoAhead } from '@/lib/demo/demo-ahead';
 import { OnboardingFrame } from '@/components/onboarding/onboarding-frame';
-import { WorkAreasStep } from '@/components/onboarding/work-areas-step';
-import { DASHBOARD_HOME } from '@/config/home';
+import {
+  defaultPickCount,
+  pickedCount,
+  promptRoom,
+  withDefaultPicks,
+  type TopicPromptPicks,
+} from '@/lib/onboarding-prompt-picks';
 
 // ── Step indicator ─────────────────────────────────────────────────────────────
 
@@ -125,168 +160,55 @@ function BrandHeader({ name, domain }: { name: string; domain: string }) {
   );
 }
 
-// ── Topic Prompt Accordion ─────────────────────────────────────────────────────
-
-interface TopicPromptsData {
-  topic: string;
-  prompts: string[];
-}
-
-function TopicAccordion({
-  data,
-  defaultOpen = false,
-  onRemoveTopic,
-  onAddPrompt,
-  onRemovePrompt,
-}: {
-  data: TopicPromptsData;
-  defaultOpen?: boolean;
-  onRemoveTopic: () => void;
-  onAddPrompt: (prompt: string) => void;
-  onRemovePrompt: (index: number) => void;
-}) {
-  const [open, setOpen] = useState(defaultOpen);
-  const [newPrompt, setNewPrompt] = useState('');
-
-  const handleAdd = () => {
-    const trimmed = newPrompt.trim();
-    if (trimmed.length >= 10) {
-      onAddPrompt(trimmed);
-      setNewPrompt('');
-    }
-  };
-
-  return (
-    <div className="border-b last:border-b-0">
-      <div className="flex items-center gap-3 py-3 px-1">
-        <button
-          onClick={() => setOpen(!open)}
-          className="flex items-center gap-2 flex-1 text-left text-sm"
-        >
-          {open ? (
-            <ChevronDown className="h-4 w-4 text-muted-foreground shrink-0" />
-          ) : (
-            <ChevronRight className="h-4 w-4 text-muted-foreground shrink-0" />
-          )}
-          <span className="font-medium">{data.topic}</span>
-          <span className="text-xs text-muted-foreground">{data.prompts.length} prompts</span>
-        </button>
-        <DropdownMenu>
-          <DropdownMenuTrigger className="p-1 rounded hover:bg-muted text-muted-foreground">
-            <MoreHorizontal className="h-4 w-4" />
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end">
-            <DropdownMenuItem
-              className="text-destructive focus:text-destructive"
-              onClick={onRemoveTopic}
-            >
-              Remove topic
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </div>
-      {open && (
-        <div className="pl-7 pb-3 space-y-1.5">
-          {data.prompts.map((p, idx) => (
-            <div
-              key={idx}
-              className="flex items-center gap-2 group rounded-md border bg-muted/30 px-3 py-2"
-            >
-              <span className="text-sm flex-1">{p}</span>
-              <button
-                onClick={() => onRemovePrompt(idx)}
-                className="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-destructive transition-opacity"
-              >
-                <X className="h-3.5 w-3.5" />
-              </button>
-            </div>
-          ))}
-          <div className="flex items-center gap-2 mt-2">
-            <Input
-              placeholder="Enter new prompt..."
-              value={newPrompt}
-              onChange={(e) => setNewPrompt(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
-              className="text-sm h-9"
-            />
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={handleAdd}
-              disabled={newPrompt.trim().length < 10}
-              className="h-9 px-2"
-            >
-              <Check className="h-4 w-4" />
-            </Button>
-            <Button size="sm" variant="ghost" onClick={() => setNewPrompt('')} className="h-9 px-2">
-              <X className="h-4 w-4" />
-            </Button>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
+// A topic's suggested prompts, each ticked or not: a checklist.
+type TopicPromptsData = TopicPromptPicks;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
-
-// The state picker's own "no state" choice, ahead of the states themselves.
-const STATE_ITEMS = [{ value: 'nationwide', label: 'Nationwide (no state)' }, ...US_STATE_ITEMS];
-
-// Plan-step copy, onboarding only — the plan switcher in Settings keeps the
-// taglines from config/plans. Engines are listed as offered at sign-up.
-const PLAN_STEP_COPY: Partial<
-  Record<PlanId, { tagline: string; platformFeatures: string; engines: string }>
-> = {
-  starter: {
-    tagline: 'Essential AI visibility tracking.',
-    platformFeatures: 'Core Platform Features',
-    engines: 'ChatGPT & Microsoft Copilot',
-  },
-  growth: {
-    tagline: 'Advanced AI insights to accelerate growth.',
-    platformFeatures: 'All Platform Features',
-    engines:
-      'ChatGPT, Google AI Overviews, Google AI Mode, Gemini, Microsoft Copilot, & Perplexity.',
-  },
-};
-
-// Shown under the plan step's heading while the free trial is on offer; checkout
-// collects a card but charges nothing until the trial ends.
-const TRIAL_ASSURANCES = ['Zero risk', 'No charge today', 'Cancel anytime'];
 
 // Card width per step, matched to each step's content column; unlisted steps are forms.
 const STEP_FRAME_WIDTH: Record<number, 'medium' | 'wide'> = {
   3: 'wide',
   4: 'wide',
-  [WORK_AREAS_STEP]: 'wide',
   [PLAN_STEP]: 'medium',
 };
 
-const TOPIC_LOADING_MESSAGES = [
-  'Researching topics for your brand...',
-  'Analyzing your industry landscape...',
-  'Identifying key themes and trends...',
-  'Finding what your audience cares about...',
-  'Evaluating competitive topics...',
-  'Almost there, finalizing suggestions...',
-];
+const TOPIC_LOADING_KEYS = [
+  'topicLoading1',
+  'topicLoading2',
+  'topicLoading3',
+  'topicLoading4',
+  'topicLoading5',
+  'topicLoading6',
+] as const;
 
-const COMPETITOR_LOADING_MESSAGES = [
-  'Searching for competitors...',
-  'Analyzing your market...',
-  'Identifying key players...',
-  'Verifying company details...',
-  'Finalizing recommendations...',
-];
+const COMPETITOR_LOADING_KEYS = [
+  'competitorLoading1',
+  'competitorLoading2',
+  'competitorLoading3',
+  'competitorLoading4',
+  'competitorLoading5',
+] as const;
 
 // ── Main page ──────────────────────────────────────────────────────────────────
 
 export default function OnboardingPage() {
   const router = useRouter();
   const tWizard = useTranslations('brands.wizard');
-  const tWelcome = useTranslations('welcome');
+  const tOffer = useTranslations('planOffer');
+  const tPlans = useTranslations('readOnly.plans');
+  const tWaiting = useTranslations('prompts.waiting');
+  const tPrompts = useTranslations('onboarding.prompts');
+  const tSetup = useTranslations('onboarding');
+  const tStart = useTranslations('onboarding.start');
+  const tExplore = useTranslations('demo.explore');
+  // The name a workspace made on the choice screen has until its first brand.
+  const workspacePlaceholder = tStart('workspaceName');
+  const workspaceFailed = tStart('workspaceFailed');
   const { addBrand, setActiveBrand, updateBrand: updateBrandInStore } = useBrandStore();
+  const stateItems = [
+    { value: 'nationwide', label: tSetup('setup.nationwide') },
+    ...US_STATE_ITEMS,
+  ];
 
   const [step, setStep] = useState(1);
   const [isLoading, setIsLoading] = useState(false);
@@ -323,16 +245,16 @@ export default function OnboardingPage() {
       topicMsgIdx.current = 0;
       return;
     }
-    setTopicLoadingMsg(TOPIC_LOADING_MESSAGES[0]);
+    setTopicLoadingMsg(tSetup(`setup.${TOPIC_LOADING_KEYS[0]}`));
     topicMsgIdx.current = 0;
 
     const interval = setInterval(() => {
-      topicMsgIdx.current = (topicMsgIdx.current + 1) % TOPIC_LOADING_MESSAGES.length;
-      setTopicLoadingMsg(TOPIC_LOADING_MESSAGES[topicMsgIdx.current]);
+      topicMsgIdx.current = (topicMsgIdx.current + 1) % TOPIC_LOADING_KEYS.length;
+      setTopicLoadingMsg(tSetup(`setup.${TOPIC_LOADING_KEYS[topicMsgIdx.current]}`));
     }, 2500);
 
     return () => clearInterval(interval);
-  }, [loadingTopics]);
+  }, [loadingTopics, tSetup]);
 
   // Step 4
   const [topicPrompts, setTopicPrompts] = useState<TopicPromptsData[]>([]);
@@ -362,34 +284,161 @@ export default function OnboardingPage() {
   const [competitorLoadingMsg, setCompetitorLoadingMsg] = useState('');
   const competitorMsgIdx = useRef(0);
 
-  // Plan step (cloud only)
-  const [checkoutLoading, setCheckoutLoading] = useState<PlanId | null>(null);
-  const [organizationId, setOrganizationId] = useState<string | null>(null);
-  // Trial length when the plan step is reached; null once the organization has
-  // had a subscription, since checkout then starts the plan without a trial.
-  const [trialDays, setTrialDays] = useState<number | null>(14);
-  // Whether the trial check said yes. The trial's promises (no charge today,
-  // the day of the first charge) wait for it, so an organization whose trial
-  // is used is never told it won't be charged.
-  const [trialConfirmed, setTrialConfirmed] = useState(false);
+  // Setup after purchase (cloud): the organization's plan is active or
+  // trialing already, so setup has no plan step. Finish aligns the prompts to
+  // the plan and starts the brand's first run (lib/onboarding/setup-after-purchase.ts).
+  const [afterPurchase, setAfterPurchase] = useState(false);
+  // The admin, who manages the plan: in setup after purchase, "Manage your
+  // plan" puts setup off for a while and opens Billing.
+  const [managesPlan, setManagesPlan] = useState(false);
+  // "Connect your site", after Finish in setup after purchase: where Done and
+  // Later land (setupLanding, with the first run's job), which was pressed,
+  // and whether the snippet was copied, for their events.
+  const [landing, setLanding] = useState<string | null>(null);
+  const [leaving, setLeaving] = useState<'done' | 'later' | null>(null);
+  const snippetCopied = useRef(false);
 
+  // Setup after purchase whose plan lapsed meanwhile (a trial canceled, a
+  // payment failed): setup's writes would refuse it, so nothing is written.
+  // Billing opens for its admin, the read-only dashboard for anyone else
+  // (planLapsed: neither layout sends them back). Read before each step's
+  // writes; a plan that can't be read leaves it to the write.
+  const leaveIfPlanLapsed = async (orgId: string | null | undefined): Promise<boolean> => {
+    if (!afterPurchase || !orgId) return false;
+    try {
+      const { data: org, error } = await createClient()
+        .from('organizations')
+        .select('subscription_status, stripe_subscription_id')
+        .eq('id', orgId)
+        .single();
+      if (
+        error ||
+        !org ||
+        !planLapsed({
+          cloud: isCloud(),
+          subscriptionStatus: org.subscription_status,
+          everSubscribed: Boolean(org.stripe_subscription_id),
+        })
+      ) {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+    toast.error(tSetup('planLapsed'));
+    window.location.href = managesPlan ? SETUP_BILLING_HREF : '/dashboard';
+    return true;
+  };
+
+  // Plan step (cloud only)
+  const [organizationId, setOrganizationId] = useState<string | null>(null);
+  // A choice on the first screen waiting for its organization to be made:
+  // the plan's button (and how it starts), or the sample brand.
+  const [preparing, setPreparing] = useState<
+    { planId: PlanId; mode: CheckoutMode } | 'demo' | null
+  >(null);
+  // The plan step as onboarding's first screen, the choice: the trial (or a
+  // plan bought), then setup after purchase; or the sample brand, no setup.
+  const [startFirst, setStartFirst] = useState(false);
+  // Trial length when the plan step is reached; null once the organization has
+  // had a subscription, which then only buys now (Checkout refuses its trial).
+  const [trialDays, setTrialDays] = useState<number | null>(14);
+  // How the plan starts, as on the plan dialog: one choice above the cards,
+  // the first-month offer shown from the first frame (the person setting up
+  // the workspace is its admin), its code checked once the step is reached.
+  // Asked once the organization exists: the route reads its customer. On the
+  // first screen, before a choice makes it, the configured offer shows, and
+  // Checkout checks the code.
+  const [offer, setOffer] = useFirstMonthOffer(
+    firstMonthOfferOn(),
+    step === PLAN_STEP && organizationId != null,
+  );
+  // The free trial first, while the workspace may have one: Monthly once
+  // it's found used.
+  const [choice, setChoice] = useStartChoice(trialDays != null, 'trial');
+  // The plans' details (what each is for and includes), in the cards.
+  const [planDetails, setPlanDetails] = useState(false);
+  const { checkout, failed, start } = useStartCheckout({
+    organizationId,
+    period: choicePeriod(choice),
+    // A canceled Checkout comes back to this step.
+    returnTo: null,
+    // Stripe turned the code down since it was checked: the plain prices.
+    onCodeRefused: (code) => {
+      setOffer(null);
+      toast.error(tPlans('promo.invalid', { code: code.toUpperCase() }));
+    },
+    // Its trial is used after all: buying now is the way.
+    onTrialUsed: () => setTrialDays(null),
+  });
+
+  // Asked once the organization exists: the trial is its first subscription's.
+  // A new person on the first screen, with none yet, may have it.
   useEffect(() => {
-    if (step !== PLAN_STEP) return;
+    if (step !== PLAN_STEP || !organizationId) return;
     let cancelled = false;
     fetch('/api/stripe/trial')
       .then((res) => (res.ok ? res.json() : null))
       .then((body: { trialAvailable: boolean; trialDays: number } | null) => {
         if (cancelled || !body) return;
         setTrialDays(body.trialAvailable ? body.trialDays : null);
-        setTrialConfirmed(body.trialAvailable);
       })
       // Keeps the default copy; checkout itself decides whether there is a trial.
       .catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, [step]);
+  }, [step, organizationId]);
   const [currentPlanId, setCurrentPlanId] = useState<PlanId>('starter');
+
+  // Whether the organization has no demo brand yet: then the plan step starts
+  // its setup ahead, so "Explore the demo" waits less.
+  const [demoMissing, setDemoMissing] = useState(false);
+  useEffect(() => {
+    if (step !== PLAN_STEP || !organizationId) return;
+    let cancelled = false;
+    createClient()
+      .from('brands')
+      .select('id')
+      .eq('organization_id', organizationId)
+      .eq('is_demo', true)
+      .limit(1)
+      .then(({ data }) => {
+        if (!cancelled) setDemoMissing(!data?.length);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [step, organizationId]);
+  usePreloadDemo(step === PLAN_STEP && demoMissing);
+  // The demo brand, the plan step's other way in: chosen in the switch above
+  // the plans (its card then shows in their place), or straight from the line
+  // under them. Both run the one explore action, with its setup screen.
+  const [demoChosen, setDemoChosen] = useState(false);
+  const exploreDemo = useExploreDemo();
+
+  // A new workspace's demo brand is built as soon as the organization exists,
+  // while its admin sets up their own brand: the first build takes a few
+  // seconds, and "Explore the demo" on the plan step then opens at once.
+  const [demoAhead, setDemoAhead] = useState(false);
+  useEffect(() => {
+    if (!isCloud() || !organizationId) return;
+    let cancelled = false;
+    const supabase = createClient();
+    void supabase.auth
+      .getUser()
+      .then(({ data: { user } }) =>
+        user ? wantsDemoAhead(supabase, { organizationId, userId: user.id }) : false,
+      )
+      .catch(() => false)
+      .then((wanted) => {
+        if (!cancelled) setDemoAhead(wanted);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [organizationId]);
+  usePreloadDemo(demoAhead);
 
   // What the dashboard preview shows when the plan step is reached by resuming
   // (a cancelled checkout, a lapsed trial) rather than by walking the steps, so
@@ -401,10 +450,48 @@ export default function OnboardingPage() {
     topics: string[];
     competitors: { name: string; domain: string }[];
   } | null>(null);
+  // The own brand the plan step was resumed on (no wizard state then).
+  const [resumedBrandId, setResumedBrandId] = useState<string | null>(null);
 
-  // Self-host has no plan step, and asks "What do you work on?" on the
-  // dashboard's first visit instead (/dashboard/welcome).
-  const totalSteps = isCloud() ? PLAN_STEP : 5;
+  // What the plan step's "Ready to track" says: the own brand's real setup,
+  // read when the step is reached. Nothing is said until it is read.
+  const planBrandId = createdBrand?.id ?? resumedBrandId;
+  const [readyCounts, setReadyCounts] = useState<{
+    prompts: number;
+    topics: number;
+    competitors: number;
+  } | null>(null);
+  useEffect(() => {
+    if (step !== PLAN_STEP || !planBrandId) return;
+    let cancelled = false;
+    Promise.all([
+      getTrackedPromptCount(planBrandId),
+      getTopics(planBrandId),
+      getCompetitors(planBrandId),
+    ])
+      .then(([prompts, topics, competitors]) => {
+        if (!cancelled) {
+          setReadyCounts({ prompts, topics: topics.length, competitors: competitors.length });
+        }
+      })
+      // No line rather than a guessed one.
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [step, planBrandId]);
+
+  // The brand's AI Traffic snippet, for "Connect your site" (null without a
+  // tracking code or the server's URL: setup after purchase then ends at Finish).
+  const siteSnippet = createdBrand ? connectSiteSnippet(createdBrand) : null;
+  // Self-host has no plan step, nor setup after purchase, which ends on
+  // "Connect your site" as its sixth step when there is a snippet to show.
+  const totalSteps =
+    isCloud() && !afterPurchase
+      ? PLAN_STEP
+      : afterPurchase
+        ? setupAfterPurchaseSteps(siteSnippet, createdBrand != null)
+        : 5;
 
   // Determine which scrapers/models are available based on the plan
   const currentPlan = getPlan(currentPlanId);
@@ -422,17 +509,34 @@ export default function OnboardingPage() {
       competitorMsgIdx.current = 0;
       return;
     }
-    setCompetitorLoadingMsg(COMPETITOR_LOADING_MESSAGES[0]);
+    setCompetitorLoadingMsg(tSetup(`setup.${COMPETITOR_LOADING_KEYS[0]}`));
     competitorMsgIdx.current = 0;
 
     const interval = setInterval(() => {
-      competitorMsgIdx.current =
-        (competitorMsgIdx.current + 1) % COMPETITOR_LOADING_MESSAGES.length;
-      setCompetitorLoadingMsg(COMPETITOR_LOADING_MESSAGES[competitorMsgIdx.current]);
+      competitorMsgIdx.current = (competitorMsgIdx.current + 1) % COMPETITOR_LOADING_KEYS.length;
+      setCompetitorLoadingMsg(tSetup(`setup.${COMPETITOR_LOADING_KEYS[competitorMsgIdx.current]}`));
     }, 2500);
 
     return () => clearInterval(interval);
-  }, [loadingCompetitors]);
+  }, [loadingCompetitors, tSetup]);
+
+  // Auto-fetch topic suggestions when arriving at step 3 with none loaded:
+  // coming back to setup with the brand saved but no topics yet. Saved topics
+  // fill the list on resume, and step 2 → 3 starts its own fetch, which this
+  // sees in flight. After a failure, the step's message and Try again stand.
+  useEffect(() => {
+    if (
+      step === 3 &&
+      !initialLoading &&
+      !loadingTopics &&
+      !topicSuggestError &&
+      suggestedTopics.length === 0 &&
+      createdBrand
+    ) {
+      fetchTopicSuggestions();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step, initialLoading]);
 
   // Auto-fetch competitor suggestions when arriving at step 5 with none loaded
   useEffect(() => {
@@ -462,6 +566,11 @@ export default function OnboardingPage() {
   // Resume logic: check existing state on mount
   useEffect(() => {
     async function checkResume() {
+      // The organization's plan is active or trialing already: setup after
+      // purchase. Set with the step the resume opens, so its first
+      // onboarding_step_viewed carries it.
+      let planActive = false;
+      let role: string | null = null;
       try {
         const supabase = createClient();
         const {
@@ -471,39 +580,122 @@ export default function OnboardingPage() {
 
         const { data: profile } = await supabase
           .from('profiles')
-          .select('organization_id, onboarding_completed, work_areas_asked_at')
+          .select('organization_id, onboarding_completed, role')
           .eq('id', user.id)
           .single();
+        role = profile?.role ?? null;
 
-        if (profile?.onboarding_completed) {
-          if (isCloud() && profile.organization_id) {
+        // Onboarded, in an organization. Onboarded with none (it couldn't be
+        // made, or was left) goes on below, where setup makes one: the
+        // dashboard would only send them back here.
+        if (profile?.onboarding_completed && profile.organization_id) {
+          // Setup after purchase, due or left unfinished, goes on below too.
+          let setupOpens = false;
+          if (isCloud()) {
             // Check subscription status — if not active/trialing, show plan selection
             const { data: org } = await supabase
               .from('organizations')
-              .select('subscription_status, plan')
+              .select('subscription_status, plan, stripe_subscription_id')
               .eq('id', profile.organization_id)
               .single();
-            if (org?.plan) setCurrentPlanId(org.plan as PlanId);
+            if (org?.plan) setCurrentPlanId(toPlanId(org.plan));
             const subStatus = org?.subscription_status;
             if (subStatus !== 'active' && subStatus !== 'trialing') {
               setOrganizationId(profile.organization_id);
-              void loadResumedPreview(profile.organization_id);
-              setStep(profile.work_areas_asked_at ? PLAN_STEP : WORK_AREAS_STEP);
+              // No plan ever and no brand of its own (the sample brand
+              // explored from the choice, and back here): the choice again,
+              // as the first screen. A brand set up under the old order:
+              // the plan step after it, with the brand, as before.
+              const ownBrands = await countPlanBrands(supabase, profile.organization_id).catch(
+                () => null,
+              );
+              if (
+                opensOnStartChoice({
+                  cloud: true,
+                  hasOrganization: true,
+                  role: profile.role,
+                  subscriptionStatus: subStatus,
+                  everSubscribed: Boolean(org?.stripe_subscription_id),
+                  ownBrands,
+                })
+              ) {
+                setStartFirst(true);
+              } else {
+                void loadResumedPreview(profile.organization_id);
+              }
+              setStep(PLAN_STEP);
               setInitialLoading(false);
               return;
             }
+            // Setup after purchase: the plan is active, the organization has
+            // no brand of its own, or its one brand was left part-way (read
+            // from its data, as the dashboard's layout reads it, so setup
+            // opens where it stands and never bounces back), for someone who
+            // can set one up.
+            const gate = { cloud: true, subscriptionStatus: subStatus, role: profile.role };
+            setupOpens = needsSetupAfterPurchase({
+              ...gate,
+              progress: await readSetupProgress(supabase, profile.organization_id),
+            });
           }
-          router.push('/dashboard');
-          router.refresh();
+          if (!setupOpens) {
+            router.push('/dashboard');
+            router.refresh();
+            return;
+          }
+        }
+
+        // A new admin on the cloud: the choice first. Its organization is
+        // made once a choice is made (choiceOrganization), not on opening, so
+        // someone who opens onboarding and leaves (before accepting an
+        // invitation, say) leaves no workspace behind. Until then the screen
+        // needs none: a new person may have the free trial, and the demo
+        // brand's setup starts ahead once the organization exists.
+        if (
+          profile &&
+          !profile.organization_id &&
+          opensOnStartChoice({ cloud: isCloud(), hasOrganization: false, role: profile.role })
+        ) {
+          setStartFirst(true);
+          setStep(PLAN_STEP);
           return;
         }
 
         if (profile?.organization_id) {
           setOrganizationId(profile.organization_id);
+          // On the cloud, a plan bought before setup (setup after purchase,
+          // resumed or just bought from the choice): Finish then starts
+          // tracking, with no plan step, and the prompts are made for the
+          // plan's engines. No plan ever: the choice may come first (below).
+          // A plan that lapsed after a subscription opens the dashboard
+          // read-only instead, Billing included (planLapsed): setup's writes
+          // would refuse it.
+          let subscriptionStatus: string | null = null;
+          let everSubscribed = false;
+          if (isCloud()) {
+            const { data: org } = await supabase
+              .from('organizations')
+              .select('subscription_status, plan, stripe_subscription_id')
+              .eq('id', profile.organization_id)
+              .single();
+            subscriptionStatus = org?.subscription_status ?? null;
+            everSubscribed = Boolean(org?.stripe_subscription_id);
+            if (org && planLapsed({ cloud: true, subscriptionStatus, everSubscribed })) {
+              router.push('/dashboard');
+              router.refresh();
+              return;
+            }
+            if (isSubscriptionActive(org?.subscription_status)) {
+              planActive = true;
+              if (org?.plan) setCurrentPlanId(toPlanId(org.plan));
+            }
+          }
+          // The person's own brand: the demo brand may be built already (demo ahead).
           const { data: brands } = await supabase
             .from('brands')
             .select('*, brand_domains(*)')
             .eq('organization_id', profile.organization_id)
+            .eq('is_demo', false)
             .limit(1);
 
           if (brands?.length) {
@@ -521,6 +713,10 @@ export default function OnboardingPage() {
               language: b.language ?? undefined,
               shoppingModeEnabled: !!b.shopping_mode_enabled,
               isActive: (b as { is_active?: boolean }).is_active ?? true,
+              // For "Connect your site", after Finish in setup after purchase.
+              trackingCode: b.tracking_code ?? undefined,
+              conversionsEnabled: b.conversions_enabled === true,
+              conversionsConsent: b.conversions_consent === 'always' ? 'always' : 'wait',
               domains: (b.brand_domains || []).map((d: Record<string, unknown>) => ({
                 id: d.id as string,
                 brandId: d.brand_id as string,
@@ -569,11 +765,29 @@ export default function OnboardingPage() {
             } else {
               setStep(3);
             }
+          } else if (
+            // The organization made on the choice screen, no plan and no
+            // brand yet (a reload, a canceled Checkout): the choice again.
+            opensOnStartChoice({
+              cloud: isCloud(),
+              hasOrganization: true,
+              role: profile.role,
+              subscriptionStatus,
+              everSubscribed,
+              ownBrands: brands ? 0 : null,
+            })
+          ) {
+            setStartFirst(true);
+            setStep(PLAN_STEP);
           }
         }
       } catch (err) {
         console.error('Resume check failed:', err);
       } finally {
+        if (planActive) {
+          setAfterPurchase(true);
+          setManagesPlan(canManagePlan(role));
+        }
         setInitialLoading(false);
       }
     }
@@ -583,12 +797,21 @@ export default function OnboardingPage() {
   // Fire `onboarding_step_viewed` whenever the wizard advances (or resumes).
   // This is the funnel surface — PostHog will compute drop-off between any
   // two adjacent step_viewed events without us needing per-step columns.
+  // In setup after purchase, the same events with setup_after_purchase; the
+  // choice as the first screen is the plan step with position: 'first'. Once
+  // the resume has decided the step, so a step never shown isn't counted.
   useEffect(() => {
+    if (initialLoading) return;
     const stepName = ONBOARDING_STEP_NAMES[step];
     if (stepName) {
-      track('onboarding_step_viewed', { step, step_name: stepName });
+      track('onboarding_step_viewed', {
+        step,
+        step_name: stepName,
+        ...setupFlowProps(afterPurchase),
+        ...startPositionProps(startFirst && step === PLAN_STEP),
+      });
     }
-  }, [step]);
+  }, [step, afterPurchase, startFirst, initialLoading]);
 
   const domain = website
     .replace(/^https?:\/\//, '')
@@ -604,49 +827,24 @@ export default function OnboardingPage() {
       const {
         data: { user },
       } = await supabase.auth.getUser();
-      if (!user) throw new Error('Not authenticated');
+      if (!user) throw new Error(tSetup('setup.notAuthenticated'));
 
-      // Check if org already exists (resume case)
-      const { data: profile } = await supabase
-        .from('profiles')
-        .select('organization_id')
-        .eq('id', user.id)
-        .single();
-
-      let orgId = profile?.organization_id;
-
-      if (!orgId) {
-        const slug = slugify(brandName) || `org-${Date.now()}`;
-
-        const { data: existing } = await supabase
-          .from('organizations')
-          .select('id')
-          .eq('slug', slug)
-          .maybeSingle();
-
-        const finalSlug = existing ? `${slug}-${Date.now()}` : slug;
-
-        const { data: org, error: orgError } = await supabase
-          .from('organizations')
-          .insert({ name: brandName.trim(), slug: finalSlug })
-          .select()
-          .single();
-
-        if (orgError || !org) throw new Error(orgError?.message ?? 'Failed to create organization');
-
-        const { error: profileError } = await supabase
-          .from('profiles')
-          .update({ organization_id: org.id })
-          .eq('id', user.id);
-
-        if (profileError) throw new Error(profileError.message);
-        orgId = org.id;
-      }
+      // The organization: the one made on the choice screen or resumed, or
+      // made now, named after the brand (a self-hosted install: no choice).
+      const { id: orgId, created: orgCreated } = await ensureOrganization(
+        supabase,
+        user.id,
+        brandName,
+      );
 
       setOrganizationId(orgId);
 
       // Create brand if not already created
       if (!createdBrand) {
+        // Setup after purchase: never with a plan that lapsed meanwhile.
+        // Onboarding stays as it is: a setup left half-way resumes from the
+        // brand's own data (readSetupProgress).
+        if (await leaveIfPlanLapsed(orgId)) return;
         // logo_url starts null — BrandAvatar derives the favicon at render time.
         const result = await createBrand({
           organizationId: orgId,
@@ -662,16 +860,29 @@ export default function OnboardingPage() {
           return;
         }
         const { brand } = result;
+        // A workspace made on the choice screen takes its first brand's name,
+        // as one made here does.
+        if (!orgCreated && isCloud()) {
+          await nameWorkspaceFromBrand(supabase, orgId, {
+            placeholder: workspacePlaceholder,
+            brandName: brand.name,
+          });
+        }
 
         setCreatedBrand(brand);
         addBrand(brand);
         setActiveBrand(brand.id);
-        track('onboarding_brand_created', { region: brand.region });
+        void detectBrandType(brand.id);
+        track('onboarding_brand_created', {
+          region: brand.region,
+          ...setupFlowProps(afterPurchase),
+        });
         track('onboarding_step_completed', {
           step: 2,
           step_name: 'brand_details',
           region: brand.region,
           language: brand.language,
+          ...setupFlowProps(afterPurchase),
         });
         setPersonProperties({
           region: brand.region,
@@ -686,7 +897,7 @@ export default function OnboardingPage() {
         fetchTopicSuggestions();
       }
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to create brand');
+      toast.error(err instanceof Error ? err.message : tSetup('setup.createBrandFailed'));
     } finally {
       setIsLoading(false);
     }
@@ -746,6 +957,7 @@ export default function OnboardingPage() {
 
   const handleGeneratePrompts = async () => {
     if (!createdBrand) return;
+    if (await leaveIfPlanLapsed(createdBrand.organizationId)) return;
     setLoadingPrompts(true);
     setTopicSaveError(false);
     setPromptGenError(null);
@@ -767,20 +979,27 @@ export default function OnboardingPage() {
     }
 
     try {
-      const { topicPrompts: generated } = await generatePromptsFromTopics(
-        {
-          brandName: brandName.trim(),
-          description: description.trim(),
-          website: domain,
-          language,
-        },
-        topicNames,
-      );
-      setTopicPrompts(generated);
+      // The plan's room, read alongside: the prompts ticked at first fit in
+      // it, so none start out waiting for a spot. Unread, 15 as usual.
+      const [{ topicPrompts: generated }, capacity] = await Promise.all([
+        generatePromptsFromTopics(
+          {
+            brandName: brandName.trim(),
+            description: description.trim(),
+            website: domain,
+            language,
+          },
+          topicNames,
+        ),
+        promptCapacity ?? getPromptCapacity(createdBrand.id).catch(() => null),
+      ]);
+      if (capacity) setPromptCapacity(capacity);
+      setTopicPrompts(withDefaultPicks(generated, defaultPickCount(promptRoom(capacity))));
       track('onboarding_step_completed', {
         step: 3,
         step_name: 'topics',
         topic_count: selectedTopics.size,
+        ...setupFlowProps(afterPurchase),
       });
       setStep(4);
     } catch (err) {
@@ -801,21 +1020,24 @@ export default function OnboardingPage() {
 
   const handleSavePromptsAndContinue = async () => {
     if (!createdBrand) return;
+    if (await leaveIfPlanLapsed(createdBrand.organizationId)) return;
     setIsLoading(true);
     setSaveError(null);
     try {
       const allPrompts = topicPrompts.flatMap((tp) =>
-        tp.prompts.map((text) => ({
-          text,
-          category: tp.topic,
-          platforms: activeScrapers.map((s) => s.id),
-          models: activeModels.map((m) => m.id),
-          isActive: true,
-        })),
+        tp.prompts
+          .filter((p) => p.picked)
+          .map(({ text }) => ({
+            text,
+            category: tp.topic,
+            platforms: activeScrapers.map((s) => s.id),
+            models: activeModels.map((m) => m.id),
+            isActive: true,
+          })),
       );
 
       if (allPrompts.length === 0) {
-        setSaveError('Add at least one prompt before continuing.');
+        setSaveError(tSetup('setup.addPrompt'));
         setIsLoading(false);
         return;
       }
@@ -829,24 +1051,26 @@ export default function OnboardingPage() {
         // No technical toasts on this step: actionable failures (plan limit)
         // show verbatim inline, anything else gets a friendly retry message.
         setSaveError(
-          result.code === 'plan_limit'
-            ? result.error
-            : "We couldn't save your prompts — please try again.",
+          result.code === 'plan_limit' ? result.error : tSetup('setup.savePromptsFailed'),
         );
         return;
       }
-      track('onboarding_prompts_saved', { count: allPrompts.length });
+      track('onboarding_prompts_saved', {
+        count: allPrompts.length,
+        ...setupFlowProps(afterPurchase),
+      });
       track('onboarding_step_completed', {
         step: 4,
         step_name: 'prompts',
         prompt_count: allPrompts.length,
         topic_count: topicPrompts.length,
+        ...setupFlowProps(afterPurchase),
       });
 
       setStep(5);
       fetchCompetitorSuggestions();
     } catch {
-      setSaveError("We couldn't save your prompts — please try again.");
+      setSaveError(tSetup('setup.savePromptsFailed'));
     } finally {
       setIsLoading(false);
     }
@@ -876,14 +1100,37 @@ export default function OnboardingPage() {
     }
   };
 
+  // The brand's kind of site, from its home page (Step 0): in the
+  // background, best effort; the app goes on guessing when it can't tell.
+  const detectBrandType = async (brandId: string) => {
+    try {
+      const { siteType, industry } = await detectSiteType(brandId);
+      if (!siteType) return;
+      const updates = {
+        siteType,
+        siteTypeSource: 'auto' as const,
+        ...(industry ? { industry } : {}),
+      };
+      setCreatedBrand((b) => (b?.id === brandId ? { ...b, ...updates } : b));
+      updateBrandInStore(brandId, updates);
+      track('onboarding_site_type_detected', { site_type: siteType });
+    } catch (err) {
+      console.error('Site type detection error:', err);
+    }
+  };
+
   // The research found an online store: Shopping mode goes on, so Product
   // Visibility shows in the menu. Best effort: it can be turned on in the
   // brand's settings too.
   const turnOnProductVisibility = async () => {
     if (!createdBrand || createdBrand.shoppingModeEnabled) return;
     try {
-      const { industry } = await markBrandAsEcommerce(createdBrand.id);
-      const updates = { industry: industry ?? undefined, shoppingModeEnabled: true };
+      const { industry, siteType } = await markBrandAsEcommerce(createdBrand.id);
+      const updates = {
+        industry: industry ?? undefined,
+        shoppingModeEnabled: true,
+        ...(siteType ? { siteType, siteTypeSource: 'auto' as const } : {}),
+      };
       setCreatedBrand({ ...createdBrand, ...updates });
       updateBrandInStore(createdBrand.id, updates);
       setEcommerceDetected(true);
@@ -910,7 +1157,7 @@ export default function OnboardingPage() {
       competitorDomain,
     );
     if (list === suggestedCompetitors) return;
-    if (duplicate) toast.info(`${duplicate.name} is already in the list`);
+    if (duplicate) toast.info(tSetup('setup.alreadyInList', { name: duplicate.name }));
     setSuggestedCompetitors(list);
     setCompetitorName('');
     setCompetitorDomain('');
@@ -937,7 +1184,7 @@ export default function OnboardingPage() {
     if (!createdBrand) return;
     const selected = takePendingCompetitor().filter((c) => c.selected);
     if (selected.length === 0) {
-      toast.error('Add at least one competitor to continue.');
+      toast.error(tSetup('setup.addCompetitor'));
       return;
     }
 
@@ -946,10 +1193,46 @@ export default function OnboardingPage() {
       // Shopping mode first, if it is still going on: the first run should
       // track ChatGPT Shopping on every prompt, not some of them.
       await ecommerceSetup.current;
+      if (await leaveIfPlanLapsed(createdBrand.organizationId)) return;
       // Save selected competitors
       await Promise.all(
         selected.map((c) => addCompetitor(createdBrand.id, { name: c.name, domain: c.domain })),
       );
+
+      // Setup after purchase: the plan is active already, so the server ends
+      // setup (the prompts aligned to the plan, the brand's first run
+      // started, onboarding marked completed) and the dashboard shows the
+      // run, as after a purchase. A plan found not active any more: lapsed
+      // after a subscription, the read-only dashboard (Billing for its
+      // admin); else the plan step below, as setup without a plan does.
+      if (afterPurchase) {
+        const finished = await finishSetupAfterPurchase(createdBrand.id).catch(() => null);
+        if (finished?.ok) {
+          track('onboarding_step_completed', {
+            step: 5,
+            step_name: 'competitors',
+            competitor_count: selected.length,
+            ...setupFlowProps(true),
+          });
+          track('onboarding_finished', { paid: true, ...setupFlowProps(true) });
+          setPersonProperties({ onboarding_completed: true, ...setupFlowProps(true) });
+          // Tracking has started. One more, optional screen when the brand
+          // has a snippet: "Connect your site" (which says so), then the same landing.
+          if (connectSiteSnippet(createdBrand)) {
+            setLanding(setupLanding(finished.jobId));
+            setSavingCompetitors(false);
+            setStep(CONNECT_SITE_STEP);
+            return;
+          }
+          toast.success(tSetup('setup.setupComplete'));
+          // A full page navigation, as below: the layout reads the fresh flag.
+          window.location.href = setupLanding(finished.jobId);
+          return;
+        }
+        if (finished?.reason !== 'no_plan') throw new Error(tSetup('finishFailed'));
+        if (await leaveIfPlanLapsed(createdBrand.organizationId)) return;
+        setAfterPurchase(false);
+      }
 
       // Mark onboarding as complete
       const supabase = createClient();
@@ -970,11 +1253,11 @@ export default function OnboardingPage() {
         onboarding_completed: true,
       });
 
-      // Cloud mode → what they work on, then the subscription step (tracking
-      // triggered after payment)
+      // Cloud mode → subscription step (tracking triggered after payment)
       if (isCloud()) {
         setSavingCompetitors(false);
-        setStep(WORK_AREAS_STEP);
+        toast.success(tSetup('saved', { trial: trialDays != null ? 'yes' : 'no' }));
+        setStep(PLAN_STEP);
         return;
       }
 
@@ -1000,46 +1283,134 @@ export default function OnboardingPage() {
       // from the Stripe success route once the plan is confirmed.
       await bootstrapBrandVolumes(createdBrand.id);
 
-      toast.success('Setup complete! Your first tracking is starting.');
+      toast.success(tSetup('setup.setupComplete'));
 
       // Full page navigation bypasses Next.js router cache, ensuring
       // the server-side layout reads the fresh onboarding_completed flag.
-      window.location.href = DASHBOARD_HOME;
+      // /dashboard opens the person's start page.
+      window.location.href = '/dashboard';
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to save competitors');
       setSavingCompetitors(false);
     }
   };
 
+  // Setup after purchase, put off for half an hour: Billing opens (a full
+  // page navigation, so the dashboard's layout reads the cookie), where the
+  // admin can change or cancel the plan before setting up a brand.
+  const openBillingFirst = () => {
+    document.cookie = setupDeferredCookie({ secure: window.location.protocol === 'https:' });
+    track('onboarding_manage_plan_opened', { step, ...setupFlowProps(true) });
+    window.location.href = SETUP_BILLING_HREF;
+  };
+
+  // ── "Connect your site": Done or Later, to the dashboard with the run ──
+
+  const leaveConnectSite = (how: 'done' | 'later') => {
+    if (leaving || !landing) return;
+    setLeaving(how);
+    track(how === 'done' ? 'onboarding_connect_site_done' : 'onboarding_connect_site_skipped', {
+      copied: snippetCopied.current,
+      ...setupFlowProps(true),
+    });
+    // A full page navigation, as Finish's: the layout reads the fresh flag.
+    window.location.href = landing;
+  };
+
+  // The organization a choice goes on with (Checkout or the sample brand):
+  // the person's, or made now with their own session, named for now (the
+  // brand step names it after the brand). ensureOrganization makes one only:
+  // a second click, another tab or a reload finds it. Null, with the error
+  // said, when it couldn't be made: the choice stays, and nothing else is
+  // written.
+  const choiceOrganization = async (): Promise<string | null> => {
+    if (organizationId) return organizationId;
+    try {
+      const supabase = createClient();
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+      if (!user) throw new Error(tSetup('setup.notAuthenticated'));
+      const { id } = await ensureOrganization(supabase, user.id, workspacePlaceholder);
+      setOrganizationId(id);
+      return id;
+    } catch (err) {
+      console.error('Could not make the organization:', err);
+      toast.error(workspaceFailed);
+      return null;
+    }
+  };
+
   // ── Plan step: Stripe checkout ──
 
-  const handleCheckout = async (planId: PlanId) => {
-    if (!organizationId) return;
-    setCheckoutLoading(planId);
+  // The choice made above the cards: the free trial, or bought now (monthly
+  // with the first-month offer while it's on, or a year); a card either way.
+  // The events carry the choice (trial, monthly, yearly), and position:
+  // 'first' on the first screen.
+  const handleCheckout = async (planId: PlanId, mode: CheckoutMode) => {
+    if (checkout || preparing) return;
+    // The first screen makes the organization now, for Checkout.
+    setPreparing({ planId, mode });
+    const orgId = await choiceOrganization();
+    setPreparing(null);
+    if (!orgId) return;
+    const chosen = { choice: startChoiceName(choice), ...startPositionProps(startFirst) };
     track('onboarding_step_completed', {
       step: PLAN_STEP,
       step_name: 'plan',
       plan_id: planId,
+      ...chosen,
     });
-    track('onboarding_plan_selected', { plan_id: planId });
+    track('onboarding_plan_selected', { plan_id: planId, checkout_mode: mode, ...chosen });
     setPersonProperties({
       intended_plan: planId,
     });
-    try {
-      const res = await fetch('/api/stripe/checkout', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ planId, organizationId }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Failed to create checkout session');
-      if (data.url) {
-        window.location.href = data.url;
+    void start(planId, mode, mode === 'buy' && choice === 'month' ? offer?.code : undefined, orgId);
+  };
+
+  // The sample brand, the plan step's other way in (choice: 'demo'). From the
+  // first screen it needs no setup: onboarding is marked completed first, so
+  // the dashboard opens on the demo, read-only (a workspace that never had a
+  // plan, with its demo brand). Its own brand is set up once a plan is bought.
+  // Only with the organization, made now if need be: without one the demo
+  // can't be made, and an onboarding marked completed with no organization
+  // would bounce between the dashboard and here. Then the error is said, the
+  // choice stays, and nothing is written.
+  const handleExploreDemo = async () => {
+    if (exploreDemo.opening || preparing) return;
+    if (startFirst) {
+      setPreparing('demo');
+      const orgId = await choiceOrganization();
+      if (!orgId) {
+        setPreparing(null);
+        return;
       }
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Checkout failed');
-      setCheckoutLoading(null);
+      const supabase = createClient();
+      const done = await supabase.auth
+        .getUser()
+        .then(async ({ data: { user } }) => {
+          if (!user) return false;
+          const { error } = await supabase
+            .from('profiles')
+            .update({ onboarding_completed: true })
+            .eq('id', user.id);
+          if (error) console.error('Could not mark onboarding completed:', error);
+          return !error;
+        })
+        .catch(() => false);
+      setPreparing(null);
+      if (!done) {
+        toast.error(tExplore('failed'));
+        return;
+      }
     }
+    track('onboarding_step_completed', {
+      step: PLAN_STEP,
+      step_name: 'plan',
+      choice: startChoiceName('demo'),
+      ...startPositionProps(startFirst),
+    });
+    void exploreDemo.explore();
   };
 
   // ── Topic prompt editing helpers ──
@@ -1050,39 +1421,50 @@ export default function OnboardingPage() {
 
   const addPromptToTopic = (topicIndex: number, prompt: string) => {
     setTopicPrompts((prev) =>
-      prev.map((tp, i) => (i === topicIndex ? { ...tp, prompts: [...tp.prompts, prompt] } : tp)),
+      prev.map((tp, i) =>
+        i === topicIndex ? { ...tp, prompts: [...tp.prompts, { text: prompt, picked: true }] } : tp,
+      ),
     );
   };
 
-  const removePromptFromTopic = (topicIndex: number, promptIndex: number) => {
+  const togglePrompt = (topicIndex: number, promptIndex: number) => {
     setTopicPrompts((prev) =>
       prev.map((tp, i) =>
         i === topicIndex
-          ? { ...tp, prompts: tp.prompts.filter((_, pi) => pi !== promptIndex) }
+          ? {
+              ...tp,
+              prompts: tp.prompts.map((p, pi) =>
+                pi === promptIndex ? { ...p, picked: !p.picked } : p,
+              ),
+            }
           : tp,
       ),
     );
   };
 
-  const totalPrompts = topicPrompts.reduce((sum, tp) => sum + tp.prompts.length, 0);
-  // Prompts this brand may save before hitting the org's plan cap (null =
-  // unknown or unlimited); over that, Continue is disabled with an inline hint.
-  const promptLimit =
-    promptCapacity && promptCapacity.maxPrompts !== -1
-      ? Math.max(0, promptCapacity.maxPrompts - promptCapacity.used)
-      : null;
-  const excessPrompts = promptLimit !== null ? Math.max(0, totalPrompts - promptLimit) : 0;
+  // The prompts offered, and the ticked ones: only those are saved, and they
+  // count toward the plan.
+  const offeredPrompts = topicPrompts.reduce((sum, tp) => sum + tp.prompts.length, 0);
+  const totalPrompts = pickedCount(topicPrompts);
+  // Prompts this brand may track before hitting the org's plan cap (null =
+  // unknown or unlimited); past it, the rest are saved waiting for a spot
+  // (savePromptSet), as on a new brand's wizard, and a note says how many.
+  const promptLimit = promptRoom(promptCapacity);
+  const overPrompts = promptLimit !== null ? Math.max(0, totalPrompts - promptLimit) : 0;
 
   async function loadResumedPreview(orgId: string) {
     try {
       const supabase = createClient();
+      // The person's own brand, not the demo brand they may have explored.
       const { data: brands } = await supabase
         .from('brands')
         .select('id, name, brand_domains(domain, is_primary)')
         .eq('organization_id', orgId)
+        .eq('is_demo', false)
         .limit(1);
       const b = brands?.[0];
       if (!b) return;
+      setResumedBrandId(b.id);
       const domains = (b.brand_domains ?? []) as { domain: string; is_primary: boolean }[];
       const [topics, competitors] = await Promise.all([getTopics(b.id), getCompetitors(b.id)]);
       setResumedPreview({
@@ -1117,10 +1499,8 @@ export default function OnboardingPage() {
               <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-primary text-primary-foreground">
                 <Globe className="h-6 w-6" />
               </div>
-              <h1 className="text-2xl font-bold tracking-tight">Set up your brand</h1>
-              <p className="text-sm text-muted-foreground">
-                See how AI platforms talk about you. Add your first brand to get started.
-              </p>
+              <h1 className="text-2xl font-bold tracking-tight">{tSetup('setup.brandTitle')}</h1>
+              <p className="text-sm text-muted-foreground">{tSetup('setup.brandIntro')}</p>
             </div>
 
             <div className="space-y-4">
@@ -1157,7 +1537,7 @@ export default function OnboardingPage() {
                 </Label>
                 <Textarea
                   id="description"
-                  placeholder="A brief description helps us generate better suggestions."
+                  placeholder={tSetup('setup.descriptionPlaceholder')}
                   value={description}
                   onChange={(e) => setDescription(e.target.value)}
                   rows={3}
@@ -1178,6 +1558,7 @@ export default function OnboardingPage() {
                     brand_name: brandName.trim(),
                     brand_domain: domain,
                     has_description: description.trim().length > 0,
+                    ...setupFlowProps(afterPurchase),
                   });
                   setPersonProperties({
                     company_url: domain,
@@ -1185,7 +1566,7 @@ export default function OnboardingPage() {
                   setStep(2);
                 }}
               >
-                Continue
+                {tSetup('setup.continue')}
               </Button>
             </div>
           </div>
@@ -1204,11 +1585,8 @@ export default function OnboardingPage() {
             <BrandHeader name={brandName} domain={domain} />
 
             <div>
-              <h1 className="text-2xl font-bold tracking-tight">Select your target market</h1>
-              <p className="text-sm text-muted-foreground mt-1">
-                Pick the region and language your audience uses. This helps us deliver more accurate
-                AI visibility data.
-              </p>
+              <h1 className="text-2xl font-bold tracking-tight">{tSetup('setup.marketTitle')}</h1>
+              <p className="text-sm text-muted-foreground mt-1">{tSetup('setup.marketIntro')}</p>
             </div>
 
             <div className="space-y-4">
@@ -1240,7 +1618,7 @@ export default function OnboardingPage() {
                 <div className="space-y-2">
                   <Label>State (optional)</Label>
                   <Select
-                    items={STATE_ITEMS}
+                    items={stateItems}
                     value={usState || 'nationwide'}
                     onValueChange={(v) => setUsState(!v || v === 'nationwide' ? '' : v)}
                   >
@@ -1248,7 +1626,7 @@ export default function OnboardingPage() {
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="nationwide">Nationwide (no state)</SelectItem>
+                      <SelectItem value="nationwide">{tSetup('setup.nationwide')}</SelectItem>
                       {US_STATES.map((s) => (
                         <SelectItem key={s.code} value={s.code}>
                           {s.label}
@@ -1256,9 +1634,7 @@ export default function OnboardingPage() {
                       ))}
                     </SelectContent>
                   </Select>
-                  <p className="text-xs text-muted-foreground">
-                    Localizes AI answers to this state. Leave empty for nationwide results.
-                  </p>
+                  <p className="text-xs text-muted-foreground">{tSetup('setup.stateHelp')}</p>
                 </div>
               )}
 
@@ -1286,10 +1662,10 @@ export default function OnboardingPage() {
                 {isLoading ? (
                   <>
                     <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    Setting up...
+                    {tSetup('setup.settingUp')}
                   </>
                 ) : (
-                  'Continue'
+                  tSetup('setup.continue')
                 )}
               </Button>
             </div>
@@ -1301,7 +1677,7 @@ export default function OnboardingPage() {
               className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
             >
               <ArrowLeft className="h-3.5 w-3.5" />
-              Back
+              {tSetup('setup.back')}
             </button>
             <StepDots current={2} total={totalSteps} />
             <div className="w-12" />
@@ -1350,14 +1726,12 @@ export default function OnboardingPage() {
                           {topicSuggestError === 'dailyLimit' ? (
                             tWizard('suggestionsUsedUp')
                           ) : (
-                            <>
-                              Couldn&apos;t fetch topic suggestions right now — add your own above.
-                            </>
+                            <>{tSetup('setup.topicSuggestFailed')}</>
                           )}
                         </span>
                         {topicSuggestError !== 'dailyLimit' && (
                           <Button variant="outline" size="sm" onClick={fetchTopicSuggestions}>
-                            Try again
+                            {tSetup('setup.tryAgain')}
                           </Button>
                         )}
                       </div>
@@ -1392,7 +1766,7 @@ export default function OnboardingPage() {
 
                     <div className="flex items-center gap-2 pt-2">
                       <Input
-                        placeholder="Add custom topic..."
+                        placeholder={tSetup('setup.customTopicPlaceholder')}
                         maxLength={BRAND_SETUP_LIMITS.topic}
                         value={customTopic}
                         onChange={(e) => setCustomTopic(e.target.value)}
@@ -1425,45 +1799,42 @@ export default function OnboardingPage() {
                   {loadingPrompts ? (
                     <>
                       <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      Generating prompts...
+                      {tSetup('setup.generatingPrompts')}
                     </>
                   ) : (
-                    'Looks good'
+                    tSetup('setup.looksGood')
                   )}
                 </Button>
               </div>
 
               <div className="lg:col-span-2">
                 <div className="rounded-xl border bg-card p-5 sticky top-10">
-                  <h3 className="text-sm font-semibold mb-4">Topic Selection Tips</h3>
+                  <h3 className="text-sm font-semibold mb-4">{tSetup('setup.tipsTitle')}</h3>
                   <div className="space-y-4">
                     <div className="flex gap-3">
                       <Check className="h-4 w-4 text-foreground shrink-0 mt-0.5" />
                       <div>
-                        <p className="text-sm font-medium">5 prompts are created per topic</p>
+                        <p className="text-sm font-medium">{tSetup('setup.tip1Title')}</p>
                         <p className="text-xs text-muted-foreground mt-0.5">
-                          You can select up to 10 topics for a total of 50 prompts. More can be
-                          added anytime from the dashboard.
+                          {tSetup('setup.tip1Body')}
                         </p>
                       </div>
                     </div>
                     <div className="flex gap-3">
                       <Check className="h-4 w-4 text-foreground shrink-0 mt-0.5" />
                       <div>
-                        <p className="text-sm font-medium">Think like your customers</p>
+                        <p className="text-sm font-medium">{tSetup('setup.tip2Title')}</p>
                         <p className="text-xs text-muted-foreground mt-0.5">
-                          Use terms your audience would search for when looking for products or
-                          services like yours.
+                          {tSetup('setup.tip2Body')}
                         </p>
                       </div>
                     </div>
                     <div className="flex gap-3">
                       <Check className="h-4 w-4 text-foreground shrink-0 mt-0.5" />
                       <div>
-                        <p className="text-sm font-medium">Keep it short</p>
+                        <p className="text-sm font-medium">{tSetup('setup.tip3Title')}</p>
                         <p className="text-xs text-muted-foreground mt-0.5">
-                          Topics should be concise — we&apos;ll turn them into detailed prompts in
-                          the next step.
+                          {tSetup('setup.tip3Body')}
                         </p>
                       </div>
                     </div>
@@ -1479,7 +1850,7 @@ export default function OnboardingPage() {
               className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
             >
               <ArrowLeft className="h-3.5 w-3.5" />
-              Back
+              {tSetup('setup.back')}
             </button>
             <StepDots current={3} total={totalSteps} />
             <div className="w-12" />
@@ -1497,11 +1868,8 @@ export default function OnboardingPage() {
             <BrandHeader name={brandName} domain={domain} />
 
             <div className="mb-6">
-              <h1 className="text-2xl font-bold tracking-tight">Review your prompts</h1>
-              <p className="text-sm text-muted-foreground mt-1">
-                These prompts will be sent to AI platforms daily. Feel free to edit, add, or remove
-                any before starting.
-              </p>
+              <h1 className="text-2xl font-bold tracking-tight">{tPrompts('title')}</h1>
+              <p className="text-sm text-muted-foreground mt-1">{tPrompts('intro')}</p>
             </div>
 
             {promptGenError && (
@@ -1509,21 +1877,18 @@ export default function OnboardingPage() {
                 {promptGenError === 'dailyLimit' ? (
                   tWizard('promptSuggestionsUsedUp')
                 ) : (
-                  <>
-                    Couldn&apos;t generate prompt suggestions right now — add your own to each topic
-                    below to continue.
-                  </>
+                  <>{tSetup('setup.promptSuggestFailed')}</>
                 )}
               </div>
             )}
 
-            {excessPrompts > 0 && (
+            {overPrompts > 0 && (
               <div className="mb-4 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm">
-                Your plan includes up to {promptLimit} prompts — remove {excessPrompts} to continue.
+                {tWaiting('brandNote', { room: promptLimit ?? 0, count: overPrompts })}
               </div>
             )}
 
-            {saveError && excessPrompts === 0 && (
+            {saveError && (
               <div className="mb-4 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm">
                 {saveError}
               </div>
@@ -1531,7 +1896,9 @@ export default function OnboardingPage() {
 
             <div className="mb-4">
               <p className="text-sm font-medium">Your Prompt List</p>
-              <p className="text-xs text-muted-foreground">{totalPrompts} prompts total</p>
+              <p data-slot="prompt-count" className="text-xs text-muted-foreground">
+                {tPrompts('count', { picked: totalPrompts, total: offeredPrompts })}
+              </p>
             </div>
 
             <div className="rounded-lg border">
@@ -1545,12 +1912,12 @@ export default function OnboardingPage() {
                   defaultOpen={idx === 0}
                   onRemoveTopic={() => removeTopic(idx)}
                   onAddPrompt={(p) => addPromptToTopic(idx, p)}
-                  onRemovePrompt={(pi) => removePromptFromTopic(idx, pi)}
+                  onTogglePrompt={(pi) => togglePrompt(idx, pi)}
                 />
               ))}
               {topicPrompts.length === 0 && (
                 <div className="py-8 text-center text-sm text-muted-foreground">
-                  No prompts generated yet.
+                  {tSetup('setup.noPrompts')}
                 </div>
               )}
             </div>
@@ -1558,15 +1925,15 @@ export default function OnboardingPage() {
             <Button
               className="mt-6 w-full"
               onClick={handleSavePromptsAndContinue}
-              disabled={isLoading || totalPrompts === 0 || excessPrompts > 0}
+              disabled={isLoading || totalPrompts === 0}
             >
               {isLoading ? (
                 <>
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Saving prompts...
+                  {tSetup('setup.savingPrompts')}
                 </>
               ) : (
-                'Continue'
+                tSetup('setup.continue')
               )}
             </Button>
           </div>
@@ -1577,7 +1944,7 @@ export default function OnboardingPage() {
               className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
             >
               <ArrowLeft className="h-3.5 w-3.5" />
-              Back
+              {tSetup('setup.back')}
             </button>
             <StepDots current={4} total={totalSteps} />
             <div className="w-12" />
@@ -1619,7 +1986,7 @@ export default function OnboardingPage() {
               <p className="text-sm text-muted-foreground">Know your competitors? Add them here.</p>
               <div className="flex items-center gap-2">
                 <Input
-                  placeholder="Company name"
+                  placeholder={tSetup('setup.companyName')}
                   value={competitorName}
                   onChange={(e) => setCompetitorName(e.target.value)}
                   onKeyDown={(e) => e.key === 'Enter' && addManualCompetitor()}
@@ -1668,7 +2035,7 @@ export default function OnboardingPage() {
                     </span>
                     {competitorSuggestError !== 'dailyLimit' && (
                       <Button variant="outline" size="sm" onClick={fetchCompetitorSuggestions}>
-                        Try again
+                        {tSetup('setup.tryAgain')}
                       </Button>
                     )}
                   </div>
@@ -1676,7 +2043,7 @@ export default function OnboardingPage() {
                 {suggestedCompetitors.length > 0 && (
                   <div className="space-y-2">
                     <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-                      Competitors to track
+                      {tSetup('setup.competitorsToTrack')}
                     </p>
                     {suggestedCompetitors.map((c, idx) => (
                       <div
@@ -1738,14 +2105,32 @@ export default function OnboardingPage() {
                   {savingCompetitors ? (
                     <>
                       <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      Finishing setup...
+                      {tSetup('setup.finishingSetup')}
                     </>
                   ) : hasSelectedCompetitors ? (
-                    `Start tracking with ${selectedCompetitorCount} competitor${selectedCompetitorCount !== 1 ? 's' : ''}`
+                    // On the cloud, tracking starts with the plan step's
+                    // Checkout (the trial or a plan bought), not here; with
+                    // a plan active already, it starts here.
+                    tSetup(
+                      isCloud() && !afterPurchase
+                        ? 'competitors.continue'
+                        : 'competitors.startTracking',
+                      { count: selectedCompetitorCount },
+                    )
                   ) : (
                     'Add a competitor to continue'
                   )}
                 </Button>
+                {isCloud() && (
+                  <p
+                    data-slot="tracking-starts"
+                    className="text-center text-xs text-muted-foreground"
+                  >
+                    {afterPurchase
+                      ? tSetup('trackingStartsNow')
+                      : tSetup('trackingStarts', { trial: trialDays != null ? 'yes' : 'no' })}
+                  </p>
+                )}
               </div>
             )}
           </div>
@@ -1756,7 +2141,7 @@ export default function OnboardingPage() {
               className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
             >
               <ArrowLeft className="h-3.5 w-3.5" />
-              Back
+              {tSetup('setup.back')}
             </button>
             <StepDots current={5} total={totalSteps} />
             <div className="w-12" />
@@ -1765,35 +2150,39 @@ export default function OnboardingPage() {
       );
     }
 
-    // ── What do you work on? (menu access) ──
+    // ── Connect your site (setup after purchase, after Finish) ──
 
-    if (step === WORK_AREAS_STEP) {
+    if (step === CONNECT_SITE_STEP) {
+      if (!createdBrand || !siteSnippet) return null;
       return (
-        <WorkAreasStep
-          title={tWelcome('title')}
-          lede={tWelcome('lede')}
-          onDone={() => {
-            track('onboarding_step_completed', {
-              step: WORK_AREAS_STEP,
-              step_name: 'work_areas',
-            });
-            toast.success('Almost done! Choose a plan to get started.');
-            setStep(PLAN_STEP);
-          }}
-          footer={
-            <div className="flex mx-auto w-full max-w-4xl items-center justify-between mt-8">
-              <button
-                onClick={() => setStep(5)}
-                className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
-              >
-                <ArrowLeft className="h-3.5 w-3.5" />
-                Back
-              </button>
-              <StepDots current={WORK_AREAS_STEP} total={totalSteps} />
-              <div className="w-12" />
-            </div>
-          }
-        />
+        <div className="flex flex-col p-6 md:p-10">
+          <div className="mx-auto w-full max-w-lg flex-1">
+            <BrandHeader name={brandName} domain={domain} />
+            <ConnectSite
+              brandId={createdBrand.id}
+              domain={domain || undefined}
+              snippet={siteSnippet}
+              leaving={leaving}
+              onCopy={() => {
+                snippetCopied.current = true;
+                track('onboarding_snippet_copied', setupFlowProps(true));
+              }}
+              onEmailed={() => track('onboarding_snippet_emailed', setupFlowProps(true))}
+              onMessageCopied={() =>
+                track('onboarding_snippet_message_copied', setupFlowProps(true))
+              }
+              onChecked={(outcome) =>
+                track('onboarding_snippet_checked', { outcome, ...setupFlowProps(true) })
+              }
+              onDone={() => leaveConnectSite('done')}
+              onLater={() => leaveConnectSite('later')}
+            />
+          </div>
+          {/* Setup's last step: nothing to go back to once tracking has started. */}
+          <div className="mx-auto mt-8 flex w-full max-w-lg justify-center">
+            <StepDots current={totalSteps} total={totalSteps} />
+          </div>
+        </div>
       );
     }
 
@@ -1801,135 +2190,156 @@ export default function OnboardingPage() {
 
     if (step !== PLAN_STEP) return null;
 
+    const trialOffered = trialDays != null;
+    const planBrandName = createdBrand?.name ?? resumedPreview?.brandName ?? (brandName || null);
+
+    // Laid out to fit a laptop screen whole (1024×768 and up): the plans'
+    // details open inside their cards. As the first screen, the choice: how
+    // it goes on from here in place of the brand's setup, and nothing before.
     return (
-      <div className="flex flex-col p-6 md:p-10">
+      <div className="flex flex-col p-6 md:px-8">
         <div className="mx-auto w-full max-w-2xl flex-1">
-          <div className="mb-8 text-center">
-            <p className="text-2xl tracking-tight">One last step</p>
-            <h1 className="mt-1 text-3xl font-bold tracking-tight sm:text-4xl">
-              {trialDays ? `Start Your ${trialDays}-Day Free Trial` : 'Choose Your Plan'}
+          <div className="mb-4 text-center">
+            <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">
+              {startFirst
+                ? tStart('title')
+                : trialOffered
+                  ? tOffer('chooseHowToStart')
+                  : tOffer('choosePlan')}
             </h1>
-            {trialDays && trialConfirmed ? (
-              <ul className="mt-4 flex flex-wrap items-center justify-center gap-2">
-                {TRIAL_ASSURANCES.map((label) => (
-                  <li
-                    key={label}
-                    className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-3 py-1 text-sm font-medium text-emerald-700 ring-1 ring-inset ring-emerald-500/20 dark:text-emerald-300"
-                  >
-                    <Check className="h-3.5 w-3.5" />
-                    {label}
-                  </li>
-                ))}
-              </ul>
-            ) : null}
-          </div>
-
-          {/* Plan cards */}
-          <div className="grid gap-6 sm:grid-cols-2">
-            {SUBSCRIBABLE_PLANS.map((planId) => {
-              const plan = PLANS[planId];
-              const price = plan.pricing;
-              if (!price) return null;
-
-              const loading = checkoutLoading === planId;
-              const copy = PLAN_STEP_COPY[planId];
-              const { maxBrands, maxPrompts, maxTeamMembers } = plan.limits;
-
-              return (
-                <div
-                  key={planId}
-                  className={cn(
-                    'relative flex flex-col rounded-2xl border bg-card p-6 shadow-sm transition-shadow hover:shadow-md',
-                    plan.highlighted && 'border-primary shadow-md ring-1 ring-primary/20',
-                  )}
+            {/* Its line's room is kept while the counts are read: nothing moves. */}
+            <div className="mt-2 min-h-5">
+              {startFirst ? (
+                <p
+                  data-slot="start-intro"
+                  className="mx-auto max-w-xl text-sm text-balance text-muted-foreground"
                 >
-                  {plan.highlighted && (
-                    <Badge className="absolute -top-3 left-1/2 -translate-x-1/2">
-                      Most Popular
-                    </Badge>
-                  )}
-
-                  <div className="mb-4">
-                    <h3 className="text-lg font-semibold">{plan.name}</h3>
-                    <p className="mt-1 text-sm text-muted-foreground">
-                      {copy?.tagline ?? plan.tagline}
-                    </p>
-                  </div>
-
-                  <div className="flex items-end gap-1 mb-4">
-                    <span className="text-4xl font-bold tracking-tight">${price.monthly}</span>
-                    <span className="mb-1 text-sm text-muted-foreground">/month</span>
-                  </div>
-
-                  <Button
-                    className="w-full"
-                    variant={plan.highlighted ? 'default' : 'outline'}
-                    onClick={() => handleCheckout(planId)}
-                    disabled={checkoutLoading !== null}
+                  {tStart('intro', {
+                    trial: trialOffered ? 'yes' : 'no',
+                    days: trialDays ?? 0,
+                  })}
+                </p>
+              ) : (
+                readyCounts &&
+                planBrandName && (
+                  <p
+                    data-slot="ready-to-track"
+                    className="inline-flex items-start gap-1.5 text-sm text-muted-foreground"
                   >
-                    {loading ? (
-                      <>
-                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                        Redirecting...
-                      </>
-                    ) : (
-                      `Choose ${plan.name}`
-                    )}
-                  </Button>
-
-                  <Separator className="my-5" />
-
-                  <div className="space-y-2.5 text-sm">
-                    {copy && <PlanFeatureItem>{copy.platformFeatures}</PlanFeatureItem>}
-                    <PlanFeatureItem>
-                      {maxTeamMembers === -1 ? 'Unlimited Users' : `Up to ${maxTeamMembers} Users`}
-                    </PlanFeatureItem>
-                    <PlanFeatureItem>
-                      {maxBrands === -1
-                        ? 'Unlimited Brands'
-                        : maxBrands === 1
-                          ? '1 Brand'
-                          : `Up to ${maxBrands} Brands`}
-                    </PlanFeatureItem>
-                    <PlanFeatureItem>
-                      {maxPrompts === -1
-                        ? 'Unlimited Prompt Tracking'
-                        : `${maxPrompts} Prompt Tracking/mo`}
-                    </PlanFeatureItem>
-                    <PlanFeatureItem>Real-time Data → Signals → Actions → Tasks</PlanFeatureItem>
-                  </div>
-
-                  {copy && (
-                    <p className="mt-auto pt-6 text-xs font-semibold leading-relaxed">
-                      For {copy.engines}
-                    </p>
-                  )}
-                </div>
-              );
-            })}
+                    <Check
+                      className="mt-0.5 size-4 shrink-0 text-emerald-600 dark:text-emerald-400"
+                      aria-hidden
+                    />
+                    <span>
+                      {tOffer.rich('readyToTrack', {
+                        brand: planBrandName,
+                        ...readyCounts,
+                        b: (chunks) => (
+                          <strong className="font-medium text-foreground">{chunks}</strong>
+                        ),
+                      })}
+                    </span>
+                  </p>
+                )
+              )}
+            </div>
           </div>
 
-          <p className="mt-8 text-center text-lg">Secure payments powered by Stripe.</p>
-          <p className="mt-1 text-center text-sm">
-            {!trialDays
-              ? 'Your free trial has been used, so your plan starts today. Cancel anytime.'
-              : trialConfirmed
-                ? `Your card is charged on day ${trialDays + 1}, unless you cancel in Settings before then.`
-                : 'Cancel anytime.'}
-          </p>
+          {/* How the plan starts: the trial, monthly, or a year; or the demo first */}
+          <div className="mb-5 flex">
+            <StartChoicePicker
+              choice={choice}
+              onChange={(next) => {
+                setDemoChosen(false);
+                setChoice(next);
+              }}
+              trialOffered={trialOffered}
+              centered
+              demo={{ chosen: demoChosen, onChoose: () => setDemoChosen(true) }}
+            />
+          </div>
+
+          {demoChosen ? (
+            // The demo, chosen above: its card in place of the plans. On the
+            // first screen there is no brand of the person's own yet.
+            <ExploreDemoChoice
+              brandName={startFirst ? null : planBrandName}
+              hasOwnBrand={!startFirst}
+              opening={exploreDemo.opening || preparing === 'demo'}
+              onExplore={() => void handleExploreDemo()}
+            />
+          ) : (
+            <>
+              {/* Plan cards */}
+              <div className="grid gap-4 sm:grid-cols-2">
+                {SUBSCRIBABLE_PLANS.map((planId) => (
+                  <PlanStartCard
+                    key={planId}
+                    planId={planId}
+                    choice={choice}
+                    offer={offer}
+                    details={planDetails}
+                  >
+                    <PlanStart
+                      planId={planId}
+                      choice={choice}
+                      offer={offer}
+                      trialOffered={trialOffered}
+                      opening={
+                        checkout?.planId === planId
+                          ? checkout.mode
+                          : preparing !== null &&
+                              preparing !== 'demo' &&
+                              preparing.planId === planId
+                            ? preparing.mode
+                            : null
+                      }
+                      // The first screen makes its organization on the click.
+                      disabled={
+                        (!organizationId && !startFirst) || checkout != null || preparing !== null
+                      }
+                      error={failed?.planId === planId ? failed.message : null}
+                      onStart={(mode) => handleCheckout(planId, mode)}
+                    />
+                  </PlanStartCard>
+                ))}
+              </div>
+
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                <span data-slot="card-note">
+                  {tOffer('cardNote', { both: trialOffered ? 'yes' : 'no' })}
+                </span>
+                <PlanDetailsToggle
+                  open={planDetails}
+                  onToggle={() => setPlanDetails((open) => !open)}
+                />
+              </div>
+
+              {/* Not ready for a card: the demo, straight from one line. */}
+              <ExploreDemoLine
+                className="mt-5"
+                opening={exploreDemo.opening || preparing === 'demo'}
+                onExplore={() => void handleExploreDemo()}
+              />
+            </>
+          )}
+          <DemoSetupDialog {...exploreDemo.setupDialog} />
         </div>
 
-        <div className="flex mx-auto w-full max-w-2xl items-center justify-between mt-8">
-          <button
-            onClick={() => setStep(WORK_AREAS_STEP)}
-            className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
-          >
-            <ArrowLeft className="h-3.5 w-3.5" />
-            Back
-          </button>
-          <StepDots current={PLAN_STEP} total={totalSteps} />
-          <div className="w-12" />
-        </div>
+        {/* The first screen has no step before it, and setup's steps come after. */}
+        {!startFirst && (
+          <div className="flex mx-auto w-full max-w-2xl items-center justify-between mt-5">
+            <button
+              onClick={() => setStep(5)}
+              className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
+            >
+              <ArrowLeft className="h-3.5 w-3.5" />
+              {tSetup('setup.back')}
+            </button>
+            <StepDots current={PLAN_STEP} total={totalSteps} />
+            <div className="w-12" />
+          </div>
+        )}
       </div>
     );
   };
@@ -1956,15 +2366,22 @@ export default function OnboardingPage() {
       }
     >
       {renderStep()}
+      {/* On setup's own steps (1-5): not the plan step, nor "Connect your site" after Finish. */}
+      {!initialLoading && afterPurchase && managesPlan && step < PLAN_STEP && (
+        <div className="flex justify-center px-6 pb-6">
+          <a
+            href={SETUP_BILLING_HREF}
+            data-slot="manage-plan"
+            onClick={(e) => {
+              e.preventDefault();
+              openBillingFirst();
+            }}
+            className="text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
+          >
+            {tSetup('managePlan')}
+          </a>
+        </div>
+      )}
     </OnboardingFrame>
-  );
-}
-
-function PlanFeatureItem({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="flex items-start gap-2">
-      <Check className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
-      <span>{children}</span>
-    </div>
   );
 }

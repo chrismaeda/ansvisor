@@ -1,6 +1,7 @@
 import { BROWSER_API_BASE_URL } from '@/config/api';
 import { apiFailure } from '@/lib/api-failure';
 import { createClient } from '@/lib/supabase/client';
+import { INTEGRATION_READ_TIMEOUT_MS } from '@/lib/integrations-client';
 
 /**
  * A brand's Framer connection for Send to CMS (#1331, phase 2; 00295), from
@@ -10,7 +11,14 @@ import { createClient } from '@/lib/supabase/client';
  */
 
 /** The parts of a page a field map places: a page's title and body always. */
-export const FRAMER_PARTS = ['title', 'body', 'metaTitle', 'metaDescription', 'jsonLd'] as const;
+export const FRAMER_PARTS = [
+  'title',
+  'body',
+  'metaTitle',
+  'metaDescription',
+  'jsonLd',
+  'reviewer',
+] as const;
 export type FramerPart = (typeof FRAMER_PARTS)[number];
 export type FramerFieldMap = Partial<Record<FramerPart, string>>;
 /** The Framer field type each part may go to (server/src/lib/cms/framer.js). */
@@ -20,6 +28,7 @@ export const FRAMER_PART_TYPES: Record<FramerPart, string> = {
   metaTitle: 'string',
   metaDescription: 'string',
   jsonLd: 'string',
+  reviewer: 'string',
 };
 /** The parts every map places. */
 export const FRAMER_NEEDED: readonly FramerPart[] = ['title', 'body'];
@@ -145,7 +154,9 @@ async function call<T>(
 
 /** The brand's connection, and whether this server can keep a Framer key. */
 export function readFramer(brandId: string) {
-  return call<{ configured: boolean; connection: FramerConnection | null }>(brandId, '');
+  return call<{ configured: boolean; connection: FramerConnection | null }>(brandId, '', {
+    signal: AbortSignal.timeout(INTEGRATION_READ_TIMEOUT_MS),
+  });
 }
 
 /**
@@ -188,6 +199,7 @@ const HINTS: Record<FramerPart, RegExp[]> = {
   metaTitle: [/(meta|seo)-?title/],
   metaDescription: [/(meta|seo)-?desc/, /summary/, /excerpt/, /description/],
   jsonLd: [/json-?ld/, /schema/, /structured/],
+  reviewer: [/reviewed?-?by/, /reviewer/],
 };
 
 /**

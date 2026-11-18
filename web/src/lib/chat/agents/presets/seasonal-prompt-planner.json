@@ -1,0 +1,28 @@
+{
+  "id": "seasonal-prompt-planner",
+  "goal": "visibility",
+  "businessTypes": [
+    "ecommerce"
+  ],
+  "industries": [],
+  "roles": [],
+  "skills": [
+    "seasonal"
+  ],
+  "triggers": [
+    {
+      "kind": "schedule",
+      "repeat": "month_first",
+      "time": "09:00"
+    }
+  ],
+  "mode": "ask_first",
+  "connections": [
+    {
+      "key": "google_search_console",
+      "required": false
+    }
+  ],
+  "status": "ready",
+  "needs": []
+}

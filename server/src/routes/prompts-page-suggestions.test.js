@@ -12,9 +12,10 @@ import express from 'express';
 
 const suggestPromptsForPage = vi.fn();
 let profileOrg;
+let topicRows;
 
 function table(name) {
-  const result = () => {
+  const result = (single = false) => {
     if (name === 'brands') {
       return {
         data: {
@@ -27,10 +28,13 @@ function table(name) {
         error: null,
       };
     }
-    if (name === 'profiles') return { data: { organization_id: profileOrg }, error: null };
+    if (name === 'profiles') {
+      return { data: { organization_id: profileOrg, role: 'admin' }, error: null };
+    }
     if (name === 'prompts')
       return { data: [{ id: 'p1', text: 'Best espresso beans?' }], error: null };
-    if (name === 'topics') return { data: [{ name: 'Espresso' }], error: null };
+    if (name === 'topics')
+      return { data: single ? (topicRows[0] ?? null) : topicRows, error: null };
     return { data: [], error: null };
   };
   const chain = new Proxy(
@@ -40,7 +44,7 @@ function table(name) {
         if (prop === 'then') {
           return (resolve, reject) => Promise.resolve(result()).then(resolve, reject);
         }
-        if (prop === 'single' || prop === 'maybeSingle') return async () => result();
+        if (prop === 'single' || prop === 'maybeSingle') return async () => result(true);
         return () => chain;
       },
     },
@@ -76,6 +80,7 @@ const post = (body) =>
 beforeEach(async () => {
   suggestPromptsForPage.mockReset();
   profileOrg = 'o1';
+  topicRows = [{ id: 't1', name: 'Espresso' }];
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -119,6 +124,17 @@ describe('POST /api/prompts/suggestions/:brandId/page', () => {
   it('rejects a URL instead of a path, or a range it cannot read', async () => {
     expect((await post({ page: 'https://acme.example/gifts' })).status).toBe(400);
     expect((await post({ page: '/gifts', from: 'last week' })).status).toBe(400);
+    expect(suggestPromptsForPage).not.toHaveBeenCalled();
+  });
+
+  it('asks for a topic first on a brand without one, before suggesting anything', async () => {
+    topicRows = [];
+    const res = await post({ page: '/gifts' });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({
+      error: 'Add a topic first: prompts are grouped under topics.',
+      code: 'no_topics',
+    });
     expect(suggestPromptsForPage).not.toHaveBeenCalled();
   });
 

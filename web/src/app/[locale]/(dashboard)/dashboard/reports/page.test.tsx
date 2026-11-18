@@ -4,6 +4,7 @@ import { NextIntlClientProvider } from 'next-intl';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import messages from '../../../../../../messages/en.json';
 import { UpgradeDialogContext } from '@/components/providers/upgrade-gate';
+import { ChatAgenticProvider } from '@/components/providers/chat-agentic-provider';
 
 /**
  * Reports on a read-only workspace (plan not active): the reports list and
@@ -23,12 +24,32 @@ vi.mock('@/stores/use-brand-store', () => ({
     select({ activeBrandId: 'b1', brands: [brand] }),
 }));
 const push = vi.hoisted(() => vi.fn());
-vi.mock('@/i18n/navigation', () => ({ useRouter: () => ({ push }) }));
+vi.mock('@/i18n/navigation', () => ({
+  useRouter: () => ({ push }),
+  Link: ({ href, children, ...rest }: { href: string; children: ReactNode }) => (
+    <a href={href} {...rest}>
+      {children}
+    </a>
+  ),
+}));
 vi.mock('@/components/ai-usage/ai-usage-meter', () => ({
   HeaderWithAiUsage: ({ children }: { children: ReactNode }) => <div>{children}</div>,
 }));
 vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+// HubSpot's pipeline section comes with the plan's crm_integrations (#2140).
+const plan = vi.hoisted(() => ({ crm: true }));
+vi.mock('@/hooks/use-feature-gate', () => ({
+  useFeatureGate: () => ({
+    canUse: (feature: string) => feature !== 'crm_integrations' || plan.crm,
+    requiredPlanFor: () => 'Growth',
+  }),
+}));
 
+const { chatPage } = vi.hoisted(() => ({ chatPage: vi.fn() }));
+vi.mock('@/components/chat/panel/chat-panel-context', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  useChatPageContext: chatPage,
+}));
 const { default: ReportsPage } = await import('./page');
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT =
@@ -40,6 +61,7 @@ const openUpgrade = vi.fn();
 
 beforeEach(() => {
   vi.clearAllMocks();
+  plan.crm = true;
   reports.getReports.mockResolvedValue([
     {
       id: 'r1',
@@ -62,15 +84,17 @@ afterEach(() => {
   document.body.replaceChildren();
 });
 
-async function render(isLocked: boolean) {
+async function render(isLocked: boolean, chatAgentic = false) {
   await act(async () => {
     root.render(
       <NextIntlClientProvider locale="en" messages={messages} timeZone="UTC">
-        <UpgradeDialogContext.Provider
-          value={{ isLocked, reason: 'ended', adminName: null, openUpgrade }}
-        >
-          <ReportsPage />
-        </UpgradeDialogContext.Provider>
+        <ChatAgenticProvider enabled={chatAgentic}>
+          <UpgradeDialogContext.Provider
+            value={{ isLocked, reason: 'ended', adminName: null, openUpgrade }}
+          >
+            <ReportsPage />
+          </UpgradeDialogContext.Provider>
+        </ChatAgenticProvider>
       </NextIntlClientProvider>,
     );
   });
@@ -101,5 +125,53 @@ describe('Reports', () => {
     await act(async () => generate().click());
     expect(dialog()).not.toBeNull();
     expect(openUpgrade).not.toHaveBeenCalled();
+  });
+
+  it('links What Ansvisor did for you only with the new Chat on (CHAT-22 §2 item 5)', async () => {
+    await render(false);
+    expect(container.querySelector('[data-action="reports.openImpact"]')).toBeNull();
+    await render(false, true);
+    const link = container.querySelector('[data-action="reports.openImpact"]')!;
+    expect(link.textContent).toBe('What Ansvisor did for you');
+    expect(link.getAttribute('href')).toBe('/dashboard/reports/impact');
+  });
+
+  it('offers the AI-sourced pipeline section on Growth, and shows it off with Growth below', async () => {
+    const section = () =>
+      [...document.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')].find((b) =>
+        b.textContent?.startsWith('AI-sourced pipeline'),
+      )!;
+    await render(false);
+    await act(async () => generate().click());
+    expect(section().disabled).toBe(false);
+    expect(section().textContent).toBe('AI-sourced pipeline');
+
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    document.body.replaceChildren(container);
+    plan.crm = false;
+    await render(false);
+    await act(async () => generate().click());
+    expect(section().disabled).toBe(true);
+    expect(section().textContent).toBe('AI-sourced pipelineGrowth');
+  });
+});
+
+describe("what Chat's side panel sees (the owner's plan, step 9)", () => {
+  it('sends the saved reports by id, each with the days it covers', async () => {
+    await render(false);
+    expect(chatPage.mock.lastCall![0]).toEqual({
+      pageName: 'Reports',
+      view: {
+        rows: [{ ref: 'r1', label: 'October review (2026-10-01 – 2026-10-27)' }],
+        total: 1,
+      },
+    });
+  });
+
+  it('sends no rows while it reads', async () => {
+    reports.getReports.mockReturnValue(new Promise(() => {}));
+    await render(false);
+    expect(chatPage.mock.lastCall![0].view).toEqual({});
   });
 });

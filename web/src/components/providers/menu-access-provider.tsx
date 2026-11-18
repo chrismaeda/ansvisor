@@ -1,6 +1,9 @@
 'use client';
 
 import { createContext, useContext, useMemo, type ReactNode } from 'react';
+import { menuSectionsFor } from '@/lib/menu-access';
+import { useChatAgentic } from '@/components/providers/chat-agentic-provider';
+import { useAdsEnabled } from '@/components/providers/ads-provider';
 
 interface MenuAccessValue {
   /** The left-menu sections the viewer's menu leaves out. */
@@ -40,4 +43,15 @@ export function useHiddenMenuSections(): ReadonlySet<string> {
 
 export function useCanManageMenus(): boolean {
   return useContext(MenuAccessContext).canManageMenus;
+}
+
+/**
+ * The left menu's sections this workspace has, in its order: Agents only
+ * with the new Chat on (CHAT_AGENTIC), Ads only with Ads on (ADS_ENABLED).
+ * What the menu-access lists show.
+ */
+export function useMenuSections(): string[] {
+  const chatAgentic = useChatAgentic();
+  const ads = useAdsEnabled();
+  return useMemo(() => menuSectionsFor(chatAgentic, ads), [chatAgentic, ads]);
 }

@@ -264,6 +264,27 @@ describe('a competitor signal with its evidence', () => {
               },
             ],
             winningSources: [{ domain: 'g2.example', answers: 2, answersRead: 3 }],
+            competitorId: 'c1',
+            pageEventDays: 28,
+            pageEvents: [
+              {
+                kind: 'changed',
+                at: '2026-10-12T03:00:00Z',
+                url: 'https://www.profound.example/pricing/',
+                domain: 'profound.example',
+                detail: {
+                  gained: [{ key: 'faq', label: 'FAQ section' }],
+                  lost: [{ key: 'dated', label: 'Visible date' }],
+                },
+              },
+              {
+                kind: 'first_cited',
+                at: '2026-10-03T00:00:00Z',
+                url: 'https://profound.example/guide',
+                domain: 'profound.example',
+                detail: { answers: 2 },
+              },
+            ],
           },
           where: NO_WHERE,
         })}
@@ -271,6 +292,15 @@ describe('a competitor signal with its evidence', () => {
     );
     const rows = [...container.querySelectorAll('dt')].map(
       (dt) => `${dt.textContent}: ${dt.nextElementSibling?.textContent}`,
+    );
+    expect(rows).toContain(
+      'What happened to their pages: profound.example/pricing' +
+        'Oct 12 · Changed · now has FAQ section · no longer has Visible date' +
+        'profound.example/guideOct 3 · First cited in your tracked answers' +
+        'See their pages over time',
+    );
+    expect(container.querySelector('a[href*="competitors?competitor=c1"]')?.textContent).toBe(
+      'See their pages over time',
     );
     expect(rows).toContain(
       'Positions by prompt: Best AI rank tracker?ChatGPT · Profound #1 ↑2 · You #3 ↓1' +
@@ -368,6 +398,91 @@ describe("a technical finding with its checks' evidence", () => {
     );
   });
 
+  it('names what the no-JS check found in words (SA-009)', () => {
+    render(
+      <SignalWhereBlock
+        signal={signal({
+          category: 'technical',
+          kind: 'content_gap',
+          currentValue: 1,
+          payload: {
+            entity: 'pages',
+            targets: [
+              {
+                id: '/app',
+                label: '/app',
+                issues: [
+                  {
+                    check: 'no-js-content',
+                    label: 'Main text without JavaScript',
+                    evidence: {
+                      hiddenPercent: 42,
+                      hiddenWords: 310,
+                      mainWords: 740,
+                      hiddenText: ['Step by step'],
+                      readAs: 'gptbot',
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+          where: NO_WHERE,
+        })}
+      />,
+    );
+    const rows = [...container.querySelectorAll('dt')].map(
+      (dt) => `${dt.textContent}: ${dt.nextElementSibling?.textContent}`,
+    );
+    expect(rows).toContain(
+      'Failed checks: /appMain text without JavaScript · Main text only after JavaScript (%): 42 · Words only after JavaScript: 310 · Main-text words: 740 · Not in the HTML: Step by step · Read as: GPTBot (OpenAI)',
+    );
+  });
+
+  it('names the crawlers a CDN or firewall turned away, and leaves out the live test’s rows (SA-008)', () => {
+    render(
+      <SignalWhereBlock
+        signal={signal({
+          category: 'technical',
+          kind: 'crawler_blocked',
+          currentValue: 1,
+          payload: {
+            entity: 'pages',
+            targets: [
+              {
+                id: '/pricing',
+                label: '/pricing',
+                issues: [
+                  {
+                    check: 'ai-bot-access',
+                    label: 'AI bot access',
+                    evidence: {
+                      aiBotsMentioned: ['gptbot'],
+                      blocked: false,
+                      blockedBots: [],
+                      bots: [{ key: 'perplexitybot', name: 'PerplexityBot', http: 403 }],
+                      liveTest: 'done',
+                      control: 200,
+                      wafBlockedBots: ['perplexitybot'],
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+          where: NO_WHERE,
+        })}
+      />,
+    );
+    const rows = [...container.querySelectorAll('dt')].map(
+      (dt) => `${dt.textContent}: ${dt.nextElementSibling?.textContent}`,
+    );
+    expect(rows).toContain('Affected crawlers: PerplexityBot (Perplexity)');
+    expect(rows).toContain(
+      'Failed checks: /pricingAI bot access · In robots.txt: GPTBot (OpenAI) · Blocked by CDN or firewall: PerplexityBot (Perplexity)',
+    );
+  });
+
   it('names what a check found, and leaves out the model that judged it', () => {
     render(
       <SignalWhereBlock
@@ -404,6 +519,50 @@ describe("a technical finding with its checks' evidence", () => {
     expect(lines).toEqual([
       'Query coverage · No pricing answers.',
       'Freshness · Age in days: 412 · Newest date: 2025-08-30',
+    ]);
+  });
+
+  it('names the language and the reading formula a page was read with', () => {
+    render(
+      <SignalWhereBlock
+        signal={signal({
+          category: 'technical',
+          kind: 'content_gap',
+          currentValue: 1,
+          payload: {
+            entity: 'pages',
+            targets: [
+              {
+                id: '/kapadokya',
+                label: '/kapadokya',
+                issues: [
+                  {
+                    check: 'readability',
+                    label: 'Readability',
+                    evidence: {
+                      language: 'tr',
+                      formula: 'atesman',
+                      readingScore: 18,
+                      wordsPerSentence: 31.5,
+                    },
+                  },
+                  {
+                    check: 'first-person',
+                    label: 'First-person evidence',
+                    evidence: { language: 'en', firstPersonSentences: 0, sentences: 40 },
+                  },
+                ],
+              },
+            ],
+          },
+          where: NO_WHERE,
+        })}
+      />,
+    );
+    const lines = [...container.querySelectorAll('dd li span.block')].map((el) => el.textContent);
+    expect(lines).toEqual([
+      'Readability · Language: Turkish · Formula: Ateşman · Reading score: 18 · Words a sentence: 31.5',
+      'First-person evidence · Language: English · First-person sentences: 0 · Sentences: 40',
     ]);
   });
 });

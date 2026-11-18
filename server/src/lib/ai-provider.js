@@ -15,6 +15,41 @@ let openaiProvider = null;
 /** @type {ReturnType<typeof createGoogleGenerativeAI> | null} */
 let googleProvider = null;
 
+/**
+ * OpenRouter's provider routing for every call made here: only providers
+ * that don't keep or train on the request (`data_collection: "deny"`), as
+ * Chat's and the Agent's calls in web/ do (W4-34).
+ */
+export const OPENROUTER_ROUTING = Object.freeze({ data_collection: 'deny' });
+
+/**
+ * A fetch that adds `routing` to each JSON request body it sends. The body's
+ * own `provider` fields are kept; the routing's win where they meet. A body
+ * that isn't JSON goes as it is.
+ *
+ * @param {Record<string, unknown>} routing
+ * @param {typeof fetch} [own] - defaults to the global fetch at each call
+ * @returns {typeof fetch}
+ */
+export function openRouterFetch(routing, own) {
+  const base = (input, init) => (own ?? globalThis.fetch)(input, init);
+  return (input, init) => {
+    if (typeof init?.body !== 'string') return base(input, init);
+    let body;
+    try {
+      body = JSON.parse(init.body);
+    } catch {
+      return base(input, init);
+    }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return base(input, init);
+    const kept = body.provider && typeof body.provider === 'object' ? body.provider : {};
+    return base(input, {
+      ...init,
+      body: JSON.stringify({ ...body, provider: { ...kept, ...routing } }),
+    });
+  };
+}
+
 // Initialize providers based on available API keys
 if (process.env.OPENAI_API_KEY) {
   openaiProvider = createOpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -52,6 +87,7 @@ if (process.env.OPENROUTER_API_KEY) {
       'HTTP-Referer': process.env.OPENROUTER_SITE_URL || 'https://ansvisor.com',
       'X-Title': process.env.OPENROUTER_SITE_NAME || 'Ansvisor',
     },
+    fetch: openRouterFetch(OPENROUTER_ROUTING),
   });
 
   // .chat() rather than the provider's default call: @ai-sdk/openai defaults to
@@ -124,10 +160,16 @@ export function getGoogleProvider() {
  * and drops the second argument, so "Search the web" prompts were answered
  * from the model's memory alone. Search is a tool now, attached per call.
  *
+ * Anthropic's is the basic web_search_20250305, the version every Claude
+ * model takes (Claude Haiku 5.5 among them; the dynamic-filtering
+ * web_search_20260209 is for Sonnet and Opus only), with at most `maxUses`
+ * searches a call.
+ *
  * @param {string} modelString
+ * @param {{ maxUses?: number }} [options]
  * @returns {Record<string, unknown> | null}
  */
-export function webSearchTools(modelString) {
+export function webSearchTools(modelString, { maxUses = 5 } = {}) {
   const [providerName] = (modelString || '').split('/');
   if (providerName === 'google' && googleProvider) {
     return { google_search: googleProvider.tools.googleSearch({}) };
@@ -136,7 +178,7 @@ export function webSearchTools(modelString) {
     return { web_search: openaiProvider.tools.webSearch({}) };
   }
   if (providerName === 'anthropic' && providers.anthropic) {
-    return { web_search: providers.anthropic.tools.webSearch_20250305({ maxUses: 5 }) };
+    return { web_search: providers.anthropic.tools.webSearch_20250305({ maxUses }) };
   }
   return null;
 }

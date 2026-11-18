@@ -3,8 +3,9 @@
 import { createClient } from '@/lib/supabase/server';
 import { supabaseAdmin } from '@/lib/supabase/admin';
 import { revalidatePath } from 'next/cache';
-import { slugify } from '@/lib/slug';
+import { insertOrganization } from '@/lib/organization-insert';
 import { assertWritable } from '@/lib/subscription-guard';
+import { isTimeZone } from '@/lib/time-zone';
 
 // ---------------------------------------------------------------------------
 // Shared helpers (mirrors the pattern in team.ts)
@@ -144,6 +145,45 @@ export async function updateAccountName(name: string): Promise<void> {
   revalidatePath('/dashboard/settings');
 }
 
+/**
+ * The time zone the signed-in person picked in Settings › Account
+ * (profiles.time_zone, 00468): null for Automatic, their browser's.
+ */
+export async function getAccountTimeZone(): Promise<string | null> {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) throw new Error('Unauthorized');
+
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('time_zone')
+    .eq('id', user.id)
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  const zone = data?.time_zone ?? null;
+  return isTimeZone(zone) ? zone : null;
+}
+
+/**
+ * Saves the person's own time zone on their row, as RLS lets them: an IANA
+ * zone, or null for Automatic. New Chat runs, schedule cards and daily
+ * suggestions use it; a scheduled job keeps the zone it was made with.
+ */
+export async function updateAccountTimeZone(zone: string | null): Promise<void> {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) throw new Error('Unauthorized');
+  if (zone !== null && !isTimeZone(zone)) throw new Error('Unknown time zone');
+
+  const { error } = await supabase.from('profiles').update({ time_zone: zone }).eq('id', user.id);
+  if (error) throw new Error(error.message);
+  revalidatePath('/dashboard/settings');
+}
+
 export async function createOrganization(name: string) {
   await assertWritable({ onboarding: true });
   const supabase = await createClient();
@@ -155,31 +195,23 @@ export async function createOrganization(name: string) {
 
   if (!user || authError) throw new Error('Unauthorized');
 
-  let slug = slugify(name);
-  if (!slug) slug = `org-${Date.now()}`;
-
-  const { data: existing } = await supabase
-    .from('organizations')
-    .select('id')
-    .eq('slug', slug)
-    .maybeSingle();
-
-  if (existing) slug = `${slug}-${Date.now()}`;
-
-  const { data: org, error } = await supabase
-    .from('organizations')
-    .insert({ name: name.trim(), slug })
-    .select()
-    .single();
-
-  if (error || !org) throw new Error(error?.message ?? 'Failed to create organization');
+  const orgId = await insertOrganization(supabase, name);
 
   const { error: profileError } = await supabase
     .from('profiles')
-    .update({ organization_id: org.id })
+    .update({ organization_id: orgId })
     .eq('id', user.id);
 
   if (profileError) throw new Error(profileError.message);
+
+  // A member now: the organization reads back with the person's session.
+  const { data: org, error } = await supabase
+    .from('organizations')
+    .select()
+    .eq('id', orgId)
+    .single();
+
+  if (error || !org) throw new Error(error?.message ?? 'Failed to create organization');
 
   revalidatePath('/dashboard');
   return org;

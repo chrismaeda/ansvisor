@@ -11,6 +11,8 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { CLOSED_ACTION_STATUSES, type ActionStatus } from '@/lib/action-center/registry';
 import type { DraftMethod, DraftStatus } from './drafts';
+import { MAX_DATA_CELL } from './draft-inputs';
+import { pagePath } from './overlap';
 
 /** The library tasks a draft is the work of, by the draft's method. */
 export const DRAFT_TASK_KEYS: Record<DraftMethod, readonly string[]> = {
@@ -43,6 +45,165 @@ export function actionPages(payload: Record<string, unknown> | null | undefined)
   ];
 }
 
+/** Drafts one "Start now" click opens at most: one per page of a multi-page play. */
+export const MAX_START_DRAFTS = 10;
+/** Prompts a draft started from an action takes, as the API's work scope lists them. */
+export const MAX_ACTION_PROMPTS = 50;
+
+const PROMPT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** The ids a payload counts its targets by: every one (targetIds) when it shows fewer. */
+function targetKeys(payload: Record<string, unknown>): string[] {
+  const listed = Array.isArray(payload.targetIds)
+    ? payload.targetIds
+    : (Array.isArray(payload.targets) ? payload.targets : []).map((target: unknown) =>
+        target && typeof target === 'object' ? (target as { id?: unknown }).id : null,
+      );
+  return [...new Set(listed.filter((key): key is string => typeof key === 'string'))];
+}
+
+/**
+ * The prompts an action's work is about: the ones its payload lists
+ * (promptIds, the API's work scope), else, for an action opened before it
+ * kept them, the prompts it targets. Ids only, MAX_ACTION_PROMPTS at most.
+ */
+export function actionPromptIds(payload: Record<string, unknown> | null | undefined): string[] {
+  const p = payload ?? {};
+  const ids = Array.isArray(p.promptIds)
+    ? p.promptIds
+    : p.targetEntity === 'prompts'
+      ? targetKeys(p)
+      : [];
+  return [
+    ...new Set(ids.filter((id): id is string => typeof id === 'string' && PROMPT_ID.test(id))),
+  ].slice(0, MAX_ACTION_PROMPTS);
+}
+
+/** The topics an action targets (G16, C09) or was sent for, for one opened before it kept its prompts. */
+export function actionTopicIds(payload: Record<string, unknown> | null | undefined): string[] {
+  const p = payload ?? {};
+  const ids = [
+    ...(p.targetEntity === 'topics' ? targetKeys(p) : []),
+    ...(typeof p.topicId === 'string' ? [p.topicId] : []),
+  ];
+  return [...new Set(ids.filter((id) => PROMPT_ID.test(id)))];
+}
+
+/**
+ * The page type the action's play picked for its page (payload.play.assetType,
+ * AC-ACTION-PLAN spec §5), as written; null for none. The Content Editor
+ * reads it as the brand's site does (opportunityPageType).
+ */
+export function playAssetType(payload: Record<string, unknown> | null | undefined): string | null {
+  const play = payload?.play;
+  if (!play || typeof play !== 'object') return null;
+  const type = (play as { assetType?: unknown }).assetType;
+  return typeof type === 'string' && type.length <= 60 ? type : null;
+}
+
+/**
+ * The title a draft started from an action takes (Start now): the page's,
+ * never the action's ("Close the visibility gap with 1 competitor"). A page
+ * to update keeps its live title, else its path; a new page takes its
+ * opportunity brief's suggested title, else the main prompt it answers ("Is
+ * a coffee subscription worth it?"). The action's title only when nothing
+ * else names the page.
+ */
+export function actionDraftTitle(input: {
+  page: string | null;
+  pageTitle?: string | null;
+  suggestedTitle?: string | null;
+  prompt?: string | null;
+  actionTitle: string;
+}): string {
+  const named = input.page
+    ? input.pageTitle?.trim() || pagePath(input.page)
+    : input.suggestedTitle?.trim() || input.prompt?.trim();
+  return named || input.actionTitle.trim();
+}
+
+/** The words of the link table a bridge links page's draft gets, in the reader's language. */
+export interface LinkTableLabels {
+  name: string;
+  linkTo: string;
+  anchor: string;
+}
+
+const cell = (value: string) => Array.from(value).slice(0, MAX_DATA_CELL).join('');
+
+/**
+ * A bridge links action's page (AC plan P-10, payload.linkPairs): the links
+ * it should get as a Brief › Your input table (content_draft_inputs.data),
+ * the page each goes to and its suggested text, for the person to place.
+ * Null for a page with none, or a new page.
+ */
+export function actionLinkTable(
+  payload: Record<string, unknown> | null | undefined,
+  page: string | null,
+  labels: LinkTableLabels | null | undefined,
+): { name: string; rows: string[][] } | null {
+  if (!page || !labels) return null;
+  const pairs = Array.isArray(payload?.linkPairs) ? payload.linkPairs : [];
+  const rows = pairs.flatMap((item: unknown) => {
+    const pair = (item ?? {}) as { from?: unknown; to?: unknown; anchor?: unknown };
+    if (pair.from !== page || typeof pair.to !== 'string' || !/^https?:\/\//i.test(pair.to)) {
+      return [];
+    }
+    return [[cell(pair.to), cell(typeof pair.anchor === 'string' ? pair.anchor.trim() : '')]];
+  });
+  return rows.length
+    ? { name: labels.name, rows: [[labels.linkTo, labels.anchor], ...rows] }
+    : null;
+}
+
+/**
+ * What "Start now" opens (AC-ACTION-PLAN spec §10): the action's writing
+ * task still to do, a new page's first, else an existing page's, in the
+ * tasks' order; and the pages it is done on, one draft each (none for a new
+ * page, or an existing page's work that names none). Null without one: the
+ * action's work isn't writing.
+ */
+export interface StartNowWork {
+  taskId: string;
+  method: DraftMethod;
+  pages: string[];
+}
+
+export function startNowWork(
+  tasks: readonly { id: string; taskKey: string | null; status: string }[],
+  payload: Record<string, unknown> | null | undefined,
+): StartNowWork | null {
+  const open = tasks.filter((task) => !TASK_DONE.includes(task.status));
+  const of = (method: DraftMethod) =>
+    open.find((task) => draftMethodForTask(task.taskKey) === method);
+  const create = of('create');
+  if (create) return { taskId: create.id, method: 'create', pages: [] };
+  const optimize = of('optimize');
+  if (!optimize) return null;
+  return {
+    taskId: optimize.id,
+    method: 'optimize',
+    pages: actionPages(payload).slice(0, MAX_START_DRAFTS),
+  };
+}
+
+/** The pages Start now writes drafts for: each of the work's, or the one new page (null). */
+export function startNowPages(work: StartNowWork): (string | null)[] {
+  return work.method === 'optimize' && work.pages.length ? work.pages : [null];
+}
+
+/**
+ * The drafts already written for that work, one for each of its pages, or
+ * null while any page has none yet: then Start now writes the rest.
+ */
+export function startNowDrafts(
+  work: StartNowWork,
+  drafts: readonly ActionDraft[],
+): ActionDraft[] | null {
+  const found = startNowPages(work).map((page) => findActionDraft(drafts, work.method, page));
+  return found.every((draft): draft is ActionDraft => draft !== null) ? found : null;
+}
+
 /**
  * The draft already written for this work: for a page, the one optimizing
  * it; without one, the action's draft of that method.
@@ -60,7 +221,7 @@ export function findActionDraft(
 }
 
 /** Statuses after which a task is no longer outstanding work. */
-const TASK_DONE = ['completed', 'skipped', 'failed'];
+export const TASK_DONE = ['completed', 'skipped', 'failed'];
 /** A draft whose writing is done. */
 const DRAFT_DONE: DraftStatus[] = ['ready', 'published'];
 /** Tries at writing an action's live pages when another write lands between (as the API's). */

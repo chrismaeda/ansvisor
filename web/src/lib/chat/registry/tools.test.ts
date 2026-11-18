@@ -1,0 +1,1818 @@
+// @vitest-environment node
+import { z } from 'zod';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import messages from '../../../../messages/en.json';
+import type { TeamRole } from '@/components/providers/role-provider';
+import type { ChatTool } from './define-tool';
+import { clientEventProblems, type ChatEvent } from '../events';
+import { pageExists } from '@/lib/app-pages';
+import { actionRef } from '@/lib/action-center/action-ref';
+
+/**
+ * The registry's rows (CHAT-20 §9, §21): each has its label and a fixture,
+ * names are unique, an EXECUTE is always a click, and each row calls the
+ * function it names — a READ the MCP data function, a WRITE the server
+ * action the app's own button calls — with nothing between.
+ */
+
+const calls = vi.hoisted(() => [] as { from: string; args: unknown[] }[]);
+/**
+ * What the functions of the list reads return here, empty: the row makes a
+ * page of it (lib/mcp/list-page.ts), so it returns that page, not this.
+ */
+const pageSources = vi.hoisted((): Record<string, unknown> => {
+  const counted = { rows: [], total: 0 };
+  return {
+    // The MCP reads Chat wraps (mcp-wrapped-reads.ts): a page of each list.
+    'mcp/data.listTopicSuggestionsFor': [],
+    'mcp/task-reviews.listTaskReviewsFor': [],
+    'mcp/content-plan.getContentPlanFor': { counts: {}, hidden: 0, rows: [] },
+    'mcp/catalog.listCatalogProductsFor': { total: 0, products: [], next_offset: null },
+    'mcp/product-visibility.getShoppingShelfFor': { total: 0, shelves: [], next_offset: null },
+    'mcp/prompt-locations.getPromptLocationsFor': {
+      total: 0,
+      locations: [],
+      ignored_locations: [],
+      averages: {},
+      prompts: [],
+      next_offset: null,
+    },
+    'mcp/data.listBrandsFor': [],
+    'mcp/data.listTopicsFor': [],
+    'mcp/data.listCompetitorsFor': [],
+    'mcp/data.listPromptSuggestionsFor': { suggestions: [], stale: false },
+    'mcp/data.getPromptPerformanceFor': { total: 0, prompts: [] },
+    'mcp/data.listCitationsFor': { totals: { domains: 0, urls: 0 }, top_domains: [], top_urls: [] },
+    'mcp/mentions.listMentionsFor': { total: 0, prompts: 0, mentions: [] },
+    'mcp/data.actionHistoryPageFor': counted,
+    'mcp/data.contentOpportunitiesPageFor': counted,
+    'mcp/data.promptVolumesPageFor': counted,
+    'mcp/data.promptsPageFor': counted,
+    'mcp/data.reportsPageFor': counted,
+    'mcp/data.siteAuditsPageFor': counted,
+    'mcp/content.contentDraftsPageFor': counted,
+  };
+});
+/**
+ * What the functions of the reads Chat reshapes return here, and what the
+ * row makes of it: a trend's every bucket with how many (trendForChat).
+ */
+const shapedSources = vi.hoisted(
+  (): Record<string, { from: unknown; to: unknown }> => ({
+    'mcp/data.getVisibilityTrendFor': {
+      from: { granularity: 'week', buckets: [] },
+      to: { granularity: 'week', note: 'No week with answers in this period.', buckets: [] },
+    },
+  }),
+);
+const tracked = vi.hoisted(() => {
+  const track = (from: string) =>
+    vi.fn(async (...args: unknown[]) => {
+      calls.push({ from, args });
+      if (from in shapedSources) return shapedSources[from].from;
+      return from in pageSources ? pageSources[from] : { from };
+    });
+  return {
+    track,
+    /** Every function a module exports, tracked; its constants as they are. */
+    all: (prefix: string, mod: Record<string, unknown>) =>
+      Object.fromEntries(
+        Object.entries(mod).map(([key, value]) => [
+          key,
+          typeof value === 'function' ? track(`${prefix}.${key}`) : value,
+        ]),
+      ),
+  };
+});
+
+vi.mock('@/lib/supabase/admin', () => ({ supabaseAdmin: {} }));
+vi.mock('@/lib/mcp/data', async (importOriginal) =>
+  tracked.all('mcp/data', await importOriginal<Record<string, unknown>>()),
+);
+vi.mock('@/lib/mcp/content', async (importOriginal) =>
+  tracked.all('mcp/content', await importOriginal<Record<string, unknown>>()),
+);
+vi.mock('@/lib/mcp/mentions', async (importOriginal) =>
+  tracked.all('mcp/mentions', await importOriginal<Record<string, unknown>>()),
+);
+vi.mock('@/lib/mcp/account', async (importOriginal) =>
+  tracked.all('mcp/account', await importOriginal<Record<string, unknown>>()),
+);
+vi.mock('@/lib/mcp/navigation', async (importOriginal) =>
+  tracked.all('mcp/navigation', await importOriginal<Record<string, unknown>>()),
+);
+vi.mock('@/lib/mcp/prompt-reads', async (importOriginal) =>
+  tracked.all('mcp/prompt-reads', await importOriginal<Record<string, unknown>>()),
+);
+vi.mock('@/lib/mcp/overview-reads', async (importOriginal) =>
+  tracked.all('mcp/overview-reads', await importOriginal<Record<string, unknown>>()),
+);
+vi.mock('@/lib/mcp/action-center-reads', async (importOriginal) =>
+  tracked.all('mcp/action-center-reads', await importOriginal<Record<string, unknown>>()),
+);
+vi.mock('@/lib/mcp/google-reads', async (importOriginal) =>
+  tracked.all('mcp/google-reads', await importOriginal<Record<string, unknown>>()),
+);
+// Customers and revenue from AI visits: each read pages itself (lib/mcp/list-page.ts).
+vi.mock('@/lib/mcp/ai-conversions', async (importOriginal) =>
+  tracked.all('mcp/ai-conversions', await importOriginal<Record<string, unknown>>()),
+);
+vi.mock('@/lib/mcp/tracking-setup', async (importOriginal) =>
+  tracked.all('mcp/tracking-setup', await importOriginal<Record<string, unknown>>()),
+);
+vi.mock('@/lib/mcp/workspace-reads', async (importOriginal) =>
+  tracked.all('mcp/workspace-reads', await importOriginal<Record<string, unknown>>()),
+);
+vi.mock('@/lib/mcp/pages', async (importOriginal) =>
+  tracked.all('mcp/pages', await importOriginal<Record<string, unknown>>()),
+);
+vi.mock('@/lib/mcp/why', async (importOriginal) =>
+  tracked.all('mcp/why', await importOriginal<Record<string, unknown>>()),
+);
+vi.mock('@/lib/mcp/brand-facts-reads', async (importOriginal) =>
+  tracked.all('mcp/brand-facts-reads', await importOriginal<Record<string, unknown>>()),
+);
+// The MCP reads Chat wraps (mcp-wrapped-reads.ts), from their own modules.
+vi.mock('@/lib/mcp/learning', async (importOriginal) =>
+  tracked.all('mcp/learning', await importOriginal<Record<string, unknown>>()),
+);
+vi.mock('@/lib/mcp/task-reviews', async (importOriginal) =>
+  tracked.all('mcp/task-reviews', await importOriginal<Record<string, unknown>>()),
+);
+vi.mock('@/lib/mcp/content-plan', async (importOriginal) =>
+  tracked.all('mcp/content-plan', await importOriginal<Record<string, unknown>>()),
+);
+vi.mock('@/lib/mcp/catalog', async (importOriginal) =>
+  tracked.all('mcp/catalog', await importOriginal<Record<string, unknown>>()),
+);
+vi.mock('@/lib/mcp/product-visibility', async (importOriginal) =>
+  tracked.all('mcp/product-visibility', await importOriginal<Record<string, unknown>>()),
+);
+vi.mock('@/lib/mcp/prompt-locations', async (importOriginal) =>
+  tracked.all('mcp/prompt-locations', await importOriginal<Record<string, unknown>>()),
+);
+vi.mock('@/lib/mcp/whats-new', async (importOriginal) =>
+  tracked.all('mcp/whats-new', await importOriginal<Record<string, unknown>>()),
+);
+vi.mock('@/lib/mcp/ready-agents', async (importOriginal) =>
+  tracked.all('mcp/ready-agents', await importOriginal<Record<string, unknown>>()),
+);
+vi.mock('@/lib/mcp/signal-page', async (importOriginal) =>
+  tracked.all('mcp/signal-page', await importOriginal<Record<string, unknown>>()),
+);
+// Today, History, the Signals summary and Agents, from their pages' own reads (plan step 6b).
+vi.mock('@/lib/mcp/today-reads', async (importOriginal) =>
+  tracked.all('mcp/today-reads', await importOriginal<Record<string, unknown>>()),
+);
+vi.mock('@/lib/mcp/agent-reads', async (importOriginal) =>
+  tracked.all('mcp/agent-reads', await importOriginal<Record<string, unknown>>()),
+);
+// What Visibility, Prompts, Competitors and AI Traffic show: each pages itself.
+vi.mock('@/lib/mcp/visibility-extra-reads', async (importOriginal) =>
+  tracked.all('mcp/visibility-extra-reads', await importOriginal<Record<string, unknown>>()),
+);
+vi.mock('@/lib/mcp/ads-reads', () => ({
+  getAdsOpportunitiesFor: tracked.track('mcp/ads-reads.getAdsOpportunitiesFor'),
+}));
+vi.mock('@/lib/actions/ads-drafts', () => ({
+  saveAdDrafts: tracked.track('actions/ads-drafts.saveAdDrafts'),
+}));
+// A page's check against its rules (W4-12b part 2): Chat's own, over the editor's rule functions.
+vi.mock('@/lib/chat/page-check', async (importOriginal) =>
+  tracked.all('chat/page-check', await importOriginal<Record<string, unknown>>()),
+);
+// Optimize here (W4-12b part 2): Chat's own, over the editor's Rewrite.
+vi.mock('@/lib/chat/page-optimize', async (importOriginal) =>
+  tracked.all('chat/page-optimize', await importOriginal<Record<string, unknown>>()),
+);
+// No app page makes images yet: the image rows call Chat's own image functions (W4-08).
+vi.mock('@/lib/chat/images/chat-images', () => ({
+  imageModelQuestion: tracked.track('chat/images.imageModelQuestion'),
+  makeChatImages: tracked.track('chat/images.makeChatImages'),
+  imageCostLine: tracked.track('chat/images.imageCostLine'),
+  imagePrecheck: tracked.track('chat/images.imagePrecheck'),
+}));
+vi.mock('@/lib/actions/content', () => ({
+  updateOpportunityStatus: tracked.track('actions/content.updateOpportunityStatus'),
+}));
+vi.mock('@/lib/actions/content-drafts', () => ({
+  createContentDraft: tracked.track('actions/content-drafts.createContentDraft'),
+  updateContentDraft: tracked.track('actions/content-drafts.updateContentDraft'),
+  setContentDraftReady: tracked.track('actions/content-drafts.setContentDraftReady'),
+  suggestDraftChanges: tracked.track('actions/content-drafts.suggestDraftChanges'),
+}));
+vi.mock('@/lib/chat/actor/drafts', () => ({
+  createContentDraftFor: tracked.track('chat/actor/drafts.createContentDraftFor'),
+  updateContentDraftFor: tracked.track('chat/actor/drafts.updateContentDraftFor'),
+}));
+vi.mock('@/lib/chat/actor/api-writes', () => ({
+  updateOpportunityStatusFor: tracked.track('chat/actor/api-writes.updateOpportunityStatusFor'),
+  dismissSuggestionFor: tracked.track('chat/actor/api-writes.dismissSuggestionFor'),
+}));
+vi.mock('@/lib/chat/actor/action-center', () => ({
+  createChatActionFor: tracked.track('chat/actor/action-center.createChatActionFor'),
+  checkChatActionCoverFor: tracked.track('chat/actor/action-center.checkChatActionCoverFor'),
+}));
+vi.mock('@/lib/actions/cms-send', () => ({
+  sendDraftToCms: tracked.track('actions/cms-send.sendDraftToCms'),
+  publishDraftToCms: tracked.track('actions/cms-send.publishDraftToCms'),
+  sendDraftToWebhook: tracked.track('actions/cms-send.sendDraftToWebhook'),
+}));
+vi.mock('@/lib/actions/cms-take-down', () => ({
+  takeDownDraft: tracked.track('actions/cms-take-down.takeDownDraft'),
+}));
+vi.mock('@/lib/actions/reports', () => ({
+  createReport: tracked.track('actions/reports.createReport'),
+}));
+vi.mock('@/lib/actions/audits', () => ({
+  startSiteAudits: tracked.track('actions/audits.startSiteAudits'),
+  getAuditQuota: tracked.track('actions/audits.getAuditQuota'),
+}));
+vi.mock('@/lib/actions/prompt-suggestions', () => ({
+  dismissSuggestion: tracked.track('actions/prompt-suggestions.dismissSuggestion'),
+}));
+vi.mock('@/lib/actions/chat-follow-ups', () => ({
+  setChatFollowUp: tracked.track('actions/chat-follow-ups.setChatFollowUp'),
+}));
+vi.mock('@/lib/actions/chat-schedules', () => ({
+  createChatSchedule: tracked.track('actions/chat-schedules.createChatSchedule'),
+}));
+vi.mock('@/lib/actions/chat-agent-calls', () => ({
+  runAgentFromChat: tracked.track('actions/chat-agent-calls.runAgentFromChat'),
+}));
+// The AEO Operator's card (PR 4): its server action, and its plan's read.
+vi.mock('@/lib/actions/chat-operator', () => ({
+  approveAgentPlanFromChat: tracked.track('actions/chat-operator.approveAgentPlanFromChat'),
+}));
+vi.mock('@/lib/mcp/agent-plan-reads', () => ({
+  getAgentPlanFor: tracked.track('mcp/agent-plan-reads.getAgentPlanFor'),
+}));
+vi.mock('@/lib/actions/chat-access-requests', () => ({
+  requestAccess: tracked.track('actions/chat-access-requests.requestAccess'),
+}));
+vi.mock('@/lib/actions/chat-skills', () => ({
+  saveChatSkill: tracked.track('actions/chat-skills.saveChatSkill'),
+}));
+vi.mock('@/lib/actions/chat-memory', () => ({
+  saveChatMemory: tracked.track('actions/chat-memory.saveChatMemory'),
+  forgetChatMemory: tracked.track('actions/chat-memory.forgetChatMemory'),
+}));
+vi.mock('@/lib/actions/prompt', () => ({
+  addTopicPrompts: tracked.track('actions/prompt.addTopicPrompts'),
+  pauseBrandPrompts: tracked.track('actions/prompt.pauseBrandPrompts'),
+}));
+vi.mock('@/lib/actions/topic', () => ({
+  addBrandTopic: tracked.track('actions/topic.addBrandTopic'),
+  renameBrandTopic: tracked.track('actions/topic.renameBrandTopic'),
+}));
+vi.mock('@/lib/actions/competitor', () => ({
+  addCompetitors: tracked.track('actions/competitor.addCompetitors'),
+  removeBrandCompetitor: tracked.track('actions/competitor.removeBrandCompetitor'),
+}));
+vi.mock('@/lib/actions/chat-action-center', () => ({
+  createChatAction: tracked.track('actions/chat-action-center.createChatAction'),
+  attachToAction: tracked.track('actions/chat-action-center.attachToAction'),
+  attachFileToTask: tracked.track('actions/chat-action-center.attachFileToTask'),
+  setTaskReadyForReview: tracked.track('actions/chat-action-center.setTaskReadyForReview'),
+  checkChatActionCover: tracked.track('actions/chat-action-center.checkChatActionCover'),
+}));
+
+const { CHAT_TOOLS, chatTool, chatToolByKey, listedTools, registryCatalog } =
+  await import('./tools');
+const chatTool_ = (name: string) => chatTool(name)!;
+const { BRAND_LOOKUP_TABLES, FIXTURE_IDS, defineTool, runsWithoutSession } =
+  await import('./define-tool');
+const { DEFAULT_CHAT_SETTINGS, allowedRoles, allowedTools, decideToolCall } =
+  await import('../precedence');
+const { planFactsFromOrgRow } = await import('../plan-facts');
+
+const ctx = {
+  userId: 'user-1',
+  email: null,
+  organizationId: 'org-1',
+  apiKeyId: 'agent-internal',
+  brandAccess: 'all' as const,
+  role: 'admin' as const,
+};
+const labels = (messages as Record<string, unknown>).chatTools as Record<string, unknown>;
+/** The rows that make their change for a run with no session (sessionFree), in the registry's order. */
+const SESSION_FREE = [
+  'create_draft',
+  'update_opportunity',
+  'dismiss_prompt_suggestion',
+  'create_action',
+  // An agent's Ready for review in Full auto (owner decision 2026-11-03).
+  'set_task_ready_for_review',
+  'update_draft',
+  // The AEO Operator's plan, approved from Slack (AEO Operator plan §4.2 step 6).
+  'run_agent_plan',
+];
+/** A run's place, as runLoggedWrite gives a write. */
+const place = {
+  conversationId: 'chat-1',
+  runId: 'run-1',
+  approvalKey: 'step-1',
+  executionMode: 'automated' as const,
+};
+
+/** What keeps a row out of the registry: a missing label, a fixture its schema refuses. */
+function rowProblems(tool: ChatTool, chatTools: Record<string, unknown> = labels): string[] {
+  const problems: string[] = [];
+  const label = chatTools?.[tool.labelKey] as Record<string, unknown> | undefined;
+  for (const part of ['name', 'step']) {
+    const text = label?.[part];
+    if (typeof text !== 'string' || !text.trim()) {
+      problems.push(`no chatTools.${tool.labelKey}.${part} in en.json`);
+    }
+  }
+  if (!tool.fixture || !('input' in tool.fixture)) problems.push('no fixture');
+  else if (!tool.inputSchema.safeParse(tool.fixture.input).success) {
+    problems.push("its fixture doesn't pass its input schema");
+  }
+  return problems;
+}
+
+const readRow = {
+  name: 'read_test',
+  class: 'read' as const,
+  area: 'brands' as const,
+  description: 'test',
+  minRole: 'analyst' as const,
+  planGate: null,
+  brandOf: null,
+  costClass: 'C0' as const,
+  labelKey: 'brands',
+  route: null,
+  mcpTool: null,
+  specRow: '0',
+  inputSchema: z.object({}),
+  run: async () => null,
+  fixture: { input: {} },
+};
+
+beforeEach(() => {
+  calls.length = 0;
+});
+
+/** The rows of a page's version in Chat that call Chat's own functions (W4-12b part 2). */
+const CHAT_PAGE_ROWS = new Set(['check_draft_rules', 'optimize_draft']);
+/** Rows the engine works itself (run_subtasks: its parts run through its driver). */
+const ENGINE_ROWS = new Set(['run_subtasks']);
+
+describe('the Chat tool registry', () => {
+  it('has a label and a valid fixture on every row', () => {
+    const problems = CHAT_TOOLS.flatMap((tool) =>
+      rowProblems(tool).map((problem) => `${tool.name}: ${problem}`),
+    );
+    expect(problems).toEqual([]);
+  });
+
+  it('fails a row whose label is missing or whose fixture is', () => {
+    const row = defineTool({ ...readRow, labelKey: 'notALabel' });
+    expect(rowProblems(row)).toEqual([
+      'no chatTools.notALabel.name in en.json',
+      'no chatTools.notALabel.step in en.json',
+    ]);
+    const noFixture = { ...defineTool(readRow), fixture: undefined } as unknown as ChatTool;
+    expect(rowProblems(noFixture)).toEqual(['no fixture']);
+    const badFixture = defineTool({
+      ...readRow,
+      inputSchema: z.object({ brand_id: z.string() }),
+      fixture: { input: {} as { brand_id: string } },
+    });
+    expect(rowProblems(badFixture)).toEqual(["its fixture doesn't pass its input schema"]);
+  });
+
+  it('gives every tool its own name and its own label', () => {
+    const names = CHAT_TOOLS.map((tool) => tool.name);
+    expect(new Set(names).size).toBe(names.length);
+    const keys = CHAT_TOOLS.map((tool) => tool.labelKey);
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+
+  it("keeps the tools' names out of the label keys, which reach the browser", () => {
+    // Every page gets all of en.json; a function name never reaches a customer (CHAT-03).
+    const camel = (name: string) => name.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
+    for (const tool of CHAT_TOOLS) {
+      expect(tool.labelKey).not.toContain('_');
+      expect(tool.labelKey).not.toBe(camel(tool.name));
+    }
+  });
+
+  it('finds a row by its name, and nothing for a name without one', () => {
+    expect(chatTool('list_brands')?.class).toBe('read');
+    expect(chatTool('delete_brand')).toBeUndefined();
+  });
+
+  it('points every route at a page of the app', () => {
+    const missing = CHAT_TOOLS.filter((tool) => tool.route && !pageExists(tool.route));
+    expect(missing.map((tool) => `${tool.name} → ${tool.route}`)).toEqual([]);
+  });
+
+  it.each(CHAT_TOOLS.map((tool) => [tool.name, tool] as const))(
+    '%s calls its own function with the fixture, and returns what it returns',
+    async (_name, tool) => {
+      const result = await tool.run(ctx, tool.inputSchema.parse(tool.fixture.input));
+      // Worked by the engine itself, whose driver its parts need (CHAT-27): nothing to call here.
+      if (ENGINE_ROWS.has(tool.name)) {
+        expect(calls).toEqual([]);
+        expect(result).toEqual({ ok: false, code: 'engine_only' });
+        return;
+      }
+      expect(calls).toHaveLength(1);
+      if (calls[0].from in pageSources) {
+        // A list read: a page of what its function returned, with its total and no next page.
+        expect(result).toMatchObject({ total: 0, offset: 0, next_offset: null });
+      } else if (calls[0].from in shapedSources) {
+        expect(result).toEqual(shapedSources[calls[0].from].to);
+      } else {
+        expect(result).toEqual({ from: calls[0].from });
+      }
+      if (tool.area === 'images') {
+        // Chat's own image functions, with the member's context.
+        expect(calls[0].from).toMatch(/^chat\/images\./);
+        expect(calls[0].args[0]).toBe(ctx);
+      } else if (CHAT_PAGE_ROWS.has(tool.name)) {
+        // A page's version in Chat (W4-12b part 2): Chat's own, with the member's context.
+        expect(calls[0].from).toMatch(/^chat\/page-/);
+        expect(calls[0].args[0]).toBe(ctx);
+      } else if (tool.class === 'read') {
+        // The MCP data functions, scoped to the signed-in member's organization.
+        expect(calls[0].from).toMatch(/^mcp\//);
+        expect(calls[0].args[0]).toBe(ctx);
+      } else {
+        // The app's server actions, through the member's own session.
+        expect(calls[0].from).toMatch(/^actions\//);
+      }
+    },
+  );
+
+  it('pages the list reads: a whole list cut to a page, a counted one by its offset', async () => {
+    const run = (name: string, input: Record<string, unknown>) => {
+      const tool = chatTool(name)!;
+      return tool.run(ctx, tool.inputSchema.parse(input));
+    };
+    const { brand } = FIXTURE_IDS;
+    const topics = Array.from({ length: 120 }, (_, i) => ({ id: `t${i}`, name: `Topic ${i}` }));
+    pageSources['mcp/data.listTopicsFor'] = topics;
+    try {
+      expect(await run('list_topics', { brand_id: brand, offset: 100 })).toEqual({
+        total: 120,
+        offset: 100,
+        next_offset: null,
+        note: 'Showing 101–120 of 120 topics. This is the last page.',
+        topics: topics.slice(100),
+      });
+    } finally {
+      pageSources['mcp/data.listTopicsFor'] = [];
+    }
+    calls.length = 0;
+    await run('get_reports', { brand_id: brand, offset: 50 });
+    expect(calls[0]).toMatchObject({ from: 'mcp/data.reportsPageFor', args: [ctx, brand, 50, 50] });
+    calls.length = 0;
+    await run('list_mentions', { brand_id: brand, offset: 70 });
+    expect(calls[0].args[1]).toMatchObject({ brandId: brand, limit: 50, offset: 70 });
+  });
+
+  it('hands the app the same arguments its pages pass', async () => {
+    const run = (name: string, input: unknown) => {
+      const tool = chatTool(name)!;
+      return tool.run(ctx, tool.inputSchema.parse(input));
+    };
+    const { brand, item } = FIXTURE_IDS;
+
+    await run('dismiss_prompt_suggestion', { suggestion_id: item });
+    await run('update_opportunity', {
+      opportunity_id: item,
+      status: 'dismissed',
+      reason: 'wrong_angle',
+    });
+    // A reason goes only with a dismissal.
+    await run('update_opportunity', {
+      opportunity_id: item,
+      status: 'reviewed',
+      reason: 'wrong_angle',
+    });
+    await run('create_draft', {
+      brand_id: brand,
+      title: ' Pricing FAQ ',
+      page_type: 'docs_faq',
+      source: { kind: 'opportunity', id: item },
+    });
+    await run('add_prompts', { brand_id: brand, topic_id: item, prompts: [' crm pricing '] });
+    await run('pause_prompts', { brand_id: brand, prompt_ids: [item] });
+    await run('add_topic', { brand_id: brand, name: ' Pricing ' });
+    await run('rename_topic', { topic_id: item, name: 'Plans' });
+    await run('add_competitors', { brand_id: brand, competitors: [{ name: 'Peec AI' }] });
+    await run('remove_competitor', { brand_id: brand, competitor_id: item });
+    // With the run's place (its chat, run and approval) for Action History, §10a.
+    const place = {
+      conversationId: 'conv-1',
+      runId: 'run-1',
+      approvalKey: 'step-1',
+      executionMode: 'assisted' as const,
+    };
+    const runInChat = (name: string, input: unknown) => {
+      const tool = chatTool_(name);
+      return tool.run({ ...ctx, chat: place }, tool.inputSchema.parse(input));
+    };
+    await runInChat('create_action', {
+      brand_id: brand,
+      title: 'Win back pricing citations',
+      category: 'recover',
+      why: 'Lost 6 citations on /pricing.',
+      prompt_ids: [item],
+      pages: ['/pricing'],
+      tasks: [
+        { title: 'Add a FAQ to /pricing', type: 'on_page', url: '/pricing', done_when: 'Live' },
+      ],
+    });
+    await runInChat('attach_to_action', { action_id: item, finding: 'Lost 6 citations.' });
+    await runInChat('attach_file_to_task', { brand_id: brand, task_id: item, file_id: item });
+    await runInChat('set_task_ready_for_review', { brand_id: brand, task_id: item });
+    await run('update_draft', { draft_id: item, body_html: '<h1>FAQ</h1>' });
+    await run('suggest_draft_changes', { draft_id: item, request: 'Make answer 3 shorter' });
+    await run('set_draft_ready', { draft_id: item });
+    await run('push_cms_draft', { draft_id: item, destination: 'wordpress' });
+    await run('publish_cms', { draft_id: item, destination: 'wix' });
+    await run('trigger_content_webhook', { draft_id: item });
+    await run('build_report', {
+      brand_id: brand,
+      template: 'competitor_benchmark',
+      date_from: '2026-10-01',
+      date_to: '2026-10-31',
+    });
+    await run('run_site_audit', { brand_id: brand, urls: [' https://acme.example/a '] });
+    await run('save_skill', {
+      name: 'pricing-faq',
+      description: ' Writes a pricing FAQ. ',
+      instructions: 'Read the pricing page.',
+    });
+
+    expect(calls.map((call) => [call.from, call.args])).toEqual([
+      ['actions/prompt-suggestions.dismissSuggestion', [item]],
+      ['actions/content.updateOpportunityStatus', [item, 'dismissed', 'wrong_angle']],
+      ['actions/content.updateOpportunityStatus', [item, 'reviewed', undefined]],
+      [
+        'actions/content-drafts.createContentDraft',
+        [
+          brand,
+          {
+            method: 'create',
+            title: 'Pricing FAQ',
+            pageType: 'docs_faq',
+            typePicked: false,
+            source: { kind: 'opportunity', id: item },
+            bodyHtml: undefined,
+            sourceUrl: undefined,
+            // Made in Chat (00463, W4-10); no chat in this context.
+            origin: 'chat',
+            conversationId: null,
+          },
+        ],
+      ],
+      ['actions/prompt.addTopicPrompts', [brand, item, ['crm pricing']]],
+      ['actions/prompt.pauseBrandPrompts', [brand, [item]]],
+      ['actions/topic.addBrandTopic', [brand, 'Pricing']],
+      ['actions/topic.renameBrandTopic', [item, 'Plans']],
+      ['actions/competitor.addCompetitors', [brand, [{ name: 'Peec AI', domain: '' }]]],
+      ['actions/competitor.removeBrandCompetitor', [brand, item]],
+      [
+        'actions/chat-action-center.createChatAction',
+        [
+          brand,
+          {
+            title: 'Win back pricing citations',
+            category: 'recover',
+            why: 'Lost 6 citations on /pricing.',
+            entities: { prompts: [item], pages: ['/pricing'], competitors: [], platforms: [] },
+            tasks: [
+              {
+                title: 'Add a FAQ to /pricing',
+                type: 'on_page',
+                url: '/pricing',
+                done_when: 'Live',
+              },
+            ],
+          },
+          place,
+          false,
+        ],
+      ],
+      [
+        'actions/chat-action-center.attachToAction',
+        [item, { finding: 'Lost 6 citations.', note: undefined, sources: undefined }, place],
+      ],
+      ['actions/chat-action-center.attachFileToTask', [brand, item, item, place]],
+      ['actions/chat-action-center.setTaskReadyForReview', [brand, item, place]],
+      [
+        'actions/content-drafts.updateContentDraft',
+        [item, { title: undefined, bodyHtml: '<h1>FAQ</h1>' }],
+      ],
+      ['actions/content-drafts.suggestDraftChanges', [item, 'Make answer 3 shorter']],
+      ['actions/content-drafts.setContentDraftReady', [item]],
+      // Outside an agent run's chat, no run is named (00480).
+      ['actions/cms-send.sendDraftToCms', [item, 'wordpress', null]],
+      ['actions/cms-send.publishDraftToCms', [item, 'wix', null]],
+      ['actions/cms-send.sendDraftToWebhook', [item, null]],
+      [
+        'actions/reports.createReport',
+        [brand, { dateFrom: '2026-10-01', dateTo: '2026-10-31', template: 'competitor_benchmark' }],
+      ],
+      ['actions/audits.startSiteAudits', [brand, ['https://acme.example/a']]],
+      [
+        'actions/chat-skills.saveChatSkill',
+        [
+          {
+            name: 'pricing-faq',
+            description: 'Writes a pricing FAQ.',
+            instructions: 'Read the pricing page.',
+          },
+        ],
+      ],
+    ]);
+  });
+
+  it('names the agent run whose card the person clicked to send or publish a page (00480)', async () => {
+    const item = FIXTURE_IDS.item;
+    const inRun = {
+      ...ctx,
+      chat: {
+        conversationId: 'conv-1',
+        runId: 'run-1',
+        agentRunId: 'agent-run-1',
+        approvalKey: 'step-1',
+        executionMode: 'assisted' as const,
+      },
+    };
+    const click = (name: string, input: unknown) => {
+      const tool = chatTool_(name);
+      return tool.run(inRun, tool.inputSchema.parse(input));
+    };
+    await click('push_cms_draft', { draft_id: item, destination: 'webflow' });
+    await click('publish_cms', { draft_id: item, destination: 'wordpress' });
+    await click('trigger_content_webhook', { draft_id: item });
+    expect(calls.map((call) => [call.from, call.args])).toEqual([
+      ['actions/cms-send.sendDraftToCms', [item, 'webflow', 'agent-run-1']],
+      ['actions/cms-send.publishDraftToCms', [item, 'wordpress', 'agent-run-1']],
+      ['actions/cms-send.sendDraftToWebhook', [item, 'agent-run-1']],
+    ]);
+  });
+
+  it('makes the drafts’ changes for a run without a session as its person, always', async () => {
+    expect(CHAT_TOOLS.filter((tool) => tool.sessionFree).map((tool) => tool.name)).toEqual(
+      SESSION_FREE,
+    );
+    for (const name of ['create_draft', 'update_draft']) {
+      expect(runsWithoutSession(chatTool_(name)), name).toBe(true);
+    }
+    const brand = FIXTURE_IDS.brand;
+    const item = FIXTURE_IDS.item;
+    const create = chatTool_('create_draft');
+    const start = create.inputSchema.parse(create.fixture.input);
+    await create.run(ctx, start);
+    await create.runFor!(ctx, start);
+    const update = chatTool_('update_draft');
+    await update.runFor!(ctx, update.inputSchema.parse({ draft_id: item, title: 'Plans' }));
+
+    const person = { userId: 'user-1', organizationId: 'org-1' };
+    const [viaSession, viaRun, change] = calls.map((call) => [call.from, call.args] as const);
+    expect(viaSession[0]).toBe('actions/content-drafts.createContentDraft');
+    // The same start the session's call gets, for the run's person.
+    expect(viaRun).toEqual(['chat/actor/drafts.createContentDraftFor', [person, ...viaSession[1]]]);
+    expect(viaRun[1]).toEqual([person, brand, expect.objectContaining({ typePicked: false })]);
+    expect(change).toEqual([
+      'chat/actor/drafts.updateContentDraftFor',
+      [person, item, { title: 'Plans', bodyHtml: undefined }],
+    ]);
+    // Made in the run's chat; an agent's run's own write is the agent's (00463, W4-10).
+    calls.length = 0;
+    const CHAT = 'cccccccc-0000-4000-8000-000000000001';
+    const inChat = {
+      ...ctx,
+      chat: {
+        conversationId: CHAT,
+        runId: 'run-1',
+        agentRunId: 'agent-run-1',
+        approvalKey: 'k',
+        executionMode: 'automated' as const,
+      },
+    };
+    await create.run(inChat, start);
+    await create.runFor!(inChat, start);
+    expect(calls[0].args[1]).toMatchObject({ origin: 'chat', conversationId: CHAT });
+    expect(calls[1].args[2]).toMatchObject({ origin: 'agent', conversationId: CHAT });
+    // A context with no workspace has no one to act for.
+    await expect(create.runFor!({ ...ctx, organizationId: null }, start)).rejects.toThrow(
+      /workspace/,
+    );
+  });
+
+  it('writes through the API server for a run without a session as its person, while that way is open', async () => {
+    const through = ['update_opportunity', 'dismiss_prompt_suggestion', 'create_action'];
+    // Closed: no CHAT_ACTING_SECRET, or one shorter than the server takes.
+    for (const secret of ['', 'x'.repeat(31)]) {
+      vi.stubEnv('CHAT_ACTING_SECRET', secret);
+      for (const name of through) expect(runsWithoutSession(chatTool_(name)), name).toBe(false);
+    }
+    vi.stubEnv('CHAT_ACTING_SECRET', 'x'.repeat(32));
+    for (const name of through) expect(runsWithoutSession(chatTool_(name)), name).toBe(true);
+    vi.unstubAllEnvs();
+
+    const item = FIXTURE_IDS.item;
+    const brand = FIXTURE_IDS.brand;
+    const run = async (name: string, input: unknown) => {
+      const tool = chatTool_(name);
+      await tool.runFor!(ctx, tool.inputSchema.parse(input));
+    };
+    await run('update_opportunity', {
+      opportunity_id: item,
+      status: 'dismissed',
+      reason: 'wrong_angle',
+    });
+    await run('update_opportunity', {
+      opportunity_id: item,
+      status: 'reviewed',
+      reason: 'wrong_angle',
+    });
+    await run('dismiss_prompt_suggestion', { suggestion_id: item });
+    const send = chatTool_('create_action');
+    const proposal = send.inputSchema.parse(send.fixture.input);
+    await send.runFor!({ ...ctx, chat: place }, proposal);
+    await send.precheckFor!(ctx, proposal);
+
+    // The run's person, from its context: never the input's.
+    const person = { userId: 'user-1', organizationId: 'org-1' };
+    expect(calls.map((call) => [call.from, call.args])).toEqual([
+      [
+        'chat/actor/api-writes.updateOpportunityStatusFor',
+        [person, item, 'dismissed', 'wrong_angle'],
+      ],
+      // A reason goes only with a dismissal, as the session's call has it.
+      ['chat/actor/api-writes.updateOpportunityStatusFor', [person, item, 'reviewed', undefined]],
+      ['chat/actor/api-writes.dismissSuggestionFor', [person, item]],
+      [
+        'chat/actor/action-center.createChatActionFor',
+        [person, brand, expect.objectContaining({ title: proposal.title }), place, false],
+      ],
+      [
+        'chat/actor/action-center.checkChatActionCoverFor',
+        [person, brand, expect.objectContaining({ pages: ['/pricing'] }), 'recover'],
+      ],
+    ]);
+    // Never the session's actions.
+    expect(calls.some((call) => call.from.startsWith('actions/'))).toBe(false);
+  });
+
+  it("checks Send to Action Center's duplicate before its card, and lets Create anyway go only where it may", async () => {
+    const send = chatTool_('create_action');
+    const input = send.inputSchema.parse(send.fixture.input);
+    const { checkChatActionCover } = await import('@/lib/actions/chat-action-center');
+    const check = vi.mocked(checkChatActionCover);
+    const duplicate = (canCreateAnyway: boolean) => ({
+      ok: false as const,
+      reason: 'duplicate' as const,
+      message: 'AC-1258 already covers this.',
+      action_id: FIXTURE_IDS.item,
+      action_no: 1258,
+      can_create_anyway: canCreateAnyway,
+    });
+
+    check.mockResolvedValueOnce({ ok: true });
+    await expect(send.precheck!(ctx, input)).resolves.toBeNull();
+    expect(check).toHaveBeenLastCalledWith(
+      FIXTURE_IDS.brand,
+      { prompts: [], pages: ['/pricing'], competitors: [], platforms: [] },
+      'recover',
+    );
+    check.mockResolvedValueOnce(duplicate(false));
+    await expect(send.precheck!(ctx, input)).resolves.toMatchObject({ reason: 'duplicate' });
+    // Create anyway: past a partial overlap only.
+    const anyway = { ...input, create_anyway: true };
+    check.mockResolvedValueOnce(duplicate(true));
+    await expect(send.precheck!(ctx, anyway)).resolves.toBeNull();
+    check.mockResolvedValueOnce(duplicate(false));
+    await expect(send.precheck!(ctx, anyway)).resolves.toMatchObject({ reason: 'duplicate' });
+  });
+
+  it('shows on its card what is frozen once made, and its Open once made (CHAT-09 18, 18b)', async () => {
+    const send = chatTool_('create_action');
+    const input = send.inputSchema.parse({
+      ...send.fixture.input,
+      goal: 'Get /pricing cited again',
+      platforms: ['google-aio'],
+      tasks: [
+        {
+          title: 'Add a FAQ to /pricing',
+          type: 'on_page',
+          url: '/pricing',
+          done_when: 'Live',
+          change: { after: 'Q: Which plan tracks Gemini? A: Growth and up.' },
+        },
+        { title: 'Pitch G2 a review', type: 'outreach', where: 'g2.com', done_when: 'Sent' },
+      ],
+    });
+    expect(send.target!(input, { organizationId: 'org-1' })).toBe(
+      '“Win back pricing citations on /pricing” · Recover · 2 tasks',
+    );
+    await expect(send.cardDetails!(input, { organizationId: 'org-1' })).resolves.toEqual({
+      items: [
+        {
+          title: 'Add a FAQ to /pricing',
+          detail: 'On-page · /pricing · Done when: Live',
+          body: 'Q: Which plan tracks Gemini? A: Growth and up.',
+        },
+        { title: 'Pitch G2 a review', detail: 'Outreach · g2.com · Done when: Sent' },
+      ],
+      why: 'Google AI Overviews stopped citing /pricing for 2 pricing prompts this week.',
+      goal: 'Get /pricing cited again',
+      targets: [
+        { kind: 'prompts', values: [] },
+        { kind: 'pages', values: ['/pricing'] },
+        { kind: 'competitors', values: [] },
+        { kind: 'platforms', values: ['Google AI Overviews'] },
+      ],
+    });
+    // Create anyway is the person's choice: a card in every mode (CHAT-09 18a).
+    expect(send.alwaysCardWhen!({ ...input, create_anyway: true })).toBe(true);
+    expect(send.alwaysCardWhen!(input)).toBe(false);
+    const href = `/dashboard/action-center/actions/${FIXTURE_IDS.item}`;
+    expect(
+      send.resultCard!(input, { ok: true, action_id: FIXTURE_IDS.item, action_no: 1271, href }),
+    ).toEqual({
+      kind: 'action_created',
+      actionNo: 1271,
+      title: 'Win back pricing citations on /pricing',
+      href,
+    });
+    expect(send.resultCard!(input, { ok: false, reason: 'duplicate' })).toBeNull();
+    const add = chatTool_('attach_to_action');
+    expect(
+      add.resultCard!(add.inputSchema.parse(add.fixture.input), {
+        ok: true,
+        action_no: 1258,
+        href,
+      }),
+    ).toMatchObject({ kind: 'action_added', actionNo: 1258 });
+  });
+
+  it('gives recurring work create_schedule set up its card', () => {
+    const schedule = chatTool_('create_schedule');
+    const input = schedule.inputSchema.parse(schedule.fixture.input);
+    const made = {
+      ok: true,
+      schedule_id: FIXTURE_IDS.item,
+      title: 'Weekly visibility report',
+      when: 'Every Monday, 09:00 · Europe/Istanbul',
+      next_run_at: '2026-11-16T06:00:00.000Z',
+      deliver: 'Chat',
+      ready_by: false,
+      recurring: true,
+    };
+    try {
+      const card = schedule.scheduleCard!(input, made);
+      expect(card).toEqual({
+        title: 'Weekly visibility report',
+        when: 'Every Monday, 09:00 · Europe/Istanbul',
+        href: `/dashboard/chat/scheduled/${FIXTURE_IDS.item}`,
+      });
+      // Safe for the browser as an event: no id field, a link in the app.
+      expect(
+        clientEventProblems({ type: 'schedule.made', seq: 1, data: card! } as ChatEvent),
+      ).toEqual([]);
+      // Work done once, or a job that wasn't made: no card.
+      expect(schedule.scheduleCard!(input, { ...made, recurring: false })).toBeNull();
+      expect(schedule.scheduleCard!(input, { ok: false, reason: 'quota_exceeded' })).toBeNull();
+      expect(schedule.scheduleCard!(input, null)).toBeNull();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('reads the actions a page at a time, all of them ranked, and asks for titles (owner, 2026-11-14)', async () => {
+    const tool = chatTool_('list_action_center_tasks');
+    const brand = FIXTURE_IDS.brand;
+    await tool.run(ctx, tool.inputSchema.parse({ brand_id: brand, offset: 50 }));
+    expect(calls.map((call) => [call.from, call.args])).toEqual([
+      [
+        'mcp/action-center-reads.listActionsPageFor',
+        [
+          ctx,
+          {
+            brandId: brand,
+            status: undefined,
+            category: undefined,
+            sort: undefined,
+            limit: undefined,
+            offset: 50,
+          },
+        ],
+      ],
+    ]);
+    // A page is at most 50 rows; the rest come by offset. Open actions unless one status is asked.
+    expect(tool.inputSchema.safeParse({ brand_id: brand, limit: 50 }).success).toBe(true);
+    expect(tool.inputSchema.safeParse({ brand_id: brand, limit: 51 }).success).toBe(false);
+    expect(tool.inputSchema.safeParse({ brand_id: brand, status: 'open' }).success).toBe(true);
+    expect(tool.inputSchema.safeParse({ brand_id: brand, offset: -1 }).success).toBe(false);
+    // What the model is told: judge the whole page, say "N of M", and name actions by title.
+    expect(tool.description).toContain(
+      'every one that matches is counted and ranked on the server',
+    );
+    expect(tool.description).toContain('read the default page (50 rows) before you judge');
+    expect(tool.description).toContain('say how many you judged ("the top 50 of 53")');
+    expect(tool.description).toContain('or read the next page with next_offset');
+    expect(tool.description).toContain(`ref (its number, as ${actionRef(12)})`);
+    expect(tool.description).toContain(
+      'Name each action by its title, with its ref after it: never a ref alone.',
+    );
+  });
+
+  it('reads actions by the codes a person wrote, in one read, and never answers with others (owner, 2026-11-16)', async () => {
+    const tool = chatTool_('list_action_center_tasks');
+    const brand = FIXTURE_IDS.brand;
+    calls.length = 0;
+    await tool.run(
+      ctx,
+      tool.inputSchema.parse({ brand_id: brand, codes: [' AC 481 ', 'AC-63'], status: 'open' }),
+    );
+    // By code, every status: the page's inputs don't apply.
+    expect(calls.map((call) => [call.from, call.args])).toEqual([
+      [
+        'mcp/action-center-reads.listActionsByCodeFor',
+        [ctx, { brandId: brand, codes: ['AC 481', 'AC-63'] }],
+      ],
+    ]);
+    const parses = (codes: unknown) =>
+      tool.inputSchema.safeParse({ brand_id: brand, codes }).success;
+    expect(parses(['AC-481', 'AC 481', 'ac481', '#481', '481', 'AC-07', 'AC-7'])).toBe(true);
+    expect(parses([])).toBe(false);
+    expect(parses(Array.from({ length: 11 }, (_, i) => `AC-${i + 1}`))).toBe(false);
+    // Read the code first, say "not found" plainly, never the closest, never "doesn't exist".
+    expect(tool.description).toContain(
+      'When the person names an action by its code (AC-12, "AC 12", "#12", or a number they clearly mean as one), read that code first: codes, every code of the message in one read.',
+    );
+    expect(tool.description).toContain('every status, Completed and Dismissed included');
+    expect(tool.description).toContain(
+      'a code that names two actions returns both: name both, never pick one',
+    );
+    expect(tool.description).toContain(
+      'say this brand has no action with that code (codes are per brand), and never offer other actions as the closest',
+    );
+    expect(tool.description).toContain(
+      "Never say an action doesn't exist because a page of the list didn't show it.",
+    );
+    expect(chatTool_('get_action').description).toContain(
+      "an action the person names by its code is read with list_action_center_tasks' codes first",
+    );
+  });
+
+  // The owner's plan (2026-11-16, item 2): "what is X?" never depends on X being on a page.
+  it('looks an item up by the code, id, words, domain or address the person named', async () => {
+    const { brand } = FIXTURE_IDS;
+    const id = (n: number) => `a1000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+    const run = async (name: string, input: Record<string, unknown>) => {
+      const tool = chatTool_(name);
+      calls.length = 0;
+      await tool.run(ctx, tool.inputSchema.parse({ brand_id: brand, ...input }));
+      return calls.map((call) => [call.from, call.args]);
+    };
+    // A lookup's inputs only: the list's own filters, sort and page don't apply.
+    expect(
+      await run('list_signals', {
+        codes: [' S 7 ', '#12'],
+        status: 'new',
+        date_from: '2026-11-01',
+      }),
+    ).toEqual([
+      [
+        'mcp/signal-page.lookUpSignalsFor',
+        [ctx, { brandId: brand, codes: ['S 7', '#12'], ids: undefined }],
+      ],
+    ]);
+    expect(await run('list_signals', { ids: [id(1)] })).toEqual([
+      [
+        'mcp/signal-page.lookUpSignalsFor',
+        [ctx, { brandId: brand, codes: undefined, ids: [id(1)] }],
+      ],
+    ]);
+    expect(
+      await run('list_prompts', {
+        search: ' skip a month ',
+        topic_id: id(2),
+        is_active: true,
+        offset: 50,
+      }),
+    ).toEqual([
+      [
+        'mcp/data.lookUpPromptsFor',
+        [ctx, { brandId: brand, ids: undefined, search: 'skip a month', offset: 50 }],
+      ],
+    ]);
+    expect(
+      await run('get_prompt_performance', {
+        prompt_ids: [id(3)],
+        topic_id: id(2),
+        sort_by: 'mentions',
+        date_from: '2026-10-01',
+        date_to: '2026-10-31',
+        region: 'US',
+      }),
+    ).toEqual([
+      [
+        'mcp/data.lookUpPromptPerformanceFor',
+        [
+          ctx,
+          {
+            brandId: brand,
+            dateFrom: '2026-10-01',
+            dateTo: '2026-10-31',
+            model: undefined,
+            region: 'US',
+            promptIds: [id(3)],
+            // Each prompt's Visibility as the Prompts page shows it (the owner's plan, item 7).
+            withScore: true,
+          },
+        ],
+      ],
+    ]);
+    expect(
+      await run('list_citations', {
+        domains: ['www.example.com'],
+        urls: ['https://example.com/a/'],
+        source_filter: 'owned',
+        topic_id: id(2),
+        date_from: '2026-10-01',
+      }),
+    ).toEqual([
+      [
+        'mcp/data.lookUpCitationsFor',
+        [
+          ctx,
+          {
+            brandId: brand,
+            dateFrom: '2026-10-01',
+            dateTo: undefined,
+            model: undefined,
+            region: undefined,
+            topicId: id(2),
+            domains: ['www.example.com'],
+            urls: ['https://example.com/a/'],
+          },
+        ],
+      ],
+    ]);
+    expect(
+      await run('list_content_opportunities', {
+        search: 'storage guide',
+        status: 'new',
+        impact: 'high',
+      }),
+    ).toEqual([
+      [
+        'mcp/data.lookUpOpportunitiesFor',
+        [ctx, { brandId: brand, ids: undefined, search: 'storage guide', offset: undefined }],
+      ],
+    ]);
+    expect(await run('list_drafts', { ids: [id(4)], status: 'in_review' })).toEqual([
+      [
+        'mcp/content.lookUpDraftsFor',
+        [ctx, { brandId: brand, ids: [id(4)], search: undefined, offset: undefined }],
+      ],
+    ]);
+    expect(await run('get_reports', { search: 'benchmark' })).toEqual([
+      [
+        'mcp/data.lookUpReportsFor',
+        [ctx, { brandId: brand, ids: undefined, search: 'benchmark', offset: undefined }],
+      ],
+    ]);
+    // Without one, each reads its page as before.
+    expect((await run('list_signals', {}))[0][0]).toBe('mcp/signal-page.listSignalsPageFor');
+    expect((await run('get_reports', { search: '' }))[0][0]).toBe('mcp/data.reportsPageFor');
+
+    // What the model may send: codes as typed, ids as ids, short words, at most 10 of each.
+    const parses = (name: string, input: Record<string, unknown>) =>
+      chatTool_(name).inputSchema.safeParse({ brand_id: brand, ...input }).success;
+    expect(parses('list_signals', { codes: ['S-07', 'S 7', 's7', '#7', '7'] })).toBe(true);
+    expect(parses('list_signals', { codes: Array.from({ length: 11 }, (_, i) => `S-${i}`) })).toBe(
+      false,
+    );
+    expect(parses('list_prompts', { ids: ['not-an-id'] })).toBe(false);
+    expect(parses('list_prompts', { search: 'x'.repeat(201) })).toBe(false);
+    expect(parses('list_citations', { domains: [] })).toBe(false);
+
+    // Each read says to read by what was named first, and never to answer with the closest.
+    for (const name of [
+      'list_signals',
+      'list_prompts',
+      'get_prompt_performance',
+      'list_citations',
+      'list_content_opportunities',
+      'list_drafts',
+      'get_reports',
+    ]) {
+      const { description } = chatTool_(name);
+      expect(description, name).toMatch(/read (?:that|prompt_ids) first/);
+      expect(description, name).toMatch(/never offer (?:other [\w ]+? |others )as the closest/);
+    }
+    expect(chatTool_('list_signals').description).toContain(
+      'When the person names a signal by its code (S-07, "S 7", "s7", "#7", or a number they clearly mean as one) or its id, read that first',
+    );
+    expect(chatTool_('list_signals').description).toContain('every status and every date');
+    expect(chatTool_('list_signals').description).toContain('(codes are per brand)');
+    expect(chatTool_('list_prompts').description).toContain(
+      "A lookup reads every topic and state, active and paused (topic_id and is_active don't apply)",
+    );
+    expect(chatTool_('list_citations').description).toContain(
+      "A lookup reads every source type (source_filter and the page don't apply)",
+    );
+    expect(chatTool_('list_content_opportunities').description).toContain(
+      "A lookup reads every status, archived included (status, impact and type don't apply)",
+    );
+    expect(chatTool_('list_drafts').description).toContain(
+      "archived drafts included and marked archived (status doesn't apply)",
+    );
+    expect(chatTool_('get_prompt_performance').description).toContain(
+      "whatever their topic (topic_id, sort, order and the page don't apply)",
+    );
+  });
+
+  it('never offers a tool that marks a task done (CHAT-09 item 15)', () => {
+    const names = CHAT_TOOLS.map((tool) => tool.name).join(' ');
+    expect(names).not.toMatch(/complete|mark_done|dismiss_action|delete_action|close_task/);
+  });
+
+  it('refuses what the update and draft writes are not for', () => {
+    const update = chatTool('update_opportunity')!.inputSchema;
+    // Only reviewed or dismissed (CHAT-20 §9 row 49), not the rest of the workflow.
+    expect(update.safeParse({ opportunity_id: FIXTURE_IDS.item, status: 'done' }).success).toBe(
+      false,
+    );
+    const draft = chatTool('create_draft')!.inputSchema;
+    const base = {
+      brand_id: FIXTURE_IDS.brand,
+      title: 'Pricing',
+      page_type: 'pricing',
+      source: { kind: 'content' },
+    };
+    expect(draft.safeParse(base).success).toBe(true);
+    expect(draft.safeParse({ ...base, source_url: 'ftp://example.com' }).success).toBe(false);
+    expect(draft.safeParse({ ...base, page_type: 'press_release' }).success).toBe(false);
+  });
+});
+
+describe('approval policies', () => {
+  it('lets a read run, and starts every write here at Ask (auto allowed in Full auto)', () => {
+    for (const tool of CHAT_TOOLS) {
+      if (tool.class === 'read') {
+        expect([tool.defaultPolicy, tool.maxPolicy]).toEqual(['on', 'on']);
+      } else if (tool.class === 'write' && (tool.flags.alwaysCard || tool.flags.costCard)) {
+        // Ask your Admin, or a cost said first: a card in every mode (CHAT-20 rows 37, 80a).
+        expect([tool.defaultPolicy, tool.maxPolicy]).toEqual(['ask', 'ask']);
+      } else if (tool.name === 'set_follow_up_check') {
+        // A follow-up check: by itself in Full auto only, never Always (CHAT-20 row 79, §13).
+        expect([tool.defaultPolicy, tool.maxPolicy]).toEqual(['ask_full_auto', 'ask_full_auto']);
+      } else if (tool.class === 'write') {
+        expect([tool.defaultPolicy, tool.maxPolicy]).toEqual(['ask_full_auto', 'always']);
+      }
+    }
+  });
+
+  it('opens daily work to every role and keeps the rest with Admins and Managers', () => {
+    // The role model of 2026-10-29, as the server (#1763), MCP (#1762) and RLS have each write.
+    const writes = CHAT_TOOLS.filter((t) => t.class !== 'read');
+    expect(Object.fromEntries(writes.map((t) => [t.name, allowedRoles(t)]))).toEqual({
+      create_draft: ['admin', 'manager', 'analyst', 'agency_partner'],
+      update_opportunity: ['admin', 'manager'],
+      dismiss_prompt_suggestion: ['admin', 'manager', 'analyst'],
+      request_access: ['admin', 'manager', 'analyst', 'agency_partner'],
+      // The brand's tracking setup (W2-06): Admins and Managers, as the app (00382, #1762).
+      add_prompts: ['admin', 'manager'],
+      pause_prompts: ['admin', 'manager'],
+      add_topic: ['admin', 'manager'],
+      rename_topic: ['admin', 'manager'],
+      add_competitors: ['admin', 'manager'],
+      remove_competitor: ['admin', 'manager'],
+      // Chat's Action Center changes (W2-10): Admins and Managers, as the server's routes.
+      create_action: ['admin', 'manager'],
+      attach_to_action: ['admin', 'manager'],
+      attach_file_to_task: ['admin', 'manager'],
+      set_task_ready_for_review: ['admin', 'manager'],
+      // Content, reports and Site Audit (W2-07, DECISIONS T): an Analyst only saves drafts.
+      update_draft: ['admin', 'manager'],
+      suggest_draft_changes: ['admin', 'manager'],
+      set_draft_ready: ['admin', 'manager'],
+      // Optimize here (W4-12b part 2): a change to the page, as update_draft.
+      optimize_draft: ['admin', 'manager'],
+      push_cms_draft: ['admin', 'manager'],
+      publish_cms: ['admin', 'manager'],
+      trigger_content_webhook: ['admin', 'manager'],
+      // Take down (AUTONOMOUS-GO-LIVE PR 10): as the API's route, a Manager even while publishing is off.
+      unpublish_cms: ['admin', 'manager'],
+      build_report: ['admin', 'manager'],
+      run_site_audit: ['admin', 'manager'],
+      // Images (CHAT-20 §9 row 70, W4-08): Admins and Managers, as a report.
+      generate_image: ['admin', 'manager'],
+      // Scheduled work (CHAT-20 §4: Admins and Managers create schedules).
+      create_schedule: ['admin', 'manager'],
+      set_follow_up_check: ['admin', 'manager'],
+      // A skill of one's own (W3-06, CHAT-13 v2): Admins and Managers save skills.
+      save_skill: ['admin', 'manager'],
+      // Memory (W3-11, CHAT-14 item 25): every role has its Me; the store checks the scope.
+      save_memory: ['admin', 'manager', 'analyst', 'agency_partner'],
+      forget_memory: ['admin', 'manager', 'analyst', 'agency_partner'],
+      // An agent running another agent (CHAT-27 phase 2): Admins and Managers, as agents are.
+      run_agent: ['admin', 'manager'],
+      // The AEO Operator's plan card (PR 4): Admins and Managers, as agents are.
+      run_agent_plan: ['admin', 'manager'],
+      // Ad drafts (Ads Phase 0 PR 15): Admins and Managers, as the Pay card's route.
+      save_ad_drafts: ['admin', 'manager'],
+    });
+    // Every read is every role's but tasks waiting for review: Admins' and Managers', as MCP's.
+    for (const tool of CHAT_TOOLS.filter((t) => t.class === 'read')) {
+      expect(allowedRoles(tool), tool.name).toEqual(
+        tool.name === 'list_task_reviews'
+          ? ['admin', 'manager']
+          : ['admin', 'manager', 'analyst', 'agency_partner'],
+      );
+    }
+  });
+
+  it('files the page create_draft saved as the draft keeps it: cleaned (CHAT-06)', () => {
+    const draft = CHAT_TOOLS.find((t) => t.name === 'create_draft')!;
+    const made = draft.deliverable!(
+      {
+        title: 'Pricing FAQ',
+        body_html:
+          '<h1>Pricing FAQ</h1><script>fetch("https://evil.example")</script><img src="https://ansvisor.com/a.png" onerror="alert(1)">',
+      } as never,
+      FIXTURE_IDS.brand,
+    ) as { body: string };
+    expect(made.body).not.toMatch(/<script/i);
+    expect(made.body).not.toMatch(/onerror/i);
+    expect(made.body).toContain('<h1>Pricing FAQ</h1>');
+  });
+
+  it('says where every row that takes a brand or an object finds its brand', () => {
+    // Memory's lines (W3-11): a Me or Workspace line has no brand, so the store checks a
+    // Brand line's brand itself (memory/store.ts), never the precedence's brand rule.
+    const OWN_BRAND_CHECK = new Set(['save_memory', 'forget_memory']);
+    const problems = CHAT_TOOLS.filter((tool) => !OWN_BRAND_CHECK.has(tool.name)).flatMap(
+      (tool) => {
+        const fields = Object.keys(tool.inputSchema.shape);
+        const ids = fields.filter((field) => field === 'id' || field.endsWith('_id'));
+        const brandOf = tool.brandOf;
+        if (fields.includes('brand_id')) {
+          return brandOf && 'input' in brandOf ? [] : [`${tool.name}: takes brand_id`];
+        }
+        if (ids.length > 0) {
+          return brandOf && 'lookup' in brandOf && ids.includes(brandOf.idField)
+            ? []
+            : [`${tool.name}: takes ${ids.join(', ')}, so its brand is looked up`];
+        }
+        return brandOf === null ? [] : [`${tool.name}: names no brand or object`];
+      },
+    );
+    expect(problems).toEqual([]);
+    for (const tool of CHAT_TOOLS) {
+      if (tool.brandOf && 'lookup' in tool.brandOf) {
+        expect(BRAND_LOOKUP_TABLES).toContain(tool.brandOf.lookup);
+      }
+    }
+    // A row can't name a field its input lacks.
+    expect(() => defineTool({ ...readRow, brandOf: { input: 'brand_id' } })).toThrow(
+      /brand_id, which its input lacks/,
+    );
+  });
+
+  it('marks the reads about no brand that list every brand the person can access (00436)', () => {
+    // A chat they run in has touched each of those brands (touched-brands.ts).
+    expect(
+      CHAT_TOOLS.filter((tool) => tool.namesBrands)
+        .map((tool) => tool.name)
+        .sort(),
+    ).toEqual(['list_brands', 'list_connections']);
+    expect(() =>
+      defineTool({
+        ...readRow,
+        inputSchema: z.object({ brand_id: z.string() }),
+        brandOf: { input: 'brand_id' },
+        namesBrands: true,
+        fixture: { input: { brand_id: 'x' } },
+      }),
+    ).toThrow(/doesn't name every brand/);
+  });
+
+  it('leaves roles out only of a row open to every role, and never an Admin', () => {
+    const write = { ...readRow, class: 'write' as const, defaultPolicy: 'ask', maxPolicy: 'ask' };
+    expect(
+      defineTool({ ...write, excludeRoles: ['agency_partner'] } as never).excludeRoles,
+    ).toEqual(['agency_partner']);
+    expect(defineTool(readRow).excludeRoles).toEqual([]);
+    expect(() =>
+      defineTool({ ...write, minRole: 'manager', excludeRoles: ['analyst'] } as never),
+    ).toThrow(/every role/);
+    expect(() => defineTool({ ...write, excludeRoles: ['admin'] } as never)).toThrow(/Admin/);
+  });
+
+  it('keeps every execute at a click', () => {
+    for (const tool of CHAT_TOOLS.filter((t) => t.class === 'execute')) {
+      expect([tool.defaultPolicy, tool.maxPolicy]).toEqual(['click', 'click']);
+    }
+    const execute = defineTool({
+      ...readRow,
+      name: 'publish_test',
+      class: 'execute',
+      executeGroup: 'publishing',
+    });
+    expect([execute.defaultPolicy, execute.maxPolicy]).toEqual(['click', 'click']);
+    expect(execute.executeGroup).toBe('publishing');
+    // Every execute is in a go-live group, so the Managers' switch covers it.
+    expect(() => defineTool({ ...readRow, class: 'execute' } as never)).toThrow(/go-live group/);
+    // A row that asks for less than a click isn't defined at all.
+    expect(() =>
+      defineTool({ ...readRow, class: 'execute', defaultPolicy: 'always' } as never),
+    ).toThrow(/click/);
+    expect(() =>
+      defineTool({ ...readRow, class: 'execute', maxPolicy: 'ask_full_auto' } as never),
+    ).toThrow(/click/);
+  });
+
+  it('runs only a write for its person without a session, and only with its runFor', () => {
+    const write = { ...readRow, class: 'write' as const, defaultPolicy: 'ask', maxPolicy: 'ask' };
+    const runFor = async () => null;
+    expect(defineTool({ ...write, sessionFree: true, runFor } as never).sessionFree).toBe(true);
+    // Its way, and a check of its own for such a run, only with it; that check beside the row's.
+    const precheck = async () => null;
+    const open = () => true;
+    expect(() => defineTool({ ...write, runForOpen: open } as never)).toThrow(/session-free/);
+    expect(() => defineTool({ ...write, precheck, precheckFor: precheck } as never)).toThrow(
+      /session-free/,
+    );
+    expect(() =>
+      defineTool({ ...write, sessionFree: true, runFor, precheckFor: precheck } as never),
+    ).toThrow(/its precheck/);
+    const closed = defineTool({
+      ...write,
+      sessionFree: true,
+      runFor,
+      runForOpen: () => false,
+    } as never);
+    expect(runsWithoutSession(closed)).toBe(false);
+    expect(runsWithoutSession(defineTool({ ...write, sessionFree: true, runFor } as never))).toBe(
+      true,
+    );
+    expect(runsWithoutSession(defineTool(write as never))).toBe(false);
+    expect(() => defineTool({ ...write, sessionFree: true } as never)).toThrow(/runFor/);
+    expect(() => defineTool({ ...write, runFor } as never)).toThrow(/runFor/);
+    // A read reads as the person already; an execute waits for their click.
+    expect(() => defineTool({ ...readRow, sessionFree: true, runFor })).toThrow(/only a write/);
+    expect(() =>
+      defineTool({
+        ...readRow,
+        class: 'execute',
+        executeGroup: 'publishing',
+        sessionFree: true,
+        runFor,
+      }),
+    ).toThrow(/only a write/);
+  });
+
+  it('lets only an execute go live on its own, and only one whose input names no outside target (AUTONOMOUS-GO-LIVE §6.3)', () => {
+    const goLive = () => ({ kind: 'cms_draft' as const, draftId: 'd', target: 'webflow' as const });
+    const execute = {
+      ...readRow,
+      name: 'publish_test',
+      class: 'execute' as const,
+      executeGroup: 'publishing' as const,
+    };
+    // Ids and fixed choices only: a draft, the CMS the brand connected, a switch.
+    const own = defineTool({
+      ...execute,
+      inputSchema: z.object({
+        draft_id: z.string().regex(/^[0-9a-f-]{36}$/),
+        guid: z.guid().optional(),
+        destination: z.enum(['webflow', 'wordpress']),
+        live: z.boolean().default(false),
+      }),
+      fixture: { input: { draft_id: FIXTURE_IDS.item, destination: 'webflow' } },
+      goLive,
+    });
+    expect(own.flags.goLiveOnOwn).toBe(true);
+    // A field that takes an address, a mail address, a site, free text or a list of them.
+    for (const field of [
+      z.string(),
+      z.string().url(),
+      z.email(),
+      z.string().max(300).optional(),
+      z.array(z.guid()),
+      z.object({ url: z.string() }),
+    ]) {
+      expect(() =>
+        defineTool({
+          ...execute,
+          inputSchema: z.object({ draft_id: z.guid(), to: field }),
+          goLive,
+        } as never),
+      ).toThrow(/takes no free text \(to\)/);
+    }
+    // Never a read or a write, which aren't clicks to lift.
+    expect(() => defineTool({ ...readRow, goLive })).toThrow(/only an execute/);
+    expect(() =>
+      defineTool({ ...readRow, class: 'write', defaultPolicy: 'ask', maxPolicy: 'ask', goLive }),
+    ).toThrow(/only an execute/);
+    // The registry: Send to CMS, Publish and the webhook send (PR 11) may, every other row may not.
+    const onItsOwn = CHAT_TOOLS.filter((tool) => tool.flags.goLiveOnOwn).map((tool) => tool.name);
+    expect(onItsOwn).toEqual(['push_cms_draft', 'publish_cms', 'trigger_content_webhook']);
+    // Take down (PR 10): an EXECUTE outside the go-live groups, which never goes live itself.
+    expect(chatTool('unpublish_cms')).toMatchObject({ class: 'execute', executeGroup: null });
+    expect(() => defineTool({ ...execute, executeGroup: null, goLive } as never)).toThrow(
+      /outside the groups never goes live/,
+    );
+    expect(chatTool('publish_cms')?.goLive?.({ draft_id: 'd', destination: 'wordpress' })).toEqual({
+      kind: 'publish',
+      draftId: 'd',
+      target: 'wordpress',
+    });
+    expect(chatTool('push_cms_draft')?.goLive?.({ draft_id: 'd', destination: 'wix' })).toEqual({
+      kind: 'cms_draft',
+      draftId: 'd',
+      target: 'wix',
+    });
+    // The webhook send takes the draft only: its target is the brand's saved webhook.
+    const webhook = chatTool('trigger_content_webhook')!;
+    expect(Object.keys(webhook.inputSchema.shape)).toEqual(['draft_id']);
+    expect(webhook).toMatchObject({ class: 'execute', executeGroup: 'publishing' });
+    expect(webhook.goLive?.({ draft_id: 'd' })).toEqual({
+      kind: 'webhook',
+      draftId: 'd',
+      target: 'webhook',
+    });
+  });
+
+  it("refuses a write's policy past what its flags allow", () => {
+    const write = { ...readRow, class: 'write' as const };
+    expect(() =>
+      defineTool({ ...write, defaultPolicy: 'always', maxPolicy: 'ask_full_auto' }),
+    ).toThrow(/past its maximum/);
+    // An always_card write shows its card in every mode, Full auto too (CHAT-20 §3a).
+    expect(() =>
+      defineTool({
+        ...write,
+        defaultPolicy: 'ask',
+        maxPolicy: 'ask_full_auto',
+        flags: { alwaysCard: true },
+      }),
+    ).toThrow(/without a card/);
+    expect(
+      defineTool({ ...write, defaultPolicy: 'ask', maxPolicy: 'ask', flags: { alwaysCard: true } })
+        .flags,
+    ).toEqual({ alwaysCard: true, costCard: false, adminMayTurnOff: false, goLiveOnOwn: false });
+    expect(() => defineTool({ ...write, defaultPolicy: 'on', maxPolicy: 'on' } as never)).toThrow(
+      /asked/,
+    );
+  });
+});
+
+describe('registryCatalog', () => {
+  it('lists every row as plain data, in registry order, with no code in it', () => {
+    const catalog = registryCatalog(CHAT_TOOLS);
+    expect(catalog.map((entry) => entry.key)).toEqual(CHAT_TOOLS.map((tool) => tool.labelKey));
+    expect(JSON.parse(JSON.stringify(catalog))).toEqual(catalog);
+    for (const entry of catalog) {
+      expect(Object.keys(entry).sort()).toEqual(
+        [
+          'area',
+          'class',
+          'costClass',
+          'defaultPolicy',
+          'excludeRoles',
+          'flags',
+          'key',
+          'maxPolicy',
+          'minRole',
+          'planGate',
+          'route',
+        ].sort(),
+      );
+    }
+  });
+
+  it('never carries a tool name to the browser, internal or MCP', () => {
+    // CHAT-03 item 22: no name in any value, and no key A1's event rule refuses.
+    const names = new Set(CHAT_TOOLS.flatMap((tool) => [tool.name, tool.mcpTool ?? '']));
+    const values: unknown[] = [];
+    const walk = (value: unknown) => {
+      if (value && typeof value === 'object') Object.values(value).forEach(walk);
+      else values.push(value);
+    };
+    const catalog = registryCatalog(CHAT_TOOLS);
+    walk(catalog);
+    expect(values.filter((value) => typeof value === 'string' && names.has(value))).toEqual([]);
+    const asEvent = { type: 'next_moves', seq: 1, data: { catalog } } as unknown as ChatEvent;
+    expect(clientEventProblems(asEvent)).toEqual([]);
+  });
+
+  it("lists Ads' rows on no page until ADS_ENABLED is on (Ads Phase 0 PR 15)", () => {
+    const ads = ['adsOpportunities', 'adDrafts'];
+    const keys = () => registryCatalog().map((entry) => entry.key);
+    vi.stubEnv('ADS_ENABLED', '');
+    expect(keys().filter((key) => ads.includes(key))).toEqual([]);
+    expect(listedTools().length).toBe(CHAT_TOOLS.length - 2);
+    vi.stubEnv('ADS_ENABLED', 'true');
+    expect(keys().filter((key) => ads.includes(key))).toEqual(ads);
+    expect(listedTools()).toBe(CHAT_TOOLS);
+    vi.unstubAllEnvs();
+  });
+
+  it('leads a key from the browser back to its row on the server', () => {
+    for (const tool of CHAT_TOOLS) expect(chatToolByKey(tool.labelKey)).toBe(tool);
+    expect(chatToolByKey('list_brands')).toBeUndefined();
+  });
+
+  it('describes a row as it is defined, without sharing its objects', () => {
+    const row = defineTool({ ...readRow, planGate: { feature: 'prompt_volumes' } });
+    const [entry] = registryCatalog([row]);
+    expect(entry).toMatchObject({
+      key: 'brands',
+      class: 'read',
+      defaultPolicy: 'on',
+      planGate: { feature: 'prompt_volumes' },
+      flags: { alwaysCard: false, costCard: false, adminMayTurnOff: false, goLiveOnOwn: false },
+    });
+    expect(entry.planGate).not.toBe(row.planGate);
+    expect(entry.flags).not.toBe(row.flags);
+  });
+});
+
+describe("the model's tool list on the registry's rows", () => {
+  // CHAT-20 §21: the list equals the rows the role, plan, brand access and policy allow.
+  const facts = (row: Parameters<typeof planFactsFromOrgRow>[0], cloud = true) => {
+    vi.stubEnv('NEXT_PUBLIC_IS_CLOUD', cloud ? 'true' : 'false');
+    try {
+      return planFactsFromOrgRow(row);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  };
+  const list = (
+    role: TeamRole,
+    plan: ReturnType<typeof facts>,
+    scope = { brandId: FIXTURE_IDS.brand as string | null, brandIsDemo: false },
+    brandAccess: 'all' | string[] = 'all',
+  ) =>
+    allowedTools(
+      CHAT_TOOLS,
+      {
+        organizationId: 'org-1',
+        role,
+        plan,
+        settings: DEFAULT_CHAT_SETTINGS,
+        mode: 'full_auto',
+        surface: 'chat',
+        autoChoices: new Set(),
+        brandAccess,
+        injectionDetected: false,
+      },
+      scope,
+    ).map((tool) => tool.name);
+
+  const reads = CHAT_TOOLS.filter((tool) => tool.class === 'read').map((tool) => tool.name);
+  // The WRITEs and the EXECUTEs (push_cms_draft, publish_cms, trigger_content_webhook), in the registry's order.
+  const writes = CHAT_TOOLS.filter((tool) => tool.class !== 'read').map((tool) => tool.name);
+  const starter = facts({ plan: 'starter', subscription_status: 'active' });
+  const growth = facts({ plan: 'growth', subscription_status: 'active' });
+  // Starter's plan opens neither Product Visibility nor the AI-sourced pipeline (CRM
+  // integrations), as their pages (the catalog's own reads are every plan's, as MCP's). Ads' read
+  // has no plan gate: the server shows Starter its first rows, as on the Ads page.
+  const shopping = [
+    'get_shopping_visibility',
+    'get_shopping_shelf',
+    'get_shopping_readiness',
+    'get_product_ai_says',
+    'list_shopping_cards',
+  ];
+  const starterReads = reads.filter((name) => ![...shopping, 'get_ai_pipeline'].includes(name));
+  // Tasks waiting for review are Admins' and Managers' (mcp-wrapped-reads.ts).
+  const memberReads = (names: string[]) => names.filter((name) => name !== 'list_task_reviews');
+
+  it('gives every role the reads its plan opens, and Analysts and Agency partners daily work only', () => {
+    // Memory (W3-11): everyone keeps their own Me.
+    const memory = ['save_memory', 'forget_memory'];
+    expect(list('analyst', starter)).toEqual([
+      ...memberReads(starterReads),
+      'create_draft',
+      'dismiss_prompt_suggestion',
+      'request_access',
+      ...memory,
+    ]);
+    expect(list('agency_partner', growth)).toEqual([
+      ...memberReads(reads),
+      'create_draft',
+      'request_access',
+      ...memory,
+    ]);
+    // Running another agent and saving ad drafts are Growth and up (CHAT-27 decision 4, ADS-01 §8).
+    expect(list('manager', starter)).toEqual([
+      ...starterReads,
+      ...writes.filter((name) => !['run_agent', 'run_agent_plan', 'save_ad_drafts'].includes(name)),
+    ]);
+    expect(list('admin', growth)).toEqual([...reads, ...writes]);
+    expect(list('analyst', facts(null, false))).toEqual([
+      ...memberReads(reads),
+      'create_draft',
+      'dismiss_prompt_suggestion',
+      'request_access',
+      ...memory,
+    ]);
+  });
+
+  it('lists reads only on a read-only workspace and on the demo brand', () => {
+    const ended = facts({ plan: 'growth', subscription_status: 'canceled' });
+    // Work in parts runs a model in each part, which neither may spend (CHAT-27).
+    const free = (names: string[]) => names.filter((name) => name !== 'run_subtasks');
+    expect(list('admin', ended)).toEqual(free(starterReads));
+    expect(list('admin', growth, { brandId: FIXTURE_IDS.brand, brandIsDemo: true })).toEqual(
+      free(reads),
+    );
+  });
+
+  it("lists nothing for a brand outside the person's scope", () => {
+    expect(list('agency_partner', growth, undefined, [])).toEqual([]);
+    expect(list('agency_partner', growth, undefined, [FIXTURE_IDS.brand])).toEqual([
+      ...memberReads(reads),
+      'create_draft',
+      'request_access',
+      'save_memory',
+      'forget_memory',
+    ]);
+  });
+});
+
+describe("save_skill's draft card (W3-08)", () => {
+  const tool = () => chatTool('save_skill')!;
+  const ctx = {
+    timezone: 'UTC',
+    organizationId: 'org-1',
+    // W3-12a's card context carries who it is for too.
+    userId: 'user-1',
+    now: new Date('2026-11-02T10:00:00Z'),
+  };
+  const input = {
+    name: 'pricing-faq',
+    description: 'Writes a pricing FAQ in our tone.',
+    instructions: 'Read the pricing page. Answer each question in two sentences.',
+  };
+
+  it('is a card in every mode: nothing is kept before Save', () => {
+    expect(tool().flags.alwaysCard).toBe(true);
+    expect([tool().defaultPolicy, tool().maxPolicy]).toEqual(['ask', 'ask']);
+  });
+
+  it('shows the draft as editable fields, with Save skill and what it can’t change', async () => {
+    const form = await tool().form!.fields(input as never, ctx);
+    expect(form).toMatchObject({ kind: 'skill', submit: 'Save skill' });
+    expect(form.fields.map((f) => [f.name, f.kind, f.value])).toEqual([
+      ['name', 'text', 'pricing-faq'],
+      ['title', 'text', 'pricing faq'],
+      ['description', 'textarea', 'Writes a pricing FAQ in our tone.'],
+      ['instructions', 'textarea', 'Read the pricing page. Answer each question in two sentences.'],
+    ]);
+    expect(form.notes).toEqual([
+      'Private to you until an Admin shares it.',
+      'It shapes how Chat works: it adds no tool and skips no card.',
+    ]);
+  });
+
+  it('saves the draft as the card was edited, and refuses a /name it can’t keep', () => {
+    const apply = (values: Record<string, string>) =>
+      tool().form!.apply(input as never, values, ctx);
+    expect(
+      apply({
+        name: ' /Pricing-Brief ',
+        title: 'Pricing brief',
+        description: ' Opens with the answer. ',
+        instructions: 'Answer first, then three sections.',
+      }),
+    ).toEqual({
+      ok: true,
+      input: {
+        name: 'pricing-brief',
+        title: 'Pricing brief',
+        description: 'Opens with the answer.',
+        instructions: 'Answer first, then three sections.',
+      },
+    });
+    // An empty title falls back to the name.
+    expect(apply({ title: '' })).toMatchObject({ ok: true, input: { title: undefined } });
+    expect(apply({ name: 'pricing faq' })).toEqual({
+      ok: false,
+      error: 'Use lowercase letters, digits and single hyphens, such as pricing-faq.',
+    });
+    expect(apply({ name: 'winback' })).toEqual({
+      ok: false,
+      error: '/winback is an Ansvisor skill or shortcut. Pick another name.',
+    });
+  });
+
+  it('says it was saved on its step, and nothing when it wasn’t', () => {
+    expect(tool().doneStep!(input as never, { ok: true, value: { id: 's1' } })).toEqual({
+      label: 'Saved skill: /pricing-faq',
+      detail: 'Private to you · Skills › My skills',
+    });
+    expect(tool().doneStep!(input as never, { ok: false })).toBeNull();
+  });
+});
+
+/** The query fan-out reads run only within a skill that names them (owner decision 2026-11-09). */
+describe('the reads that run only within a skill', () => {
+  it('are both fan-out reads, and nothing else', () => {
+    expect(CHAT_TOOLS.filter((tool) => tool.withSkill).map((tool) => tool.name)).toEqual([
+      'get_fanouts',
+      'get_fanout_gaps',
+    ]);
+    expect(chatTool('get_fanouts')?.class).toBe('read');
+    expect(chatTool('get_fanout_gaps')?.class).toBe('read');
+  });
+});
+
+describe('add_prompts over the plan limit (Simplify PR 15)', () => {
+  it('says the prompts past the limit wait for a spot, apart from the added ones', async () => {
+    const { PROMPT_TOOLS } = await import('./prompt-tools');
+    expect(PROMPT_TOOLS.find((tool) => tool.name === 'add_prompts')!.description).toContain(
+      "When the plan's prompt locations run out, the rest are saved waiting for a spot: listed in `waiting`, not in `added`",
+    );
+  });
+});
+
+/**
+ * The Paid Opportunity agent (Ads Phase 0 PR 18; ADS-01 §7a.2 rules 2 and 3):
+ * its run gets only the rows its skills name that the plan opens, never an
+ * EXECUTE, and its ad drafts wait on a card when no one's session is behind it.
+ */
+describe("the Paid Opportunity agent's run", () => {
+  const named = async () => {
+    const { SKILL_LIBRARY: library } = await import('../skills/library');
+    const bodies = ['earn-or-pay', 'ad-drafts'].map(
+      (name) => library.find((skill) => skill.name === name)?.body ?? '',
+    );
+    const names = bodies.flatMap((body) => [...body.matchAll(/`([a-z_]+)`/g)].map((m) => m[1]));
+    return CHAT_TOOLS.filter((tool) => names.includes(tool.name));
+  };
+  const plan = (row: { plan: string; subscription_status: string }) => {
+    vi.stubEnv('NEXT_PUBLIC_IS_CLOUD', 'true');
+    try {
+      return planFactsFromOrgRow(row);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  };
+  const agentRun = (
+    row: { plan: string; subscription_status: string },
+    mode: 'auto' | 'full_auto',
+  ) => ({
+    organizationId: 'org-1',
+    role: 'admin' as const,
+    plan: plan(row),
+    settings: DEFAULT_CHAT_SETTINGS,
+    mode,
+    surface: 'chat' as const,
+    autoChoices: new Set<string>(),
+    brandAccess: 'all' as const,
+    injectionDetected: false,
+    agentRun: true,
+  });
+  const scope = { brandId: FIXTURE_IDS.brand as string, brandIsDemo: false };
+
+  it('names reads and writes inside Ansvisor only: no EXECUTE, and nothing that goes live', async () => {
+    const tools = await named();
+    expect(tools.map((tool) => tool.name)).toEqual(
+      expect.arrayContaining(['get_ads_opportunities', 'save_ad_drafts', 'create_action']),
+    );
+    for (const tool of tools) {
+      expect(tool.class, tool.name).not.toBe('execute');
+      expect(tool.goLive, tool.name).toBeUndefined();
+    }
+    expect(CHAT_TOOLS.filter((tool) => tool.area === 'ads' && tool.class === 'execute')).toEqual(
+      [],
+    );
+  });
+
+  it("gets what the plan opens: Starter reads its rows, Growth's drafts ask, and wait with no session", async () => {
+    const tools = await named();
+    const names = (ctx: ReturnType<typeof agentRun>) =>
+      allowedTools(tools, ctx, scope).map((tool) => tool.name);
+    const starter = names(agentRun({ plan: 'starter', subscription_status: 'active' }, 'auto'));
+    expect(starter).toContain('get_ads_opportunities');
+    expect(starter).not.toContain('save_ad_drafts');
+    const growth = agentRun({ plan: 'growth', subscription_status: 'active' }, 'auto');
+    expect(names(growth)).toContain('save_ad_drafts');
+    const save = chatTool('save_ad_drafts')!;
+    const call = { ...scope, tainted: false };
+    // Auto, ask before changes: a card. A draft written from an AI answer asks in Full auto too.
+    expect(decideToolCall(save, growth, call).kind).toBe('ask');
+    const fullAuto = agentRun({ plan: 'growth', subscription_status: 'active' }, 'full_auto');
+    expect(decideToolCall(save, fullAuto, { ...call, tainted: true }).kind).toBe('ask');
+    // A scheduled run has no one's session: the engine holds the save for its card.
+    expect(runsWithoutSession(save)).toBe(false);
+  });
+});

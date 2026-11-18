@@ -1,6 +1,9 @@
 import supabaseAdmin from '../config/supabase.js';
+import { assertBrandAccess } from './access.js';
 import { logger } from './logger.js';
 import { onBrandDomain } from './audit/host.js';
+import { closeTakenDown, shipCmsPublish } from './impact-ledger/ship.js';
+import { announcePublishedPage } from './indexnow.js';
 
 /**
  * A sent page now live at `url` (Send to CMS #1331), as a webhook's
@@ -14,7 +17,9 @@ import { onBrandDomain } from './audit/host.js';
  * CMS id it now names. A new delivery of a page live at the same address
  * (the post updated in place) is the page as published again. The delivery
  * is written last: a write before it that fails throws, and the next try,
- * finding it not yet published, does it all again.
+ * finding it not yet published, does it all again. Then the publish goes
+ * into the impact ledger as a shipped change (shipCmsPublish), and the page
+ * to IndexNow when its brand turned that on (indexnow.js, once per page).
  *
  * @param {{ id: string, draft_id: string|null, status: string, published_url: string|null }} delivery
  * @param {string} url
@@ -34,6 +39,7 @@ export async function markDeliveryPublished(delivery, url, { externalId = null }
     }
     return;
   }
+  let pagePublished = false;
   if (delivery.draft_id) {
     const { data: latest, error: latestError } = await supabaseAdmin
       .from('content_draft_deliveries')
@@ -43,13 +49,108 @@ export async function markDeliveryPublished(delivery, url, { externalId = null }
       .limit(1)
       .maybeSingle();
     if (latestError) throw new Error(latestError.message);
-    if (latest?.id === delivery.id) await markDraftPublished(delivery.draft_id, url, { at: now });
+    if (latest?.id === delivery.id) {
+      await markDraftPublished(delivery.draft_id, url, { at: now });
+      pagePublished = true;
+    }
   }
   const { error: deliveryError } = await supabaseAdmin
     .from('content_draft_deliveries')
     .update({ status: 'published', published_url: url, published_at: now, ...own })
     .eq('id', delivery.id);
   if (deliveryError) throw new Error(deliveryError.message);
+  // A shipped change for the impact ledger (CHAT-22 §2), measured at 7, 14,
+  // 30 and 90 days: behind CHAT_AGENTIC, once per send, and never throws.
+  await shipCmsPublish({ deliveryId: delivery.id, url, publishedAt: now });
+  // IndexNow, once per page, when the brand turned it on (#2142). Never throws.
+  if (pagePublished) await announcePublishedPage({ draftId: delivery.draft_id, url });
+}
+
+/**
+ * A published send taken down to a draft in its CMS (AUTONOMOUS-GO-LIVE PR
+ * 10), once the CMS did it: the send is taken_down (00460: the status sweeps
+ * and the nightly ship fill leave it), then, each logged and never thrown, as
+ * the page is down whatever they do:
+ *   * the page's address cleared, back to Ready, when it is this send's;
+ *   * an agent's go-live of that page and CMS taken_down (00443), which its
+ *     agent page shows;
+ *   * the open notices of that go-live closed: there is nothing left to take down;
+ *   * its ship events' measurements Not measurable, taken_down.
+ * A page someone took down never goes live on its own again (the send's
+ * status, read by Chat and the internal go-live route).
+ *
+ * @param {{ id: string, draft_id: string|null, target: string, published_url: string|null }} delivery
+ * @param {{ userId: string, at?: string }} options
+ */
+export async function markDeliveryTakenDown(delivery, { userId, at = new Date().toISOString() }) {
+  const { data: taken, error } = await supabaseAdmin
+    .from('content_draft_deliveries')
+    .update({ status: 'taken_down', taken_down_at: at, taken_down_by: userId })
+    .eq('id', delivery.id)
+    .eq('status', 'published')
+    .select('id');
+  if (error) throw new Error(error.message);
+  if (!taken?.length) return false;
+  if (!delivery.draft_id) return true;
+  const draftId = delivery.draft_id;
+  const steps = [
+    [
+      'page address',
+      async () => {
+        const { data: draft, error: readError } = await supabaseAdmin
+          .from('content_drafts')
+          .select('published_url')
+          .eq('id', draftId)
+          .maybeSingle();
+        if (readError) throw new Error(readError.message);
+        if (!draft?.published_url || draft.published_url !== delivery.published_url) return;
+        const { error: writeError } = await supabaseAdmin
+          .from('content_drafts')
+          .update({ status: 'ready', published_url: null, published_at: null })
+          .eq('id', draftId)
+          .eq('published_url', draft.published_url);
+        if (writeError) throw new Error(writeError.message);
+      },
+    ],
+    [
+      'go-live step',
+      async () => {
+        const { error: stepError } = await supabaseAdmin
+          .from('chat_agent_go_live_events')
+          .update({ status: 'taken_down', taken_down_at: at, taken_down_by: userId })
+          .eq('content_draft_id', draftId)
+          .eq('target', delivery.target)
+          .eq('kind', 'publish')
+          .eq('status', 'done');
+        if (stepError) throw new Error(stepError.message);
+      },
+    ],
+    ['notices', () => tellTakenDown(draftId, at)],
+  ];
+  for (const [what, step] of steps) {
+    try {
+      await step();
+    } catch (err) {
+      logger.warn(
+        { err: { name: err?.name, message: err?.message }, draftId },
+        `[content-published] taken down, ${what} not updated`,
+      );
+    }
+  }
+  await closeTakenDown({ draftId, at });
+  return true;
+}
+
+/** The open went-live notices of a page published on its own: closed, as it is down. */
+async function tellTakenDown(draftId, at) {
+  const { error } = await supabaseAdmin
+    .from('chat_notices')
+    .update({ resolved_at: at })
+    .eq('kind', 'agent_went_live')
+    .eq('payload->>draftId', draftId)
+    .eq('payload->>kind', 'publish')
+    .is('resolved_at', null);
+  if (error) throw new Error(error.message);
 }
 
 const MAX_URL = 2048;
@@ -58,12 +159,12 @@ const PAGE_WRITES = 3;
 /** A task a person or the system can still complete: not done, skipped, failed or waiting. */
 const OPEN_TASKS = ['todo', 'in_progress'];
 /** The library tasks a draft is the work of, by its method (the web's DRAFT_TASK_KEYS). */
-const DRAFT_TASK_KEYS = {
+export const DRAFT_TASK_KEYS = {
   create: ['create_content_draft'],
   optimize: ['optimize_content', 'refresh_content'],
 };
 /** A task no longer outstanding work (the web's TASK_DONE). */
-const TASK_DONE = ['completed', 'skipped', 'failed'];
+export const TASK_DONE = ['completed', 'skipped', 'failed'];
 /** A draft whose writing is done. */
 const DRAFT_DONE = ['ready', 'published'];
 
@@ -326,4 +427,50 @@ export async function publishDraft(draft, url, actorId) {
   const onDomain = await onBrandDomains(draft.brand_id, url);
   const { taskCompleted } = await markDraftPublished(draft.id, url, { at, actorId, onDomain });
   return { publishedUrl: url, publishedAt: at, taskCompleted, onBrandDomain: onDomain };
+}
+
+/**
+ * The same mark for an MCP API key (`mark_content_draft_published`): the key
+ * carries no session, so the web MCP layer passes the key's organization and
+ * user. As the route, the draft must be the organization's, of a brand the
+ * user reaches, and not archived;
+ * null when it isn't (another's reads as not there). A page already
+ * published at `url` is left as it is, its live-since time kept, so a call
+ * made again changes nothing (the tool says it is idempotent).
+ *
+ * @param {{ draftId: string, url: string, userId: string, orgId: string }} input
+ * @returns {Promise<{ publishedUrl: string, publishedAt: string, taskCompleted: boolean, onBrandDomain: boolean } | null>}
+ */
+export async function publishDraftForKeyUser({ draftId, url, userId, orgId }) {
+  const { data: draft, error } = await supabaseAdmin
+    .from('content_drafts')
+    .select(
+      'id, brand_id, action_id, archived_at, status, published_url, published_at, brands!inner(organization_id)',
+    )
+    .eq('id', draftId)
+    .eq('brands.organization_id', orgId)
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  if (!draft || draft.archived_at) return null;
+  // The key's user must reach the draft's brand (Selected brands, as the
+  // route has it); a brand they weren't given reads as not there.
+  try {
+    await assertBrandAccess(draft.brand_id, userId);
+  } catch (err) {
+    if (err.status === 403 || err.status === 404) return null;
+    throw err;
+  }
+  if (draft.status === 'published' && draft.published_url === url) {
+    return {
+      publishedUrl: url,
+      publishedAt: draft.published_at,
+      taskCompleted: false,
+      onBrandDomain: await onBrandDomains(draft.brand_id, url),
+    };
+  }
+  return publishDraft(
+    { id: draft.id, brand_id: draft.brand_id, action_id: draft.action_id },
+    url,
+    userId,
+  );
 }

@@ -36,10 +36,12 @@ import {
 import { LoadingDots } from '@/components/ui/loading-dots';
 
 /**
- * The opportunity panel's actions (the user's spec): three in front, in this
- * order: Send to Actions, Generate Brief, Send to Editor. Each turns into
- * its state in place once done (Open in Actions, Brief generated, Open
- * draft). The rest sit in the "…" menu on the right.
+ * The opportunity panel's actions (the user's spec): in front, in this
+ * order: Send to Actions, Generate Brief, Send to Editor, and Write this
+ * (customer priorities item 9) as the main one. Each turns into its state in
+ * place once done (Open in Actions, Brief generated, Open draft, which
+ * takes both Send to Editor's and Write this's place). The rest sit in the
+ * "…" menu on the right.
  */
 export function OpportunityActions({
   actionId,
@@ -64,7 +66,8 @@ export function OpportunityActions({
     generating: boolean;
     /** Why it can't be generated now (the month's briefs are used up). */
     blockedReason: string | null;
-    onGenerate: () => void;
+    /** Null for a member who can't generate one (admins and managers do). */
+    onGenerate: (() => void) | null;
   };
   /**
    * The Content Editor: the draft written for this opportunity (undefined
@@ -79,6 +82,8 @@ export function OpportunityActions({
     onRetry?: () => void;
     canStart: boolean;
     onStart: () => void;
+    /** Write this: the brief and the page in one go, beside Start. */
+    onWriteThis?: () => void;
     onOpenDraft: (draftId: string) => void;
   };
   /** Its Plan row's priority mark (undefined while looked up); null when not offered. */
@@ -127,17 +132,19 @@ export function OpportunityActions({
           {t('briefGenerated')}
         </Button>
       ) : (
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={brief.onGenerate}
-          disabled={brief.generating || brief.blockedReason !== null}
-          title={brief.blockedReason ?? undefined}
-          className="gap-2"
-        >
-          {brief.generating ? <LoadingDots /> : <Sparkles className="h-4 w-4" />}
-          {brief.generating ? t('generatingBrief') : t('generateBrief')}
-        </Button>
+        brief.onGenerate && (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={brief.onGenerate}
+            disabled={brief.generating || brief.blockedReason !== null}
+            title={brief.blockedReason ?? undefined}
+            className="gap-2"
+          >
+            {brief.generating ? <LoadingDots /> : <Sparkles className="h-4 w-4" />}
+            {brief.generating ? t('generatingBrief') : t('generateBrief')}
+          </Button>
+        )
       )}
       {showContent &&
         (content.lookupFailed ? (
@@ -151,15 +158,30 @@ export function OpportunityActions({
             {t('openDraft')}
           </Button>
         ) : (
-          <Button
-            size="sm"
-            className="gap-2"
-            onClick={content.onStart}
-            disabled={draftId === undefined}
-          >
-            {draftId === undefined ? <LoadingDots /> : <FilePen className="h-4 w-4" />}
-            {t('sendToEditor')}
-          </Button>
+          <>
+            <Button
+              size="sm"
+              variant={content.onWriteThis ? 'outline' : 'default'}
+              className="gap-2"
+              onClick={content.onStart}
+              disabled={draftId === undefined}
+            >
+              {draftId === undefined ? <LoadingDots /> : <FilePen className="h-4 w-4" />}
+              {t('sendToEditor')}
+            </Button>
+            {content.onWriteThis && (
+              <Button
+                size="sm"
+                className="gap-2"
+                onClick={content.onWriteThis}
+                disabled={draftId === undefined}
+                title={t('writeThis.menuHint')}
+              >
+                {draftId === undefined ? <LoadingDots /> : <Sparkles className="h-4 w-4" />}
+                {t('writeThis.menu')}
+              </Button>
+            )}
+          </>
         ))}
 
       <DropdownMenu>
