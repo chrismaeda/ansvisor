@@ -45,7 +45,7 @@ check_context() {
   ctx="$(mktemp -d)"
   printf 'FROM scratch\nCOPY . /\n' |
     docker buildx build --quiet --output "type=local,dest=$ctx" -f - "./$svc" >/dev/null
-  leaked="$(cd "$ctx" && find . -name '.env*' ! -path "./$allowed" | sort)"
+  leaked="$(cd "$ctx" && find . -name '.env*' ${allowed:+! -path "./$allowed"} | sort)"
   rm -rf "$ctx"
   [[ -z "$leaked" ]] ||
     die "$svc/.dockerignore lets env files into the build context:
@@ -71,8 +71,15 @@ if [[ "$PUSH" == "true" ]]; then
     fi
   done
 
-  aws ecr get-login-password --region "$AWS_REGION" |
-    docker login --username AWS --password-stdin "$REGISTRY"
+  # With amazon-ecr-credential-helper configured for this registry, Docker
+  # fetches ECR credentials itself (and `docker login` fails: the helper
+  # can't store them). Otherwise log in with a 12-hour token.
+  if grep -qs "\"$REGISTRY\": *\"ecr-login\"" "${DOCKER_CONFIG:-$HOME/.docker}/config.json"; then
+    echo "using ecr-login credential helper for $REGISTRY"
+  else
+    aws ecr get-login-password --region "$AWS_REGION" |
+      docker login --username AWS --password-stdin "$REGISTRY"
+  fi
   output_flag=--push
 else
   REGISTRY=""
