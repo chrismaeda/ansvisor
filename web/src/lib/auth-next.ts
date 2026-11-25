@@ -31,6 +31,25 @@ export function safeNextPath(value: string | null | undefined): string {
 }
 
 /**
+ * The site's own origin, for the absolute redirects the auth routes send:
+ * NEXT_PUBLIC_APP_URL's when set, else the request's. Self-hosted behind a
+ * proxy (Docker + Cloudflare Tunnel), the standalone server's `request.url`
+ * carries the container's hostname and port (`https://61ccffa44820:3000`),
+ * not the address the browser used, so it can't be trusted for a Location.
+ */
+export function appOrigin(requestUrl: string): string {
+  const configured = process.env.NEXT_PUBLIC_APP_URL;
+  if (configured) {
+    try {
+      return new URL(configured).origin;
+    } catch {
+      // Not a URL: fall back to the request's.
+    }
+  }
+  return new URL(requestUrl).origin;
+}
+
+/**
  * The absolute URL to send a visitor to after an e-mail link (`/auth/confirm`).
  * `redirect_to` can be a whole URL, since Supabase expands `{{ .RedirectTo }}`
  * and we build that from NEXT_PUBLIC_APP_URL. Such a URL is kept only when its

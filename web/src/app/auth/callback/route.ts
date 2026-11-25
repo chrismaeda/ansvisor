@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
-import { NEXT_COOKIE, nextFromCookie, safeNextPath } from '@/lib/auth-next';
+import { NEXT_COOKIE, appOrigin, nextFromCookie, safeNextPath } from '@/lib/auth-next';
 
 /**
  * GET /auth/callback — where GitHub and Google sign-in come back. Goes on to
@@ -9,7 +9,8 @@ import { NEXT_COOKIE, nextFromCookie, safeNextPath } from '@/lib/auth-next';
  * to a page on this site.
  */
 export async function GET(request: NextRequest) {
-  const { searchParams, origin } = new URL(request.url);
+  const { searchParams } = new URL(request.url);
+  const origin = appOrigin(request.url);
   const code = searchParams.get('code');
   const next = safeNextPath(
     searchParams.get('next') ?? nextFromCookie(request.cookies.get(NEXT_COOKIE)?.value),

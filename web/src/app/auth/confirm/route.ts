@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
 import type { EmailOtpType } from '@supabase/supabase-js';
-import { safeRedirectUrl } from '@/lib/auth-next';
+import { appOrigin, safeRedirectUrl } from '@/lib/auth-next';
 
 /**
  * GET /auth/confirm — server-side OTP verification for email-driven auth flows.
@@ -25,7 +25,8 @@ import { safeRedirectUrl } from '@/lib/auth-next';
  * magiclink, email_change. The type comes from the template, not from us.
  */
 export async function GET(request: Request) {
-  const { searchParams, origin } = new URL(request.url);
+  const { searchParams } = new URL(request.url);
+  const origin = appOrigin(request.url);
   const tokenHash = searchParams.get('token_hash');
   const type = searchParams.get('type') as EmailOtpType | null;
   // Only to a page on this site (#1203): a crafted link can't send someone

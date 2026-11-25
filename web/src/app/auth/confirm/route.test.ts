@@ -72,4 +72,20 @@ describe('GET /auth/confirm', () => {
       'https://app.example.com/sign-in?error=auth_confirm_failed&reason=expired',
     );
   });
+
+  it("redirects on NEXT_PUBLIC_APP_URL, not the container's own address, behind a proxy", async () => {
+    // The standalone server in Docker sees the container's hostname and port.
+    vi.stubEnv('NEXT_PUBLIC_APP_URL', 'https://app.example.com');
+    let res = await GET(
+      new Request(
+        'https://61ccffa44820:3000/auth/confirm?token_hash=h1&type=invite&next=/reset-password',
+      ),
+    );
+    expect(res.headers.get('location')).toBe('https://app.example.com/reset-password');
+
+    res = await GET(new Request('https://61ccffa44820:3000/auth/confirm'));
+    expect(res.headers.get('location')).toBe(
+      'https://app.example.com/sign-in?error=auth_confirm_missing_params',
+    );
+  });
 });
