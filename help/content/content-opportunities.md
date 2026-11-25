@@ -4,14 +4,18 @@ route: /dashboard/content
 keywords: [content opportunities, opportunity score, impact, visibility gap, content ideas, export csv, filter opportunities, bulk actions]
 synonyms: [content optimization, content gaps, what to write, content suggestions]
 plan: all
-updated: 2026-11-06
-last_checked: 2026-11-06
+updated: 2026-11-21
+last_checked: 2026-11-21
 owner: Cihan
 app_version: 0.3.0
 approved: true
 sources: [docs/guides/content-optimization.mdx, docs/guides/content-editor.mdx]
 ---
 The **Opportunities** page, under **Content** in the sidebar, lists content opportunities: what to write or change so AI answers name you where they don't yet. Ansvisor suggests them on its own as tracking data comes in. An opportunity is built for a group of related prompts that one piece of content can answer, or for a single prompt. From each one you can start writing, plan it, brief it or send it on.
+
+## What the counts count
+
+With **All Statuses**, the cards above the list count done and dismissed opportunities too, and say so. The **Available** count beside **Opportunities** counts only the ones still to do. Pick a status to count that status alone.
 
 ## What each row shows
 
@@ -23,13 +27,17 @@ The **Opportunities** page, under **Content** in the sidebar, lists content oppo
 
 Above the list, cards count the **Total Opportunities** and the **High Impact** ones, and give the **Avg. Score**. On plans with monthly limits, **This billing period** shows how many new opportunities and content briefs are left, and when they reset.
 
+## In your language
+
+Ansvisor writes each opportunity's title and reason in English. When your interface language is another, the ones on your screen show in your language: in English for a moment the first time, then translated. Each is translated once and kept, so teammates who use the same language see it at once. Search still matches the English words.
+
 ## Filter, sort and export
 
 - Search the opportunities, and narrow the list by topic, prompt, type, impact, **Source** and status. The sources are **System**, suggested automatically; **Manual**, made with **New**; **Prompt**, suggested from a prompt; and **Action**, sent from an Action Center task.
 - **Suggested** picks a period, all time, this month, the last 30 days or your own dates, and the order: highest score, newest or oldest.
 - Archived opportunities stay hidden unless you filter to them.
 - Most filters and the order stay in the page's address, so a link opens the same view; the topic and the search don't.
-- **Export CSV** downloads every opportunity that matches the filters and the search, not only the page you see.
+- **Export CSV**, the download icon at the top right, downloads every opportunity that matches the filters and the search, not only the page you see.
 
 ## Quick actions on a row
 
@@ -82,6 +90,10 @@ A question also gets only one open opportunity. When a new one would answer the 
 
 For a second take on the same need, use **Another angle** on the opportunity.
 
+## Kept to what you track
+
+A new opportunity whose title says what an open one's says, in other words, isn't added. Nor is one about an AI engine none of your active prompts runs on, such as one you paused. An opportunity's **Keywords** come from its prompts and the searches AI engines ran for them: keyword-tool terms that share no words with them are left out.
+
 ## When fewer come back
 
 When a run writes fewer than you asked for, or none, the message says why:
@@ -99,7 +111,9 @@ New opportunities come from a monthly allowance set by your plan, with a cap on 
 After each day's tracking run, Ansvisor writes new opportunities by itself, on a plan with an active subscription:
 
 - **Up to 3 a night**, one per topic, for groups of prompts with tracked answers and no opportunity yet. That's at most 21 a week, but only as many as there are such groups: new groups come when you add prompts.
-- **When no group is left, at most 1 a night** as another angle (at most 7 a week). It goes to the group with the most estimated AI volume whose opportunity has been done for 30 days, where your brand is still mentioned or cited in fewer than 1 in 5 answers. On many nights nothing qualifies, and nothing is written.
+- **When no group is left, at most 1 a night** as another angle (at most 7 a week), for the group with the most estimated AI volume whose opportunity was done 30 days ago and where your brand still shows in fewer than 1 in 5 answers. Often nothing qualifies.
+
+When none can be added, a note above the list says why: every group has an opportunity, or the month's allowance is used up. Then Ansvisor also refreshes your prompt suggestions, at most weekly, so new prompts can open new groups.
 
 ## While the first tracking runs
 

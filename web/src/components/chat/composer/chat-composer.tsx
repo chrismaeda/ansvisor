@@ -2,6 +2,7 @@
 
 import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { useTranslations } from 'next-intl';
+import { useServerErrorText } from '@/hooks/use-server-error';
 import { toast } from 'sonner';
 import { ArrowUp, AtSign, Building2, CalendarDays, FileText, ListFilter } from 'lucide-react';
 import { Link, useRouter } from '@/i18n/navigation';
@@ -312,6 +313,7 @@ export function ChatComposer({
   const tRoles = useTranslations('chatAccess.roleNames');
   const tAsk = useTranslations('chatAccess.askAdmin');
   const tMeter = useTranslations('aiUsage.meter');
+  const serverError = useServerErrorText();
   const { usage: aiUsage } = useAiUsage();
   const router = useRouter();
   const { role, canAdmin, canManage } = useUserRole();
@@ -569,8 +571,8 @@ export function ChatComposer({
       if (result.ok) toast.success(tAsk('sent'));
       else if (result.reason === 'already_today') toast.info(tAsk('alreadyToday'));
       else toast.error(tAsk('failed'));
-    } catch {
-      toast.error(tAsk('failed'));
+    } catch (err) {
+      toast.error(serverError(err, tAsk('failed')));
     }
   }
 
@@ -842,7 +844,7 @@ export function ChatComposer({
             <span
               key={chip.key}
               title={shown === chip.label ? undefined : chip.label}
-              className="inline-flex h-[22px] items-center gap-1 rounded-[7px] border bg-muted/60 pr-1 pl-[7px] text-[11.5px] text-foreground/80"
+              className="inline-flex h-[22px] items-center gap-1 rounded-[7px] border bg-muted/60 pe-1 ps-[7px] text-[11.5px] text-foreground/80"
             >
               <ChipIcon chipKey={chip.key} />
               {shown}
@@ -856,7 +858,7 @@ export function ChatComposer({
                     box.current?.focus();
                   }}
                   aria-label={t('removeChip', { label: chip.label })}
-                  className="-ml-0.5 inline-flex size-4 items-center justify-center rounded-[4px] text-muted-foreground hover:bg-muted hover:text-foreground"
+                  className="-ms-0.5 inline-flex size-4 items-center justify-center rounded-[4px] text-muted-foreground hover:bg-muted hover:text-foreground"
                 >
                   ×
                 </button>
@@ -928,7 +930,7 @@ export function ChatComposer({
                   data-status={entry.status}
                   title={entry.file.name}
                   className={cn(
-                    'inline-flex h-[22px] max-w-[220px] items-center gap-1 rounded-[7px] border bg-muted/60 pr-1 pl-1.5 text-[11.5px] text-foreground/80',
+                    'inline-flex h-[22px] max-w-[220px] items-center gap-1 rounded-[7px] border bg-muted/60 pe-1 ps-1.5 text-[11.5px] text-foreground/80',
                     entry.status === 'failed' &&
                       'border-red-300 bg-red-50 text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300',
                   )}
@@ -1021,7 +1023,7 @@ export function ChatComposer({
                 className="pointer-events-auto flex min-w-0 cursor-pointer items-center text-muted-foreground/70"
               >
                 <span className="truncate">{ghost}</span>
-                <kbd className="ml-1.5 shrink-0 rounded-[4px] border px-1 font-sans text-[11px] text-muted-foreground">
+                <kbd className="ms-1.5 shrink-0 rounded-[4px] border px-1 font-sans text-[11px] text-muted-foreground">
                   {t('tab')}
                 </kbd>
               </span>
@@ -1031,7 +1033,7 @@ export function ChatComposer({
         {/* One row under the text: ＋ / @ on the left, the microphone and Send on the right. */}
         <div
           data-slot="composer-controls"
-          className="flex items-center gap-1 pt-1.5 pr-2 pb-2 pl-2"
+          className="flex items-center gap-1 pt-1.5 pe-2 pb-2 ps-2"
         >
           <button
             type="button"
@@ -1072,7 +1074,7 @@ export function ChatComposer({
           </button>
           <div
             data-slot="composer-send-group"
-            className="ml-auto flex shrink-0 items-center gap-1.5"
+            className="ms-auto flex shrink-0 items-center gap-1.5"
           >
             <VoiceButton onText={addSpoken} onDeniedChange={setMicDenied} disabled={disabled} />
             {(running || answering) && (
@@ -1146,9 +1148,11 @@ export function ChatComposer({
                 onClick={onModelChoice ? () => setModelOpen((on) => !on) : onOpenModel}
                 aria-label={usageLabel ? t('modelWarn', { usage: usageLabel }) : t('model')}
                 aria-expanded={onModelChoice ? modelOpen : undefined}
-                title={usageLabel}
+                title={usageLabel ?? t('modelTip')}
                 className="flex h-7 min-w-0 items-center gap-1 rounded-lg px-1.5 text-xs whitespace-nowrap hover:bg-muted aria-expanded:bg-muted"
               >
+                {/* Labelled, as the run mode is (UX audit CH-07). */}
+                <span className="shrink-0 text-muted-foreground">{t('modelPrefix')}</span>
                 <span className="truncate">{modelWords}</span> <span aria-hidden>▾</span>
                 {usageDot}
               </button>
@@ -1157,6 +1161,7 @@ export function ChatComposer({
                 title={usageLabel}
                 className="flex h-7 min-w-0 items-center gap-1 px-1.5 text-xs whitespace-nowrap"
               >
+                <span className="shrink-0 text-muted-foreground">{t('modelPrefix')}</span>
                 <span className="truncate">{modelWords}</span>
                 {usageDot}
               </span>

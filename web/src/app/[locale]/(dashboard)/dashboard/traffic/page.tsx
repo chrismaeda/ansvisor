@@ -180,13 +180,13 @@ function TrafficFilterBar({
   return (
     <div className="flex flex-wrap items-center gap-3">
       <div className="relative flex-1 min-w-[240px]">
-        <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
+        <Search className="absolute start-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
         <Input
           type="text"
           placeholder={t('searchPlaceholder')}
           value={searchInput}
           onChange={(e) => onSearchInputChange(e.target.value)}
-          className="pl-9 h-9 text-sm"
+          className="ps-9 h-9 text-sm"
         />
       </div>
 
@@ -245,12 +245,13 @@ function TablePager({
   onPage: (p: number) => void;
   isLoading: boolean;
 }) {
+  const t = useTranslations('traffic.page');
   if (totalPages <= 1) return null;
 
   return (
     <div className="flex items-center justify-between border-t px-4 py-3">
       <span className="text-xs text-muted-foreground tabular-nums">
-        {start + 1}–{end} of {total}
+        {t('range', { start: start + 1, end, total })}
       </span>
       <div className="flex items-center gap-2">
         <Button
@@ -260,7 +261,7 @@ function TablePager({
           disabled={page === 0 || isLoading}
           onClick={() => onPage(page - 1)}
         >
-          Previous
+          {t('previous')}
         </Button>
         <span className="text-xs text-muted-foreground tabular-nums">
           {page + 1} / {totalPages}
@@ -272,7 +273,7 @@ function TablePager({
           disabled={page >= totalPages - 1 || isLoading}
           onClick={() => onPage(page + 1)}
         >
-          Next
+          {t('next')}
         </Button>
       </div>
     </div>
@@ -765,9 +766,10 @@ function TrafficPageContent({ brand }: { brand: Brand }) {
       <HeaderWithAiUsage align="end">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <h1 className="text-2xl font-bold tracking-tight">AI Traffic Analytics</h1>
+            <h1 className="text-2xl font-bold tracking-tight">{t('title')}</h1>
             <p className="text-muted-foreground text-sm">
-              {primaryDomain ? `${primaryDomain} · ` : ''}AI-referred visits to your website
+              {primaryDomain ? `${primaryDomain} · ` : ''}
+              {t('page.subtitle')}
             </p>
           </div>
           {/* items-end, not items-center: the range control is two rows tall
@@ -911,7 +913,9 @@ function TrafficPageContent({ brand }: { brand: Brand }) {
 
                 <Card>
                   <CardHeader className="pb-2">
-                    <CardTitle className="text-sm font-medium">Platform Breakdown</CardTitle>
+                    <CardTitle className="text-sm font-medium">
+                      {t('page.platformBreakdown')}
+                    </CardTitle>
                   </CardHeader>
                   <CardContent>
                     <PlatformBreakdownChart data={summary?.platformBreakdown ?? []} />
@@ -928,7 +932,9 @@ function TrafficPageContent({ brand }: { brand: Brand }) {
                   <CardHeader className="pb-2">
                     <div className="flex items-center justify-between gap-2">
                       <div className="flex items-center gap-1">
-                        <CardTitle className="text-sm font-medium">Referrals by Platform</CardTitle>
+                        <CardTitle className="text-sm font-medium">
+                          {t('page.referralsByPlatform')}
+                        </CardTitle>
                         <AskAboutThis
                           reference={{
                             type: 'table',
@@ -944,12 +950,12 @@ function TrafficPageContent({ brand }: { brand: Brand }) {
                     <Table>
                       <TableHeader>
                         <TableRow>
-                          <TableHead className="pl-6">Platform</TableHead>
-                          <TableHead className="text-right">Visits</TableHead>
-                          <TableHead className="text-right">Change</TableHead>
+                          <TableHead className="ps-6">{t('page.columns.platform')}</TableHead>
+                          <TableHead className="text-end">{t('page.columns.visits')}</TableHead>
+                          <TableHead className="text-end">{t('page.columns.change')}</TableHead>
                           {/* From Google Analytics (AT-005). */}
-                          <TableHead className="text-right">{t('platforms.engaged')}</TableHead>
-                          <TableHead className="text-right pr-6">
+                          <TableHead className="text-end">{t('platforms.engaged')}</TableHead>
+                          <TableHead className="text-end pe-6">
                             {t('platforms.keyEvents')}
                           </TableHead>
                         </TableRow>
@@ -960,7 +966,7 @@ function TrafficPageContent({ brand }: { brand: Brand }) {
                             key={`${row.platform}|${row.surface ?? ''}`}
                             className="hover:bg-muted/50"
                           >
-                            <TableCell className={row.surface ? 'pl-10' : 'pl-6'}>
+                            <TableCell className="ps-6">
                               {row.surface ? (
                                 // Part of its platform's row above (#1283).
                                 <span
@@ -981,13 +987,13 @@ function TrafficPageContent({ brand }: { brand: Brand }) {
                             </TableCell>
                             <TableCell
                               className={cn(
-                                'text-right tabular-nums',
+                                'text-end tabular-nums',
                                 row.surface ? 'text-muted-foreground' : 'font-semibold',
                               )}
                             >
                               {formatNumber(row.visits)}
                             </TableCell>
-                            <TableCell className="text-right">
+                            <TableCell className="text-end">
                               <div className="flex justify-end">
                                 <DeltaBadge
                                   current={row.visits}
@@ -996,10 +1002,10 @@ function TrafficPageContent({ brand }: { brand: Brand }) {
                                 />
                               </div>
                             </TableCell>
-                            <TableCell className="text-right">
+                            <TableCell className="text-end">
                               <EngagedCell analytics={gaMissing ? null : row.analytics} />
                             </TableCell>
-                            <TableCell className="text-right pr-6">
+                            <TableCell className="text-end pe-6">
                               <KeyEventsCell analytics={gaMissing ? null : row.analytics} />
                             </TableCell>
                           </TableRow>
@@ -1015,7 +1021,9 @@ function TrafficPageContent({ brand }: { brand: Brand }) {
                   <CardHeader className="pb-2">
                     <div className="flex items-center justify-between gap-2">
                       <div className="flex items-center gap-1">
-                        <CardTitle className="text-sm font-medium">Top Landing Pages</CardTitle>
+                        <CardTitle className="text-sm font-medium">
+                          {t('page.topLandingPages')}
+                        </CardTitle>
                         <AskAboutThis
                           reference={{
                             type: 'table',
@@ -1031,11 +1039,11 @@ function TrafficPageContent({ brand }: { brand: Brand }) {
                     <Table>
                       <TableHeader>
                         <TableRow>
-                          <TableHead className="pl-6">Page</TableHead>
-                          <TableHead className="text-right">Visits</TableHead>
-                          <TableHead className="text-right">Change</TableHead>
+                          <TableHead className="ps-6">{t('page.columns.page')}</TableHead>
+                          <TableHead className="text-end">{t('page.columns.visits')}</TableHead>
+                          <TableHead className="text-end">{t('page.columns.change')}</TableHead>
                           {/* How often tracked AI answers cite the page (AT-006). */}
-                          <TableHead className="text-right pr-6">
+                          <TableHead className="text-end pe-6">
                             {t('pageList.columns.citedInAnswers')}
                           </TableHead>
                         </TableRow>
@@ -1043,15 +1051,15 @@ function TrafficPageContent({ brand }: { brand: Brand }) {
                       <TableBody>
                         {(summary?.topPages ?? []).map((row) => (
                           <TableRow key={row.url} className="hover:bg-muted/50">
-                            <TableCell className="pl-6 max-w-[200px]">
+                            <TableCell className="ps-6 max-w-[200px]">
                               <span className="font-mono text-xs text-muted-foreground line-clamp-1">
                                 {row.url}
                               </span>
                             </TableCell>
-                            <TableCell className="text-right font-semibold tabular-nums text-sm">
+                            <TableCell className="text-end font-semibold tabular-nums text-sm">
                               {formatNumber(row.visits)}
                             </TableCell>
-                            <TableCell className="text-right">
+                            <TableCell className="text-end">
                               <div className="flex justify-end">
                                 <DeltaBadge
                                   current={row.visits}
@@ -1060,7 +1068,7 @@ function TrafficPageContent({ brand }: { brand: Brand }) {
                                 />
                               </div>
                             </TableCell>
-                            <TableCell className="text-right pr-6 tabular-nums text-sm">
+                            <TableCell className="text-end pe-6 tabular-nums text-sm">
                               {formatNumber(row.citations)}
                             </TableCell>
                           </TableRow>
@@ -1090,7 +1098,7 @@ function TrafficPageContent({ brand }: { brand: Brand }) {
                       <div className="flex items-center gap-2">
                         <LayoutList className="h-4 w-4 text-muted-foreground" />
                         <CardTitle className="text-sm font-medium">
-                          Recent AI Referral Visits
+                          {t('page.recentVisits')}
                         </CardTitle>
                       </div>
                       <div className="flex flex-wrap items-center justify-end gap-2">
@@ -1126,16 +1134,20 @@ function TrafficPageContent({ brand }: { brand: Brand }) {
                       <Table>
                         <TableHeader>
                           <TableRow>
-                            <TableHead className="pl-6 w-[100px]">Time</TableHead>
-                            <TableHead>Platform</TableHead>
-                            <TableHead>Page</TableHead>
-                            <TableHead className="text-right pr-6">Country</TableHead>
+                            <TableHead className="ps-6 w-[100px]">
+                              {t('page.columns.time')}
+                            </TableHead>
+                            <TableHead>{t('page.columns.platform')}</TableHead>
+                            <TableHead>{t('page.columns.page')}</TableHead>
+                            <TableHead className="text-end pe-6">
+                              {t('page.columns.country')}
+                            </TableHead>
                           </TableRow>
                         </TableHeader>
                         <TableBody>
                           {logs.map((row) => (
                             <TableRow key={row.id} className="hover:bg-muted/50">
-                              <TableCell className="pl-6 text-xs text-muted-foreground whitespace-nowrap">
+                              <TableCell className="ps-6 text-xs text-muted-foreground whitespace-nowrap">
                                 {formatRelative(row.createdAt, tCommon)}
                               </TableCell>
                               <TableCell>
@@ -1162,7 +1174,7 @@ function TrafficPageContent({ brand }: { brand: Brand }) {
                                   )}
                                 </div>
                               </TableCell>
-                              <TableCell className="text-right pr-6">
+                              <TableCell className="text-end pe-6">
                                 <span className="text-xs text-muted-foreground">
                                   {row.country ?? '—'}
                                 </span>

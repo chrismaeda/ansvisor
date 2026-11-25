@@ -1,5 +1,9 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+const languages = [];
 const emails = {
   all1: 'ana@acme.test',
   all2: 'bo@acme.test',
@@ -8,15 +12,29 @@ const emails = {
 };
 vi.mock('../../config/supabase.js', () => ({
   default: {
+    from: () => ({
+      select: () => ({
+        in: async (_col, ids) => ({
+          data: languages.filter((r) => ids.includes(r.id)),
+          error: null,
+        }),
+      }),
+    }),
     auth: { admin: { getUserById: async (id) => ({ data: { user: { email: emails[id] } } }) } },
   },
 }));
 const readers = vi.hoisted(() => ({ map: new Map() }));
 vi.mock('../access.js', () => ({ brandReaders: async () => readers.map }));
+// Each brand's "Audit finished" choices (Settings › Notifications): none by default.
+const finished = vi.hoisted(() => ({ byBrand: {} }));
+vi.mock('../notifications/choices.js', () => ({
+  brandAudience: async (_org, brandId) => finished.byBrand[brandId] ?? new Map(),
+}));
 const sendEmail = vi.hoisted(() => vi.fn());
 vi.mock('../email.js', () => ({ sendEmail }));
 
 const { renderAutoAuditEmail, sendAutoAuditEmail } = await import('./auto-audit-email.js');
+const { forgetMessages } = await import('../i18n.js');
 
 describe('renderAutoAuditEmail', () => {
   it('sums up the run, with the next run date', () => {
@@ -59,6 +77,7 @@ describe('sendAutoAuditEmail', () => {
 
   beforeEach(() => {
     sendEmail.mockReset().mockResolvedValue(true);
+    finished.byBrand = {};
   });
 
   it('sends one e-mail listing every brand when everyone sees them all, as before', async () => {
@@ -71,6 +90,35 @@ describe('sendAutoAuditEmail', () => {
     expect(sendEmail.mock.calls[0][0].to).toEqual(['ana@acme.test', 'bo@acme.test']);
     expect(sendEmail.mock.calls[0][0].html).toContain('Acme Coffee');
     expect(sendEmail.mock.calls[0][0].html).toContain('Acme Tea');
+  });
+
+  it('leaves out the brands a person gets "Audit finished" for, so they never get both', async () => {
+    readers.map = new Map([
+      ['all1', new Set(['coffee', 'tea'])],
+      ['all2', new Set(['coffee', 'tea'])],
+    ]);
+    finished.byBrand = {
+      coffee: new Map([
+        ['all1', 'instant'],
+        ['all2', 'off'],
+      ]),
+      tea: new Map([
+        ['all1', 'daily'],
+        ['all2', 'off'],
+      ]),
+    };
+    expect(await sendAutoAuditEmail('org-1', run)).toBe(true);
+    // all1 chose it for both brands: nothing here; all2 gets the run as before.
+    expect(sendEmail).toHaveBeenCalledTimes(1);
+    expect(sendEmail.mock.calls[0][0].to).toEqual(['bo@acme.test']);
+    finished.byBrand = { coffee: new Map([['all1', 'instant']]) };
+    sendEmail.mockClear();
+    await sendAutoAuditEmail('org-1', run);
+    // all1 still gets the tea brand's.
+    const mine = sendEmail.mock.calls.find(([mail]) => mail.to.includes('ana@acme.test'))[0];
+    // Tea's 2 pages alone, not Coffee's 3.
+    expect(mine.html).toContain('2 pages audited');
+    expect(mine.html).not.toContain('Acme Coffee');
   });
 
   it('gives someone with Selected brands only the brands they see', async () => {
@@ -117,5 +165,60 @@ describe('sendAutoAuditEmail', () => {
     ]);
     sendEmail.mockResolvedValueOnce(false);
     expect(await sendAutoAuditEmail('org-1', run)).toBe(false);
+  });
+});
+
+describe('in each reader’s language (LOC-008)', () => {
+  const file = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    '../../../messages/de.json',
+  );
+  const run = {
+    brands: [{ id: 'coffee', name: 'Acme Coffee', pages: 3, completed: 3, criticalIssues: 1 }],
+    nextRunAt: '2026-11-01T00:00:00.000Z',
+  };
+  beforeEach(() => {
+    sendEmail.mockReset().mockResolvedValue(true);
+    finished.byBrand = {};
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        autoAudit: {
+          title: 'Auto-Audit abgeschlossen',
+          summary:
+            '{pages, plural, one {# Seite} other {# Seiten}} geprüft · {issues, plural, one {# kritisches Problem} other {# kritische Probleme}}',
+        },
+      }),
+    );
+    forgetMessages();
+  });
+  afterEach(() => {
+    languages.length = 0;
+    fs.rmSync(file, { force: true });
+    forgetMessages();
+  });
+
+  it('renders the German copy, plurals and all, and keeps English for what has no text', () => {
+    const { subject, html } = renderAutoAuditEmail(run, 'de');
+    expect(subject).toBe('Site Audit: 3 Seiten geprüft · 1 kritisches Problem');
+    expect(html).toContain('Auto-Audit abgeschlossen');
+    expect(html).toContain('Open Site Audit');
+  });
+
+  it('sends the same brands in one e-mail per language, to the same people', async () => {
+    languages.push({ id: 'all2', ui_language: 'de' });
+    readers.map = new Map([
+      ['all1', new Set(['coffee'])],
+      ['all2', new Set(['coffee'])],
+    ]);
+    expect(await sendAutoAuditEmail('org-1', run)).toBe(true);
+    const mails = sendEmail.mock.calls.map(([mail]) => mail);
+    expect(mails).toHaveLength(2);
+    expect(mails.find((mail) => mail.to[0] === 'ana@acme.test').subject).toBe(
+      'Site Audit: 3 pages audited · 1 critical issue',
+    );
+    expect(mails.find((mail) => mail.to[0] === 'bo@acme.test').subject).toBe(
+      'Site Audit: 3 Seiten geprüft · 1 kritisches Problem',
+    );
   });
 });

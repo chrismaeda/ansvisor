@@ -112,6 +112,11 @@ export function BulkTagsDialog({
       toast.success(t(removing ? 'removed' : 'done', { count: result.updated }));
       onOpenChange(false);
       onDone();
+    } catch {
+      // A thrown action (a network cut, a server 500) rejects the promise:
+      // without a catch that rejection surfaces nowhere and the dialog just
+      // looks idle.
+      setError(t('saveFailed'));
     } finally {
       setSaving(false);
     }
@@ -180,7 +185,7 @@ export function BulkTagsDialog({
               {tags.length > 0 && (
                 <div className="flex flex-wrap gap-1.5">
                   {tags.map((tag) => (
-                    <Badge key={tag} variant="secondary" className="gap-1 pr-1.5">
+                    <Badge key={tag} variant="secondary" className="gap-1 pe-1.5">
                       {tag}
                       <button
                         type="button"
@@ -234,7 +239,7 @@ export function BulkTagsDialog({
             onClick={() => void save()}
             disabled={saving || tags.length === 0 || change.changes.length === 0}
           >
-            {saving && <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />}
+            {saving && <Loader2 className="me-1.5 h-3.5 w-3.5 animate-spin" />}
             {t(removing ? 'removeSave' : 'save', { count: change.changes.length })}
           </Button>
         </DialogFooter>

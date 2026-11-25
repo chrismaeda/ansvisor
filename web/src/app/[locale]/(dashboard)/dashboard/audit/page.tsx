@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { useTranslations } from 'next-intl';
+import { useCaughtErrorText, useServerErrorText } from '@/hooks/use-server-error';
 import { toast } from 'sonner';
 import {
   Search,
@@ -55,12 +56,13 @@ import {
   type AuditQuota,
   type AuditTrend,
 } from '@/lib/actions/audits';
-import { pct, scoreColor, CATEGORY_META } from '@/components/audit/audit-report';
+import { barColor, pct, scoreColor, CATEGORY_META } from '@/components/audit/audit-report';
 import { formatMonthDay, formatNumber } from '@/lib/format';
 import { frictionFlow } from '@/lib/friction-events';
 import { SiteTrustCard } from './_site-trust-card';
 import { ScoreTrendChart } from './_charts';
 import { AuditPagesTable } from './_pages-table';
+import { mergePages, pruneSelection } from '@/lib/audit/merge-pages';
 import { AuditBulkBar, ExportMenu } from './_bulk-bar';
 import { AuditOverviewCards } from './_overview-cards';
 import {
@@ -76,6 +78,8 @@ import {
 } from './_opportunity-filter';
 import { AuditSettingsDialog } from './_settings-dialog';
 import { AutoRunNotice } from './_auto-run-notice';
+import { BatchProgress } from './_batch-progress';
+import { nextBatch, type Batch } from '@/lib/audit/batch-progress';
 import { AuditSummaryStrip } from './_summary-strip';
 import { EmptyPoolMessage } from './_quota-meter';
 import { usePagesExport } from './_use-pages-export';
@@ -86,6 +90,7 @@ import { HeaderWithAiUsage } from '@/components/ai-usage/ai-usage-meter';
 import { useChatPageContext } from '@/components/chat/panel/chat-panel-context';
 import { rangeChipLabel } from '@/lib/chat/page-context';
 import { viewRows } from '@/lib/chat/page-view';
+import { useRubricText } from '@/hooks/use-rubric-text';
 
 type RangePreset = '7d' | '30d' | '90d' | 'all';
 const RANGE_DAYS: Record<RangePreset, number | null> = { '7d': 7, '30d': 30, '90d': 90, all: null };
@@ -108,15 +113,16 @@ function TabCount({ count }: { count: number }) {
 /** While audits run, the Pages list and the quota are read again this often. */
 const RUNNING_POLL_MS = 10_000;
 
+/** The most pages one read returns (the server's limit). */
+const HUB_PAGES_MAX = 100;
+
 function barClass(score: number | null): string {
-  if (score === null) return 'bg-muted';
-  if (score >= 0.7) return 'bg-green-600';
-  if (score >= 0.4) return 'bg-amber-500';
-  return 'bg-destructive';
+  return barColor(score);
 }
 
 export default function SiteAuditPage() {
   const t = useTranslations('audit');
+  const rubric = useRubricText();
   const router = useRouter();
   const { askOne, saySkipped } = useRecentAudit();
   const activeBrandId = useBrandStore((s) => s.activeBrandId);
@@ -126,6 +132,8 @@ export default function SiteAuditPage() {
   // instead; the settings open to read, and their Save asks too.
   const { guard, isLocked } = useUpgradeGate();
   const tActions = useTranslations('readOnly.actions');
+  const caughtError = useCaughtErrorText();
+  const serverError = useServerErrorText();
 
   // Prefill the URL with the active brand's primary domain (read once at init).
   const [url, setUrl] = useState(() => {
@@ -147,9 +155,12 @@ export default function SiteAuditPage() {
   const [overview, setOverview] = useState<AuditOverview | null>(null);
   const [range, setRange] = useState<RangePreset>('30d');
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
+  // The bulk audit under way, or just done: "N of M done · about X min left", and This batch.
+  const [batch, setBatch] = useState<Batch | null>(null);
+  const [batchNow, setBatchNow] = useState(() => Date.now());
+  // Pages lists only the batch's pages (read from the time its first audit started).
+  const [thisBatchOnly, setThisBatchOnly] = useState(false);
   const [opps, setOpps] = useState<AuditOpportunities | null>(null);
-  // The inbox loads after the rest of the hub (getAuditHubExtras).
-  const [oppsLoading, setOppsLoading] = useState(true);
   const [oppSelected, setOppSelected] = useState<Set<string>>(() => new Set());
   // Opportunities shown by why they're listed (customer priorities item 11).
   const [oppFilter, setOppFilter] = useState<OpportunityFilter>('all');
@@ -234,19 +245,22 @@ export default function SiteAuditPage() {
     listsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   };
 
-  // Load the hub in two requests: the audited pages, the quota, the trend
-  // and the cards first, so the page shows; then the Opportunities inbox and
-  // the latest auto-audit run, which take longer, fill in.
+  // Load the hub in two requests side by side: the audited pages, the quota,
+  // the trend and the cards; the Opportunities inbox and the latest auto-audit
+  // run. The page shows once both are in, in its final layout: filled in
+  // one after the other, the cards, the trend and the run's notice pushed
+  // the lists down twice while it opened.
   useEffect(() => {
     if (!activeBrandId) return;
     let cancelled = false;
     setLoading(true);
-    setOppsLoading(true);
     setError(null);
     // A selection, and the tab, belong to the brand they were made on.
     setSelected(new Set());
     setOppSelected(new Set());
     setOppFilter('all');
+    setBatch(null);
+    setThisBatchOnly(false);
     // The store may only know the brand after the first render: that's the one it opened with.
     linked.current.brandId ??= activeBrandId;
     setTab(activeBrandId === linked.current.brandId ? linked.current.tab : null);
@@ -262,18 +276,18 @@ export default function SiteAuditPage() {
       });
     (async () => {
       try {
-        const hub = await getAuditHub(activeBrandId);
+        const [hub, extras] = await Promise.all([
+          getAuditHub(activeBrandId),
+          getAuditHubExtras(activeBrandId),
+        ]);
         if (cancelled) return;
         setPages(hub.pages.pages);
         setPagesTotal(hub.pages.total);
         setPrimaryHost(hub.pages.primaryHost);
+        applyRunning(hub.pages.running);
         setQuota(hub.quota);
         setTrend(hub.trend);
         setOverview(hub.overview);
-        setLoading(false);
-
-        const extras = await getAuditHubExtras(activeBrandId);
-        if (cancelled) return;
         setOpps(extras.opportunities);
         setLatestRun(extras.latestRun);
         // The inbox is the first tab when it has pages, unless one was picked meanwhile.
@@ -285,21 +299,18 @@ export default function SiteAuditPage() {
       } catch (err) {
         console.error('Failed to load audit hub data:', err);
         if (!cancelled) {
-          const msg = err instanceof Error ? err.message : t('failed');
+          const msg = caughtError(err, t('failed'));
           setError(msg);
           toast.error(msg);
         }
       } finally {
-        if (!cancelled) {
-          setLoading(false);
-          setOppsLoading(false);
-        }
+        if (!cancelled) setLoading(false);
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [activeBrandId, refreshKey, t]);
+  }, [activeBrandId, refreshKey, t, caughtError]);
 
   useEffect(() => {
     if (!groupByTemplate || !activeBrandId) return;
@@ -311,7 +322,7 @@ export default function SiteAuditPage() {
       .catch((err) => {
         console.error('Failed to load the page templates:', err);
         if (!cancelled) {
-          toast.error(t('pages.templatesFailed'));
+          toast.error(serverError(err, t('pages.templatesFailed')));
           setGroupByTemplate(false);
         }
       });
@@ -319,7 +330,7 @@ export default function SiteAuditPage() {
       cancelled = true;
       setTemplates(null);
     };
-  }, [groupByTemplate, activeBrandId, refreshKey, t]);
+  }, [groupByTemplate, activeBrandId, refreshKey, t, serverError]);
 
   // Without an active plan the quota reads 0 of 0: not used up. Run audit
   // stays clickable, and opens the plan dialog.
@@ -385,7 +396,7 @@ export default function SiteAuditPage() {
       router.push(`/dashboard/audit/${started.audit.id}`);
     } catch (err) {
       SITE_AUDIT_RUN.failed();
-      toast.error(err instanceof Error ? err.message : t('failed'));
+      toast.error(caughtError(err, t('failed')));
       setRunning(false);
     }
   };
@@ -406,43 +417,100 @@ export default function SiteAuditPage() {
     { action: tActions('runAudit') },
   );
 
-  // Append the next page of the Pages list. Dedupe by page: a page audited
-  // since the first read moves to the top and shifts offsets by one.
-  const handleLoadMore = async () => {
+  // The reads that follow a bulk audit say how many audits still run; the
+  // batch is what they add up to (lib/audit/batch-progress.ts). The ref gives
+  // the polling timer the batch's start, which its closure would hold stale.
+  const sinceRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    sinceRef.current = thisBatchOnly && batch ? batch.since : undefined;
+  }, [thisBatchOnly, batch]);
+  const applyRunning = (running: { count: number; since: string | null } | undefined) => {
+    if (!running) return;
+    const now = Date.now();
+    setBatchNow(now);
+    setBatch((prev) => nextBatch(prev, running, now));
+  };
+
+  // This batch on or off: the Pages list is read again, from the batch's
+  // start or in full. Selected pages stay selected, kept by page key.
+  const showBatchOnly = async (on: boolean) => {
     if (!activeBrandId) return;
+    const since = on && batch ? batch.since : undefined;
+    sinceRef.current = since;
+    setThisBatchOnly(on);
     setLoadingMore(true);
     try {
-      const next = await getAuditPages(activeBrandId, pages.length);
-      setPages((current) => {
-        const seen = new Set(current.map((p) => p.key));
-        return [...current, ...next.pages.filter((p) => !seen.has(p.key))];
-      });
-      setPagesTotal(next.total);
+      const res = await getAuditPages(activeBrandId, 0, 50, since);
+      setPages(res.pages);
+      setPagesTotal(res.total);
+      setPrimaryHost(res.primaryHost);
+      applyRunning(res.running);
+      if (on) showList('pages');
     } catch (err) {
+      sinceRef.current = undefined;
+      setThisBatchOnly(false);
       toast.error(err instanceof Error ? err.message : t('failed'));
     } finally {
       setLoadingMore(false);
     }
   };
 
-  // Read the pages shown (up to the server's 100), the quota and the trend
-  // again, in place: the table stays up with its open histories. Selected
-  // pages that are gone or now running are dropped from the selection.
+  // Append the next page of the Pages list. Dedupe by page: a page audited
+  // since the first read moves to the top and shifts offsets by one.
+  const handleLoadMore = async () => {
+    if (!activeBrandId) return;
+    setLoadingMore(true);
+    try {
+      const next = await getAuditPages(activeBrandId, pages.length, 50, sinceRef.current);
+      setPages((current) => {
+        const seen = new Set(current.map((p) => p.key));
+        return [...current, ...next.pages.filter((p) => !seen.has(p.key))];
+      });
+      setPagesTotal(next.total);
+    } catch (err) {
+      toast.error(caughtError(err, t('failed')));
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
+  // Read the pages shown, the quota and the trend again, in place: the table
+  // stays up with its open histories and every row loaded so far, the rows
+  // patched where they are (by page key) rather than the list replaced. The
+  // selection is kept by key, outside the paged rows; only pages now running
+  // (or gone) leave it.
   const shownRef = useRef(0);
   useEffect(() => {
     shownRef.current = pages.length;
   }, [pages.length]);
   const reloadInPlace = async (brandId: string) => {
-    const hub = await getAuditHub(brandId, Math.min(Math.max(shownRef.current, 50), 100));
+    const shown = Math.max(shownRef.current, 50);
+    const since = sinceRef.current;
+    const hub = await getAuditHub(brandId, Math.min(shown, HUB_PAGES_MAX), since);
     const data = hub.pages;
-    setPages(data.pages);
+    // The hub reads the first rows only; the rest of what's shown is read in chunks.
+    let fresh = data.pages;
+    while (shown > HUB_PAGES_MAX && fresh.length < Math.min(shown, data.total)) {
+      const more = await getAuditPages(
+        brandId,
+        fresh.length,
+        Math.min(HUB_PAGES_MAX, shown - fresh.length),
+        since,
+      );
+      if (more.pages.length === 0) break;
+      fresh = [...fresh, ...more.pages];
+    }
+    // With This batch on, the read covers the batch only, so it can't say a
+    // page outside it is gone: rows and selection are kept as they are.
+    const complete = !since && fresh.length >= data.total;
+    setPages((current) => mergePages(current, fresh, complete));
     setPagesTotal(data.total);
     setPrimaryHost(data.primaryHost);
+    applyRunning(data.running);
     setQuota(hub.quota);
     setTrend(hub.trend);
     setOverview(hub.overview);
-    const selectable = new Set(data.pages.filter((p) => p.status !== 'running').map((p) => p.key));
-    setSelected((prev) => new Set([...prev].filter((key) => selectable.has(key))));
+    setSelected((prev) => pruneSelection(prev, fresh, complete));
 
     const { opportunities: op, latestRun: run } = await getAuditHubExtras(brandId);
     setOpps(op);
@@ -461,7 +529,7 @@ export default function SiteAuditPage() {
       await deleteAudit(id);
       await reloadInPlace(activeBrandId);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t('failed'));
+      toast.error(caughtError(err, t('failed')));
     }
   };
 
@@ -501,7 +569,7 @@ export default function SiteAuditPage() {
         );
         await reloadInPlace(brandId);
       } catch (err) {
-        toast.error(err instanceof Error ? err.message : t('failed'));
+        toast.error(caughtError(err, t('failed')));
       }
     });
   };
@@ -527,7 +595,7 @@ export default function SiteAuditPage() {
       await reloadInPlace(activeBrandId);
     } catch (err) {
       SITE_AUDIT_RUN.failed();
-      toast.error(err instanceof Error ? err.message : t('failed'));
+      toast.error(caughtError(err, t('failed')));
     } finally {
       setStartingBulk(false);
     }
@@ -583,7 +651,7 @@ export default function SiteAuditPage() {
       await reloadInPlace(activeBrandId);
     } catch (err) {
       SITE_AUDIT_RUN.failed();
-      toast.error(err instanceof Error ? err.message : t('failed'));
+      toast.error(caughtError(err, t('failed')));
     } finally {
       setStartingBulk(false);
     }
@@ -608,7 +676,7 @@ export default function SiteAuditPage() {
       await reloadInPlace(activeBrandId);
     } catch (err) {
       console.error('Failed to update the opportunities:', err);
-      toast.error(t('opportunities.prefsFailed'));
+      toast.error(serverError(err, t('opportunities.prefsFailed')));
     }
   };
 
@@ -634,7 +702,7 @@ export default function SiteAuditPage() {
       );
       await reloadInPlace(activeBrandId);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t('opportunities.prefsFailed'));
+      toast.error(caughtError(err, t('opportunities.prefsFailed')));
     }
   };
   const excludeTemplates = async (templates: string[]) => {
@@ -643,7 +711,7 @@ export default function SiteAuditPage() {
     try {
       before = (await getAuditSettings(activeBrandId)).excludePatterns;
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t('opportunities.prefsFailed'));
+      toast.error(caughtError(err, t('opportunities.prefsFailed')));
       return;
     }
     await savePatterns(
@@ -709,7 +777,7 @@ export default function SiteAuditPage() {
                   })),
                   total: pagesTotal,
                 }
-              : tab === 'opportunities' && !oppsLoading
+              : tab === 'opportunities' && !loading
                 ? {
                     rows: viewRows(shownOpps, (o) => ({
                       ref: o.lastAudit?.auditId,
@@ -745,7 +813,7 @@ export default function SiteAuditPage() {
         </div>
       </HeaderWithAiUsage>
       <AuditConfirmDialog
-        // Each asking starts over: Leave out the recent ones ticked again.
+        // Each asking starts over, Leave out the recent ones as its kind starts it.
         key={confirm?.at}
         pages={confirm?.pages ?? null}
         mode={confirm?.mode ?? 'picked'}
@@ -776,6 +844,7 @@ export default function SiteAuditPage() {
 
       {/* Summary strip, as in the v2 mockup (SA-019) */}
       <AuditSummaryStrip
+        loading={loading}
         overview={loading ? null : overview}
         quota={quota}
         now={new Date(nowMs)}
@@ -806,12 +875,12 @@ export default function SiteAuditPage() {
             <Button onClick={handleRun} disabled={running || quotaExhausted} className="shrink-0">
               {running ? (
                 <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  <Loader2 className="me-2 h-4 w-4 animate-spin" />
                   {t('running')}
                 </>
               ) : (
                 <>
-                  <Search className="mr-2 h-4 w-4" />
+                  <Search className="me-2 h-4 w-4" />
                   {t('runAudit')}
                 </>
               )}
@@ -833,6 +902,20 @@ export default function SiteAuditPage() {
         onSetUp={canManage ? () => setSettingsOpen(true) : undefined}
       />
 
+      {/* A bulk audit's progress: N of M done, the time left, and This batch */}
+      {batch && (
+        <BatchProgress
+          batch={batch}
+          now={batchNow}
+          thisBatch={thisBatchOnly}
+          onToggleThisBatch={() => void showBatchOnly(!thisBatchOnly)}
+          onDismiss={() => {
+            setBatch(null);
+            if (thisBatchOnly) void showBatchOnly(false);
+          }}
+        />
+      )}
+
       {/* KPI cards, as in the v2 mockup (SA-018) */}
       {(loading || overview) && (
         <AuditOverviewCards
@@ -846,8 +929,47 @@ export default function SiteAuditPage() {
         />
       )}
 
+      {/* While the hub loads, the trend card's place, line for line, so the
+          cards below don't move when it fills in */}
+      {loading && (
+        <Card aria-hidden data-testid="audit-trend-skeleton">
+          <CardHeader className="flex flex-row items-start justify-between gap-3 space-y-0">
+            <div>
+              <div className="flex h-6 items-center">
+                <Skeleton className="h-4 w-32" />
+              </div>
+              <div className="mt-0.5 flex h-4 items-center">
+                <Skeleton className="h-3 w-24" />
+              </div>
+            </div>
+            <Skeleton className="h-[26px] w-40 shrink-0" />
+          </CardHeader>
+          <CardContent className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+            <div className="lg:col-span-2">
+              <div className="mb-2 flex h-9 items-center">
+                <Skeleton className="h-7 w-20" />
+              </div>
+              <Skeleton className="h-[200px] w-full" />
+            </div>
+            <div className="space-y-3">
+              <div className="flex h-4 items-center">
+                <Skeleton className="h-3 w-28" />
+              </div>
+              {CATEGORY_META.map((cat) => (
+                <div key={cat.key}>
+                  <div className="mb-1 flex h-4 items-center">
+                    <Skeleton className="h-3 w-24" />
+                  </div>
+                  <Skeleton className="h-1.5 w-full rounded-full" />
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       {/* Primary-domain score trend + category breakdown */}
-      {trend && trend.points.length > 0 && (
+      {!loading && trend && trend.points.length > 0 && (
         <Card>
           <CardHeader className="flex flex-row items-start justify-between gap-3 space-y-0">
             <div>
@@ -930,7 +1052,7 @@ export default function SiteAuditPage() {
                 return (
                   <div key={cat.key}>
                     <div className="mb-1 flex items-center justify-between text-xs">
-                      <span className="font-medium">{cat.label}</span>
+                      <span className="font-medium">{rubric.category(cat.key, cat.label)}</span>
                       <span className="text-muted-foreground tabular-nums">
                         {p === null ? t('na') : `${p}/100`}
                       </span>
@@ -978,13 +1100,12 @@ export default function SiteAuditPage() {
             <div className="text-base font-semibold">{t('failed')}</div>
             <p className="max-w-md text-sm text-muted-foreground">{error}</p>
             <Button variant="outline" size="sm" onClick={refetch}>
-              <RefreshCw className="mr-2 h-4 w-4" />
+              <RefreshCw className="me-2 h-4 w-4" />
               {t('retry')}
             </Button>
           </CardContent>
         </Card>
-      ) : !oppsLoading &&
-        pages.length === 0 &&
+      ) : pages.length === 0 &&
         (opps?.opportunities.length ?? 0) === 0 &&
         (opps?.excluded.length ?? 0) === 0 ? (
         <Card>
@@ -995,25 +1116,13 @@ export default function SiteAuditPage() {
           </CardContent>
         </Card>
       ) : (
-        // While the inbox loads, its tab leads (it usually has pages) with a placeholder.
-        <Tabs
-          ref={listsRef}
-          value={tab ?? (oppsLoading ? 'opportunities' : 'pages')}
-          onValueChange={(v) => showList(v as ListTab)}
-        >
+        <Tabs ref={listsRef} value={tab ?? 'pages'} onValueChange={(v) => showList(v as ListTab)}>
           <TabsList variant="line" aria-label={t('lists.label')}>
-            {(opps || oppsLoading) && (
+            {opps && (
               <TabsTrigger value="opportunities">
                 {t('lists.opportunities')}
                 <PageDot dot={oppDot} />
-                {opps ? (
-                  <TabCount count={opps.opportunities.length} />
-                ) : (
-                  <Loader2
-                    className="h-3 w-3 animate-spin text-muted-foreground"
-                    aria-label={t('lists.loading')}
-                  />
-                )}
+                <TabCount count={opps.opportunities.length} />
               </TabsTrigger>
             )}
             <TabsTrigger value="pages">
@@ -1021,20 +1130,6 @@ export default function SiteAuditPage() {
               <TabCount count={pagesTotal} />
             </TabsTrigger>
           </TabsList>
-          {oppsLoading && !opps && (
-            <TabsContent value="opportunities" className="mt-3">
-              <Card aria-busy="true">
-                <CardContent className="space-y-3 py-4">
-                  {Array.from({ length: 5 }).map((_, i) => (
-                    <div key={i} className="flex items-center justify-between gap-4">
-                      <Skeleton className="h-4 w-1/2" />
-                      <Skeleton className="h-4 w-24" />
-                    </div>
-                  ))}
-                </CardContent>
-              </Card>
-            </TabsContent>
-          )}
           {opps && (
             <TabsContent value="opportunities" className="mt-3">
               <OpportunitiesTable
@@ -1051,7 +1146,7 @@ export default function SiteAuditPage() {
                       filterShown === 'notAudited' && (
                         <Button
                           size="sm"
-                          className="ml-2 h-7 rounded-full px-3 text-xs"
+                          className="ms-2 h-7 rounded-full px-3 text-xs"
                           disabled={startingBulk}
                           onClick={guard(() => confirmOpps(shownOpps, 'notAudited'), {
                             action: tActions('auditPages'),

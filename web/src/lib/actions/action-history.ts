@@ -30,6 +30,7 @@ import { storedPriorityLevel } from '@/lib/action-center/priority';
 import { readEntityCounts, withEntityCounts } from '@/lib/action-center/entity-counts';
 import {
   HISTORY_STATUSES,
+  historyWindowFilter,
   controlNetOf,
   daysBetween,
   type ActionHistoryItem,
@@ -193,7 +194,8 @@ function resultsFrom(validation: ValidationSnapshot | null): ActionResultMetric[
         ...(before === 0
           ? {}
           : { deltaPercent: Math.round(((after - before) / before) * 1000) / 10 }),
-        unit: m.unit as ActionResultMetric['unit'],
+        // The sweep stores the Visibility score as 'percent'; it is a score (D2).
+        unit: m.metric === 'ai_visibility' ? 'points' : (m.unit as ActionResultMetric['unit']),
         // Every metric the sweep measures reads higher-is-better.
         direction: 'higher_is_better',
       } satisfies ActionResultMetric;
@@ -265,13 +267,16 @@ export async function getActionHistory(
       .select(columns)
       .eq('brand_id', brandId)
       .in('status', HISTORY_STATUSES as string[])
-      .order('created_at', { ascending: false })
+      .order('updated_at', { ascending: false })
       .limit(500);
 
-    // The window covers when an action closed, falling back to when it was
-    // raised for one still running — which is the date the row shows.
-    if (opts?.from) query = query.gte('created_at', opts.from);
-    if (opts?.to) query = query.lte('created_at', opts.to);
+    // The window is when it happened (UX audit AC-60, decision D13): a
+    // completed action by when it was completed, a dismissed one by when it
+    // was dismissed (its last change: dismissing sets no completed_at), and
+    // one still in progress or on hold by its last change, however long ago
+    // it was raised.
+    const window = historyWindowFilter(opts?.from, opts?.to);
+    if (window) query = query.or(window);
     return query;
   };
 

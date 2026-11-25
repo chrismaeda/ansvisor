@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslations } from 'next-intl';
+import { useServerErrorText } from '@/hooks/use-server-error';
 import { toast } from 'sonner';
 import { Check, Copy, Loader2, TriangleAlert, Upload } from 'lucide-react';
 import { Link } from '@/i18n/navigation';
@@ -115,7 +116,7 @@ function SetupSteps({ created }: { created: NewBotConnection }) {
         <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
         {t('secretOnce')}
       </p>
-      <ol className="list-decimal space-y-1 pl-5 text-xs text-muted-foreground">
+      <ol className="list-decimal space-y-1 ps-5 text-xs text-muted-foreground">
         {(t.raw(`steps.${kind}`) as string[]).map((step) => (
           <li key={step}>{step}</li>
         ))}
@@ -309,6 +310,7 @@ export function BotsDialog({
   const { guard } = useUpgradeGate();
   const tActions = useTranslations('readOnly.actions');
   const tReadOnly = useTranslations('readOnly');
+  const serverError = useServerErrorText();
 
   const close = (next: boolean) => {
     if (!next) {
@@ -324,7 +326,11 @@ export function BotsDialog({
       const result = await createBotConnection(brandId, kind);
       setCreating(false);
       if ('error' in result) {
-        toast.error(result.code === 'plan_limit' ? t('planLimit') : result.error);
+        toast.error(
+          result.code === 'plan_limit'
+            ? t('planLimit')
+            : serverError(result, result.error, result.status),
+        );
         return;
       }
       setCreated(result);
@@ -339,7 +345,7 @@ export function BotsDialog({
     setRevoking(null);
     setConfirming(null);
     if ('error' in result) {
-      toast.error(result.error);
+      toast.error(serverError(result, result.error, result.status));
       return;
     }
     toast.success(t('revoked'));
@@ -462,7 +468,7 @@ export function BotsDialog({
                     aria-checked={kind === k}
                     onClick={() => setKind(k)}
                     className={cn(
-                      'rounded-md border px-3 py-2 text-left transition-colors',
+                      'rounded-md border px-3 py-2 text-start transition-colors',
                       kind === k ? 'border-primary bg-primary/5' : 'hover:bg-muted/50',
                     )}
                   >

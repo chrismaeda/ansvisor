@@ -27,6 +27,7 @@ import {
   X,
 } from 'lucide-react';
 import { RemovedNote } from '@/components/action-center/removed-note';
+import { LowConfidenceTag } from '@/components/action-center/low-confidence-tag';
 import { RunAgentButton } from '@/components/action-center/run-agent-button';
 import { useDotViewer } from '@/components/layout/menu-dot';
 import { PageDot } from '@/components/layout/page-dot';
@@ -73,7 +74,12 @@ import {
   assigneeLabel,
   labelInitials,
 } from '@/lib/action-center/display';
-import { STALE_AFTER_DAYS, isStale, type PriorityLevel } from '@/lib/action-center/priority';
+import {
+  STALE_AFTER_DAYS,
+  isStale,
+  quietDays,
+  type PriorityLevel,
+} from '@/lib/action-center/priority';
 import { actionCode } from '@/lib/action-center/action-ref';
 import {
   columnSortDirection,
@@ -83,6 +89,7 @@ import {
 } from '@/lib/action-center/sort';
 import { formatRelative } from '@/lib/format-relative';
 import { cn } from '@/lib/utils';
+import { useActionAiText } from '@/hooks/use-action-ai-text';
 import { useUpgradeGate } from '@/components/providers/upgrade-gate';
 
 type IconComponent = React.ComponentType<{ className?: string }>;
@@ -148,6 +155,23 @@ export function ActionStatusBadge({ status }: { status: ActionStatus }) {
 }
 
 /**
+ * Created since the person's last visit to the list. Not the New status:
+ * a mark beside the title, gone on the next visit.
+ */
+export function NewMark() {
+  const t = useTranslations('actionCenter.actionsPage');
+  return (
+    <span
+      data-new-mark=""
+      title={t('newMark.hint')}
+      className="shrink-0 rounded-full bg-primary px-1.5 py-px text-[10px] font-semibold text-primary-foreground"
+    >
+      {t('newMark.label')}
+    </span>
+  );
+}
+
+/**
  * Stale (00432): New for a month with no one on it. Amber, as On Hold: it
  * waits on someone.
  */
@@ -162,6 +186,27 @@ export function StalePill() {
       <Clock aria-hidden="true" className="h-3 w-3" />
       {t('stale.pill')}
     </Badge>
+  );
+}
+
+/**
+ * A stale action's row (AC-10): one status badge, and under it how long no
+ * one has updated it, as a hint rather than a second status. The Stale filter
+ * lists them all.
+ */
+export function StaleHint({ action }: { action: { status: string; staleAt?: string | null } }) {
+  const t = useTranslations('actionCenter.actionsPage');
+  const days = quietDays(action);
+  if (days === null) return null;
+  return (
+    <p
+      data-stale-hint=""
+      className="mt-1 inline-flex items-center gap-1 text-[10px] text-amber-700 dark:text-amber-400"
+      title={t('stale.hint', { days: STALE_AFTER_DAYS })}
+    >
+      <Clock aria-hidden="true" className="h-3 w-3" />
+      {t('stale.quiet', { days })}
+    </p>
   );
 }
 
@@ -233,7 +278,7 @@ export function AssigneeAvatar({ assignee }: { assignee: ActionItem['assignee'] 
  * Opaque, with the row's hover tint, so it covers what scrolls under it.
  */
 const MENU_CELL =
-  'sticky right-0 z-[5] w-10 bg-card [tr:hover>&]:bg-[color-mix(in_oklab,var(--muted)_50%,var(--card))]';
+  'sticky end-0 z-[5] w-10 bg-card [tr:hover>&]:bg-[color-mix(in_oklab,var(--muted)_50%,var(--card))]';
 
 /** The statuses the row menu sets, in its order. */
 const MENU_STATUSES = [
@@ -416,8 +461,11 @@ export function ActionTable({
   busyIds,
   sort,
   onSortChange,
+  newIds,
 }: {
   actions: ActionItem[];
+  /** Actions created since the person's last visit: their rows say New. */
+  newIds?: Set<string>;
   onSelect: (action: ActionItem) => void;
   /** With these, each row gets its menu (status changes and Delete). */
   onStatusChange?: (
@@ -440,6 +488,8 @@ export function ActionTable({
   const t = useTranslations('actionCenter.actionsPage');
   const withMenu = Boolean(onStatusChange && onDelete);
   const tTexts = useTranslations('actionCenter.actionTexts');
+  // Written titles in the reader's language (LOC-010).
+  const shownAction = useActionAiText(actions);
   const tCategories = useTranslations('actionCenter.actionCategories');
   const tCommon = useTranslations('common');
   const viewer = useDotViewer();
@@ -475,7 +525,7 @@ export function ActionTable({
         </TableHeader>
         <TableBody>
           {actions.map((action) => {
-            const texts = actionTexts(action, tTexts);
+            const texts = actionTexts(shownAction(action), tTexts);
             const tags = actionContextTags(action, t);
             return (
               <TableRow key={action.id} className="cursor-pointer" onClick={() => onSelect(action)}>
@@ -491,6 +541,7 @@ export function ActionTable({
                     <div className="min-w-0">
                       <div className="flex min-w-0 items-center gap-1">
                         <p className="truncate text-sm font-medium">{texts.title}</p>
+                        {newIds?.has(action.id) && <NewMark />}
                         <PageDot
                           dot={pickDot(actionDots(action, action.dotFacts, today), viewer)}
                         />
@@ -519,19 +570,22 @@ export function ActionTable({
                             {tag}
                           </Badge>
                         ))}
-                        <RemovedNote payload={action.payload ?? {}} />
+                        <RemovedNote action={action} />
                       </div>
                     </div>
                   </div>
                 </TableCell>
                 <TableCell>
-                  <PriorityBadge score={action.priorityScore} level={action.priorityLevel} />
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <PriorityBadge score={action.priorityScore} level={action.priorityLevel} />
+                    <LowConfidenceTag confidence={action.priorityReason?.confidence} />
+                  </div>
                 </TableCell>
                 <TableCell>
                   <div className="flex flex-wrap items-center gap-1">
                     <ActionStatusBadge status={action.status} />
-                    {isStale(action) && <StalePill />}
                   </div>
+                  <StaleHint action={action} />
                   {action.taskTotal > 0 && (
                     <div className="mt-1.5 w-24">
                       <p className="text-[10px] text-muted-foreground">

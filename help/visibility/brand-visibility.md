@@ -4,8 +4,8 @@ route: /dashboard/insights
 keywords: [brand visibility, overview tab, mentions tab, citations tab, product visibility tab, answer engine insights, visibility score, key metrics, leaderboard, by AI platform, topics vs competitors, opportunities, filters]
 synonyms: [visibility page, AI visibility report, analytics hub, insights page, dashboard overview, visibility dashboard]
 plan: all
-updated: 2026-11-17
-last_checked: 2026-11-17
+updated: 2026-11-23
+last_checked: 2026-11-23
 owner: Cihan
 app_version: 0.3.0
 approved: true
@@ -17,7 +17,7 @@ sources: [docs/guides/answer-engine-insights.mdx, docs/guides/competitors.mdx, d
 
 The tabs sit under the page's header. In the sidebar, **Visibility** under **Analytics** opens and closes a group with the same entries, **Overview**, **Mentions**, **Citations** and, for an online shop on a plan with it, **Products**; it is open whenever one of them is showing.
 
-Each tab loads its own data when you open it, and shows a placeholder while it loads. The date range, AI platform, country and topic you picked stay set when you switch tabs; Mentions has no **All** range, so it opens on its 30 days instead. Product Visibility keeps its own filters. A tab whose data can't be read says so, with **Retry**, and the other tabs keep working.
+Each tab loads its own data when you open it, and shows a placeholder while it loads. The date range, AI platform, country and topic you picked stay set when you switch tabs; Mentions has no **All** range, so it opens on its 30 days instead. Product Visibility keeps its own filters. On **Overview**, a part that can't be read is read again by itself a moment later, and shows as loading meanwhile. A tab or part whose data still can't be read says so, with **Retry**, and the other tabs keep working.
 
 ## The header
 
@@ -59,6 +59,8 @@ The **Leaderboard** ranks you against your competitors, with each brand's score,
 
 A platform with too few answers shows **Low sample** or **No runs this period** instead of numbers. Use the table to send your content work toward your weakest platform.
 
+Each platform has one name everywhere in Ansvisor, in reports and e-mails too: Google's Gemini app is **Gemini**. Answers from an AI model asked directly, not through its app, have **API** after the name: **ChatGPT API**, **Gemini API** and **Claude API**.
+
 ## Why it changed
 
 **Why it changed** lists the platforms, topics and prompts that moved your Visibility most, under **Gains** and **Drops**. Each row shows its own score before and after, and its effect on your overall score. A note counts the prompts added during the period, which aren't counted in the change.
@@ -86,7 +88,7 @@ The volumes shown with these suggestions are an AI's guess, since no keyword beh
 
 Under the tabs:
 
-- **Date Range**: **24h** (the default, the latest completed run), **7d**, **30d**, **90d**, **All** or **Custom**.
+- **Date Range**: **24h** (the default, the latest completed run), **7d**, **30d**, **90d**, **All** or **Custom**. With **Custom**, **From** and **To** open a calendar in your language: pick a day with the mouse, or the arrow keys and Enter. The same calendar sets dates elsewhere in the app.
 - **Topic**: one topic, shown when the brand has topics.
 - **Region**: one region your prompts run in.
 - **AI Model**: one AI platform; versions of the same engine count as one.
@@ -98,4 +100,4 @@ The filters apply to everything on the tab except **Opportunities**, which lists
 1. Set the range to **7d**. Is your Visibility up or down? If it's down, **Why it changed** shows which platforms, topics and prompts moved it.
 2. In **By AI platform**, find the platform with the lowest score or the highlighted biggest drop: that's your next investment.
 3. Look at the suggested topics and prompts in **Opportunities**, and track one to three of them.
-4. From **Opportunities** under **Content** in the sidebar, open the opportunity for the topic that did worst this week and click **Generate Brief**.
+4. From **Opportunities** under **Content** in the sidebar, open the opportunity for the topic that did worst this week and click **Build brief**.

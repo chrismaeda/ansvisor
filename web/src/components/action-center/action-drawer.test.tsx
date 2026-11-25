@@ -137,19 +137,19 @@ describe('ActionDrawer', () => {
   it('puts status, assignee and due date under the header, ahead of the tabs', async () => {
     await renderDrawer();
     const drawer = document.body.querySelector('[role="dialog"]')!;
-    const labels = [...drawer.querySelectorAll('label')].map((l) => l.textContent);
-    expect(labels).toEqual(['Status', 'Assignee', 'Due date']);
-
+    // Quiet chips (drawer mockup 1), each named for hover and screen readers.
+    const ids = ['action-drawer-status', 'action-drawer-assignee', 'action-drawer-due-date'];
     const tabs = drawer.querySelector('nav')!;
-    for (const label of drawer.querySelectorAll('label')) {
-      expect(before(label, tabs)).toBe(true);
-    }
-    // Each field once (no second copy below the content), named by its label.
-    for (const label of drawer.querySelectorAll('label')) {
-      const control = drawer.querySelectorAll(`#${label.htmlFor}`);
+    for (const id of ids) {
+      // Each field once (no second copy below the content), ahead of the tabs.
+      const control = drawer.querySelectorAll<HTMLElement>(`#${id}`);
       expect(control).toHaveLength(1);
+      expect(before(control[0], tabs)).toBe(true);
     }
-    expect(drawer.querySelector<HTMLInputElement>('#action-drawer-due-date')!.value).toBe(
+    expect(
+      ids.map((id) => drawer.querySelector(`#${id}`)!.getAttribute('aria-label')?.split(':')[0]),
+    ).toEqual(['Status', 'Assignee', 'Due date']);
+    expect(drawer.querySelector<HTMLElement>('#action-drawer-due-date')!.dataset.value).toBe(
       '2026-11-01',
     );
   });
@@ -159,12 +159,10 @@ describe('ActionDrawer', () => {
     const drawer = document.body.querySelector('[role="dialog"]')!;
     const id = drawer.querySelector<HTMLElement>('[title^="Action ID"]')!;
     expect(id.title).toBe(`Action ID: AC-${action.actionNo}`);
-    expect(id.textContent).toBe(`Action ID: AC-${action.actionNo}`);
-    // Only the label gives way, and only beside Run agent.
-    const label = id.firstElementChild as HTMLElement;
+    // On screen only the code, after the priority; the label is for screen readers.
+    expect(id.textContent).toBe(`· Action ID: AC-${action.actionNo}`);
+    const label = id.querySelector('.sr-only')!;
     expect(label.textContent).toBe('Action ID: ');
-    expect(label.className).toBe('group-has-[[data-run-agent]]/top:sr-only');
-    expect(id.closest('.group\\/top')).not.toBeNull();
   });
 
   // The owner's ask (14 Nov): each brand numbers its actions from AC-01 (00534).
@@ -174,13 +172,19 @@ describe('ActionDrawer', () => {
     expect(drawer.querySelector<HTMLElement>('[title^="Action ID"]')!.title).toBe(
       'Action ID: AC-03',
     );
-    const previous = [...drawer.querySelectorAll('span')].find(
+    // In the ⋯ menu, under the exports.
+    const more = drawer.querySelector<HTMLButtonElement>('[data-action-more]')!;
+    await act(async () => {
+      more.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true }));
+      more.click();
+    });
+    const previous = [...document.querySelectorAll('p')].find(
       (el) => el.textContent === 'Previously AC-648',
     );
     expect(previous?.className).toContain('text-muted-foreground');
   });
 
-  it("gives the Why the demand of a signal's prompt the action didn't keep", async () => {
+  it('tells the Why from the Affected set: a signal’s prompt the action didn’t keep isn’t counted (UX audit AC-20, AC-23)', async () => {
     const lost = (id: string, promptId: string, promptText: string) =>
       ({
         id,
@@ -223,35 +227,88 @@ describe('ActionDrawer', () => {
     await renderDrawer({ ...action, payload: { targetEntity: 'prompts', targetCount: 1 } });
 
     expect(server.getPromptDemand).toHaveBeenCalledWith('b1', ['p1', 'p2']);
-    // Both prompts' demand, not the kept one's alone (4.1–6.9k).
-    expect(document.body.querySelector('[role="dialog"]')!.textContent).toContain(
-      '2 prompts (8.2–13.8k AI searches a month, estimated)',
+    // The kept prompt alone, as the title (1 prompt) and the Affected tab
+    // list it, with its own demand: the sum of the rows below (4.1–6.9k).
+    const text = document.body.querySelector('[role="dialog"]')!.textContent;
+    expect(text).toContain(
+      '“Best coffee subscription?” (4.1–6.9k AI searches a month, estimated) lost its citations',
     );
+    expect(text).not.toContain('2 prompts');
+  });
+
+  it('says a passed goal date and offers a new one, without moving it (UX audit AC-21)', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-11-19T12:00:00Z'));
+    try {
+      server.getActionDetail.mockResolvedValue({
+        ...emptyDetail,
+        signals: [
+          {
+            id: 's1',
+            category: 'citation',
+            kind: 'lost_citations',
+            impact: 'high',
+            status: 'new',
+            source: ['ai_results'],
+            detectedAt: '2026-10-09T00:00:00Z',
+            lastDetectedAt: '2026-10-09T00:00:00Z',
+            resolvedAt: null,
+            previousValue: null,
+            currentValue: null,
+            changeValue: null,
+            payload: { promptId: 'p1', promptText: 'Best coffee subscription?' },
+            kpiKeys: [],
+            actionId: 'a1',
+            where: { platforms: ['chatgpt-web'], regions: [], topics: [] },
+          } as Signal,
+        ],
+      });
+      server.getPromptDemand.mockResolvedValue({});
+      // Its due date, Nov 1, has gone: said, and left as it is.
+      await renderDrawer(action);
+      const dialog = document.body.querySelector('[role="dialog"]')!;
+      expect(dialog.textContent).toContain('by Nov 1.');
+      expect(dialog.textContent).toContain('Goal date passed');
+      const offer = [...dialog.querySelectorAll('button')].find(
+        (b) => b.textContent === 'Set a new date',
+      )!;
+      await act(async () => offer.click());
+      expect(document.activeElement?.id).toBe('action-drawer-due-date');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('names a linked KPI’s target as the brand’s monthly goal, in its unit (UX audit AC-22)', async () => {
+    server.getActionDetail.mockResolvedValue({
+      ...emptyDetail,
+      kpis: [{ kpiKey: 'citations', target: 5000, timeframe: 'monthly' }],
+    });
+    await renderDrawer({ ...action, kpiKeys: ['citations'] });
+    const text = document.body.querySelector('[role="dialog"]')!.textContent;
+    expect(text).toContain('Brand monthly goal: 5k');
+    expect(text).not.toContain('target 5000');
   });
 
   describe('changes', () => {
     beforeEach(() => vi.useFakeTimers());
     afterEach(() => vi.useRealTimers());
 
-    const dueDate = () => document.querySelector<HTMLInputElement>('#action-drawer-due-date')!;
-    /** What the browser does as a date is picked or typed into the field. */
-    const enter = (value: string) =>
-      act(() => {
-        const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!;
-        set.call(dueDate(), value);
-        dueDate().dispatchEvent(new Event('input', { bubbles: true }));
-      });
+    const dueDate = () => document.querySelector<HTMLElement>('#action-drawer-due-date')!;
+    /** Opens the app's date picker (AC-25) and picks a day, or Clear. */
+    const pickDay = async (day: string | null) => {
+      await act(async () => dueDate().click());
+      const target = day
+        ? document.querySelector<HTMLButtonElement>(`[data-day="${day}"]`)
+        : document.querySelector<HTMLButtonElement>('[data-action="datePicker.clear"]');
+      await act(async () => target!.click());
+    };
+    const enter = (day: string) => pickDay(day);
     const settle = () => act(async () => void (await vi.advanceTimersByTimeAsync(800)));
 
-    it('shows a due date at once and saves only the one it settles on', async () => {
+    it('saves the day picked at once, and shows it', async () => {
       await renderDrawer();
-      // Typing 18 passes through the 1st.
-      enter('2026-11-01');
-      enter('2026-11-18');
-      expect(dueDate().value).toBe('2026-11-18');
-      expect(server.setActionDueDate).not.toHaveBeenCalled();
-
-      await settle();
+      await enter('2026-11-18');
       expect(server.setActionDueDate).toHaveBeenCalledTimes(1);
       expect(server.setActionDueDate).toHaveBeenCalledWith('b1', 'a1', '2026-11-18');
       expect(onPatched).toHaveBeenCalledWith(
@@ -260,36 +317,22 @@ describe('ActionDrawer', () => {
       );
       // The list isn't read again; the detail is, for its History.
       expect(onChanged).not.toHaveBeenCalled();
+      await settle();
       expect(server.getActionDetail).toHaveBeenCalledTimes(2);
     });
 
-    it("doesn't save a year still being typed, and puts the saved date back on leaving", async () => {
+    it('saves nothing when the same day is picked, and a cleared date as none', async () => {
       await renderDrawer();
-      enter('0002-11-01');
-      await settle();
+      await enter('2026-11-01');
       expect(server.setActionDueDate).not.toHaveBeenCalled();
-
-      act(() => dueDate().dispatchEvent(new FocusEvent('focusout', { bubbles: true })));
-      expect(dueDate().value).toBe('2026-11-01');
-      expect(server.setActionDueDate).not.toHaveBeenCalled();
-    });
-
-    it('saves on leaving the field, and a cleared date as none', async () => {
-      await renderDrawer();
-      enter('2026-12-05');
-      await act(async () => dueDate().dispatchEvent(new FocusEvent('focusout', { bubbles: true })));
-      expect(server.setActionDueDate).toHaveBeenCalledWith('b1', 'a1', '2026-12-05');
-
-      enter('');
-      await settle();
+      await pickDay(null);
       expect(server.setActionDueDate).toHaveBeenLastCalledWith('b1', 'a1', null);
-      expect(server.setActionDueDate).toHaveBeenCalledTimes(2);
     });
 
     it('says so when a save fails, and reads the list again', async () => {
       server.setActionDueDate.mockRejectedValueOnce(new Error('offline'));
       await renderDrawer();
-      enter('2026-12-05');
+      await enter('2026-11-25');
       await settle();
       expect(toast.error).toHaveBeenCalledWith("Couldn't update the action.");
       expect(onChanged).toHaveBeenCalledTimes(1);
@@ -297,15 +340,15 @@ describe('ActionDrawer', () => {
 
     it('changes nothing on a read-only workspace: the due date and Add task open the upgrade dialog', async () => {
       await renderDrawer(action, true);
-      enter('2026-11-18');
+      await enter('2026-11-18');
       expect(openUpgrade).toHaveBeenLastCalledWith('Setting a due date needs a plan');
-      expect(dueDate().value).toBe('2026-11-01');
+      expect(dueDate().dataset.value).toBe('2026-11-01');
       await settle();
       expect(server.setActionDueDate).not.toHaveBeenCalled();
 
       const button = (name: string) =>
         [...document.querySelectorAll<HTMLButtonElement>('button')].find(
-          (b) => b.textContent?.trim() === name || b.textContent?.startsWith(`${name} (`),
+          (b) => b.textContent?.trim() === name || b.textContent?.startsWith(`${name} `),
         )!;
       await act(async () => button('Tasks').click());
       await act(async () => button('Add task').click());
@@ -318,7 +361,7 @@ describe('ActionDrawer', () => {
       await renderDrawer();
       const button = (name: string) =>
         [...document.querySelectorAll<HTMLButtonElement>('button')].find(
-          (b) => b.textContent?.trim() === name || b.textContent?.startsWith(`${name} (`),
+          (b) => b.textContent?.trim() === name || b.textContent?.startsWith(`${name} `),
         )!;
       await act(async () => button('Tasks').click());
       await act(async () => button('Add task').click());
@@ -352,7 +395,7 @@ describe('ActionDrawer', () => {
   describe('from Chat', () => {
     const button = (name: string) =>
       [...document.querySelectorAll<HTMLButtonElement>('button')].find(
-        (b) => b.textContent?.trim() === name || b.textContent?.startsWith(`${name} (`),
+        (b) => b.textContent?.trim() === name || b.textContent?.startsWith(`${name} `),
       )!;
     const attached = (fileId: string) => ({
       fileId,
@@ -497,7 +540,7 @@ describe('ActionDrawer', () => {
       await renderDrawer();
       const button = (name: string) =>
         [...document.querySelectorAll<HTMLButtonElement>('button')].find(
-          (b) => b.textContent?.trim() === name || b.textContent?.startsWith(`${name} (`),
+          (b) => b.textContent?.trim() === name || b.textContent?.startsWith(`${name} `),
         )!;
       await act(async () => button('Tasks').click());
       await act(async () => button(`1. ${title}`).click());
@@ -536,7 +579,7 @@ describe('ActionDrawer', () => {
     });
     const button = (name: string) =>
       [...document.querySelectorAll<HTMLButtonElement>('button')].find(
-        (b) => b.textContent?.trim() === name || b.textContent?.startsWith(`${name} (`),
+        (b) => b.textContent?.trim() === name || b.textContent?.startsWith(`${name} `),
       );
     const openTask = async (title: string) => {
       await act(async () => button('Tasks')!.click());
@@ -728,7 +771,7 @@ describe('ActionDrawer Check now (AC-010)', () => {
   };
   const button = (name: string) =>
     [...document.querySelectorAll<HTMLButtonElement>('button')].find(
-      (b) => b.textContent?.trim() === name || b.textContent?.startsWith(`${name} (`),
+      (b) => b.textContent?.trim() === name || b.textContent?.startsWith(`${name} `),
     );
   const openTask = async () => {
     await act(async () => button('Tasks')!.click());

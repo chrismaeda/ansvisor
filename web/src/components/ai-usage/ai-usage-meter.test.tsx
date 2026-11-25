@@ -136,6 +136,15 @@ beforeEach(() => {
   toast.warning.mockReset();
   toast.error.mockReset();
   localStorage.clear();
+  // The first read waits for the browser to be idle: here, it is at once.
+  idle.callbacks = [];
+  idle.atOnce = true;
+  window.requestIdleCallback = ((run: IdleRequestCallback) => {
+    if (idle.atOnce) run({ didTimeout: false, timeRemaining: () => 50 });
+    else idle.callbacks.push(run);
+    return 1;
+  }) as typeof window.requestIdleCallback;
+  window.cancelIdleCallback = () => {};
 });
 
 afterEach(() => {
@@ -143,6 +152,8 @@ afterEach(() => {
   container.remove();
   vi.restoreAllMocks();
 });
+
+const idle = { atOnce: true, callbacks: [] as IdleRequestCallback[] };
 
 describe('AiUsageMeter', () => {
   it('shows the month’s share with a bar, named with what it shows', async () => {
@@ -152,6 +163,16 @@ describe('AiUsageMeter', () => {
     expect(button.getAttribute('aria-label')).toBe('AI 21.4% used this month');
     expect(button.className).toContain('text-foreground');
     expect(button.querySelector<HTMLElement>('[style]')!.style.width).toBe('21.4%');
+  });
+
+  it('reads the month’s usage once the page’s own reads leave the browser idle (Content test 2026-11-19)', async () => {
+    idle.atOnce = false;
+    await render();
+    expect(readAiUsage).not.toHaveBeenCalled();
+    await act(async () =>
+      idle.callbacks.forEach((run) => run({ didTimeout: false, timeRemaining: () => 50 })),
+    );
+    expect(readAiUsage).toHaveBeenCalledTimes(1);
   });
 
   it('keeps its room while the first read runs, from a phone’s width up', async () => {
@@ -240,7 +261,7 @@ describe('AiUsageMeter', () => {
     // Opening reads the usage again.
     expect(readAiUsage).toHaveBeenCalledTimes(2);
     expect(links()).toEqual([
-      ['Get more AI usage', '/dashboard/settings/billing'],
+      ['Get more AI usage', '/dashboard/settings/billing#plan-add-ons'],
       ['Use your own key', '/dashboard/settings/ai-providers'],
       ['See details', '/dashboard/settings/billing#ai-usage'],
     ]);
@@ -503,7 +524,8 @@ describe('HeaderWithAiUsage', () => {
         </HeaderWithAiUsage>
       </ChatPanelContext.Provider>
     );
-    // The h-* classes: the same one on all three, a default button's.
+    // The h-* classes: a default button's on the page's button and Ask Chat;
+    // the narrow meter, borderless, is a little shorter and centred beside them.
     const heights = (el: Element) => el.className.split(/\s+/).filter((c) => /^h-/.test(c));
     await render('admin', header());
     const row = container.firstElementChild!;
@@ -512,7 +534,7 @@ describe('HeaderWithAiUsage', () => {
     expect(meter.getAttribute('aria-label')).toBe('AI 21.4% used this month');
     expect(ask.getAttribute('data-action')).toBe('panel.open');
     expect(heights(page)).toEqual(['h-8']);
-    expect(heights(meter)).toEqual(['h-8']);
+    expect(heights(meter)).toEqual(['h-7']);
     expect(heights(ask)).toEqual(['h-8']);
     expect(row.className).toContain('sm:items-start');
 
@@ -525,11 +547,11 @@ describe('HeaderWithAiUsage', () => {
   it('leaves room on the row for a drawer’s close button', async () => {
     await render(
       'admin',
-      <HeaderWithAiUsage banner={false} className="pr-8">
+      <HeaderWithAiUsage banner={false} className="pe-8">
         <h1>Opportunity</h1>
       </HeaderWithAiUsage>,
     );
-    expect(container.firstElementChild!.className).toContain('pr-8');
+    expect(container.firstElementChild!.className).toContain('pe-8');
     expect(container.firstElementChild!.lastElementChild).toBe(trigger());
   });
 
@@ -560,7 +582,7 @@ describe('HeaderWithAiUsage', () => {
 
     vi.mocked(readAiUsage).mockReturnValue(new Promise(() => {}));
     await render('admin', header);
-    expect(slot()!.className).toContain('sm:min-w-[8.5rem]');
+    expect(slot()!.className).toContain('sm:min-w-[5.5rem]');
     // A phone keeps the meter under the row, as without it.
     expect(slot()!.className).toContain('contents');
     expect(slot()!.querySelector('span[aria-hidden]')).not.toBeNull();
@@ -573,7 +595,7 @@ describe('HeaderWithAiUsage', () => {
     vi.mocked(readAiUsage).mockResolvedValue(null);
     await fresh();
     expect(trigger()).toBeNull();
-    expect(slot()!.className).toContain('sm:min-w-[8.5rem]');
+    expect(slot()!.className).toContain('sm:min-w-[5.5rem]');
   });
 
   it('keeps no room without reserveMeter, or self-hosted', async () => {

@@ -126,7 +126,7 @@ function ImpactItem({
           {tReport('prompts', { count: row.targetPrompts })}
         </span>
       </div>
-      <div className="flex flex-col items-end gap-0.5 text-right max-[520px]:flex-row max-[520px]:flex-wrap max-[520px]:items-center max-[520px]:gap-x-2.5 max-[520px]:text-left">
+      <div className="flex flex-col items-end gap-0.5 text-end max-[520px]:flex-row max-[520px]:flex-wrap max-[520px]:items-center max-[520px]:gap-x-2.5 max-[520px]:text-start">
         <span data-slot="agent-impact-outcome" className={cn(PILL, OUTCOME_PILL[row.outcome])}>
           {outcomeLabel(row, tReport)}
         </span>
@@ -184,6 +184,7 @@ export function AgentImpactCard({ id }: { id: string }) {
         })
       : format.dateTime(new Date(at), { month: 'short', day: 'numeric' });
 
+  const shipped = impact !== 'loading' && impact !== null && impact.rows.length > 0;
   let body: ReactNode;
   if (impact === 'loading') {
     body = (
@@ -309,7 +310,7 @@ export function AgentImpactCard({ id }: { id: string }) {
         <h2 id="agent-impact-title" className="text-[15px] font-semibold">
           {t('title')}
         </h2>
-        <span data-slot="agent-impact-period" className="ml-auto text-xs text-muted-foreground">
+        <span data-slot="agent-impact-period" className="ms-auto text-xs text-muted-foreground">
           {t('period')}
         </span>
       </div>
@@ -327,13 +328,16 @@ export function AgentImpactCard({ id }: { id: string }) {
               tReport('method.correlation'),
             ].join(' · ')}
           </span>
-          <Link
-            href="/dashboard/reports/impact"
-            data-action="agent.openReports"
-            className="font-medium text-foreground underline-offset-2 hover:underline"
-          >
-            {t('openReports')} →
-          </Link>
+          {/* Only once something has shipped: the report is empty before. */}
+          {shipped && (
+            <Link
+              href="/dashboard/reports/impact"
+              data-action="agent.openReports"
+              className="font-medium text-foreground underline-offset-2 hover:underline"
+            >
+              {t('openReports')} →
+            </Link>
+          )}
         </div>
       </div>
     </section>

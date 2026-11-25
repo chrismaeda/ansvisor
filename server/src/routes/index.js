@@ -4,6 +4,7 @@ import trackingRoutes from './tracking.js';
 import volumeRoutes from './volumes.js';
 import contentRoutes from './content.js';
 import contentPageRoutes from './content-pages.js';
+import aiTextRoutes from './ai-text.js';
 import contentDraftRoutes from './content-drafts.js';
 import competitorRoutes from './competitors.js';
 import topicRoutes from './topics.js';
@@ -28,6 +29,7 @@ import demoRoutes from './demo.js';
 import chatOutboundRoutes from './chat-outbound.js';
 import slackRoutes from './slack.js';
 import adsRoutes from './ads.js';
+import adsAccountsRoutes from './ads-accounts.js';
 
 const router = Router();
 
@@ -36,6 +38,7 @@ router.use('/tracking', trackingRoutes);
 router.use('/volumes', volumeRoutes);
 router.use('/content', contentRoutes);
 router.use('/content-pages', contentPageRoutes);
+router.use('/ai-text', aiTextRoutes);
 router.use('/content-drafts', contentDraftRoutes);
 router.use('/competitors', competitorRoutes);
 router.use('/topics', topicRoutes);
@@ -61,6 +64,8 @@ router.use('/demo', demoRoutes);
 router.use('/chat-outbound', chatOutboundRoutes);
 router.use('/slack', slackRoutes);
 // Ads (ADS-01), in development: not found unless the server's ADS_ENABLED is on.
+// A brand's ad accounts (Ads Phase 1), hidden with Ads (ADS_ENABLED) like /ads.
+router.use('/ads/accounts', adsAccountsRoutes);
 router.use('/ads', adsRoutes);
 
 router.get('/health', (req, res) => {

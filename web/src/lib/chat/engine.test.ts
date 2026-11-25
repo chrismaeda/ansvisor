@@ -36,6 +36,22 @@ import type { GoLiveFacts } from './precedence';
 vi.mock('@/lib/supabase/admin', async () => ({
   supabaseAdmin: (await import('@/lib/chat/testing/fake-supabase')).createFakeSupabase(),
 }));
+// A German with two texts, for a person who picked it (the person's language, below).
+vi.mock('@/i18n/messages', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/i18n/messages')>();
+  return {
+    ...actual,
+    loadMessages: async (locale: Parameters<typeof actual.loadMessages>[0]) =>
+      locale === 'de'
+        ? actual.mergeMessages(await actual.loadMessages('en'), {
+            chatEngine: {
+              error: { notFound: 'Diesen Chat gibt es nicht mehr.' },
+              step: { askStopped: 'Frage übersprungen' },
+            },
+          })
+        : actual.loadMessages(locale),
+  };
+});
 vi.mock('@/lib/actions/content-drafts', () => ({
   createContentDraft: vi.fn(),
   updateContentDraft: vi.fn(),
@@ -278,6 +294,8 @@ vi.mock('./budget', async (importOriginal) => ({
   fitChatUnits: fakes.fit,
 }));
 // Images on the server (chat-images.test.ts reads them): what the engine and the rows call.
+const presentationFakes = vi.hoisted(() => ({ make: vi.fn() }));
+vi.mock('./presentation-run', () => ({ makeChatPresentation: presentationFakes.make }));
 const imageFakes = vi.hoisted(() => ({ fit: vi.fn(), make: vi.fn() }));
 vi.mock('./images/chat-images', () => ({
   fitImageParts: imageFakes.fit,
@@ -4548,6 +4566,8 @@ describe('who may do what (W1-22: CHAT-05 test set 27–30, CHAT-20 §4c, §5)',
     'trigger_content_webhook',
     'unpublish_cms',
     'build_report',
+    // A saved report as a deck (issue #2298): Admins and Managers, as build_report.
+    'make_presentation',
     'run_site_audit',
     // W4-08's images: Admins and Managers only.
     'generate_image',
@@ -6612,7 +6632,7 @@ describe('Send to Action Center (CHAT-09 §E, CHAT-20 §12)', () => {
     expectClean(events);
   });
 
-  it('lists its tasks on the card, then sends it as the person approved it, with Open in Actions', async () => {
+  it('lists its tasks on the card, then sends it as the person approved it, with Open in Action Center', async () => {
     useModels([READY], [calls(sendCall), text('Sent.')]);
     const runId = await turn(ADMIN, 'Send this to Action Center', 'auto');
     const confirm = ofType(await eventsOf(runId), 'confirm.required')[0].data;
@@ -7411,6 +7431,16 @@ describe('the /tasks task strip (W2-11, CHAT-09 §B)', () => {
         1,
       );
     }
+  });
+
+  it('names the action it read on its step, for Data used (UX audit CH-10)', async () => {
+    fakes.readRun.mockResolvedValueOnce({ id: 'a-top', code: 'AC-12', data_as_of: DATA_AS_OF });
+    useModels(
+      [calls(toolCall('r1', 'get_action', { brand_id: BRAND, action_id: 'a-top' })), READY],
+      [text('AC-12 is about /pricing.')],
+    );
+    const runId = await turn(ADMIN, 'What is AC-12?');
+    expect(stepsOf(runId)[0].scope_json).toMatchObject({ record: 'AC-12' });
   });
 
   it('queues the week’s tasks, marks the opened action Writing, and settles as the run ends', async () => {
@@ -10826,5 +10856,110 @@ describe('an AEO Operator’s run', () => {
       'get_agent_plan',
       'run_agent_plan',
     ]);
+  });
+});
+
+describe("the person's language (profiles.ui_language)", () => {
+  const pick = (person: string, language: string | null) => {
+    const profile = db.tables.profiles.find((p) => p.id === person) as Record<string, unknown>;
+    profile.ui_language = language;
+  };
+
+  it('writes the run’s steps and refusals in it, and English with no pick', async () => {
+    const ask = {
+      question: 'Which page?',
+      options: [{ label: '/pricing', recommended: true }, { label: '/features' }],
+    };
+    useModels([READY], [calls(toolCall('q1', ASK_TOOL, ask))]);
+    const runId = await turn(ADMIN, 'Write a FAQ');
+    expect(runRow(runId).status).toBe('waiting');
+    expect(await engine.stopChatRun(ANALYST, runId)).toMatchObject({
+      status: 404,
+      message: "This chat isn't there any more.",
+    });
+    pick(PEOPLE.analyst, 'de');
+    expect(await engine.stopChatRun(ANALYST, runId)).toMatchObject({
+      status: 404,
+      message: 'Diesen Chat gibt es nicht mehr.',
+    });
+    pick(PEOPLE.admin, 'de');
+    expect(await engine.stopChatRun(ADMIN, runId)).toEqual({ ok: true });
+    expect(stepsOf(runId)[0]).toMatchObject({ status: 'skipped', label: 'Frage übersprungen' });
+  });
+});
+
+describe('a saved report as an editable deck (issue #2298)', () => {
+  const REPORT = 'eeeeeeee-0000-4000-8000-000000000001';
+  const made = {
+    ok: true,
+    file_id: 'file-deck',
+    title: 'Presentation · Weekly Visibility Summary',
+    report_id: REPORT,
+    slides: 8,
+  };
+  const deck = () => calls(toolCall('p1', 'make_presentation', { report_id: REPORT }));
+
+  beforeEach(() => {
+    presentationFakes.make.mockResolvedValue(made);
+    db.tables.reports.push({ id: REPORT, brand_id: BRAND, title: 'Weekly Visibility Summary' });
+  });
+
+  it('makes and files the deck in Full auto: the card shows it, the engine files nothing again', async () => {
+    useModels([READY], [deck(), text('Here is your deck.')]);
+    const runId = await turn(ADMIN, 'Turn the October report into slides', 'full_auto');
+    expect(presentationFakes.make).toHaveBeenCalledWith(
+      expect.objectContaining({
+        organizationId: ORG,
+        chat: expect.objectContaining({ runId }),
+      }),
+      expect.objectContaining({ report_id: REPORT }),
+    );
+    // The run filed the deck itself: the engine names it, and files nothing again.
+    expect((db.tables.chat_files ?? []).filter((f) => f.run_id === runId)).toEqual([]);
+    expect(uploads).toEqual([]);
+    expect(ofType(await eventsOf(runId), 'deliverable.created').map((c) => c.data)).toEqual([
+      {
+        title: 'Presentation · Weekly Visibility Summary',
+        type: 'report',
+        formats: ['pptx'],
+        status: 'draft',
+        filed: 'in_files',
+      },
+    ]);
+    expect(runRow(runId).status).toBe('done');
+    expectClean(await eventsOf(runId));
+  });
+
+  it('asks first in Ask first, with the report on the card, then runs on the approval', async () => {
+    useModels([READY], [deck(), text('Here is your deck.')]);
+    const runId = await turn(ADMIN, 'Turn the October report into slides', 'ask_first');
+    expect(presentationFakes.make).not.toHaveBeenCalled();
+    const [card] = ofType(await eventsOf(runId), 'confirm.required').map((e) => e.data);
+    expect(card.action).toBe('Make presentations');
+
+    expect((await approve(ADMIN, runId)).ok).toBe(true);
+    expect(presentationFakes.make).toHaveBeenCalledTimes(1);
+    expect(ofType(await eventsOf(runId), 'deliverable.created').map((c) => c.data)).toEqual([
+      {
+        title: 'Presentation · Weekly Visibility Summary',
+        type: 'report',
+        formats: ['pptx'],
+        status: 'draft',
+        filed: 'in_files',
+      },
+    ]);
+    expectClean(await eventsOf(runId));
+  });
+
+  it('shows no output card when the report is gone, and tells the model why', async () => {
+    presentationFakes.make.mockResolvedValue({
+      ok: false,
+      reason: 'not_found',
+      message: 'That report was not found. List the saved reports, then pick one.',
+    });
+    const { sonnet } = useModels([READY], [deck(), text('I could not find that report.')]);
+    const runId = await turn(ADMIN, 'Turn the October report into slides', 'full_auto');
+    expect(ofType(await eventsOf(runId), 'deliverable.created')).toEqual([]);
+    expect(JSON.stringify(sonnet.seen[1].prompt.at(-1))).toContain('not_found');
   });
 });

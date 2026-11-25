@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import { useTranslations } from 'next-intl';
+import { useServerErrorText } from '@/hooks/use-server-error';
 import { toast } from 'sonner';
 import { Loader2, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -15,7 +16,7 @@ export function taskWriterEnabled(): boolean {
 }
 
 /** Server reasons this build has words for (actionsPage.drawer.regenerate.errors). */
-const KNOWN_ERRORS = [
+export const KNOWN_ERRORS = [
   'disabled',
   'not_found',
   'sent',
@@ -52,6 +53,7 @@ export function RegenerateTasks({
   // A read-only workspace (plan not active): the upgrade dialog instead of the question.
   const { guard } = useUpgradeGate();
   const tActions = useTranslations('readOnly.actions');
+  const serverError = useServerErrorText();
 
   const run = async () => {
     setBusy(true);
@@ -71,7 +73,7 @@ export function RegenerateTasks({
             ? t(result.error)
             : result.code && KNOWN_ERRORS.includes(result.code)
               ? t(`errors.${result.code}`)
-              : result.message,
+              : serverError(result, result.message),
         );
       }
     } finally {
@@ -129,7 +131,7 @@ export function RegenerateTasks({
       onClick={guard(() => setConfirming(true), { action: tActions('regenerateTasks') })}
       className="mt-2 h-8 w-full text-xs"
     >
-      <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+      <RefreshCw className="me-1.5 h-3.5 w-3.5" />
       {t('button')}
     </Button>
   );

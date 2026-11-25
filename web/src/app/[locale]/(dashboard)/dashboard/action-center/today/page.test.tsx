@@ -207,6 +207,7 @@ const overview: TodayOverview = {
   lastRunAt: new Date(Date.now() - 3600_000).toISOString(),
   trackedPrompts: 12,
   openActions: 3,
+  openBreakdown: { onHold: 1, mine: 2 },
   doneThisWeek: 1,
 };
 const standing: TodayStanding = {
@@ -214,6 +215,8 @@ const standing: TodayStanding = {
   change: 0.4,
   rank: 2,
   of: 5,
+  set: 'rivals',
+  runAt: '2026-11-17T06:00:00Z',
   neighbour: { name: 'Northbound Roasters', gap: 6.2, ahead: false },
   competitors: [],
 };
@@ -427,9 +430,9 @@ describe('Action Center › Today', () => {
     expect(cells).toEqual([
       '1 · Prompts12 tracked',
       '2 · AI answersUpdated today',
-      '3 · Actions3 open',
+      '3 · Actions3 open1 on hold · 2 yours',
       '4 · Done1 this week',
-      '5 · Results53.9 +0.4',
+      '5 · Results53.9/100 +0.4',
     ]);
     expect(container.querySelector('[aria-current="step"]')?.getAttribute('data-loop-step')).toBe(
       'actions',
@@ -453,9 +456,9 @@ describe('Action Center › Today', () => {
       'Finish setting up',
     ]);
     expect(summaryRow()).toEqual(['waiting', 'stand']);
-    expect(text('[data-today-part="waiting"] a[href="/dashboard/content/library"]')).toBe(
-      'Review 2 drafts',
-    );
+    expect(
+      text('[data-today-part="waiting"] a[href="/dashboard/content/library?tab=in_review"]'),
+    ).toBe('Review 2 drafts');
     for (const section of container.querySelectorAll('section')) {
       const id = section.getAttribute('aria-labelledby');
       expect(id && container.querySelector(`[id="${id}"]`)).toBeTruthy();
@@ -609,8 +612,12 @@ describe('Action Center › Today', () => {
   it('says where the brand stands', async () => {
     await draw();
     const stand = container.querySelector('[data-today-part="stand"]');
-    expect(stand?.textContent).toContain('53.9 +0.4 since yesterday');
-    expect(stand?.textContent).toContain('#2 of 5 brands. 6.2 points behind Northbound Roasters.');
+    // The Visibility score out of 100, ranked among the primary rivals, from the latest run (AC-02).
+    expect(stand?.textContent).toContain('Visibility score53.9/100 +0.4 since yesterday');
+    expect(stand?.textContent).toContain(
+      '#2 of 5 with your primary rivals. 6.2 points behind Northbound Roasters.',
+    );
+    expect(stand?.textContent).toMatch(/From the latest run, Nov 1[67]/);
   });
 
   it('hides only the part whose read failed', async () => {
@@ -666,7 +673,7 @@ describe('Action Center › Today', () => {
       };
       await draw();
       expect(summaryRow()).toEqual(['waiting', 'stand']);
-      expect(stand()).toContain('#2 of 5 brands.');
+      expect(stand()).toContain('#2 of 5 with your primary rivals.');
     });
   });
 
@@ -742,8 +749,12 @@ describe('Action Center › Today', () => {
     const link = (type: string) => container.querySelector(`[data-waiting="${type}"] a`);
     expect(rows[0].textContent).toContain('An agent is waiting for your OK on “Comparison page”.');
     expect(link('agent')?.getAttribute('href')).toBe('/dashboard/chat/c1');
+    // Every draft in review, whoever wrote it, linked to Library › In review (AC-03).
+    expect(rows[1].textContent).toContain(
+      '2 drafts waiting for your review. Nothing goes live without your OK.',
+    );
     expect(link('drafts')?.textContent).toBe('Review 2 drafts');
-    expect(link('drafts')?.getAttribute('href')).toBe('/dashboard/content/library');
+    expect(link('drafts')?.getAttribute('href')).toBe('/dashboard/content/library?tab=in_review');
     expect(rows[2].textContent).toContain('Due today: Validate across AI platforms.');
     expect(link('due')?.getAttribute('href')).toBe('/dashboard/action-center/actions?action=a7');
     expect(link('review')?.getAttribute('href')).toBe('/dashboard/action-center/review');
@@ -915,6 +926,40 @@ describe('Action Center › Today', () => {
     expect(reads.getTodayChanges).toHaveBeenCalledWith('b1', '2026-11-10T08:00:00.000Z', [
       'traffic',
     ]);
+  });
+
+  it('reads near-identical changes as one row, with its one action and each change under Show all (AC-06)', async () => {
+    const rival = (id: string, name: string) =>
+      signal(id, {
+        category: 'competitor',
+        kind: 'competitor_leads',
+        impact: 'high',
+        actionId: 'a7',
+        previousValue: 3,
+        currentValue: 40,
+        payload: { entity: 'competitors', targets: [{ label: name }] },
+      });
+    reads.getTodayChanges.mockResolvedValue({
+      ...changes,
+      items: [rival('c1', 'Northbound'), rival('c2', 'Morning Ritual'), rival('c3', 'Bean Co')],
+      total: 3,
+    });
+    await draw();
+    const part = container.querySelector('[data-today-part="since"]')!;
+    const row = part.querySelector('[data-signal-group="competitor_leads"]')!;
+    expect(row.textContent).toContain('3 rivals are mentioned far more than you · 1 action');
+    const link = row.querySelector('a')!;
+    expect(link.textContent).toBe('1 action');
+    expect(link.getAttribute('href')).toBe('/dashboard/action-center/actions?action=a7');
+    const toggle = row.querySelector('button')!;
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    await act(async () => toggle.click());
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    const each = [...row.querySelectorAll('ul li')];
+    expect(each).toHaveLength(3);
+    expect(each[1].textContent).toBe(
+      'Morning Ritual is mentioned far more than you. An action was added.',
+    );
   });
 
   it('names the day the window starts when it is before yesterday', async () => {
@@ -1226,6 +1271,7 @@ describe('Action Center › Today', () => {
           change: 3.5,
           rank: 2,
           of: 5,
+          set: 'top',
           neighbour: { name: 'Northbound Roasters', gap: 6.2, ahead: false },
           competitors: [],
         },
@@ -1267,7 +1313,7 @@ describe('Action Center › Today', () => {
         'Northbound Roasters still leads by 6.2 points. 3 actions are ready to close it.',
       );
       expect(text('[data-today-part="saved"]')).toContain(
-        '1 draft from your agent: The low-acid buying guide.',
+        '1 draft waiting for your review: The low-acid buying guide.',
       );
       // The focus is read-only: no Skip, no Start; "Needs a plan" opens the upgrade dialog.
       expect(button('Skip for now')).toBeUndefined();

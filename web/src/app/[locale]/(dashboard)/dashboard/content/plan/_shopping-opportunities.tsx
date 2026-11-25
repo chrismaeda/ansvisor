@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { useTranslations } from 'next-intl';
+import { useServerErrorText } from '@/hooks/use-server-error';
 import { toast } from 'sonner';
 import { Loader2 } from 'lucide-react';
 import { Link, useRouter } from '@/i18n/navigation';
@@ -53,6 +54,7 @@ export function ShoppingOpportunities({
   hidden?: boolean;
 }) {
   const t = useTranslations('contentEditor.plan.shopping');
+  const serverError = useServerErrorText();
   const router = useRouter();
   const [read, setRead] = useState<Read | null>(null);
   const [creating, setCreating] = useState<string | null>(null);
@@ -96,7 +98,7 @@ export function ShoppingOpportunities({
       router.push(contentEditorPath(id));
     } catch (err) {
       console.error('Failed to start the buying guide:', err);
-      toast.error(t('createFailed'));
+      toast.error(serverError(err, t('createFailed')));
       setCreating(null);
     }
   };
@@ -147,17 +149,17 @@ export function ShoppingOpportunitiesView({
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead className="pl-6">{t('columns.page')}</TableHead>
+                  <TableHead className="ps-6">{t('columns.page')}</TableHead>
                   <TableHead>{t('columns.why')}</TableHead>
                   <TableHead>{t('columns.category')}</TableHead>
                   <TableHead>{t('columns.score')}</TableHead>
-                  <TableHead className="pr-6 text-right">{t('columns.action')}</TableHead>
+                  <TableHead className="pe-6 text-end">{t('columns.action')}</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {rows.map((row) => (
                   <TableRow key={row.key}>
-                    <TableCell className="min-w-[160px] max-w-[200px] whitespace-normal pl-6 xl:max-w-[260px]">
+                    <TableCell className="min-w-[160px] max-w-[200px] whitespace-normal ps-6 xl:max-w-[260px]">
                       <p className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
                         {t(`kinds.${row.kind}`)}
                         <Badge
@@ -189,7 +191,7 @@ export function ShoppingOpportunitiesView({
                         levelClassName="hidden xl:inline"
                       />
                     </TableCell>
-                    <TableCell className="pr-6 text-right">
+                    <TableCell className="pe-6 text-end">
                       {row.draft ? (
                         <Link
                           href={contentEditorPath(row.draft.id)}

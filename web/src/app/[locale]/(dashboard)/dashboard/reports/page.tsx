@@ -3,17 +3,30 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Link, useRouter } from '@/i18n/navigation';
 import { useTranslations } from 'next-intl';
+import { useServerErrorText } from '@/hooks/use-server-error';
 import { toast } from 'sonner';
 import { useBrandStore } from '@/stores/use-brand-store';
 import { useUpgradeGate } from '@/components/providers/upgrade-gate';
 import { useFeatureGate } from '@/hooks/use-feature-gate';
-import { createReport, getReports, deleteReport, type ReportListItem } from '@/lib/actions/reports';
+import { useUserRole } from '@/hooks/use-user-role';
+import {
+  createReport,
+  getReport,
+  getReports,
+  deleteReport,
+  renameReport,
+  type ReportListItem,
+} from '@/lib/actions/reports';
+import { getReportBranding } from '@/lib/actions/white-label';
+import { brandHasShipped } from '@/lib/actions/impact-report';
+import { saveReportPdf } from './_save-pdf';
 import { useChatPageContext } from '@/components/chat/panel/chat-panel-context';
 import { viewRows } from '@/lib/chat/page-view';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button, buttonVariants } from '@/components/ui/button';
 import { useChatAgentic } from '@/components/providers/chat-agentic-provider';
 import { Input } from '@/components/ui/input';
+import { DatePicker } from '@/components/ui/date-picker';
 import {
   Dialog,
   DialogContent,
@@ -31,7 +44,27 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import { Check, Crown, FileBarChart, Loader2, Plus, Trash2 } from 'lucide-react';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { REPORT_TEMPLATE_TITLES } from '@/lib/reports/template-titles';
+import { samePeriodReport } from '@/lib/reports/same-period';
+import {
+  Check,
+  Crown,
+  FileBarChart,
+  FileDown,
+  Link2,
+  Loader2,
+  MoreHorizontal,
+  Pencil,
+  Plus,
+  Trash2,
+} from 'lucide-react';
 import { formatDate } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import {
@@ -76,6 +109,7 @@ export default function ReportsPage() {
   // the upgrade dialog instead; reading and downloading reports stay open.
   const { guard } = useUpgradeGate();
   const tActions = useTranslations('readOnly.actions');
+  const serverError = useServerErrorText();
   const router = useRouter();
   const activeBrandId = useBrandStore((s) => s.activeBrandId);
   const brands = useBrandStore((s) => s.brands);
@@ -85,18 +119,44 @@ export default function ReportsPage() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
   const [pendingConfirm, setPendingConfirm] = useState<string | null>(null);
+  // Renaming is an Admin's or a Manager's, as the server checks (RP-11).
+  const { canManage } = useUserRole();
+  // Rename (UX audit RP-11): the report, and the title being typed.
+  const [renaming, setRenaming] = useState<ReportListItem | null>(null);
+  const [newTitle, setNewTitle] = useState('');
+  const [savingTitle, setSavingTitle] = useState(false);
 
   const [template, setTemplate] = useState<ReportTemplateId>('executive_summary');
   const [preset, setPreset] = useState<DatePreset>('30d');
   const [customRange, setCustomRange] = useState({ from: '', to: '' });
   const [reportTitle, setReportTitle] = useState('');
+  // A report with the same template and days, found on Generate (RP-11).
+  const [duplicate, setDuplicate] = useState<ReportListItem | null>(null);
   // US-1.1: the dialog can generate for any brand, defaulting to the active one.
   const [reportBrandId, setReportBrandId] = useState<string | null>(activeBrandId);
   // US-1.3: templates only pre-select; the user adjusts the module set freely.
   const [sections, setSections] = useState<Set<ReportSection>>(
     () => new Set(REPORT_TEMPLATES.find((tpl) => tpl.id === 'executive_summary')!.sections),
   );
+
+  // What Ansvisor did for you shows once the brand has shipped something:
+  // before, the report is empty. Shown only on a yes, so it never flashes.
+  const [shipped, setShipped] = useState<{ brandId: string; yes: boolean } | null>(null);
+  useEffect(() => {
+    if (!chatAgentic || !activeBrandId) return;
+    let current = true;
+    brandHasShipped(activeBrandId)
+      .then((yes) => {
+        if (current) setShipped({ brandId: activeBrandId, yes });
+      })
+      .catch(() => {});
+    return () => {
+      current = false;
+    };
+  }, [chatAgentic, activeBrandId]);
+  const showImpact = chatAgentic && shipped?.brandId === activeBrandId && shipped.yes;
 
   const reportBrand = brands.find((b) => b.id === (reportBrandId ?? activeBrandId));
   // Shopping is brand-pref-gated: hidden here exactly like the sidebar hides
@@ -111,6 +171,7 @@ export default function ReportsPage() {
 
   const selectTemplate = (id: ReportTemplateId) => {
     setTemplate(id);
+    setDuplicate(null);
     // Templates carry a sensible default window (weekly → 7d) and a default
     // module set; the user can still override both below.
     const def = REPORT_TEMPLATES.find((tpl) => tpl.id === id);
@@ -132,6 +193,7 @@ export default function ReportsPage() {
   const openDialog = guard(
     () => {
       setReportBrandId(activeBrandId);
+      setDuplicate(null);
       setDialogOpen(true);
     },
     { action: tActions('generateReports') },
@@ -144,11 +206,11 @@ export default function ReportsPage() {
       setReports(await getReports(activeBrandId));
     } catch (err) {
       console.error('Failed to load reports:', err);
-      toast.error(t('loadFailed'));
+      toast.error(serverError(err, t('loadFailed')));
     } finally {
       setLoading(false);
     }
-  }, [activeBrandId, t]);
+  }, [activeBrandId, t, serverError]);
 
   useEffect(() => {
     load();
@@ -173,7 +235,12 @@ export default function ReportsPage() {
       : null,
   );
 
-  const handleGenerate = async () => {
+  /**
+   * Generate; a report of the same template and days on this brand asks
+   * first, "Same period as an existing report. Open it?" (UX audit RP-11),
+   * unless `anyway`.
+   */
+  const handleGenerate = async (anyway = false) => {
     const targetBrandId = reportBrandId ?? activeBrandId;
     if (!targetBrandId) return;
     const { dateFrom, dateTo } = getDateRange(preset, customRange);
@@ -185,6 +252,15 @@ export default function ReportsPage() {
       toast.error(t('selectSections'));
       return;
     }
+    const same =
+      targetBrandId === activeBrandId
+        ? samePeriodReport(reports, { template, dateFrom, dateTo })
+        : null;
+    if (same && !anyway) {
+      setDuplicate(same);
+      return;
+    }
+    setDuplicate(null);
     setGenerating(true);
     try {
       const { id } = await createReport(targetBrandId, {
@@ -199,9 +275,67 @@ export default function ReportsPage() {
       router.push(`/dashboard/reports/${id}`);
     } catch (err) {
       console.error('Report generation error:', err);
-      toast.error(t('generateFailed'));
+      toast.error(serverError(err, t('generateFailed')));
     } finally {
       setGenerating(false);
+    }
+  };
+
+  const handleRename = async () => {
+    if (!renaming || savingTitle) return;
+    const title = newTitle.replace(/\s+/g, ' ').trim();
+    if (!title || title === renaming.title) {
+      setRenaming(null);
+      return;
+    }
+    setSavingTitle(true);
+    try {
+      if (!(await renameReport(renaming.id, title))) throw new Error('not renamed');
+      setReports((prev) => prev.map((r) => (r.id === renaming.id ? { ...r, title } : r)));
+      setRenaming(null);
+      toast.success(t('rename.done'));
+    } catch (err) {
+      console.error('Report rename error:', err);
+      toast.error(t('rename.failed'));
+    } finally {
+      setSavingTitle(false);
+    }
+  };
+
+  // Share and Download in the row's menu (UX audit RP-09). The link opens the
+  // report for anyone in the workspace; reports have no public link.
+  const handleCopyLink = async (id: string) => {
+    try {
+      await navigator.clipboard.writeText(`${window.location.origin}/dashboard/reports/${id}`);
+      toast.success(t('linkCopied'));
+    } catch {
+      toast.error(t('copyLinkFailed'));
+    }
+  };
+
+  // The same PDF as the report's page: the saved report and the white label
+  // kit are read first, and a kit that couldn't be read makes no PDF.
+  const handleDownload = async (item: ReportListItem) => {
+    setDownloadingId(item.id);
+    try {
+      const [report, branding] = await Promise.all([
+        getReport(item.id),
+        getReportBranding(item.brandId).catch(() => ({ ok: false }) as const),
+      ]);
+      if (!report) {
+        toast.error(t('notFound'));
+        return;
+      }
+      if (!branding.ok) {
+        toast.error(t('brandingFailed'));
+        return;
+      }
+      await saveReportPdf(report, branding.branding);
+    } catch (err) {
+      console.error('PDF download error:', err);
+      toast.error(t('downloadFailed'));
+    } finally {
+      setDownloadingId(null);
     }
   };
 
@@ -213,7 +347,7 @@ export default function ReportsPage() {
       setPendingConfirm(null);
     } catch (err) {
       console.error('Report delete error:', err);
-      toast.error(t('deleteFailed'));
+      toast.error(serverError(err, t('deleteFailed')));
     } finally {
       setDeletingId(null);
     }
@@ -228,8 +362,8 @@ export default function ReportsPage() {
             <p className="text-muted-foreground">{t('description')}</p>
           </div>
           <div className="flex items-center gap-2">
-            {/* What Ansvisor did for you (CHAT-22 §2 item 5): kept only with the new Chat on. */}
-            {chatAgentic && (
+            {/* What Ansvisor did for you (CHAT-22 §2 item 5): with the new Chat on, once the brand has shipped. */}
+            {showImpact && (
               <Link
                 href="/dashboard/reports/impact"
                 data-action="reports.openImpact"
@@ -269,7 +403,7 @@ export default function ReportsPage() {
                     <TableHead>{t('columns.title')}</TableHead>
                     <TableHead>{t('columns.period')}</TableHead>
                     <TableHead>{t('columns.created')}</TableHead>
-                    <TableHead className="w-[140px] text-right">{t('columns.actions')}</TableHead>
+                    <TableHead className="w-[140px] text-end">{t('columns.actions')}</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -277,7 +411,11 @@ export default function ReportsPage() {
                     <TableRow key={report.id}>
                       <TableCell>
                         <span className="font-medium">{report.title}</span>
+                        {/* The template's name under a title of the person's own;
+                            a default title already is it. */}
                         {KNOWN_TEMPLATE_IDS.has(report.template) &&
+                          report.title !==
+                            REPORT_TEMPLATE_TITLES[report.template as ReportTemplateId] &&
                           t.has(`templates.${report.template}.name`) && (
                             <span className="mt-0.5 block text-xs text-muted-foreground">
                               {t(`templates.${report.template}.name`)}
@@ -290,7 +428,7 @@ export default function ReportsPage() {
                       <TableCell className="text-muted-foreground">
                         {formatDate(report.createdAt)}
                       </TableCell>
-                      <TableCell className="text-right">
+                      <TableCell className="text-end">
                         <div className="flex items-center justify-end gap-1">
                           <Button
                             size="sm"
@@ -299,27 +437,114 @@ export default function ReportsPage() {
                           >
                             {tc('view')}
                           </Button>
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            className="text-muted-foreground hover:text-destructive"
-                            disabled={deletingId === report.id}
-                            onClick={guard(() => setPendingConfirm(report.id), {
-                              action: tActions('deleteReports'),
-                            })}
-                          >
-                            {deletingId === report.id ? (
-                              <Loader2 className="h-4 w-4 animate-spin" />
-                            ) : (
-                              <Trash2 className="h-4 w-4" />
-                            )}
-                          </Button>
+                          {/* Delete sits in the row's menu, away from View, and asks
+                              first (UX audit RP-10). */}
+                          <DropdownMenu>
+                            <DropdownMenuTrigger
+                              className="rounded p-1.5 text-muted-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-50"
+                              disabled={deletingId === report.id || downloadingId === report.id}
+                              aria-label={t('rowMenuLabel', { title: report.title })}
+                            >
+                              {deletingId === report.id || downloadingId === report.id ? (
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                              ) : (
+                                <MoreHorizontal className="h-4 w-4" />
+                              )}
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end" className="w-44">
+                              {canManage && (
+                                <DropdownMenuItem
+                                  data-action="reports.rename"
+                                  onClick={guard(
+                                    () => {
+                                      setNewTitle(report.title);
+                                      setRenaming(report);
+                                    },
+                                    { action: tActions('renameReports') },
+                                  )}
+                                >
+                                  <Pencil className="h-4 w-4" />
+                                  {t('rename.item')}
+                                </DropdownMenuItem>
+                              )}
+                              <DropdownMenuItem
+                                data-action="reports.copyLink"
+                                onClick={() => void handleCopyLink(report.id)}
+                              >
+                                <Link2 className="h-4 w-4" />
+                                {t('copyLink')}
+                              </DropdownMenuItem>
+                              <DropdownMenuItem
+                                data-action="reports.downloadPdf"
+                                onClick={() => void handleDownload(report)}
+                              >
+                                <FileDown className="h-4 w-4" />
+                                {t('downloadPDF')}
+                              </DropdownMenuItem>
+                              <DropdownMenuSeparator />
+                              <DropdownMenuItem
+                                variant="destructive"
+                                onClick={guard(() => setPendingConfirm(report.id), {
+                                  action: tActions('deleteReports'),
+                                })}
+                              >
+                                <Trash2 className="h-4 w-4" />
+                                {t('deleteTitle')}
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
                         </div>
                       </TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
               </Table>
+              <Dialog
+                open={renaming !== null}
+                onOpenChange={(v) => !v && !savingTitle && setRenaming(null)}
+              >
+                <DialogContent className="sm:max-w-sm">
+                  <DialogHeader>
+                    <DialogTitle>{t('rename.title')}</DialogTitle>
+                    <DialogDescription>{t('rename.description')}</DialogDescription>
+                  </DialogHeader>
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      void handleRename();
+                    }}
+                    className="space-y-4"
+                  >
+                    <Input
+                      autoFocus
+                      aria-label={t('rename.label')}
+                      data-action="reports.renameTitle"
+                      value={newTitle}
+                      maxLength={200}
+                      onChange={(e) => setNewTitle(e.target.value)}
+                      disabled={savingTitle}
+                    />
+                    <DialogFooter>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        onClick={() => setRenaming(null)}
+                        disabled={savingTitle}
+                      >
+                        {tc('cancel')}
+                      </Button>
+                      <Button
+                        type="submit"
+                        data-action="reports.saveTitle"
+                        disabled={savingTitle || !newTitle.trim()}
+                      >
+                        {savingTitle && <Loader2 className="me-2 h-4 w-4 animate-spin" />}
+                        {t('rename.save')}
+                      </Button>
+                    </DialogFooter>
+                  </form>
+                </DialogContent>
+              </Dialog>
               <Dialog
                 open={pendingConfirm !== null}
                 onOpenChange={(v) => !v && setPendingConfirm(null)}
@@ -346,7 +571,7 @@ export default function ReportsPage() {
                       }}
                     >
                       {deletingId === pendingConfirm && (
-                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        <Loader2 className="me-2 h-4 w-4 animate-spin" />
                       )}
                       {tc('delete')}
                     </Button>
@@ -376,7 +601,8 @@ export default function ReportsPage() {
                     onClick={() => selectTemplate(tpl.id)}
                     disabled={generating}
                     className={cn(
-                      'rounded-lg border p-3 text-left transition-colors',
+                      // Top-aligned, the cards' text starts on one line (UX audit RP-13).
+                      'flex h-full flex-col justify-start rounded-lg border p-3 text-start transition-colors',
                       template === tpl.id
                         ? 'border-primary bg-primary/5'
                         : 'border-border hover:border-muted-foreground/40',
@@ -407,6 +633,52 @@ export default function ReportsPage() {
                   </button>
                 ))}
               </div>
+            </div>
+
+            {/* The range the template set, right under it, to change (RP-13). */}
+            <div className="space-y-2">
+              <p className="text-sm font-medium">{t('dateRange')}</p>
+              <p className="text-xs text-muted-foreground">{t('dateRangeHint')}</p>
+              <div className="flex gap-1">
+                {(['7d', '30d', '90d', 'custom'] as DatePreset[]).map((p) => (
+                  <button
+                    key={p}
+                    type="button"
+                    onClick={() => {
+                      setPreset(p);
+                      setDuplicate(null);
+                    }}
+                    disabled={generating}
+                    className={cn(
+                      'rounded-md border px-3 py-1.5 text-xs transition-colors',
+                      preset === p
+                        ? 'border-primary bg-primary/10 font-medium text-primary'
+                        : 'border-border text-muted-foreground hover:border-muted-foreground/40',
+                    )}
+                  >
+                    {t(`presets.${p}`)}
+                  </button>
+                ))}
+              </div>
+              {preset === 'custom' && (
+                <div className="flex items-center gap-2 pt-1">
+                  <DatePicker
+                    aria-label={tc('from')}
+                    value={customRange.from || null}
+                    onChange={(day) => setCustomRange((r) => ({ ...r, from: day ?? '' }))}
+                    disabled={generating}
+                    className="h-9 text-sm"
+                  />
+                  <span className="text-xs text-muted-foreground">—</span>
+                  <DatePicker
+                    aria-label={tc('to')}
+                    value={customRange.to || null}
+                    onChange={(day) => setCustomRange((r) => ({ ...r, to: day ?? '' }))}
+                    disabled={generating}
+                    className="h-9 text-sm"
+                  />
+                </div>
+              )}
             </div>
 
             {brands.length > 1 && (
@@ -442,7 +714,7 @@ export default function ReportsPage() {
                       onClick={() => toggleSection(s)}
                       disabled={generating || locked}
                       className={cn(
-                        'flex items-center gap-2 rounded-md border px-2.5 py-1.5 text-left text-xs transition-colors',
+                        'flex items-center gap-2 rounded-md border px-2.5 py-1.5 text-start text-xs transition-colors',
                         on
                           ? 'border-primary bg-primary/5'
                           : 'border-border text-muted-foreground hover:border-muted-foreground/40',
@@ -460,7 +732,7 @@ export default function ReportsPage() {
                       </span>
                       {t(`sections.${s}`)}
                       {locked && (
-                        <span className="ml-auto inline-flex items-center gap-0.5 rounded border px-1 text-[10px] font-medium">
+                        <span className="ms-auto inline-flex items-center gap-0.5 rounded border px-1 text-[10px] font-medium">
                           <Crown aria-hidden className="h-2.5 w-2.5" />
                           {requiredPlanFor('crm_integrations')}
                         </span>
@@ -480,54 +752,42 @@ export default function ReportsPage() {
                 disabled={generating}
               />
             </div>
-
-            <div className="space-y-2">
-              <p className="text-sm font-medium">{t('dateRange')}</p>
-              <div className="flex gap-1">
-                {(['7d', '30d', '90d', 'custom'] as DatePreset[]).map((p) => (
-                  <button
-                    key={p}
-                    type="button"
-                    onClick={() => setPreset(p)}
-                    disabled={generating}
-                    className={cn(
-                      'rounded-md border px-3 py-1.5 text-xs transition-colors',
-                      preset === p
-                        ? 'border-primary bg-primary/10 font-medium text-primary'
-                        : 'border-border text-muted-foreground hover:border-muted-foreground/40',
-                    )}
-                  >
-                    {t(`presets.${p}`)}
-                  </button>
-                ))}
-              </div>
-              {preset === 'custom' && (
-                <div className="flex items-center gap-2 pt-1">
-                  <Input
-                    type="date"
-                    value={customRange.from}
-                    onChange={(e) => setCustomRange((r) => ({ ...r, from: e.target.value }))}
-                    disabled={generating}
-                    className="text-sm"
-                  />
-                  <span className="text-xs text-muted-foreground">—</span>
-                  <Input
-                    type="date"
-                    value={customRange.to}
-                    onChange={(e) => setCustomRange((r) => ({ ...r, to: e.target.value }))}
-                    disabled={generating}
-                    className="text-sm"
-                  />
-                </div>
-              )}
-            </div>
           </div>
 
-          <DialogFooter>
+          {duplicate && (
+            <div
+              role="status"
+              data-slot="report-duplicate"
+              className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200"
+            >
+              <span className="min-w-0 flex-1">
+                {t('duplicate.line', { title: duplicate.title })}
+              </span>
+              <button
+                type="button"
+                data-action="reports.openDuplicate"
+                onClick={() => router.push(`/dashboard/reports/${duplicate.id}`)}
+                className="font-medium underline underline-offset-2"
+              >
+                {t('duplicate.open')}
+              </button>
+              <button
+                type="button"
+                data-action="reports.generateAnyway"
+                onClick={() => void handleGenerate(true)}
+                className="font-medium underline underline-offset-2"
+              >
+                {t('duplicate.anyway')}
+              </button>
+            </div>
+          )}
+
+          {/* Always in view, the dialog scrolling above it (RP-13). */}
+          <DialogFooter className="sticky -bottom-4 z-10 bg-card">
             <Button variant="outline" onClick={() => setDialogOpen(false)} disabled={generating}>
               {tc('cancel')}
             </Button>
-            <Button onClick={handleGenerate} disabled={generating} className="gap-2">
+            <Button onClick={() => void handleGenerate()} disabled={generating} className="gap-2">
               {generating && <Loader2 className="h-4 w-4 animate-spin" />}
               {generating ? t('generating') : t('generateReport')}
             </Button>

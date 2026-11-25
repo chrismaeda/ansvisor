@@ -4,6 +4,7 @@ import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { useFormatter, useNow, useTranslations } from 'next-intl';
 import { useFailureToast } from '@/hooks/use-failure-toast';
+import { useServerErrorText } from '@/hooks/use-server-error';
 import { useSearchParams } from 'next/navigation';
 import { Link, usePathname, useRouter } from '@/i18n/navigation';
 import { PROMPTS_BASE, sectionFor, sectionFromPath } from '@/lib/prompts-routes';
@@ -26,6 +27,7 @@ import {
   countByStatus,
   locationQuotaFromUsage,
   locationsWarning,
+  planEnded,
   matchesStatusFilter,
   newFirst,
   planUsageHref,
@@ -37,6 +39,7 @@ import {
 import {
   LocationFilter,
   LocationsWarningLine,
+  PlanEndedLine,
   NotAnalyzedLine,
   PromptsListSwitch,
   PromptsMoreMenu,
@@ -280,6 +283,7 @@ import {
 import { viewerTimeZone } from '@/lib/time-zone';
 import { exportFileName } from '@/lib/white-label/export-name';
 import { HeaderWithAiUsage } from '@/components/ai-usage/ai-usage-meter';
+import { PromptsInfo } from './_prompts-guide';
 
 // ─── Info Tooltip ─────────────────────────────────────────────────────────────
 
@@ -692,6 +696,7 @@ function AddPromptDialog({
   const { allowedScraperIds, allowedModelIds, visibleScrapers, visibleModels } =
     useAllowedEngines(shoppingEnabled);
   const tCommon = useTranslations('common');
+  const serverError = useServerErrorText();
 
   const [text, setText] = useState('');
   const [category, setCategory] = useState('');
@@ -797,7 +802,7 @@ function AddPromptDialog({
       if ('error' in result) {
         PROMPT_ADD.failed(result.code);
         if (isNoTopics(result)) setNoTopics(true);
-        else setError(result.error);
+        else setError(serverError(result, result.error));
         return;
       }
       const added = result.importedIdx.length;
@@ -900,7 +905,7 @@ function AddPromptDialog({
                   onClick={addToList}
                   disabled={saving || !text.trim() || !enginesChosen}
                 >
-                  <Plus className="mr-1 h-3.5 w-3.5" />
+                  <Plus className="me-1 h-3.5 w-3.5" />
                   Add to list
                 </Button>
 
@@ -957,12 +962,12 @@ function AddPromptDialog({
                 >
                   {saving ? (
                     <>
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      <Loader2 className="me-2 h-4 w-4 animate-spin" />
                       Saving…
                     </>
                   ) : (
                     <>
-                      <Plus className="mr-2 h-4 w-4" />
+                      <Plus className="me-2 h-4 w-4" />
                       {toSave.length > 1 ? `Save ${toSave.length} & close` : 'Save & close'}
                     </>
                   )}
@@ -1020,6 +1025,8 @@ function EditPromptDialog({
   const { allowedScraperIds, allowedModelIds, visibleScrapers, visibleModels } =
     useAllowedEngines(shoppingEnabled);
   const tTags = useTranslations('prompts.tags');
+  const tErrors = useTranslations('prompts.errors');
+  const serverError = useServerErrorText();
 
   const [text, setText] = useState('');
   const [category, setCategory] = useState('');
@@ -1082,11 +1089,7 @@ function EditPromptDialog({
       if (isActive !== prompt.isActive) {
         const result = await setPromptActive(prompt.id, isActive);
         if ('error' in result) {
-          setError(
-            result.code === 'plan_limit'
-              ? result.error
-              : 'Failed to update prompt. Please try again.',
-          );
+          setError(serverError(result, tErrors('updateFailed')));
           return;
         }
         activeChanged = true;
@@ -1101,8 +1104,8 @@ function EditPromptDialog({
       onClose();
       toast.success('Prompt updated.');
       onChanged();
-    } catch {
-      setError('Failed to update prompt. Please try again.');
+    } catch (err) {
+      setError(serverError(err, tErrors('updateFailed')));
       // The pause or resume already went through; show it in the table.
       if (activeChanged) onChanged();
     } finally {
@@ -1163,7 +1166,7 @@ function EditPromptDialog({
             {tags.length > 0 && (
               <div className="flex flex-wrap gap-1.5">
                 {tags.map((tag) => (
-                  <Badge key={tag} variant="secondary" className="gap-1 pr-1.5">
+                  <Badge key={tag} variant="secondary" className="gap-1 pe-1.5">
                     {tag}
                     <button
                       type="button"
@@ -1229,9 +1232,9 @@ function EditPromptDialog({
                   disabled={deleting}
                 >
                   {deleting ? (
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    <Loader2 className="me-2 h-4 w-4 animate-spin" />
                   ) : (
-                    <Trash2 className="mr-2 h-4 w-4" />
+                    <Trash2 className="me-2 h-4 w-4" />
                   )}
                   Delete
                 </Button>
@@ -1242,11 +1245,11 @@ function EditPromptDialog({
               <Button
                 type="button"
                 variant="ghost"
-                className="text-red-500 hover:text-red-600 sm:mr-auto"
+                className="text-red-500 hover:text-red-600 sm:me-auto"
                 onClick={() => setConfirmingDelete(true)}
                 disabled={busy}
               >
-                <Trash2 className="mr-2 h-4 w-4" />
+                <Trash2 className="me-2 h-4 w-4" />
                 Delete
               </Button>
               <Button type="button" variant="outline" onClick={handleClose} disabled={busy}>
@@ -1259,7 +1262,7 @@ function EditPromptDialog({
               >
                 {saving ? (
                   <>
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    <Loader2 className="me-2 h-4 w-4 animate-spin" />
                     Saving…
                   </>
                 ) : (
@@ -2219,7 +2222,10 @@ export default function PromptsPage() {
       {/* Header: the title alone, with the AI meter and Ask Chat at the right.
           The meter keeps its room on every tab, read or not, so the row never moves. */}
       <HeaderWithAiUsage reserveMeter>
-        <h1 className="text-2xl font-bold tracking-tight">{tHeader('title')}</h1>
+        <div className="flex items-center gap-2">
+          <h1 className="text-2xl font-bold tracking-tight">{tHeader('title')}</h1>
+          <PromptsInfo brandId={activeBrandId} />
+        </div>
       </HeaderWithAiUsage>
 
       <Tabs value={tab} onValueChange={(v) => showSection(v as TabId, view)}>
@@ -2280,7 +2286,7 @@ export default function PromptsPage() {
                 trackedCount={trackedCount}
               />
             )}
-            <div className="ml-auto flex flex-wrap items-end justify-end gap-3">
+            <div className="ms-auto flex flex-wrap items-end justify-end gap-3">
               <DateRangeFilter
                 value={rangePreset}
                 presets={PROMPT_RANGE_PRESETS}
@@ -2335,6 +2341,7 @@ export default function PromptsPage() {
                   quota={locationQuota}
                   onShow={() => setStatusFilter('waiting')}
                   onFreeUp={canSwap ? () => setSwapFor(waitingFirst.id) : undefined}
+                  addMore={canSwap && locationQuota?.planId === 'growth'}
                 />
               )}
               {firstRun && allPrompts.length > 0 && <FirstRunEmptyState run={firstRun} />}
@@ -2384,6 +2391,7 @@ export default function PromptsPage() {
                     {usageWarning && (
                       <LocationsWarningLine warning={usageWarning} planHref={planHref} />
                     )}
+                    {planEnded(usageState) && <PlanEndedLine planHref={planHref} />}
                     {!loading && volumesState === 'ready' && unanalyzedCount > 0 && (
                       <NotAnalyzedLine
                         count={unanalyzedCount}
@@ -2667,12 +2675,12 @@ export default function PromptsPage() {
                   <div className="flex items-center justify-between gap-4 flex-wrap">
                     <CardTitle className="text-sm font-medium">Prompt Volumes</CardTitle>
                     <div className="relative w-60">
-                      <Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-muted-foreground" />
+                      <Search className="absolute start-2.5 top-2.5 h-3.5 w-3.5 text-muted-foreground" />
                       <Input
                         placeholder="Search prompts…"
                         value={search}
                         onChange={(e) => setSearch(e.target.value)}
-                        className="pl-8 h-8 text-xs"
+                        className="ps-8 h-8 text-xs"
                       />
                     </div>
                   </div>
@@ -2681,12 +2689,12 @@ export default function PromptsPage() {
                   <Table>
                     <TableHeader>
                       <TableRow>
-                        <TableHead className="pl-6">Prompt</TableHead>
+                        <TableHead className="ps-6">Prompt</TableHead>
 
-                        <ColHead className="text-right" tooltip={tVolumes('googleTip')}>
+                        <ColHead className="text-end" tooltip={tVolumes('googleTip')}>
                           {tVolumes('googleColumn')}
                         </ColHead>
-                        <ColHead className="text-right" tooltip={tVolumes('aiTip')}>
+                        <ColHead className="text-end" tooltip={tVolumes('aiTip')}>
                           {tVolumes('aiColumn')}
                         </ColHead>
                         <ColHead
@@ -2700,14 +2708,14 @@ export default function PromptsPage() {
                     <TableBody>
                       {filtered.map((row) => (
                         <TableRow key={row.id} className="hover:bg-muted/50">
-                          <TableCell className="pl-6 font-medium text-sm max-w-[280px]">
+                          <TableCell className="ps-6 font-medium text-sm max-w-[280px]">
                             <span className="line-clamp-1">{row.promptText}</span>
                           </TableCell>
 
-                          <TableCell className="text-right tabular-nums text-sm text-muted-foreground">
+                          <TableCell className="text-end tabular-nums text-sm text-muted-foreground">
                             {formatNumber(row.totalGoogleVolume)}
                           </TableCell>
-                          <TableCell className="text-right">
+                          <TableCell className="text-end">
                             <EstimateRange
                               estimate={estimateOf(row)}
                               handle={volumeTableNote}
@@ -2750,7 +2758,7 @@ export default function PromptsPage() {
                       <CardTitle className="text-sm font-medium">
                         High Opportunity Prompts
                       </CardTitle>
-                      <span className="text-xs text-muted-foreground ml-1">
+                      <span className="text-xs text-muted-foreground ms-1">
                         Prompts with highest estimated AI search demand
                       </span>
                     </div>
@@ -2759,18 +2767,15 @@ export default function PromptsPage() {
                     <Table>
                       <TableHeader>
                         <TableRow>
-                          <TableHead className="pl-6">Prompt</TableHead>
-                          <ColHead
-                            className="text-right"
-                            tooltip={tVolumes('opportunityVolumeTip')}
-                          >
+                          <TableHead className="ps-6">Prompt</TableHead>
+                          <ColHead className="text-end" tooltip={tVolumes('opportunityVolumeTip')}>
                             Est. AI Volume
                           </ColHead>
                           <ColHead className="text-center" tooltip="The detected search intent.">
                             Intent
                           </ColHead>
                           <ColHead
-                            className="text-right pr-6"
+                            className="text-end pe-6"
                             tooltip={tVolumes('opportunityLevelTip', {
                               high: formatCompactNumber(OPPORTUNITY_HIGH_VOLUME),
                               min: formatCompactNumber(OPPORTUNITY_MIN_VOLUME),
@@ -2783,10 +2788,10 @@ export default function PromptsPage() {
                       <TableBody>
                         {opportunityRows.map((row) => (
                           <TableRow key={row.id} className="hover:bg-muted/50">
-                            <TableCell className="pl-6 font-medium text-sm">
+                            <TableCell className="ps-6 font-medium text-sm">
                               {row.promptText}
                             </TableCell>
-                            <TableCell className="text-right">
+                            <TableCell className="text-end">
                               <EstimateRange
                                 estimate={estimateOf(row)}
                                 handle={opportunityTableNote}
@@ -2801,7 +2806,7 @@ export default function PromptsPage() {
                                 {INTENT_LABELS[row.intent] || row.intent}
                               </Badge>
                             </TableCell>
-                            <TableCell className="text-right pr-6">
+                            <TableCell className="text-end pe-6">
                               <Badge
                                 variant="outline"
                                 className={cn(
@@ -3272,6 +3277,8 @@ function AllPromptsTab({
   const tUsage = useTranslations('prompts.usage');
   const format = useFormatter();
   const tDelete = useTranslations('prompts.bulkDelete');
+  const tErrors = useTranslations('prompts.errors');
+  const serverError = useServerErrorText();
   const tPerformance = useTranslations('prompts.performance');
   const tStatus = useTranslations('prompts.status');
   const tWaiting = useTranslations('prompts.waiting');
@@ -3480,10 +3487,11 @@ function AllPromptsTab({
           }
           // Resuming needs a free slot on the plan; the message says how many.
           toast.error(
-            result.code === 'plan_limit'
-              ? 'Not enough room to resume'
-              : 'Failed to update the prompt.',
-            { description: result.code === 'plan_limit' ? result.error : prompt.text },
+            result.code === 'plan_limit' ? tErrors('noRoomToResume') : tErrors('updateFailed'),
+            {
+              description:
+                result.code === 'plan_limit' ? serverError(result, result.error) : prompt.text,
+            },
           );
           return;
         }
@@ -3496,11 +3504,11 @@ function AllPromptsTab({
           { description: prompt.text },
         );
         onChanged();
-      } catch {
-        toast.error('Failed to update the prompt.');
+      } catch (err) {
+        toast.error(serverError(err, tErrors('updateFailed')));
       }
     },
-    [onChanged, onSwap, tWaiting],
+    [onChanged, onSwap, tWaiting, tErrors, serverError],
   );
 
   // Bulk Pause / Resume: one write for the selected prompts that change.
@@ -3519,8 +3527,8 @@ function AllPromptsTab({
           // Resuming needs free slots on the plan; the message says how many.
           const planLimit = 'code' in result && result.code === 'plan_limit';
           toast.error(
-            planLimit ? 'Not enough room to resume' : `Failed to ${verb} the prompts.`,
-            planLimit ? { description: result.error } : undefined,
+            planLimit ? tErrors('noRoomToResume') : tErrors('bulkFailed', { action: verb }),
+            planLimit ? { description: serverError(result, result.error) } : undefined,
           );
           return;
         }
@@ -3530,14 +3538,20 @@ function AllPromptsTab({
           );
         }
         if (result.updated < ids.length) {
-          toast.error(`${ids.length - result.updated} of ${ids.length} couldn't be ${verb}d.`);
+          toast.error(
+            tErrors('bulkPartial', {
+              action: verb,
+              failed: ids.length - result.updated,
+              total: ids.length,
+            }),
+          );
         }
         onChanged();
       } finally {
         setBulkBusy(false);
       }
     },
-    [onChanged],
+    [onChanged, tErrors, serverError],
   );
 
   // "Suggest content" (PROMPT-006): one content opportunity for a prompt,
@@ -3734,6 +3748,10 @@ function AllPromptsTab({
   // Custom tags (#2151, #2378): any set of them, all or any matching.
   const [tagFilter, setTagFilter] = useState<string[]>([]);
   const [tagMatch, setTagMatch] = useState<'all' | 'any'>('all');
+  // The brand the picked tags belong to: a brand switch swaps the whole
+  // roster, so the filter starts over instead of pointing at the old brand's
+  // tags.
+  const [tagFilterBrand, setTagFilterBrand] = useState(activeBrandId);
   // Optimistic per-row status overrides — the prompts prop belongs to the
   // parent's load cycle; a full reload for a one-column change would flash
   // the whole table.
@@ -3920,6 +3938,18 @@ function AllPromptsTab({
     () => [...new Set(prompts.flatMap((p) => p.tags ?? []))].sort(),
     [prompts],
   );
+  // A bulk removal can take the last prompt carrying a filtered tag, and the
+  // popover lists only live options, so the filter would stick on a tag that
+  // can't be cleared — with no tags left it would vanish while the table
+  // stays empty. Prune the filter to the live options; on a brand switch,
+  // start over. Adjust-state-during-render, like the positions panel above.
+  if (tagFilterBrand !== activeBrandId) {
+    setTagFilterBrand(activeBrandId);
+    if (tagFilter.length > 0) setTagFilter([]);
+  } else if (tagFilter.length > 0) {
+    const live = tagFilter.filter((tag) => tagOptions.includes(tag));
+    if (live.length !== tagFilter.length) setTagFilter(live);
+  }
 
   const performanceCounts = useMemo(() => {
     const counts: Record<PerformanceFilter, number> = {
@@ -4138,7 +4168,7 @@ function AllPromptsTab({
     visibility: (
       <SortableHead
         key="visibility"
-        className="text-right"
+        className="text-end"
         tooltip={tTips('visibility', { range: rangeLabel })}
         sortKey="visibility"
         activeSort={latenessOrder ? null : activeSort}
@@ -4151,7 +4181,7 @@ function AllPromptsTab({
     mentions: (
       <SortableHead
         key="mentions"
-        className="text-right"
+        className="text-end"
         tooltip={tTips('mentions', { range: rangeLabel })}
         sortKey="mentions"
         activeSort={latenessOrder ? null : activeSort}
@@ -4164,7 +4194,7 @@ function AllPromptsTab({
     citations: (
       <SortableHead
         key="citations"
-        className="text-right"
+        className="text-end"
         tooltip={tTips('citations', { range: rangeLabel })}
         sortKey="citations"
         activeSort={latenessOrder ? null : activeSort}
@@ -4177,7 +4207,7 @@ function AllPromptsTab({
     positions: (
       <SortableHead
         key="positions"
-        className="pl-8"
+        className="ps-8"
         tooltip={tTips('positions', { range: rangeLabel })}
         sortKey="position"
         activeSort={latenessOrder ? null : activeSort}
@@ -4190,7 +4220,7 @@ function AllPromptsTab({
     volume: (
       <SortableHead
         key="volume"
-        className="text-right"
+        className="text-end"
         tooltip={tTips('volume')}
         sortKey="volume"
         activeSort={latenessOrder ? null : activeSort}
@@ -4208,7 +4238,7 @@ function AllPromptsTab({
     runs: (
       <SortableHead
         key="runs"
-        className="text-right"
+        className="text-end"
         tooltip={tTips('runs', { range: rangeLabel })}
         sortKey="runs"
         activeSort={latenessOrder ? null : activeSort}
@@ -4221,7 +4251,7 @@ function AllPromptsTab({
     added: (
       <SortableHead
         key="added"
-        className="text-right"
+        className="text-end"
         tooltip={tTips('added')}
         sortKey="added"
         activeSort={latenessOrder ? null : activeSort}
@@ -4234,7 +4264,7 @@ function AllPromptsTab({
     lastRun: (
       <SortableHead
         key="lastRun"
-        className="text-right"
+        className="text-end"
         tooltip={tTips('lastRun')}
         sortKey="lastRun"
         activeSort={latenessOrder ? null : activeSort}
@@ -4344,12 +4374,12 @@ function AllPromptsTab({
             </SelectContent>
           </Select>
           <div className="relative w-60">
-            <Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-muted-foreground" />
+            <Search className="absolute start-2.5 top-2.5 h-3.5 w-3.5 text-muted-foreground" />
             <Input
               placeholder="Search prompts…"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              className="pl-8 h-8 text-xs"
+              className="ps-8 h-8 text-xs"
             />
           </div>
           {layout === 'table' && (
@@ -4484,7 +4514,7 @@ function AllPromptsTab({
             )}
             <TableHeader>
               <TableRow>
-                <TableHead className="pl-6">
+                <TableHead className="ps-6">
                   {onEditPrompt ? (
                     <div className="flex items-center gap-3">
                       <Checkbox
@@ -4501,7 +4531,7 @@ function AllPromptsTab({
                 {columns.map((id) => {
                   const loc = parseLocationColumn(id);
                   return loc ? (
-                    <TableHead key={id} className="bg-muted/40 text-right">
+                    <TableHead key={id} className="bg-muted/40 text-end">
                       <span className="block text-xs font-medium">{tMetrics(loc.metric)}</span>
                       <span className="block text-[11px] font-normal text-muted-foreground">
                         {regionLabel(loc.region)}
@@ -4512,7 +4542,7 @@ function AllPromptsTab({
                   );
                 })}
                 {onEditPrompt && (
-                  <TableHead className="text-right pr-6 w-[60px]">
+                  <TableHead className="text-end pe-6 w-[60px]">
                     <span className="sr-only">Actions</span>
                   </TableHead>
                 )}
@@ -4621,7 +4651,7 @@ function AllPromptsTab({
                     </TableCell>
                   ),
                   visibility: (
-                    <TableCell key="visibility" className="text-right">
+                    <TableCell key="visibility" className="text-end">
                       {vis ? (
                         <div
                           className="inline-flex items-center gap-2 justify-end min-w-[110px]"
@@ -4657,17 +4687,17 @@ function AllPromptsTab({
                     </TableCell>
                   ),
                   mentions: (
-                    <TableCell key="mentions" className="text-right tabular-nums text-sm">
+                    <TableCell key="mentions" className="text-end tabular-nums text-sm">
                       {vis ? formatNumber(vis.totalMentions) : noAnswers('mentions')}
                     </TableCell>
                   ),
                   citations: (
-                    <TableCell key="citations" className="text-right tabular-nums text-sm">
+                    <TableCell key="citations" className="text-end tabular-nums text-sm">
                       {vis ? formatNumber(vis.totalCitations) : noAnswers('citations')}
                     </TableCell>
                   ),
                   positions: (
-                    <TableCell key="positions" className="pl-8">
+                    <TableCell key="positions" className="ps-8">
                       {/* Fixed widths so the value, dots and See line up on every row. */}
                       <div className="inline-flex items-center gap-2">
                         <div className="w-[5.5rem] whitespace-nowrap">
@@ -4696,9 +4726,9 @@ function AllPromptsTab({
                     </TableCell>
                   ),
                   volume: (
-                    <TableCell key="volume" className="text-right">
+                    <TableCell key="volume" className="text-end">
                       {volumesPending ? (
-                        <Skeleton data-volume-pending className="ml-auto h-4 w-16" />
+                        <Skeleton data-volume-pending className="ms-auto h-4 w-16" />
                       ) : vol ? (
                         <EstimateRange
                           estimate={estimateByPromptId.get(p.id)!}
@@ -4725,14 +4755,14 @@ function AllPromptsTab({
                     </TableCell>
                   ),
                   runs: (
-                    <TableCell key="runs" className="text-right tabular-nums text-sm">
+                    <TableCell key="runs" className="text-end tabular-nums text-sm">
                       {vis ? formatNumber(vis.runs) : noAnswers('runs')}
                     </TableCell>
                   ),
                   added: (
                     <TableCell
                       key="added"
-                      className="text-right text-xs whitespace-nowrap text-muted-foreground"
+                      className="text-end text-xs whitespace-nowrap text-muted-foreground"
                       title={new Date(p.createdAt).toLocaleString('en-US', {
                         dateStyle: 'medium',
                         timeStyle: 'short',
@@ -4742,7 +4772,7 @@ function AllPromptsTab({
                     </TableCell>
                   ),
                   lastRun: (
-                    <TableCell key="lastRun" className="text-right text-xs text-muted-foreground">
+                    <TableCell key="lastRun" className="text-end text-xs text-muted-foreground">
                       {pendingAt === 'lastRun'
                         ? noAnswers('lastRun')
                         : formatRelative(vis?.lastRunAt, tCommon)}
@@ -4751,7 +4781,7 @@ function AllPromptsTab({
                 };
                 return (
                   <TableRow key={p.id} className="hover:bg-muted/50">
-                    <TableCell className="pl-6 font-medium text-sm max-w-[320px]">
+                    <TableCell className="ps-6 font-medium text-sm max-w-[320px]">
                       <div className="flex items-start gap-3">
                         {onEditPrompt && (
                           <Checkbox
@@ -4795,7 +4825,7 @@ function AllPromptsTab({
                       return (
                         <TableCell
                           key={id}
-                          className="bg-muted/20 text-right text-sm font-semibold tabular-nums"
+                          className="bg-muted/20 text-end text-sm font-semibold tabular-nums"
                         >
                           {pending ? (
                             <LocationPending
@@ -4816,7 +4846,7 @@ function AllPromptsTab({
                       );
                     })}
                     {onEditPrompt && (
-                      <TableCell className="text-right pr-6">
+                      <TableCell className="text-end pe-6">
                         <RowActionsMenu
                           prompt={p}
                           brandId={activeBrandId}
@@ -4984,7 +5014,7 @@ function AllPromptsTab({
                 setConfirmDelete(null);
               }}
             >
-              <Trash2 className="mr-2 h-4 w-4" />
+              <Trash2 className="me-2 h-4 w-4" />
               Delete
             </Button>
           </DialogFooter>
@@ -5025,7 +5055,7 @@ function SimilarTopicsList({ volumes }: { volumes: PromptVolume[] }) {
                 style={{ width: `${(item.volume / maxVol) * 100}%` }}
               />
             </div>
-            <span className="w-12 text-right font-medium tabular-nums text-foreground">
+            <span className="w-12 text-end font-medium tabular-nums text-foreground">
               {formatCompactNumber(item.volume)}
             </span>
           </div>

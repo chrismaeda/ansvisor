@@ -2,11 +2,13 @@
 
 import { Fragment } from 'react';
 import { useTranslations } from 'next-intl';
+import { Skeleton } from '@/components/ui/skeleton';
 import { CATEGORY_META, pct } from '@/components/audit/audit-report';
 import type { AuditOverview, AuditQuota, SiteCoverage } from '@/lib/actions/audits';
 import { nextAutoRun } from '@/lib/audit-auto-runs';
 import { formatMonthDay } from '@/lib/format';
 import { cn } from '@/lib/utils';
+import { useRubricText } from '@/hooks/use-rubric-text';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -26,14 +28,39 @@ export function AuditSummaryStrip({
   quota,
   now,
   coverage = null,
+  loading = false,
 }: {
   overview: AuditOverview | null;
   quota: AuditQuota | null;
   now: Date;
-  /** The site's coverage (customer priorities item 11): "18 of 36 pages audited". */
+  /**
+   * The site's coverage (customer priorities item 11): "18 of 36 pages
+   * audited", every page with an audit (out of date ones too), as the site
+   * score and the Authority card count them.
+   */
   coverage?: SiteCoverage | null;
+  /** The hub is still loading: a placeholder of the strip's height. */
+  loading?: boolean;
 }) {
   const t = useTranslations('audit.strip');
+  const rubric = useRubricText();
+  // While the hub loads, a strip of the same height holds its place, so the
+  // page below doesn't move down when it fills in.
+  if (loading) {
+    return (
+      <div
+        aria-hidden
+        data-testid="audit-summary-strip-skeleton"
+        className="flex items-center gap-3.5 rounded-xl border bg-card px-4 py-3"
+      >
+        <div className="flex h-5 items-center">
+          <Skeleton className="h-3.5 w-28" />
+        </div>
+        <Skeleton className="h-3.5 w-24" />
+        <Skeleton className="h-3.5 w-36" />
+      </div>
+    );
+  }
   if (!overview) return null;
 
   const b = (chunks: React.ReactNode) => <b className="font-semibold">{chunks}</b>;
@@ -59,15 +86,14 @@ export function AuditSummaryStrip({
   }
   items.push(
     coverage && coverage.pages > 0
-      ? t('pagesOf', { audited: coverage.audited, count: coverage.pages })
+      ? t('pagesOf', { audited: coverage.audited + coverage.stale, count: coverage.pages })
       : overview.pages > 0
         ? t('pages', { count: overview.pages })
         : t('noPages'),
   );
   if (overview.lowestCategory) {
-    const label =
-      CATEGORY_META.find((c) => c.key === overview.lowestCategory?.key)?.label ??
-      overview.lowestCategory.key;
+    const { key } = overview.lowestCategory;
+    const label = rubric.category(key, CATEGORY_META.find((c) => c.key === key)?.label ?? key);
     items.push(
       t.rich('lowest', { b, category: label, score: pct(overview.lowestCategory.score) ?? 0 }),
     );
@@ -101,7 +127,7 @@ export function AuditSummaryStrip({
         </Fragment>
       ))}
       {overview.primaryHost && (
-        <span className="ml-auto text-xs text-muted-foreground">{overview.primaryHost}</span>
+        <span className="ms-auto text-xs text-muted-foreground">{overview.primaryHost}</span>
       )}
     </div>
   );

@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import { useTranslations } from 'next-intl';
+import { useServerErrorText } from '@/hooks/use-server-error';
 import { toast } from 'sonner';
 import {
   Check,
@@ -119,6 +120,7 @@ export function DeliverableCard({
   const t = useTranslations('chatDeliverable');
   const tFormats = useTranslations('chatAnswer.formats');
   const tReadOnly = useTranslations('readOnly.actions');
+  const serverError = useServerErrorText();
   const openGetMore = useGetMore();
   const { guard, openUpgrade } = useUpgradeGate();
   const [fileStatus, setFileStatus] = useState(deliverable.status);
@@ -182,8 +184,8 @@ export function DeliverableCard({
     setBusy(true);
     try {
       return settle(await write(runId, n), label);
-    } catch {
-      toast.error(t('task.failed.failed'));
+    } catch (err) {
+      toast.error(serverError(err, t('task.failed.failed')));
       return false;
     } finally {
       setBusy(false);
@@ -363,7 +365,7 @@ function TaskControls({
     return (
       <span
         data-slot="task-done"
-        className="ml-auto inline-flex items-center gap-1 rounded-full border border-green-200 bg-green-50 px-2 py-0.5 text-[11px] text-green-800 dark:border-green-900 dark:bg-green-950/30 dark:text-green-300"
+        className="ms-auto inline-flex items-center gap-1 rounded-full border border-green-200 bg-green-50 px-2 py-0.5 text-[11px] text-green-800 dark:border-green-900 dark:bg-green-950/30 dark:text-green-300"
       >
         <Check className="size-3" aria-hidden />
         {fileStatus === 'done' ? t('doneAttached') : t('doneInActionCenter')}
@@ -372,7 +374,7 @@ function TaskControls({
   }
   if (!canChange) return null;
   return (
-    <div className="ml-auto flex items-center gap-1">
+    <div className="ms-auto flex items-center gap-1">
       <button
         type="button"
         data-action="deliverable.attachAndMarkDone"

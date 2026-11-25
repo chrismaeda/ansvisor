@@ -2,6 +2,7 @@
 
 import { useEffect, useId, useState } from 'react';
 import { useTranslations } from 'next-intl';
+import { useServerErrorText } from '@/hooks/use-server-error';
 import { Check, X } from 'lucide-react';
 import { Link } from '@/i18n/navigation';
 import { Button } from '@/components/ui/button';
@@ -43,6 +44,7 @@ export function AddKeyCard({
 }) {
   const t = useTranslations('chatKeys');
   const tProviders = useTranslations('settings.agent_providers');
+  const serverError = useServerErrorText();
   const { canAdmin } = useUserRole();
   const fieldId = useId();
   const [access, setAccess] = useState<Access | null | 'failed'>(null);
@@ -97,7 +99,7 @@ export function AddKeyCard({
         check?: Saved;
       } | null;
       if (!res.ok || !body?.ok) {
-        setError(body?.error ?? t('failed'));
+        setError(serverError(body, body?.error ?? t('failed'), res.status));
         return;
       }
       // Kept: the field is cleared, and only its outcome shows.
@@ -124,7 +126,7 @@ export function AddKeyCard({
           data-action="addKey.close"
           aria-label={t('close')}
           onClick={onClose}
-          className="ml-auto inline-flex size-6 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+          className="ms-auto inline-flex size-6 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
         >
           <X className="size-3.5" aria-hidden />
         </button>

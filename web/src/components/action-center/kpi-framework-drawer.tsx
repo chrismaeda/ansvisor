@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslations } from 'next-intl';
+import { useServerErrorText } from '@/hooks/use-server-error';
 import { toast } from 'sonner';
 import {
   BarChart3,
@@ -120,6 +121,7 @@ export function KpiFrameworkDrawer({
   // A read-only workspace (plan not active): Save & Apply opens the upgrade dialog instead.
   const { guard } = useUpgradeGate();
   const tActions = useTranslations('readOnly.actions');
+  const serverError = useServerErrorText();
 
   const [isLoading, setIsLoading] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
@@ -156,13 +158,13 @@ export function KpiFrameworkDrawer({
           }),
         ) as Draft,
       );
-    } catch {
-      toast.error(t('loadFailed'));
+    } catch (err) {
+      toast.error(serverError(err, t('loadFailed')));
       onOpenChange(false);
     } finally {
       setIsLoading(false);
     }
-  }, [brandId, onOpenChange, t]);
+  }, [brandId, onOpenChange, t, serverError]);
 
   useEffect(() => {
     if (open) void prefill();
@@ -194,7 +196,7 @@ export function KpiFrameworkDrawer({
 
   // Switching the period rescales flow targets to the new cadence (weekly
   // 23 citations becomes monthly ~99) so the numbers keep meaning the same
-  // goal; percent targets are levels and stay as typed. A non-numeric
+  // goal; percent and score targets are levels and stay as typed. A non-numeric
   // half-typed value is left alone rather than clobbered.
   const handleTimeframeChange = (next: KpiTimeframe) => {
     setDraft((prev) => {
@@ -223,8 +225,8 @@ export function KpiFrameworkDrawer({
         onOpenChange(false);
         onSaved();
         toast.success(t('saved'));
-      } catch {
-        toast.error(t('saveFailed'));
+      } catch (err) {
+        toast.error(serverError(err, t('saveFailed')));
       } finally {
         setIsSaving(false);
       }
@@ -269,7 +271,7 @@ export function KpiFrameworkDrawer({
                         setDraft((prev) => templateDraft(key, prev));
                       }}
                       className={cn(
-                        'flex w-full items-start gap-3 rounded-lg border p-3 text-left transition-colors',
+                        'flex w-full items-start gap-3 rounded-lg border p-3 text-start transition-colors',
                         isSelected
                           ? 'border-foreground bg-muted/60 ring-1 ring-foreground'
                           : 'hover:bg-muted/40 disabled:cursor-not-allowed disabled:opacity-50',
@@ -361,10 +363,17 @@ export function KpiFrameworkDrawer({
                               [key]: { ...prev[key], target: e.target.value },
                             }))
                           }
-                          className={cn('h-9 pr-7 text-sm', isInvalid && 'border-destructive')}
+                          className={cn(
+                            'h-9 text-sm',
+                            KPI_REGISTRY[key].unit === 'points' ? 'pe-11' : 'pe-7',
+                            isInvalid && 'border-destructive',
+                          )}
                         />
-                        <span className="pointer-events-none absolute inset-y-0 right-2.5 flex items-center text-xs text-muted-foreground">
-                          {UNIT_SUFFIX[KPI_REGISTRY[key].unit]}
+                        {/* The Visibility score is out of 100, never a % (D2). */}
+                        <span className="pointer-events-none absolute inset-y-0 end-2.5 flex items-center text-xs text-muted-foreground">
+                          {KPI_REGISTRY[key].unit === 'points'
+                            ? t('scoreSuffix')
+                            : UNIT_SUFFIX[KPI_REGISTRY[key].unit]}
                         </span>
                       </div>
                     </div>

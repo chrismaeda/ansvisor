@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
+  byImpact,
   pickFocus,
   rankedIds,
   skippedActions,
   standingFrom,
   type FocusCandidate,
+  type FocusRank,
   type StandingSummary,
 } from './focus';
 
@@ -131,6 +133,26 @@ describe("Today's focus", () => {
     ).toEqual(['a', 'b', 'c']);
     expect(rankedIds(null)).toEqual([]);
   });
+
+  it('shows the highest impact first, then the higher priority (AC-04)', () => {
+    const card = (id: string, priorityLevel: FocusRank['priorityLevel'], score: number | null) => ({
+      id,
+      action: { priorityLevel, priorityScore: score },
+    });
+    const shown = byImpact([
+      card('medium', 'medium', 55),
+      card('high-60', 'high', 60),
+      card('none', null, null),
+      card('high-72', 'high', 72),
+      card('critical', 'critical', 90),
+    ]);
+    expect(shown.map((c) => c.id)).toEqual(['critical', 'high-72', 'high-60', 'medium', 'none']);
+    // Same impact and score: kept as the person keeps them.
+    expect(byImpact([card('a', 'high', 70), card('b', 'high', 70)]).map((c) => c.id)).toEqual([
+      'a',
+      'b',
+    ]);
+  });
 });
 
 describe('Where you stand', () => {
@@ -157,6 +179,7 @@ describe('Where you stand', () => {
       change: 0.4,
       rank: 2,
       of: 4,
+      set: 'top',
       neighbour: { name: 'Northbound', gap: 6.2, ahead: false },
       competitors: [
         { name: 'Northbound', score: 60.1, change: 0.1 },
@@ -181,5 +204,69 @@ describe('Where you stand', () => {
 
   it('has nothing to say without a score', () => {
     expect(standingFrom(summary(null, [['Rival', 50]]), null)).toBeNull();
+  });
+
+  describe('among primary rivals or enough-sample competitors (AC-02)', () => {
+    const every = (
+      score: number,
+      list: [string, number | null, number | null][],
+    ): StandingSummary => ({
+      ...summary(
+        score,
+        list.slice(0, 5).map(([name, s]) => [name, s]),
+      ),
+      everyCompetitor: list.map(([name, s, prompts]) => ({
+        id: `id-${name}`,
+        name,
+        score: s,
+        visiblePrompts: prompts,
+      })),
+    });
+    const current = every(27.4, [
+      ['Semrush', 40, 120],
+      ['Profound', 35, 90],
+      ['Ahrefs', 30, 80],
+      ['Scrunch', 50, 4],
+      ['Peec', 20, 30],
+      ['Otterly', 10, 12],
+      ['Tiny', 60, 2],
+    ]);
+
+    it('ranks among the primary rivals, a rival no answer named at 0', () => {
+      const rivals = ['Semrush', 'Profound', 'Peec', 'Nobody'].map((name) => ({
+        id: `id-${name}`,
+        name,
+      }));
+      const standing = standingFrom(current, null, rivals);
+      expect(standing).toMatchObject({ rank: 3, of: 5, set: 'rivals' });
+      expect(standing?.neighbour).toEqual({ name: 'Profound', gap: 7.6, ahead: false });
+      expect(standing?.competitors.map((c) => c.name)).toEqual([
+        'Semrush',
+        'Profound',
+        'Peec',
+        'Nobody',
+      ]);
+      expect(standing?.competitors.at(-1)?.score).toBe(0);
+    });
+
+    it('falls back to every competitor named in 10+ prompts, not the top 5 by mentions', () => {
+      const standing = standingFrom(current, null, []);
+      expect(standing).toMatchObject({ rank: 4, of: 6, set: 'competitors' });
+      expect(standing?.competitors.map((c) => c.name)).toEqual([
+        'Semrush',
+        'Profound',
+        'Ahrefs',
+        'Peec',
+        'Otterly',
+      ]);
+    });
+
+    it('takes the change since the run before from the full list', () => {
+      const previous = every(27, [['Otterly', 9, 11]]);
+      const otterly = standingFrom(current, previous)?.competitors.find(
+        (c) => c.name === 'Otterly',
+      );
+      expect(otterly?.change).toBe(1);
+    });
   });
 });

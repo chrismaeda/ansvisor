@@ -2,6 +2,7 @@
 
 import { useCallback, useState } from 'react';
 import { useTranslations } from 'next-intl';
+import { useServerErrorText } from '@/hooks/use-server-error';
 import { toast } from 'sonner';
 import { ListDot } from '@/components/agentic/list-dot';
 import { FormSwitch } from '@/components/chat/agents/agent-form-triggers';
@@ -49,6 +50,12 @@ export function ScheduledList({
 }) {
   const t = useTranslations('chatSchedules.page');
   const tErrors = useTranslations('chatSchedules.page.errors');
+  const serverError = useServerErrorText();
+  /** A refusal in the person's language (LOC-008): its reason's words, else the server's. */
+  const refusalText = (result: { reason?: string; message?: string }) =>
+    result.reason && tErrors.has(result.reason)
+      ? tErrors(result.reason)
+      : (result.message ?? tErrors('failed'));
   const [now] = useState(() => nowProp ?? new Date());
   const words = useScheduleWords(now);
   const agentWords = useAgentWords(now);
@@ -62,11 +69,17 @@ export function ScheduledList({
   }, []);
 
   /** A change to one job: its row is busy until the list is read again. */
-  const change = async (id: string, act: () => Promise<{ ok: boolean; message?: string }>) => {
+  const change = async (
+    id: string,
+    act: () => Promise<{ ok: boolean; reason?: string; message?: string }>,
+  ) => {
     setBusy(id);
     try {
-      const done = await act().catch(() => ({ ok: false, message: tErrors('failed') }));
-      if (!done.ok) toast.error(done.message ?? tErrors('failed'));
+      const done = await act().catch((err: unknown) => ({
+        ok: false,
+        message: serverError(err, tErrors('failed')),
+      }));
+      if (!done.ok) toast.error(refusalText(done));
       await reload();
       return done.ok;
     } finally {
@@ -195,7 +208,7 @@ function Header({ list }: { list: ScheduleListRead }) {
         <h1 className="text-2xl font-bold tracking-[-.6px]">{t('title')}</h1>
         <p className="text-[13px] text-muted-foreground">{t('subtitle')}</p>
       </div>
-      <div className="ml-auto flex items-center gap-3">
+      <div className="ms-auto flex items-center gap-3">
         {list.ok && list.limit !== null && (
           <span className="text-xs text-muted-foreground tabular-nums">
             {t('limit', { active: list.active, limit: list.limit })}

@@ -36,6 +36,8 @@ function query(table) {
       one = true;
       return builder;
     },
+    // Site Audit settings (exclude patterns): none here.
+    maybeSingle: () => builder,
     order: () => builder,
     update: (values) => {
       updated.push({ table, values });
@@ -51,6 +53,7 @@ function query(table) {
     },
     lt: () => builder,
     gte: () => builder,
+    limit: () => builder,
     range: (from, to) => {
       range = [from, to];
       return builder;
@@ -153,6 +156,8 @@ const audit = (id, url, day, score, status = 'completed') => ({
   created_at: `2026-10-${String(day).padStart(2, '0')}T09:00:00Z`,
 });
 
+const www = (url) => url.replace('//acme.com', '//www.acme.com');
+
 beforeEach(async () => {
   signalQueries = [];
   inserted = [];
@@ -206,6 +211,37 @@ describe('GET /api/audits/pages', () => {
     const byPath = Object.fromEntries(body.pages.map((p) => [`${p.host}${p.path}`, p.template]));
     expect(byPath['acme.com/blog/milk-drinks']).toBe('/blog/*');
     expect(byPath['other.com/blog/x']).toBeNull();
+  });
+
+  it('says how many pages have an audit running, and when the oldest started', async () => {
+    const older = new Date(Date.now() - 10 * 60_000).toISOString();
+    const newer = new Date(Date.now() - 5 * 60_000).toISOString();
+    audits.push({ ...audit('r1', 'https://acme.com/a', 20, null, 'running'), created_at: newer });
+    audits.push({ ...audit('r2', 'https://acme.com/b', 18, null, 'running'), created_at: older });
+    const body = await (await fetch(`${baseUrl}/pages?brandId=b1`)).json();
+    expect(body.running).toEqual({ count: 2, since: older });
+
+    audits = audits.filter((a) => a.status !== 'running');
+    const idle = await (await fetch(`${baseUrl}/pages?brandId=b1`)).json();
+    expect(idle.running).toEqual({ count: 0, since: null });
+  });
+
+  it("lists only a batch's pages with since: those audited at or after it", async () => {
+    const started = new Date(Date.now() - 5 * 60_000).toISOString();
+    audits.unshift({
+      ...audit('r1', 'https://acme.com/a', 20, null, 'running'),
+      created_at: started,
+    });
+    const body = await (
+      await fetch(`${baseUrl}/pages?brandId=b1&since=${encodeURIComponent(started)}`)
+    ).json();
+    expect(body.pages.map((p) => p.path)).toEqual(['/a']);
+    expect(body.total).toBe(1);
+    // The running count is the brand's, whatever the filter.
+    expect(body.running.count).toBe(1);
+
+    const junk = await (await fetch(`${baseUrl}/pages?brandId=b1&since=soon`)).json();
+    expect(junk.total).toBe(4);
   });
 
   it('pages over pages, not audits', async () => {
@@ -322,7 +358,8 @@ describe('POST /api/audits/bulk', () => {
 
     // All five are running rows; three fetch their page, two wait.
     expect(inserted).toHaveLength(5);
-    expect(pagesFetched).toEqual(urls.slice(0, 3));
+    // The brand's domain is www.acme.com: its pages are fetched there.
+    expect(pagesFetched).toEqual(urls.slice(0, 3).map(www));
   });
 
   it('refuses a request without URLs, with too many, or with something that is not a URL', async () => {
@@ -392,14 +429,14 @@ describe('startAutoAudits', () => {
     ]);
     await new Promise((resolve) => setTimeout(resolve, 20));
     // Two at a time, and a user's bulk audit doesn't wait behind them.
-    expect(pagesFetched).toEqual(urls.slice(0, 2));
+    expect(pagesFetched).toEqual(urls.slice(0, 2).map(www));
     await fetch(`${baseUrl}/bulk`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ brandId, urls: ['https://acme.com/mine'] }),
     });
     await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(pagesFetched).toEqual([...urls.slice(0, 2), 'https://acme.com/mine']);
+    expect(pagesFetched).toEqual([...urls.slice(0, 2), 'https://acme.com/mine'].map(www));
     // A user's audit row keeps the column default.
     expect(inserted.at(-1).source).toBeUndefined();
   });

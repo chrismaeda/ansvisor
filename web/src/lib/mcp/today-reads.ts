@@ -17,6 +17,7 @@ import { isMondayIn } from '@/lib/action-center/last-week';
 import { priorityReasonText } from '@/lib/action-center/priority';
 import { changeDirection } from '@/lib/action-center/since';
 import {
+  LIBRARY_IN_REVIEW,
   finishOne,
   waitingRows,
   type WaitingAction,
@@ -215,7 +216,7 @@ function waitingRow(row: WaitingRow) {
         open:
           row.count === 1
             ? `/dashboard/content/editor/${encodeURIComponent(row.draftId)}`
-            : '/dashboard/content/library',
+            : LIBRARY_IN_REVIEW,
       };
     case 'due':
       return {
@@ -276,6 +277,10 @@ const standingOf = (standing: TodayStanding | null) =>
     change: standing.change,
     rank: standing.rank,
     of: standing.of,
+    // Which brands `of` counts (AC-02): primary rivals, competitors named in
+    // 10+ prompts, or the five named most.
+    rank_among: standing.set,
+    ...(standing.runAt ? { run_at: standing.runAt } : {}),
     neighbour: standing.neighbour,
     competitors: standing.competitors,
   };

@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { useTranslations } from 'next-intl';
+import { useServerErrorText } from '@/hooks/use-server-error';
 import { toast } from 'sonner';
 import { Check, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -40,6 +41,7 @@ export function ProductBlockDialog({
   onClose: () => void;
 }) {
   const t = useTranslations('contentEditor.editor.productBlock');
+  const serverError = useServerErrorText();
   const inputRef = useRef<HTMLInputElement>(null);
   const [query, setQuery] = useState('');
   const [hits, setHits] = useState<BlockProductRead[] | 'failed' | null>(null);
@@ -135,7 +137,7 @@ export function ProductBlockDialog({
     } catch (err) {
       if (closed.current) return;
       console.error('Failed to read the products:', err);
-      toast.error(t('failed'));
+      toast.error(serverError(err, t('failed')));
     } finally {
       if (!closed.current) setBusy(false);
     }
@@ -176,7 +178,7 @@ export function ProductBlockDialog({
                     type="button"
                     aria-pressed={on}
                     disabled={!on && (!!why || picked.length >= MAX_BLOCK_PRODUCTS)}
-                    className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-muted disabled:opacity-50"
+                    className="flex w-full items-center gap-2 px-3 py-2 text-start text-sm hover:bg-muted disabled:opacity-50"
                     onClick={() => toggle(hit)}
                   >
                     <span
@@ -204,7 +206,7 @@ export function ProductBlockDialog({
               {picked.map((p) => (
                 <li
                   key={p.id}
-                  className="flex max-w-full items-center gap-1 rounded-full border py-0.5 pl-2.5 pr-1 text-xs"
+                  className="flex max-w-full items-center gap-1 rounded-full border py-0.5 ps-2.5 pe-1 text-xs"
                 >
                   <span className="truncate">{p.title}</span>
                   <button

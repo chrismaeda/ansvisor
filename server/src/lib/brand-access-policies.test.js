@@ -50,6 +50,8 @@ const SERVER_ONLY = [
   'ads_ad_drafts',
   'ads_decision_overrides',
   'ads_opportunity_snapshots',
+  // Ads Phase 1's ad accounts (00560): spend and keys are served by the API to the roles and plans that read them.
+  'ads_accounts',
   'brand_fact_pages',
   // Each brand's last action and signal number (00534).
   'brand_number_counters',
@@ -70,6 +72,8 @@ const SERVER_ONLY = [
   // The same terms packed per entity and day (00540), and the brands reading them.
   'mentions_terms_daily_packed',
   'mentions_terms_packed_ready',
+  // Which notification e-mail went to whom (00556): the senders' claims.
+  'notification_sends',
   'prompt_improve_suggestions',
   'signal_runs',
   // What was posted to a brand's Slack channel (00515, #2139): its dedupe and error codes.
@@ -108,6 +112,8 @@ const NOT_BRAND_DATA = {
   organization_menu_roles: "The Account's menu access by role (00374).",
   organizations: 'The Account itself: its plan, billing and members (D1).',
   profiles: "A person's own profile.",
+  translation_suggestions:
+    "A person's own suggested better translations of the interface (00555): no brand's.",
   setting_changes:
     "The Account's settings changes (00481): which setting, its value before and after, who and when; no brand's data.",
   site_audit_auto_runs:
@@ -148,6 +154,8 @@ const OWN_ROWS_WITHOUT_BRAND = {
     "A person marks their own notice read or closes it (00441, 00446): it changes no one else's, and they read only those about brands they reach.",
   'chat_schedules: chat_schedules: own or admin select':
     'A scheduled job about the whole workspace: the person who made it (its runs act as them), or an admin.',
+  'notification_preferences: notification_preferences: own rows':
+    "A person's own e-mail choices (00554): a row with no brand is their All my brands choice, no brand's data; a brand's row only for a brand they reach.",
   'chat_memory_items: chat_memory_items: own select':
     'A person’s own Me memory (00459): only they read it, and it never has a brand.',
   'chat_memory_items: chat_memory_items: workspace select':

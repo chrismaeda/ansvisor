@@ -2,7 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import dynamic from 'next/dynamic';
-import { useTranslations } from 'next-intl';
+import { useFormatter, useNow, useTranslations } from 'next-intl';
+import { useServerErrorText } from '@/hooks/use-server-error';
 import { toast } from 'sonner';
 import {
   AlertCircle,
@@ -16,6 +17,7 @@ import {
   X,
 } from 'lucide-react';
 import { useBrandStore } from '@/stores/use-brand-store';
+import { getTrackingWindow } from '@/lib/visibility-reads';
 import type { Brand } from '@/types';
 import {
   getSignals,
@@ -104,16 +106,44 @@ function utcDay(offset = 0): string {
   return new Date(Date.now() - offset * DAY_MS).toISOString().slice(0, 10);
 }
 
+/**
+ * When the brand's latest AI answer run finished (AC-40): signals come from
+ * the nightly run, not in real time, so the subtitle says how old they are.
+ * Null before the first run, or when it can't be read.
+ */
+function useLastRunAt(brandId: string | undefined): string | null {
+  const [read, setRead] = useState<{ brandId: string; at: string | null } | null>(null);
+  useEffect(() => {
+    if (!brandId) return;
+    let live = true;
+    getTrackingWindow(brandId)
+      .then((win) => {
+        if (live) setRead({ brandId, at: win.lastRunAt });
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [brandId]);
+  return read && read.brandId === brandId ? read.at : null;
+}
+
 export default function ActionCenterSignalsPage() {
   const brand = useBrandStore((s) => s.getActiveBrand());
   const t = useTranslations('actionCenter.signalsPage');
+  const format = useFormatter();
+  const now = useNow({ updateInterval: 60_000 });
+  const lastRunAt = useLastRunAt(brand?.id);
+  const subtitle = lastRunAt
+    ? t('subtitleRun', { ago: format.relativeTime(new Date(lastRunAt), now) })
+    : t('subtitle');
 
   return (
     <div className="space-y-6">
       <HeaderWithAiUsage>
         <div>
           <h1 className="text-2xl font-bold tracking-tight">{t('title')}</h1>
-          <p className="mt-1 text-sm text-muted-foreground">{t('subtitle')}</p>
+          <p className="mt-1 text-sm text-muted-foreground">{subtitle}</p>
         </div>
       </HeaderWithAiUsage>
       <ActionCenterTabs />
@@ -317,6 +347,7 @@ function SignalsContent({ brand }: { brand: Brand }) {
   // Chat's side panel sees the page (the owner's plan of 2026-11-16, step 9): its window, its
   // filters, and once read, the signals on screen by the code each row shows, with how many.
   const tChatRange = useTranslations('chatPanel.range');
+  const serverError = useServerErrorText();
   const chatFilters: ChatPageFilter[] = [
     ...(category !== 'all'
       ? [{ key: 'category', label: tCategories(category), value: category }]
@@ -429,8 +460,8 @@ function SignalsContent({ brand }: { brand: Brand }) {
           : s;
       setSignals((prev) => (prev ?? []).map(patch));
       setSelected((prev) => (prev && ids.has(prev.id) ? patch(prev) : prev));
-    } catch {
-      toast.error(t('statusChangeFailed'));
+    } catch (err) {
+      toast.error(serverError(err, t('statusChangeFailed')));
     } finally {
       withBusy(false);
     }
@@ -517,7 +548,8 @@ function SignalsContent({ brand }: { brand: Brand }) {
             prev={summary.prevResolved}
             rangeLabel={prevRangeLabel}
             spark={sparkSeries(summary.byDayResolved)}
-            note={countsNote}
+            // Resolved can pass New (AC-42): it counts signals opened before the period too.
+            note={[t('cards.resolvedNote'), countsNote].filter(Boolean).join(' ')}
           />
           <AvgImpactCard summary={summary} days={windowDays} />
         </div>
@@ -601,12 +633,12 @@ function SignalsContent({ brand }: { brand: Brand }) {
           allLabel={t('filters.all')}
         />
         <div className="relative">
-          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+          <Search className="pointer-events-none absolute start-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <Input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder={t('filters.search')}
-            className="h-8 w-56 pl-8 text-xs"
+            className="h-8 w-56 ps-8 text-xs"
           />
         </div>
         {hasActiveFilters && (
@@ -619,7 +651,7 @@ function SignalsContent({ brand }: { brand: Brand }) {
           type="button"
           variant="outline"
           size="sm"
-          className="ml-auto gap-2 text-xs"
+          className="ms-auto gap-2 text-xs"
           onClick={handleExportCsv}
           disabled={visible.length === 0}
         >

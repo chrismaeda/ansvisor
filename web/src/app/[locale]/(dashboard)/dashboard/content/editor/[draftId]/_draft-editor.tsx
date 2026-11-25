@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useFormatter, useTranslations } from 'next-intl';
+import { useServerErrorText } from '@/hooks/use-server-error';
 import { toast } from 'sonner';
 import { createDocument, getHTMLFromFragment } from '@tiptap/core';
 import { EditorContent, useEditor, type Editor } from '@tiptap/react';
@@ -12,6 +13,7 @@ import { TableKit } from '@tiptap/extension-table';
 import { CharacterCount, Placeholder } from '@tiptap/extensions';
 import {
   ArrowLeft,
+  Plus,
   ArrowUpRight,
   Bot,
   Check,
@@ -92,6 +94,7 @@ import type { SiteTrust } from '@/lib/content/site-trust';
 import {
   AGENT_POLL_MS,
   CONTENT_LIBRARY_PATH,
+  CONTENT_NEW_PATH,
   isPageType,
   type ContentDraft,
   type PageType,
@@ -154,7 +157,13 @@ import {
 } from '@/lib/content/ready-to-publish';
 import { estimateDocument } from '@/lib/content/audit-estimate';
 import { detectPageType, isSiteType, type SiteType } from '@/lib/content/page-types';
-import { BAND_CLASSES, qualityAverage, qualityBand, qualityPhase } from '@/lib/content/quality';
+import {
+  BAND_CLASSES,
+  eeatAwaitsAuthor,
+  qualityAverage,
+  qualityBand,
+  qualityPhase,
+} from '@/lib/content/quality';
 import { inputsGiven } from '@/lib/content/draft-inputs';
 import {
   linksToCheck,
@@ -197,6 +206,7 @@ import {
   openRulesForAgent,
   overLengthFor,
   lengthCapFor,
+  lengthRangeOf,
   lengthSpan,
   rewriteAdvice,
   NO_RULE_CONTEXT,
@@ -337,15 +347,15 @@ const DOCUMENT_CLASS = cn(
   // A weak source's amber wavy line takes the place of its link's (CE-046).
   'prose-a:has-[.quality-weak-source]:no-underline!',
   'prose-h1:text-3xl prose-h1:tracking-tight prose-h2:tracking-tight',
-  '[&_table]:my-4 [&_table]:w-full [&_table]:table-fixed [&_td]:border [&_td]:px-2 [&_td]:py-1.5 [&_th]:border [&_th]:bg-muted/50 [&_th]:px-2 [&_th]:py-1.5 [&_th]:text-left',
+  '[&_table]:my-4 [&_table]:w-full [&_table]:table-fixed [&_td]:border [&_td]:px-2 [&_td]:py-1.5 [&_th]:border [&_th]:bg-muted/50 [&_th]:px-2 [&_th]:py-1.5 [&_th]:text-start',
   // Cells and list items hold paragraphs; their margins would pad every row.
   '[&_td>p]:my-0 [&_th>p]:my-0 [&_li>p]:my-0 prose-li:my-1',
   '[&_.selectedCell]:bg-primary/10 [&_img]:rounded-md [&_.ProseMirror-selectednode]:ring-2 [&_.ProseMirror-selectednode]:ring-ring/50',
   // Locked passages (CE-018): a green line, and what quotes them above.
-  '[&_.cited-passage]:rounded-r-md [&_.cited-passage]:border-l-[3px] [&_.cited-passage]:border-emerald-300 [&_.cited-passage]:bg-emerald-50/70 [&_.cited-passage]:py-1 [&_.cited-passage]:pr-2 [&_.cited-passage]:pl-3 dark:[&_.cited-passage]:border-emerald-700 dark:[&_.cited-passage]:bg-emerald-950/30',
+  '[&_.cited-passage]:rounded-e-md [&_.cited-passage]:border-s-[3px] [&_.cited-passage]:border-emerald-300 [&_.cited-passage]:bg-emerald-50/70 [&_.cited-passage]:py-1 [&_.cited-passage]:pe-2 [&_.cited-passage]:ps-3 dark:[&_.cited-passage]:border-emerald-700 dark:[&_.cited-passage]:bg-emerald-950/30',
   '[&_.cited-passage]:before:mb-0.5 [&_.cited-passage]:before:block [&_.cited-passage]:before:text-[11.5px] [&_.cited-passage]:before:leading-snug [&_.cited-passage]:before:font-medium [&_.cited-passage]:before:tracking-normal [&_.cited-passage]:before:text-emerald-700 [&_.cited-passage]:before:content-[attr(data-cited-label)] dark:[&_.cited-passage]:before:text-emerald-400',
   // An accepted agent suggestion (CE-018): a thin green line, the words it put in underlined.
-  '[&_.agent-accepted]:border-l-2 [&_.agent-accepted]:border-emerald-300 [&_.agent-accepted]:pl-2.5 dark:[&_.agent-accepted]:border-emerald-700',
+  '[&_.agent-accepted]:border-s-2 [&_.agent-accepted]:border-emerald-300 [&_.agent-accepted]:ps-2.5 dark:[&_.agent-accepted]:border-emerald-700',
   '[&_.agent-accepted-text]:underline [&_.agent-accepted-text]:decoration-emerald-300 [&_.agent-accepted-text]:decoration-2 [&_.agent-accepted-text]:underline-offset-4 dark:[&_.agent-accepted-text]:decoration-emerald-700',
   '[&_.is-editor-empty:first-child]:before:pointer-events-none [&_.is-editor-empty:first-child]:before:float-left [&_.is-editor-empty:first-child]:before:h-0 [&_.is-editor-empty:first-child]:before:text-muted-foreground [&_.is-editor-empty:first-child]:before:content-[attr(data-placeholder)]',
 );
@@ -622,6 +632,7 @@ export function DraftEditor({
     `${tRules('agent.now')}: ${ruleStatusDetail(tStatus, status)}`,
   ];
   const tStatus = useTranslations('contentEditor.editor.rules.status');
+  const serverError = useServerErrorText();
   // History keeps the page before the first suggestion accepted here.
   const agentBeforeKept = useRef(false);
   const onDecide = useRef<(id: string, decision: SuggestionDecision) => void>(() => {});
@@ -943,7 +954,7 @@ export function DraftEditor({
       .catch((err) => {
         console.error('Failed to save the author confirmation:', err);
         setAuthorConfirmed(before);
-        toast.error(t('quality.confirmFailed'));
+        toast.error(serverError(err, t('quality.confirmFailed')));
       })
       .finally(() => setConfirming(false));
   };
@@ -1319,7 +1330,7 @@ export function DraftEditor({
       } catch (err) {
         console.error('Failed to confirm the intro facts:', err);
         takeBack(keys.slice(i));
-        toast.error(t('quality.confirmCaseFailed'));
+        toast.error(serverError(err, t('quality.confirmCaseFailed')));
         return;
       }
     }
@@ -1340,7 +1351,7 @@ export function DraftEditor({
     } catch (err) {
       console.error('Failed to confirm the customer case:', err);
       takeBack();
-      toast.error(t('quality.confirmCaseFailed'));
+      toast.error(serverError(err, t('quality.confirmCaseFailed')));
     }
   };
   const confirmImage = async (src: string) => {
@@ -1359,7 +1370,7 @@ export function DraftEditor({
     } catch (err) {
       console.error('Failed to confirm the image:', err);
       takeBack();
-      toast.error(t('quality.confirmImageFailed'));
+      toast.error(serverError(err, t('quality.confirmImageFailed')));
     }
   };
   // Out of the editor (to Quality, to Before you publish): the block left
@@ -1449,18 +1460,20 @@ export function DraftEditor({
       // Only this one goes back: another kept meanwhile stays.
       setKeptSources((kept) => kept.filter((source) => source !== url));
       if (err instanceof Error && err.message === 'full') {
-        toast.error(t('quality.keepFull'));
+        toast.error(serverError(err, t('quality.keepFull')));
         return;
       }
       console.error('Failed to keep the source:', err);
-      toast.error(t('quality.keepFailed'));
+      toast.error(serverError(err, t('quality.keepFailed')));
     }
   };
-  const qualityScore = qualityAverage([
-    eeatScore?.score ?? null,
-    trustScore?.score ?? null,
-    readable?.score ?? null,
-  ]);
+  // E-E-A-T waiting for an author is a to-do, not a 0 in the average
+  // (eeatAwaitsAuthor), while another score stands: with none, the chip
+  // still opens Quality, where the author is asked for.
+  const awaitsAuthor = eeatAwaitsAuthor(pageAuthor, authorConfirmed);
+  const qualityScore =
+    (awaitsAuthor ? qualityAverage([trustScore?.score ?? null, readable?.score ?? null]) : null) ??
+    qualityAverage([eeatScore?.score ?? null, trustScore?.score ?? null, readable?.score ?? null]);
   const hasAuthors = (authorsRead?.authors.length ?? 0) > 0;
   // Add byline to content (CE-057): the brand's CMS has no author field, so
   // its exports carry one byline line under the H1.
@@ -1540,6 +1553,7 @@ export function DraftEditor({
             : null,
         readability: readable,
         eeat: eeatScore,
+        eeatAwaitsAuthor: awaitsAuthor,
         trust: trustScore,
         author: pageAuthor,
         canEdit: canEditPageAuthor,
@@ -1582,7 +1596,7 @@ export function DraftEditor({
     } catch (err) {
       console.error('Failed to set the reviewer:', err);
       if (pick === reviewerPick.current) setReviewerId(savedReviewer.current);
-      toast.error(t('reviewer.failed'));
+      toast.error(serverError(err, t('reviewer.failed')));
     }
   };
   // Quality's Add opens Brief › Your input.
@@ -1690,7 +1704,7 @@ export function DraftEditor({
     } catch (err) {
       console.error('Failed to set the author:', err);
       if (pick === authorPick.current) setAuthorId(savedAuthor.current);
-      toast.error(t('author.failed'));
+      toast.error(serverError(err, t('author.failed')));
     }
   };
   useEffect(() => {
@@ -2047,7 +2061,7 @@ export function DraftEditor({
       else toast(t('suggestions.undoneToast', { count: changed.length }));
     } catch (err) {
       console.error('Failed to decide the suggestions:', err);
-      toast.error(t('suggestions.saveFailed'));
+      toast.error(serverError(err, t('suggestions.saveFailed')));
     } finally {
       setDeciding(false);
     }
@@ -2057,7 +2071,9 @@ export function DraftEditor({
   // The page's last rewrite, from any run (00285), read on opening and again
   // whenever the rewrite shown changes: a Length it missed isn't a rewrite's to reach
   // (rules.ts RewriteReach). A later Fix run's batch doesn't hide it.
-  const [lastRewrite, setLastRewrite] = useState<(LastRewrite & { html: string }) | null>(null);
+  const [lastRewrite, setLastRewrite] = useState<
+    (LastRewrite & { html: string; beforeHtml: string | null }) | null
+  >(null);
   const shownRewriteId = pageSuggestion?.id ?? null;
   // The rewrite shown when it was last read (or failed to be): the Length's
   // state waits for the read for the rewrite shown now.
@@ -2098,9 +2114,17 @@ export function DraftEditor({
         target: lastRewrite.target,
         kept: lastRewrite.kept,
         chars: lastRewrite.html ? htmlChars(lastRewrite.html) : lastRewrite.chars,
+        // Met fewer rules than the page it rewrote: no rewrite is recommended again.
+        lowered:
+          !!lastRewrite.beforeHtml &&
+          !!lastRewrite.html &&
+          rules.ready &&
+          rulesMet(rules.checkHtml(lastRewrite.html, htmlChars(lastRewrite.html))).met <
+            rulesMet(rules.checkHtml(lastRewrite.beforeHtml, htmlChars(lastRewrite.beforeHtml)))
+              .met,
       },
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- its page, once
-    [lastRewrite, editor],
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- its pages, once the rules are read
+    [lastRewrite, editor, rules.ready],
   );
   const reach: RewriteReach = { kept: keptChars, floor: keptChars, last: lastCounted };
   // The rules' count stands once My rules and the fan-outs (the fan-out
@@ -2411,7 +2435,7 @@ export function DraftEditor({
       else toast(t('rewrite.undoneToast'));
     } catch (err) {
       console.error('Failed to decide the rewritten page:', err);
-      toast.error(t('suggestions.saveFailed'));
+      toast.error(serverError(err, t('suggestions.saveFailed')));
     } finally {
       if (editable) editor.setEditable(true, false);
       setDeciding(false);
@@ -3099,7 +3123,7 @@ export function DraftEditor({
       );
     } catch (err) {
       console.error('Failed to export the page:', err);
-      toast.error(t('export.failed'));
+      toast.error(serverError(err, t('export.failed')));
     }
   };
 
@@ -3145,7 +3169,7 @@ export function DraftEditor({
       onAgentStarted?.('write');
     } catch (err) {
       console.error('Failed to start the Content Agent again:', err);
-      toast.error(t('agentFailed.errors.failed'));
+      toast.error(serverError(err, t('agentFailed.errors.failed')));
     } finally {
       setStarting(false);
     }
@@ -3237,7 +3261,7 @@ export function DraftEditor({
       onAgentStarted?.('rewrite');
     } catch (err) {
       console.error('Failed to start the page rewrite:', err);
-      toast.error(t('agentFailed.errors.failed'));
+      toast.error(serverError(err, t('agentFailed.errors.failed')));
     } finally {
       setRewriting(false);
     }
@@ -3398,8 +3422,8 @@ export function DraftEditor({
       // isn't marked ready.
       try {
         await autosave.settle();
-      } catch {
-        toast.error(t('markReadyUnsaved'));
+      } catch (err) {
+        toast.error(serverError(err, t('markReadyUnsaved')));
         return;
       }
       const next = await (anyway
@@ -3413,7 +3437,7 @@ export function DraftEditor({
       );
     } catch (err) {
       console.error('Failed to mark the draft ready:', err);
-      toast.error(t('markReadyFailed'));
+      toast.error(serverError(err, t('markReadyFailed')));
     } finally {
       setMarking(false);
     }
@@ -3863,7 +3887,7 @@ export function DraftEditor({
       } else toast(t('header.backInReview'));
     } catch (err) {
       console.error('Failed to move the draft back to review:', err);
-      toast.error(t('header.backInReviewFailed'));
+      toast.error(serverError(err, t('header.backInReviewFailed')));
     } finally {
       setUnmarking(false);
     }
@@ -3967,7 +3991,7 @@ export function DraftEditor({
       }
     } catch (err) {
       console.error('Failed to restore the version:', err);
-      toast.error(t('history.restoreFailed'));
+      toast.error(serverError(err, t('history.restoreFailed')));
     } finally {
       editor.setEditable(true, false);
       restoringNow.current = false;
@@ -3984,7 +4008,7 @@ export function DraftEditor({
     } catch (err) {
       console.error('Failed to set the page type:', err);
       setPicked(before);
-      toast.error(t('pageType.failed'));
+      toast.error(serverError(err, t('pageType.failed')));
       return;
     }
     // A type picked is a choice about the rules (the owner, 2026-11-14): its set
@@ -4068,6 +4092,18 @@ export function DraftEditor({
               <ArrowLeft className="h-4 w-4" />
             </Link>
           )}
+          {/* A new page from the editor too (Content test 2026-11-19, item 21):
+              Editor in the sidebar comes back to the last draft (#1477). */}
+          {!embedded && (
+            <Link
+              href={CONTENT_NEW_PATH}
+              aria-label={t('newContent')}
+              title={t('newContent')}
+              className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}
+            >
+              <Plus className="h-4 w-4" />
+            </Link>
+          )}
           {/* The title takes the room left (at least ~140px from 1024px, 96px
               narrower; less while the save state needs its words), ends in "…",
               and never pushes, overlaps or wraps the buttons (Next step spec §3b). */}
@@ -4086,7 +4122,7 @@ export function DraftEditor({
                 type="button"
                 onClick={renameInPage}
                 title={t('header.rename', { title: title.trim() || t('untitled') })}
-                className="block max-w-full truncate rounded-sm text-left hover:underline hover:underline-offset-2 focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
+                className="block max-w-full truncate rounded-sm text-start hover:underline hover:underline-offset-2 focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
               >
                 {title.trim() || t('untitled')}
               </button>
@@ -4107,7 +4143,7 @@ export function DraftEditor({
           <div
             className={cn(
               'flex shrink-0 items-center gap-1.5 sm:gap-2.5',
-              embedded && 'ml-auto min-w-0 shrink flex-wrap justify-end gap-y-1.5',
+              embedded && 'ms-auto min-w-0 shrink flex-wrap justify-end gap-y-1.5',
             )}
           >
             {qualityOn && (
@@ -4256,7 +4292,7 @@ export function DraftEditor({
           </div>
         </div>
         {/* Lined up under the title (the back button's 28px and the 10px gap). */}
-        <div className="mt-3 flex flex-wrap items-center gap-2 pl-[38px]">
+        <div className="mt-3 flex flex-wrap items-center gap-2 ps-[38px]">
           <PageTypeMenu
             brandId={draft.brandId}
             siteType={siteType}
@@ -4412,7 +4448,7 @@ export function DraftEditor({
               aria-label={panelOpen ? t('panel.hide') : t('panel.show')}
               title={panelOpen ? t('panel.hide') : t('panel.show')}
               onClick={togglePanel}
-              className={cn('-my-1 ml-auto shrink-0', panelOpen && 'bg-muted')}
+              className={cn('-my-1 ms-auto shrink-0', panelOpen && 'bg-muted')}
             >
               <PanelRight className="h-4 w-4" />
             </Button>
@@ -4447,7 +4483,7 @@ export function DraftEditor({
                   title={aiUsedUp ?? undefined}
                   onClick={() => void (failedRewrite ? rewritePage() : startAgent())}
                 >
-                  {(starting || rewriting) && <WorkingDots className="ml-0" />}
+                  {(starting || rewriting) && <WorkingDots className="ms-0" />}
                   {t('agentFailed.retry')}
                 </Button>
                 <Button
@@ -4558,6 +4594,7 @@ export function DraftEditor({
             <EditorToolbar
               editor={editor}
               target={rules.length}
+              range={lengthRangeOf(rules.rules)}
               lengthWarning={lengthWarns(rules.rules)}
               htmlView={htmlSource !== null}
               onToggleHtml={htmlSource === null ? openHtmlView : applyHtmlView}
@@ -4578,7 +4615,7 @@ export function DraftEditor({
                 <span className="font-medium text-foreground">{t('html.title')}</span> ·{' '}
                 {t('html.hint', { marker: '<!-- html-block -->' })}
               </span>
-              <Button size="sm" className="ml-auto h-7" onClick={applyHtmlView}>
+              <Button size="sm" className="ms-auto h-7" onClick={applyHtmlView}>
                 {t('html.back')}
               </Button>
             </div>

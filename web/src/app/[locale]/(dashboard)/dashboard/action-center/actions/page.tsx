@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslations } from 'next-intl';
+import { useServerErrorText } from '@/hooks/use-server-error';
 import { toast } from 'sonner';
 import {
   AlertCircle,
@@ -17,6 +18,7 @@ import {
   X,
 } from 'lucide-react';
 import { useBrandStore } from '@/stores/use-brand-store';
+import { useAuthStore } from '@/stores/use-auth-store';
 import { useChatPageContext } from '@/components/chat/panel/chat-panel-context';
 import type { ChatPageFilter } from '@/lib/chat/page-context';
 import { viewRows } from '@/lib/chat/page-view';
@@ -34,13 +36,21 @@ import {
   type ActionItem,
 } from '@/lib/actions/action-center';
 import { listBrandMembers, type TeamMember } from '@/lib/actions/team';
+import { getClosedThisWeekCount } from '@/lib/actions/action-center-counts';
+import {
+  CLOSED_WEEK_DAYS,
+  isClosedThisWeek,
+  isNewSinceVisit,
+  readActionsVisit,
+  writeActionsVisit,
+} from '@/lib/action-center/actions-visit';
 import { readUrlChoice, readUrlParam, writeUrlParams } from '@/lib/url-state';
 import { actionCode, matchesActionCode } from '@/lib/action-center/action-ref';
 import {
   ACTION_CATEGORIES,
   ACTION_STATUSES,
   FROM_PRODUCTS_KINDS,
-  OPEN_ACTION_STATUSES,
+  isOpenAction,
   type ActionCategory,
   type ActionDismissReason,
   type ActionStatus,
@@ -90,11 +100,26 @@ import { saveBlob } from '@/lib/download';
 import { exportFileName } from '@/lib/white-label/export-name';
 import { HeaderWithAiUsage } from '@/components/ai-usage/ai-usage-meter';
 
-const isOpen = (action: ActionItem) => OPEN_ACTION_STATUSES.includes(action.status);
+const isOpen = (action: ActionItem) => isOpenAction(action.status);
 
-/** The Status filter: a status, or Stale (New with no one on it for a month, 00432). */
-type StatusChoice = ActionStatus | 'all' | 'stale';
-const STATUS_CHOICES: StatusChoice[] = ['all', ...ACTION_STATUSES, 'stale'];
+/**
+ * The Status filter: Open (new, in progress or on hold, the count Today's
+ * Actions step shows, AC-01), every status, one status, or Stale (New with
+ * no one on it for a month, 00432). Open by default; closed actions are a
+ * choice away and on History.
+ */
+type StatusChoice = ActionStatus | 'open' | 'all' | 'stale';
+const STATUS_CHOICES: StatusChoice[] = ['open', 'all', ...ACTION_STATUSES, 'stale'];
+const DEFAULT_STATUS: StatusChoice = 'open';
+
+const matchesStatus = (action: ActionItem, status: StatusChoice) =>
+  status === 'all'
+    ? true
+    : status === 'open'
+      ? isOpen(action)
+      : status === 'stale'
+        ? isStale(action)
+        : action.status === status;
 
 /**
  * What each summary card counts, one predicate per card.
@@ -110,6 +135,8 @@ const CARD_FILTERS = {
     isOpen(action) && (action.category === 'recover' || action.category === 'fix'),
   opportunities: (action: ActionItem) => isOpen(action) && action.category === 'growth',
   inProgress: (action: ActionItem) => action.status === 'in_progress',
+  // The summary's "closed this week", shown under Status: All.
+  closedWeek: (action: ActionItem) => isClosedThisWeek(action, new Date()),
 } as const;
 
 /** Top Actions is the five highest-priority open actions (AC-006), not a predicate. */
@@ -130,7 +157,7 @@ export default function ActionCenterActionsPage() {
   const setActiveBrand = useBrandStore((s) => s.setActiveBrand);
   const t = useTranslations('actionCenter.actionsPage');
 
-  // A link to an action on another brand (Chat's Open in Actions, actions/[id]) names
+  // A link to an action on another brand (Chat's Open in Action Center, actions/[id]) names
   // its brand: switch to it once, when it's one of the person's, so its drawer opens.
   // A brand picked afterwards stays picked.
   const brandFromUrl = useRef(false);
@@ -179,6 +206,7 @@ function ActionsContent({ brand }: { brand: Brand }) {
   const tCategories = useTranslations('actionCenter.actionCategories');
   const tChat = useTranslations('chatPanel.suggest');
   const tStarted = useTranslations('actionCenter.gettingStarted');
+  const serverError = useServerErrorText();
 
   const [actions, setActions] = useState<ActionItem[] | null>(null);
   const [members, setMembers] = useState<TeamMember[]>([]);
@@ -189,7 +217,7 @@ function ActionsContent({ brand }: { brand: Brand }) {
   // "From Products" (ECOM-013): only what Product Visibility sent, beside the category.
   const [fromProducts, setFromProducts] = useState(false);
   const [priority, setPriority] = useState<PriorityLevel | 'all'>('all');
-  const [status, setStatus] = useState<StatusChoice>('all');
+  const [status, setStatus] = useState<StatusChoice>(DEFAULT_STATUS);
   const [assignee, setAssignee] = useState<string>('all');
   // Most recently updated first, by the date the list shows (Updated).
   const [sort, setSort] = useState<ActionSort>(DEFAULT_ACTION_SORT);
@@ -209,6 +237,21 @@ function ActionsContent({ brand }: { brand: Brand }) {
   }, []);
   const [focus, setFocus] = useState<CardFocus | null>(null);
 
+  // The person's last visit to this list on the brand, read once per visit
+  // and then moved to now: this visit's New marks stay until the next one.
+  // undefined until read; null when none is kept (nothing is marked New).
+  const userId = useAuthStore((s) => s.user?.id ?? null);
+  const [lastVisit, setLastVisit] = useState<string | null | undefined>(undefined);
+  const visitRead = useRef<string | null>(null);
+  useEffect(() => {
+    if (!userId) return;
+    const key = `${userId}:${brand.id}`;
+    if (visitRead.current === key) return;
+    visitRead.current = key;
+    setLastVisit(readActionsVisit(userId, brand.id));
+    writeActionsVisit(userId, brand.id, new Date());
+  }, [userId, brand.id]);
+
   // Filters, sort and search live in the URL (#896) so a refresh keeps them
   // and a filtered view can be shared. Read after mount; defaults stay out.
   const [urlRead, setUrlRead] = useState(false);
@@ -217,7 +260,7 @@ function ActionsContent({ brand }: { brand: Brand }) {
     setPriority(
       readUrlChoice<PriorityLevel | 'all'>('priority', ['all', ...PRIORITY_LEVELS], 'all'),
     );
-    setStatus(readUrlChoice<StatusChoice>('status', STATUS_CHOICES, 'all'));
+    setStatus(readUrlChoice<StatusChoice>('status', STATUS_CHOICES, DEFAULT_STATUS));
     setAssignee(readUrlParam('assignee') || 'all');
     // An old link's ?sort=newest lands on the one date sort.
     setSort(parseActionSort(readUrlParam('sort')));
@@ -244,7 +287,7 @@ function ActionsContent({ brand }: { brand: Brand }) {
           {
             category: 'all',
             priority: 'all',
-            status: 'all',
+            status: DEFAULT_STATUS,
             assignee: 'all',
             sort: DEFAULT_ACTION_SORT,
             from: 'all',
@@ -353,8 +396,8 @@ function ActionsContent({ brand }: { brand: Brand }) {
     try {
       await change();
       toast.success(done);
-    } catch {
-      toast.error(t('updateFailed'));
+    } catch (err) {
+      toast.error(serverError(err, t('updateFailed')));
     } finally {
       await load();
       setBusyIds((prev) => {
@@ -412,8 +455,7 @@ function ActionsContent({ brand }: { brand: Brand }) {
       if (category !== 'all' && action.category !== category) return false;
       if (fromProducts && !FROM_PRODUCTS_KINDS.includes(action.kind)) return false;
       if (priority !== 'all' && action.priorityLevel !== priority) return false;
-      if (status === 'stale' ? !isStale(action) : status !== 'all' && action.status !== status)
-        return false;
+      if (!matchesStatus(action, status)) return false;
       if (assignee !== 'all') {
         if (assignee === 'unassigned' ? action.assignee !== null : action.assignee?.id !== assignee)
           return false;
@@ -454,8 +496,8 @@ function ActionsContent({ brand }: { brand: Brand }) {
         brand.id,
         visible.map((action) => action.id),
       );
-    } catch {
-      if (mounted.current) toast.error(t('export.exportFailed'));
+    } catch (err) {
+      if (mounted.current) toast.error(serverError(err, t('export.exportFailed')));
       return;
     } finally {
       setIsExporting(false);
@@ -485,18 +527,24 @@ function ActionsContent({ brand }: { brand: Brand }) {
       new Blob([BYTE_ORDER_MARK, csv], { type: 'text/csv;charset=utf-8;' }),
       await exportFileName(`${slug}_actions_${date}.csv`),
     );
-  }, [brand.id, brand.slug, visible, tTexts, tCategories, t]);
+  }, [brand.id, brand.slug, visible, tTexts, tCategories, t, serverError]);
 
+  // The pills count what the Status filter keeps, so All matches the table
+  // and, on Open, Today's "N open" (AC-01).
+  const inStatus = useMemo(
+    () => (actions ?? []).filter((action) => matchesStatus(action, status)),
+    [actions, status],
+  );
   const categoryCounts = useMemo(() => {
     const counts = new Map<ActionCategory, number>();
-    for (const action of actions ?? []) {
+    for (const action of inStatus) {
       counts.set(action.category, (counts.get(action.category) ?? 0) + 1);
     }
     return counts;
-  }, [actions]);
+  }, [inStatus]);
   const fromProductsCount = useMemo(
-    () => (actions ?? []).filter((action) => FROM_PRODUCTS_KINDS.includes(action.kind)).length,
-    [actions],
+    () => inStatus.filter((action) => FROM_PRODUCTS_KINDS.includes(action.kind)).length,
+    [inStatus],
   );
 
   const summary = useMemo(() => {
@@ -511,11 +559,40 @@ function ActionsContent({ brand }: { brand: Brand }) {
     };
   }, [actions, topIds]);
 
+  const newIds = useMemo(
+    () =>
+      new Set(
+        (actions ?? [])
+          .filter((action) => isNewSinceVisit(action, lastVisit ?? null))
+          .map((action) => action.id),
+      ),
+    [actions, lastVisit],
+  );
+
+  // "Closed this week" counted on the server, read again when the list's
+  // own closed rows change; null until read or when the read failed.
+  const closedHere = (actions ?? []).filter(CARD_FILTERS.closedWeek).length;
+  const [closedCount, setClosedCount] = useState<number | null>(null);
+  useEffect(() => {
+    let current = true;
+    getClosedThisWeekCount(brand.id)
+      .then((count) => current && setClosedCount(count))
+      .catch(() => current && setClosedCount(null));
+    return () => {
+      current = false;
+    };
+  }, [brand.id, closedHere]);
+
+  const showClosedWeek = () => {
+    setStatus('all');
+    setFocus(focus === 'closedWeek' ? null : 'closedWeek');
+  };
+
   const hasActiveFilters =
     focus !== null ||
     category !== 'all' ||
     priority !== 'all' ||
-    status !== 'all' ||
+    status !== DEFAULT_STATUS ||
     assignee !== 'all' ||
     search !== '';
 
@@ -523,7 +600,7 @@ function ActionsContent({ brand }: { brand: Brand }) {
     setFocus(null);
     setCategory('all');
     setPriority('all');
-    setStatus('all');
+    setStatus(DEFAULT_STATUS);
     setAssignee('all');
     setSearch('');
   };
@@ -677,11 +754,43 @@ function ActionsContent({ brand }: { brand: Brand }) {
         </Card>
       </div>
 
+      {/* Where the actions went: the open count stays level as new ones come
+          and others close, so the summary says both. */}
+      <p
+        data-actions-summary=""
+        className="flex flex-wrap items-center gap-x-1.5 text-xs text-muted-foreground"
+      >
+        <span>{t('summary.open', { count: list.filter(isOpen).length })}</span>
+        {closedCount !== null && (
+          <>
+            <span aria-hidden="true">·</span>
+            <button
+              type="button"
+              onClick={showClosedWeek}
+              aria-pressed={focus === 'closedWeek'}
+              title={t('summary.closedHint', { days: CLOSED_WEEK_DAYS })}
+              className={cn(
+                'underline-offset-2 hover:text-foreground hover:underline',
+                focus === 'closedWeek' && 'font-medium text-foreground underline',
+              )}
+            >
+              {t('summary.closed', { count: closedCount })}
+            </button>
+          </>
+        )}
+        {typeof lastVisit === 'string' && (
+          <>
+            <span aria-hidden="true">·</span>
+            <span>{t('summary.new', { count: newIds.size })}</span>
+          </>
+        )}
+      </p>
+
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-2">
           <CategoryPill
             label={t('allActions')}
-            count={list.length}
+            count={inStatus.length}
             isActive={category === 'all'}
             onClick={() => setCategory('all')}
           />
@@ -738,7 +847,7 @@ function ActionsContent({ brand }: { brand: Brand }) {
           label={t('filters.status')}
           value={status}
           onChange={(v) => setStatus(v as StatusChoice)}
-          options={[...ACTION_STATUSES, 'stale' as const].map((v) => ({
+          options={['open' as const, ...ACTION_STATUSES, 'stale' as const].map((v) => ({
             value: v,
             label: t(`status.${v}`),
           }))}
@@ -758,12 +867,12 @@ function ActionsContent({ brand }: { brand: Brand }) {
           allLabel={t('filters.all')}
         />
         <div className="relative">
-          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+          <Search className="pointer-events-none absolute start-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <Input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder={t('filters.search')}
-            className="h-8 w-56 pl-8 text-xs"
+            className="h-8 w-56 ps-8 text-xs"
           />
         </div>
         {hasActiveFilters && (
@@ -776,7 +885,7 @@ function ActionsContent({ brand }: { brand: Brand }) {
           type="button"
           variant="outline"
           size="sm"
-          className="ml-auto gap-2 text-xs"
+          className="ms-auto gap-2 text-xs"
           onClick={handleExportCsv}
           disabled={visible.length === 0 || isExporting}
         >
@@ -792,6 +901,7 @@ function ActionsContent({ brand }: { brand: Brand }) {
       {visible.length > 0 ? (
         <ActionTable
           actions={visible}
+          newIds={newIds}
           onSelect={(action) => selectAction(action.id)}
           onStatusChange={changeStatus}
           onKeep={keepAction}
@@ -804,9 +914,17 @@ function ActionsContent({ brand }: { brand: Brand }) {
         />
       ) : (
         <div className="flex flex-col items-center justify-center rounded-lg border border-dashed py-16 text-center">
-          <p className="text-sm text-muted-foreground">{t('noResults')}</p>
-          <Button variant="outline" size="sm" className="mt-3" onClick={clearFilters}>
-            {t('filters.clear')}
+          {/* Open by default: with every action closed, nothing is filtered but the status. */}
+          <p className="text-sm text-muted-foreground">
+            {hasActiveFilters ? t('noResults') : t('noOpen')}
+          </p>
+          <Button
+            variant="outline"
+            size="sm"
+            className="mt-3"
+            onClick={hasActiveFilters ? clearFilters : () => setStatus('all')}
+          >
+            {hasActiveFilters ? t('filters.clear') : t('showAllStatuses')}
           </Button>
         </div>
       )}

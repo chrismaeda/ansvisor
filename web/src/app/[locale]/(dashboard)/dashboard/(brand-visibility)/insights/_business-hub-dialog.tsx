@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { useTranslations } from 'next-intl';
+import { useServerErrorText } from '@/hooks/use-server-error';
 import { Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
@@ -14,6 +15,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
+import { DatePicker } from '@/components/ui/date-picker';
 import { Label } from '@/components/ui/label';
 import { saveBusinessHubSnapshot } from '@/lib/actions/business-hub';
 import {
@@ -76,6 +78,7 @@ export function BusinessHubDialog({
   onSaved: () => void;
 }) {
   const t = useTranslations('insights.businessHub');
+  const serverError = useServerErrorText();
   const [draft, setDraft] = useState<EntryDraft>(() => draftOf(entry));
   const [problems, setProblems] = useState<Problems>({});
   const [saving, setSaving] = useState(false);
@@ -121,8 +124,8 @@ export function BusinessHubDialog({
       toast.success(t('saved'));
       onOpenChange(false);
       onSaved();
-    } catch {
-      toast.error(t('saveFailed'));
+    } catch (err) {
+      toast.error(serverError(err, t('saveFailed')));
     } finally {
       setSaving(false);
     }
@@ -184,13 +187,13 @@ export function BusinessHubDialog({
               </fieldset>
               <div className="space-y-1.5">
                 <Label htmlFor="bh-last-day">{t('dialog.lastDay')}</Label>
-                <Input
+                <DatePicker
                   id="bh-last-day"
-                  type="date"
-                  value={draft.periodEnd}
+                  value={draft.periodEnd || null}
                   disabled={Boolean(entry)}
                   aria-invalid={Boolean(problems.periodEnd)}
-                  onChange={(event) => set({ periodEnd: event.target.value })}
+                  onChange={(day) => set({ periodEnd: day ?? '' })}
+                  className="h-9 text-sm"
                 />
                 <p className="text-xs text-muted-foreground">{t('dialog.lastDayHint')}</p>
                 {error('periodEnd')}

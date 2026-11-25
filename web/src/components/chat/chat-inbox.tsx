@@ -19,7 +19,7 @@ import type { ChatNotice } from '@/lib/actions/chat-notices';
 import type { OutsideEmail } from '@/lib/actions/chat-outbound';
 import type { ChatListItem } from '@/lib/chat/conversations';
 import { agoOf } from '@/lib/chat/home';
-import { chatMenuLists } from '@/lib/chat/menu-groups';
+import { inboxChats } from '@/lib/chat/menu-groups';
 import { cn } from '@/lib/utils';
 import type { ChatListStatus } from './chat-list-provider';
 import { INBOX_ROW, SuggestionRows, SuggestionsPanel, type InboxDaily } from './inbox-suggestions';
@@ -29,11 +29,11 @@ import { OutsideEmailRows } from './inbox-outside';
 
 /**
  * The Inbox's rows: what needs the person, what runs, and unread results —
- * their own chats in Agents at work. A teammate's shared chat waits on its
+ * their own chats (inboxChats). A teammate's shared chat waits on its
  * author, who alone can answer it, so it is never one that "needs you".
  */
-export function inboxItems(chats: ChatListItem[], now = new Date()): ChatListItem[] {
-  return chatMenuLists(chats, now).atWork.filter((chat) => chat.mine);
+export function inboxItems(chats: ChatListItem[]): ChatListItem[] {
+  return inboxChats(chats);
 }
 
 /**
@@ -42,22 +42,6 @@ export function inboxItems(chats: ChatListItem[], now = new Date()): ChatListIte
  */
 export function ofBrand(chats: ChatListItem[], brandId: string | null | undefined) {
   return brandId ? chats.filter((chat) => !chat.brandId || chat.brandId === brandId) : chats;
-}
-
-/** The Inbox's counts: needs you, running, and results that came in today. */
-export function inboxCounts(items: ChatListItem[], now = new Date()) {
-  const today = now.toDateString();
-  return {
-    total: items.length,
-    needsYou: items.filter((c) => c.state === 'needsYou').length,
-    running: items.filter((c) => c.state === 'running' || c.state === 'paused').length,
-    doneToday: items.filter(
-      (c) =>
-        (c.state === 'done' || c.state === 'failed') &&
-        !!c.finishedAt &&
-        new Date(c.finishedAt).toDateString() === today,
-    ).length,
-  };
 }
 
 /**
@@ -257,14 +241,9 @@ function PlainInboxView({
   brandId,
 }: Omit<ChatInboxViewProps, 'daily' | 'initialTab'>) {
   const t = useTranslations('chatShell.inbox');
-  const counts = inboxCounts(items, now ?? new Date());
   const waiting = notices.length + outside.length;
-  const needsYou = counts.needsYou + waiting;
-  const summary = [
-    needsYou ? t('summary.needsYou', { count: needsYou }) : null,
-    counts.running ? t('summary.running', { count: counts.running }) : null,
-    counts.doneToday ? t('summary.doneToday', { count: counts.doneToday }) : null,
-  ].filter(Boolean);
+  // One number, the one Needs you holds (UX audit CH-04).
+  const needsYou = items.filter((c) => c.state === 'needsYou').length + waiting;
 
   return (
     <div className="max-w-[880px]">
@@ -273,7 +252,7 @@ function PlainInboxView({
       </div>
       {status === 'ready' && items.length + waiting > 0 && (
         <p className="-mt-1 mb-3.5 text-[13px] text-muted-foreground">
-          {summary.length > 0 && `${summary.join(' · ')}. `}
+          {needsYou > 0 && `${t('summary.needsYou', { count: needsYou })}. `}
           {t('lands')}
         </p>
       )}
@@ -318,7 +297,7 @@ function PlainInboxView({
 
 /**
  * The Inbox in topic tabs (CHAT-26 §2.1, §2.2; mockup #d-inbox): the
- * subtitle keeps its counts, with the week's suggestions; each tab shows
+ * subtitle gives one number, Needs you's (UX audit CH-04); each tab shows
  * its count and only its rows. All opens first, or the topic the address
  * names (`?tab=`), which the address keeps as the person moves between
  * them, so coming back from a row opens the same one. The arrow keys move
@@ -353,14 +332,7 @@ function TabbedInboxView({
   const suggestionsTotal = gets ? daily.read.total : 0;
   const tabs = INBOX_TABS.filter((name) => gets || name !== 'suggestions');
   const ready = status === 'ready';
-  const counts = inboxCounts(items, now ?? new Date());
   const tabCounts = inboxTabCounts(items, suggestionsTotal, notices.length + outside.length);
-  const summary = [
-    tabCounts.needsYou ? t('summary.needsYou', { count: tabCounts.needsYou }) : null,
-    counts.running ? t('summary.running', { count: counts.running }) : null,
-    counts.doneToday ? t('summary.doneToday', { count: counts.doneToday }) : null,
-    suggestionsTotal ? t('summary.suggestions', { count: suggestionsTotal }) : null,
-  ].filter(Boolean);
 
   const switchTab = (next: InboxTab) => {
     setTab(next);
@@ -417,7 +389,9 @@ function TabbedInboxView({
       </div>
       {ready && (
         <p className="-mt-1 mb-3.5 text-[13px] text-muted-foreground">
-          {summary.length > 0 ? `${summary.join(' · ')}. ` : `${t('nothingNeedsYou')} `}
+          {tabCounts.needsYou > 0
+            ? `${t('summary.needsYou', { count: tabCounts.needsYou })}. `
+            : `${t('nothingNeedsYou')} `}
           {t(gets ? 'landsWithSuggestions' : 'lands')}
         </p>
       )}
@@ -445,7 +419,7 @@ function TabbedInboxView({
           >
             {t(`tabs.${name}`)}
             {(ready || name === 'suggestions') && (
-              <span className="ml-[5px] text-muted-foreground tabular-nums">
+              <span className="ms-[5px] text-muted-foreground tabular-nums">
                 {tabCounts[name].toLocaleString('en-US')}
               </span>
             )}

@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { useFormatter, useTranslations } from 'next-intl';
+import { useServerErrorText } from '@/hooks/use-server-error';
 import { toast } from 'sonner';
 import { Plus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -117,6 +118,7 @@ export default function ContentPlanPage() {
   // period still filter.
   const { guard, isLocked } = useUpgradeGate();
   const tActions = useTranslations('readOnly.actions');
+  const serverError = useServerErrorText();
   // The people who can see the brand, read for it: another brand's aren't offered.
   const [team, setTeam] = useState<{ brandId: string; members: TeamMember[] } | null>(null);
   const members = team && team.brandId === activeBrandId ? team.members : [];
@@ -261,7 +263,7 @@ export default function ContentPlanPage() {
       reload();
     } catch (err) {
       console.error('Failed to mark the Plan row:', err);
-      toast.error(t('rowMenu.failed'));
+      toast.error(serverError(err, t('rowMenu.failed')));
     }
   };
 
@@ -272,7 +274,7 @@ export default function ContentPlanPage() {
       reload();
     } catch (err) {
       console.error('Failed to show the Plan row:', err);
-      toast.error(t('rowMenu.failed'));
+      toast.error(serverError(err, t('rowMenu.failed')));
     }
   };
 
@@ -286,7 +288,7 @@ export default function ContentPlanPage() {
       });
     } catch (err) {
       console.error('Failed to hide the Plan row:', err);
-      toast.error(t('rowMenu.failed'));
+      toast.error(serverError(err, t('rowMenu.failed')));
     }
   };
 
@@ -349,10 +351,15 @@ export default function ContentPlanPage() {
               aria-label={t('period')}
               className="inline-flex h-8 rounded-lg border bg-muted/40 p-0.5"
             >
+              {/* "Last" once, then the lengths: the full name stays each button's label. */}
+              <span aria-hidden className="self-center px-2 text-sm text-muted-foreground">
+                {t('periodLast')}
+              </span>
               {PLAN_PERIODS.map((value) => (
                 <button
                   key={value}
                   type="button"
+                  aria-label={t('periods', { days: value })}
                   aria-pressed={days === value}
                   onClick={() => changeDays(value)}
                   className={cn(
@@ -362,7 +369,7 @@ export default function ContentPlanPage() {
                       : 'text-muted-foreground hover:text-foreground',
                   )}
                 >
-                  {t('periods', { days: value })}
+                  {t('periodDays', { days: value })}
                 </button>
               ))}
             </div>
@@ -403,7 +410,7 @@ export default function ContentPlanPage() {
             disabled={!plan}
             onClick={() => setCard((c) => (c === value ? null : value))}
             className={cn(
-              'rounded-xl border bg-card p-4 text-left transition-colors hover:bg-muted/40 disabled:cursor-default disabled:hover:bg-card',
+              'rounded-xl border bg-card p-4 text-start transition-colors hover:bg-muted/40 disabled:cursor-default disabled:hover:bg-card',
               card === value && 'border-foreground ring-1 ring-inset ring-foreground',
             )}
           >

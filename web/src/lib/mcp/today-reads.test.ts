@@ -180,6 +180,7 @@ function start(over: Partial<TodayStart> = {}): TodayStart {
       lastRunAt: '2026-11-17T06:00:00Z',
       trackedPrompts: 40,
       openActions: 9,
+      openBreakdown: { onHold: 1, mine: 3 },
       doneThisWeek: 2,
     }),
     state: settled(null),
@@ -205,6 +206,7 @@ function start(over: Partial<TodayStart> = {}): TodayStart {
       change: 1.1,
       rank: 2,
       of: 5,
+      set: 'rivals',
       neighbour: { name: 'Northbound', gap: 3.4, ahead: false },
       competitors: [],
     }),
@@ -257,7 +259,7 @@ describe('get_today', () => {
     expect(today).toMatchObject({
       day: 'normal',
       loop: { tracked_prompts: 40, open_actions: 9, done_this_week: 2 },
-      where_you_stand: { score: 54.2, rank: 2, of: 5 },
+      where_you_stand: { score: 54.2, rank: 2, of: 5, rank_among: 'rivals' },
       last_week: null,
     });
   });
@@ -296,7 +298,11 @@ describe('get_today', () => {
         line: 'An agent is waiting for your OK on “Fix FAQ”.',
         open: '/dashboard/chat/c2',
       }),
-      expect.objectContaining({ type: 'drafts', count: 1 }),
+      expect.objectContaining({
+        type: 'drafts',
+        count: 1,
+        line: '1 draft waiting for your review. Nothing goes live without your OK.',
+      }),
       expect.objectContaining({ type: 'due', ref: 'AC-20', due: '2026-11-15' }),
       expect.objectContaining({ type: 'review', count: 2 }),
     ]);
@@ -315,7 +321,15 @@ describe('get_today', () => {
 
   it("reads Last week on the person's Monday, and This week's focus", async () => {
     page.getTodayLastWeek.mockResolvedValue({
-      visibility: { score: 50, change: 2, rank: 1, of: 4, neighbour: null, competitors: [] },
+      visibility: {
+        score: 50,
+        change: 2,
+        rank: 1,
+        of: 4,
+        set: 'top',
+        neighbour: null,
+        competitors: [],
+      },
       done: { count: 1, actions: [{ id: 'a3', kind: 'recover_lost_citations', payload: {} }] },
       results: null,
     });
@@ -342,6 +356,7 @@ describe('get_today', () => {
           lastRunAt: null,
           trackedPrompts: 8,
           openActions: 0,
+          openBreakdown: { onHold: 0, mine: 0 },
           doneThisWeek: 0,
         }),
         // A part the first day doesn't show is null, as getTodayStart gives it.

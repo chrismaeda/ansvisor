@@ -17,6 +17,7 @@ const content = vi.hoisted(() => ({
   getGenerationJobStatus: vi.fn(),
   getContentUsage: vi.fn(),
   getOpportunities: vi.fn(),
+  getOpportunityAvailability: vi.fn(),
   getOpportunityPrompts: vi.fn(),
   getOpportunityTopics: vi.fn(),
   updateOpportunityStatus: vi.fn(),
@@ -138,7 +139,8 @@ async function render(isLocked: boolean) {
 
 const buttonNamed = (name: string) =>
   [...document.body.querySelectorAll<HTMLButtonElement>('button')].find(
-    (b) => b.textContent?.trim() === name,
+    // An icon button is named by its aria-label.
+    (b) => (b.textContent?.trim() || b.getAttribute('aria-label')) === name,
   )!;
 const pickRow = async () => {
   const box = container.querySelector<HTMLElement>('tbody [role="checkbox"]')!;
@@ -172,6 +174,15 @@ beforeEach(() => {
   content.getOpportunityPrompts.mockResolvedValue([]);
   content.getOpportunityTopics.mockResolvedValue([]);
   content.getContentUsage.mockResolvedValue(null);
+  content.getOpportunityAvailability.mockResolvedValue({
+    needs: 3,
+    open: 1,
+    covered: 2,
+    noAnswers: 0,
+    angles: 0,
+    topics: {},
+    promptOpportunity: {},
+  });
   content.bulkUpdateStatus.mockResolvedValue({ updated: 1 });
   content.getWebhookConfig.mockResolvedValue({
     webhookUrl: 'https://hooks.example/acme',
@@ -187,6 +198,40 @@ beforeEach(() => {
 afterEach(() => {
   act(() => root.unmount());
   container.remove();
+});
+
+describe('Content Opportunities loading order (Content test 2026-11-19, item 9)', () => {
+  it('reads the list before the filters’ options and the usage card', async () => {
+    await render(false);
+    const first = (fn: { mock: { invocationCallOrder: number[] } }) =>
+      fn.mock.invocationCallOrder[0] ?? Infinity;
+    const list = first(content.getOpportunities);
+    expect(list).toBeLessThan(Infinity);
+    for (const later of [
+      content.getOpportunityPrompts,
+      content.getOpportunityTopics,
+      content.getContentUsage,
+      content.getOpportunityAvailability,
+    ]) {
+      expect(first(later)).toBeGreaterThan(list);
+    }
+  });
+});
+
+describe('Content Opportunities counters (Content test 2026-11-19, item 10)', () => {
+  it('counts the open ones as Available, and says the cards hold every status', async () => {
+    content.getOpportunities.mockResolvedValue({
+      opportunities: [OPPORTUNITY],
+      total: 265,
+      open: 60,
+      aggregates: { avgScore: 78, highImpactCount: 159, sentCount: 0, signalCount: 0 },
+    });
+    await render(false);
+    expect(container.textContent).toContain('60 Available');
+    expect(container.textContent).not.toContain('265 Available');
+    expect(container.textContent).toContain('all statuses, done ones too');
+    expect(container.textContent).toContain('out of 100 · all statuses');
+  });
 });
 
 describe('Content Opportunities on a read-only workspace', () => {
@@ -265,6 +310,7 @@ describe('the usage card and New without an active plan', () => {
     expect(container.textContent).toContain('No active plan');
     expect(container.textContent).not.toContain('Limit reached');
     expect(container.textContent).not.toContain('Growth plan');
+    expect(container.textContent).not.toContain('used up');
     // The usage card: the counts used, no red bar or line.
     const card = [...container.querySelectorAll('[data-slot="card"]')].find((el) =>
       el.textContent?.includes('This billing period'),
@@ -298,6 +344,33 @@ describe('the usage card and New without an active plan', () => {
       "Unused allowance doesn't carry over. Both reset on Nov 1, when your subscription renews.",
     );
     expect(buttonNamed('New').disabled).toBe(true);
+    // The note says nightly runs stop too, until the renewal.
+    expect(container.querySelector('[role="status"]')?.textContent).toContain(
+      "This month's new opportunities are used up. Nightly runs add more again from Nov 1.",
+    );
+  });
+});
+
+describe('Content Opportunities note on why none arrive overnight', () => {
+  it('says every need has an opportunity once none is left open', async () => {
+    content.getOpportunityAvailability.mockResolvedValue({
+      needs: 3,
+      open: 0,
+      covered: 3,
+      noAnswers: 0,
+      angles: 0,
+      topics: {},
+      promptOpportunity: {},
+    });
+    await render(false);
+    const note = container.querySelector('[role="status"]');
+    expect(note?.textContent).toContain('Every need you track already has an opportunity');
+    expect(note?.querySelector('a')?.getAttribute('href')).toBe('/dashboard/prompts');
+  });
+
+  it('shows no note while needs are still open', async () => {
+    await render(false);
+    expect(container.textContent).not.toContain('already has an opportunity');
   });
 });
 
@@ -315,6 +388,28 @@ describe('Content Opportunities on an active plan', () => {
       'Dismiss opportunities?',
     );
     expect(openUpgrade).not.toHaveBeenCalled();
+  });
+});
+
+describe('the Sources filter', () => {
+  it('shows each hint in full, in a menu wider than its trigger, with nothing truncated', async () => {
+    await render(false);
+    const trigger = container.querySelector<HTMLElement>('[aria-label="Source"]')!;
+    await act(async () => trigger.click());
+    const popup = document.body.querySelector<HTMLElement>('[data-slot="select-content"]')!;
+    expect(popup.className).toContain('w-auto');
+    expect(popup.className).toContain('min-w-(--anchor-width)');
+    for (const hint of [
+      'Suggested automatically as tracking data comes in',
+      'Sent from a task in the Action Center',
+    ]) {
+      const el = [...popup.querySelectorAll<HTMLElement>('span')].find(
+        (e) => e.textContent === hint,
+      )!;
+      expect(el).toBeTruthy();
+      expect(el.className).toContain('whitespace-normal');
+      expect(el.closest('.truncate')).toBeNull();
+    }
   });
 });
 

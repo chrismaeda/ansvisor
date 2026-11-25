@@ -289,7 +289,7 @@ describe('ChatMenuView', () => {
       ]);
       // Indented under the row, as Connections' list.
       for (const link of items()!.querySelectorAll('a'))
-        expect(link.className).toContain('pl-[23px]');
+        expect(link.className).toContain('ps-[23px]');
       // Home is the page shown: none of Settings' items is marked.
       expect(items()!.querySelector('[aria-current]')).toBeNull();
 
@@ -408,7 +408,7 @@ describe('ChatMenuView', () => {
     vi.unstubAllGlobals();
   });
 
-  it('counts the Inbox, and lists Agents at work in three rows until See all', async () => {
+  it('counts what needs the person on the Inbox, and lists Agents at work in three rows until See all', async () => {
     const chats = [
       chat('a', { state: 'needsYou', progress: { done: 3, total: 6 } }),
       chat('b', {
@@ -417,28 +417,28 @@ describe('ChatMenuView', () => {
         progress: { done: 1, total: 5 },
       }),
       chat('c', { state: 'running' }),
+      chat('p', { state: 'paused' }),
       chat('d', { state: 'done', unread: true, finishedAt: '2026-10-30T08:02:00' }),
       chat('e'),
     ];
     await render(menu(chats));
-    // The Inbox counts what Agents at work lists, with a dot while one needs the person.
+    // The Inbox counts what needs the person, as its Needs you tab (CH-04).
     const inbox = action('chatMenu.openInbox')[0];
-    expect(inbox.textContent).toBe('Inbox4');
-    expect(inbox.getAttribute('aria-label')).toBe('Inbox · 4 items · 1 needs you');
+    expect(inbox.textContent).toBe('Inbox1');
+    expect(inbox.getAttribute('aria-label')).toBe('Inbox · 1 needs you');
+    // Agents at work: what is under way or waits (UX audit CH-03), not a finished answer.
     expect(text()).toContain('Agents at work4');
     expect(text()).toContain('Waiting for your OK · step 4 of 6');
     expect(text()).toContain('Step 2 of 5 · Comparing cited pages');
-    expect(text()).not.toContain('Chat d');
     await act(async () => action('chatMenu.seeAllRuns')[0].click());
-    expect(text()).toContain('Done · 08:02');
     expect(action('chatMenu.showLessRuns')).toHaveLength(1);
     await act(async () => action('chatMenu.showLessRuns')[0].click());
-    expect(text()).not.toContain('Chat d');
-    // A chat at work isn't listed again below.
-    expect(action('chatMenu.openChat')).toHaveLength(4);
+    // The finished one is under its day, with its result, never in Agents at work.
+    expect(text()).toContain('Done · 08:02');
+    expect(action('chatMenu.openChat')).toHaveLength(5);
   });
 
-  it('names Agents for screen readers "Agents · in Action Center", and keeps Agents at work', async () => {
+  it('names Agents "Agents · in Action Center", marks it as leaving Chat, and keeps Agents at work', async () => {
     const chats = [
       chat('a', { state: 'needsYou', progress: { done: 3, total: 6 } }),
       chat('b', { state: 'running' }),
@@ -449,6 +449,9 @@ describe('ChatMenuView', () => {
     expect(agents.getAttribute('href')).toBe('/dashboard/agents');
     expect(agents.textContent).toBe('AgentsNew');
     expect(agents.getAttribute('aria-label')).toBe('Agents · in Action Center');
+    // It leaves Chat (CH-05): an arrow, and a tooltip saying where it goes.
+    expect(agents.querySelector('[data-slot="leaves-chat"]')).not.toBeNull();
+    expect(agents.getAttribute('title')).toBe('Opens Action Center › Agents, outside Chat');
     expect(text()).toContain('Agents at work2');
     expect(text()).toContain('Waiting for your OK · step 4 of 6');
   });
@@ -463,7 +466,8 @@ describe('ChatMenuView', () => {
       chat('e'),
     ];
     await render(menu(chats));
-    await act(async () => action('chatMenu.seeAllRuns')[0].click());
+    // Three at work fit without See all; the finished ones are under their day.
+    expect(action('chatMenu.seeAllRuns')).toHaveLength(0);
     const dotOf = (id: string) => {
       const row = [...action('chatMenu.openChat')].find(
         (link) => link.getAttribute('href') === `/dashboard/chat/${id}`,
@@ -500,8 +504,27 @@ describe('ChatMenuView', () => {
       ]),
     );
     const inbox = action('chatMenu.openInbox')[0];
-    expect(inbox.textContent).toBe('Inbox1');
-    expect(inbox.getAttribute('aria-label')).toBe('Inbox · 1 item');
+    expect(inbox.textContent).toBe('Inbox');
+    expect(inbox.getAttribute('aria-label')).toBeNull();
+  });
+
+  it('leads a title more than one chat has with its date, and keeps one menu scroll (CH-08, CH-15)', async () => {
+    await render(
+      menu([
+        chat('a', { title: 'What’s new in Ansvisor', lastMessageAt: '2026-10-30T10:00:00' }),
+        chat('b', { title: 'What’s new in Ansvisor', lastMessageAt: '2026-10-28T09:00:00' }),
+        chat('c', { title: 'Pricing citations', lastMessageAt: '2026-10-30T09:00:00' }),
+      ]),
+    );
+    const dates = [...host.querySelectorAll('[data-slot="chat-row-date"]')].map(
+      (el) => el.textContent,
+    );
+    expect(dates).toEqual(['10:00 · ', 'Oct 28 · ']);
+    // New chat and Search chats sit at the top of the one scroll area: the Chats list has none of its own.
+    const nav = host.querySelector('nav')!;
+    expect(nav.className).toContain('overflow-y-auto');
+    expect(host.querySelector('[data-slot="chat-menu-top"] #chat-menu-search')).not.toBeNull();
+    expect(nav.querySelectorAll('.overflow-y-auto')).toHaveLength(0);
   });
 
   it('groups the other chats by day, bold while unread, and folds Chats', async () => {
@@ -521,6 +544,30 @@ describe('ChatMenuView', () => {
     await act(async () => fold.click());
     expect(fold.getAttribute('aria-expanded')).toBe('false');
     expect(action('chatMenu.openChat')).toHaveLength(0);
+  });
+
+  it("offers Clear on a day with the person's own chats, never on Pinned or a teammate's day", async () => {
+    const onClearGroup = vi.fn();
+    await render(
+      menu(
+        [
+          chat('p', { lastMessageAt: '2026-10-30T11:00:00', pinned: true }),
+          chat('a', { lastMessageAt: '2026-10-25T10:00:00' }),
+          chat('b', { lastMessageAt: '2026-10-24T10:00:00' }),
+          chat('s', { lastMessageAt: '2026-10-23T10:00:00', mine: false, shared: true }),
+          chat('o', { lastMessageAt: '2026-09-02T10:00:00', mine: false, shared: true }),
+        ],
+        { onClearGroup },
+      ),
+    );
+    const clear = action('chatMenu.clearGroup');
+    expect(clear).toHaveLength(1);
+    expect(clear[0].getAttribute('aria-label')).toBe('Delete your 2 chats from Previous 7 days');
+    await act(async () => clear[0].click());
+    expect(onClearGroup).toHaveBeenCalledWith(
+      [expect.objectContaining({ id: 'a' }), expect.objectContaining({ id: 'b' })],
+      'Previous 7 days',
+    );
   });
 
   it("moves Today's chats to Yesterday once the menu, left open, passes midnight", async () => {

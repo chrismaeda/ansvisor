@@ -42,7 +42,17 @@ vi.mock('@/lib/actions/settings-state', () => ({
 vi.mock('@/lib/actions/user-brand-state', () => ({ markSeen: vi.fn(async () => ({ ok: true })) }));
 const signOut = vi.fn(async () => ({}));
 vi.mock('@/lib/supabase/client', () => ({ createClient: () => ({ auth: { signOut } }) }));
-vi.mock('@/lib/chat/start-chat', () => ({ startChatRun: vi.fn() }));
+vi.mock('@/lib/chat/start-chat', () => ({ askInOneChat: vi.fn() }));
+// The Language item's list (LOC-005): a customer's, English only.
+vi.mock('@/lib/actions/ui-language', () => ({
+  getUiLanguageState: async () => ({
+    selected: null,
+    automatic: 'en',
+    options: ['en'],
+    preview: false,
+  }),
+  setUiLanguage: vi.fn(),
+}));
 
 const { UserProfileNavItem } = await import('./user-profile-nav-item');
 
@@ -124,6 +134,7 @@ describe('UserProfileNavItem', () => {
       'Integrations',
       'API & MCP',
       'Plans & billing',
+      'Language',
       'Help',
       'Send feedback',
       'Sign out',
@@ -179,7 +190,7 @@ describe('UserProfileNavItem', () => {
     await render('analyst', true);
     expect(container.querySelector('a')).toBeNull();
     expect(trigger().textContent).toContain('Ayşe Kaya, account menu');
-    expect((await openMenu()).length).toBe(9);
+    expect((await openMenu()).length).toBe(10);
   });
 
   it("opens the chat What's new starts as soon as it has its id", async () => {
@@ -188,14 +199,18 @@ describe('UserProfileNavItem', () => {
     globalThis.fetch = vi.fn(
       async () => new Response(JSON.stringify({ ok: true, hasUnread: false })),
     ) as unknown as typeof fetch;
-    const { startChatRun } = await import('@/lib/chat/start-chat');
-    vi.mocked(startChatRun).mockResolvedValueOnce({ ok: true, chatId: 'chat-9' });
+    const { askInOneChat } = await import('@/lib/chat/start-chat');
+    vi.mocked(askInOneChat).mockResolvedValueOnce({ ok: true, chatId: 'chat-9' });
     try {
       await render('analyst');
       await openMenu();
       const item = document.querySelector<HTMLElement>('[data-account-item="whats-new"]')!;
       await act(async () => item.click());
-      expect(startChatRun).toHaveBeenCalledWith(expect.any(String), null);
+      // In the person's What's new chat when they have one (askInOneChat).
+      expect(askInOneChat).toHaveBeenCalledWith(
+        'What’s new in Ansvisor and how can it help me?',
+        null,
+      );
       expect(push).toHaveBeenCalledWith('/dashboard/chat/chat-9');
     } finally {
       globalThis.fetch = realFetch;

@@ -104,6 +104,13 @@ export const DEMO_GUARDED = [
   ),
   // Notify me on a later ad platform: logged, and the demo's log stays empty.
   guard('POST /ads/connections/notify', brandIn('body')),
+  // A brand's ad accounts (Phase 1): a demo brand reads no real ad account.
+  guard('POST /ads/accounts/chatgpt', brandIn('body')),
+  guard(
+    'DELETE /ads/accounts/:accountId',
+    brandIn('query'),
+    rowIn('ads_accounts', 'path', 'accountId'),
+  ),
 
   // Site Audit (audits.js).
   guard('POST /audits', brandIn('body')),
@@ -291,6 +298,10 @@ export const DEMO_GUARDED = [
 
 /** The write routes left open on a demo brand, and why. */
 export const DEMO_OPEN = [
+  open(
+    'POST /ai-text/translate',
+    "AI-written text in the reader's language (LOC-010): reads rows the caller may see and keeps their translations, changing no sample data; each row and language is translated once.",
+  ),
   open(
     'PATCH /ads/settings',
     "The organization's own Ads thresholds, changed by its Admins: names no brand, changes no sample data and costs nothing.",

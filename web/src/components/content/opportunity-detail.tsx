@@ -3,6 +3,7 @@
 import { useState, useEffect } from 'react';
 import { useLocale, useTranslations } from 'next-intl';
 import { useFailureToast } from '@/hooks/use-failure-toast';
+import { useCaughtErrorText, useServerErrorText } from '@/hooks/use-server-error';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -75,6 +76,7 @@ import { useUserRole } from '@/hooks/use-user-role';
 import { useUpgradeGate } from '@/components/providers/upgrade-gate';
 import { isNoPlan } from '@/lib/billing/no-plan';
 import { useBrandStore } from '@/stores/use-brand-store';
+import { useAiText } from '@/hooks/use-ai-text';
 import { OpportunityActions } from '@/components/content/opportunity-actions';
 import { NewContentDialog, type DialogPreset } from '@/components/content/new-content-dialog';
 import { WriteThisDialog } from '@/components/content/write-this-dialog';
@@ -197,6 +199,8 @@ export function OpportunityDetail({
 }) {
   const t = useTranslations('content');
   const failureToast = useFailureToast();
+  const serverError = useServerErrorText();
+  const caughtError = useCaughtErrorText();
   const assetTypeLabel = useAssetTypeLabel();
   const locale = useLocale();
   // A read-only workspace (plan not active): every action here opens the
@@ -210,6 +214,8 @@ export function OpportunityDetail({
   useEffect(() => {
     if (opportunity) onOpportunity?.(opportunity);
   }, [opportunity, onOpportunity]);
+  // Its title and reason in the person's interface language (LOC-010).
+  const aiText = useAiText('opportunity', opportunity ? [opportunity.id] : []);
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
   const [generatingBrief, setGeneratingBrief] = useState(false);
@@ -276,8 +282,8 @@ export function OpportunityDetail({
       toast.success(t('sentToPlan'), {
         action: { label: t('openPlan'), onClick: () => router.push('/dashboard/content/plan') },
       });
-    } catch {
-      toast.error(t('sendToPlanError'));
+    } catch (err) {
+      toast.error(serverError(err, t('sendToPlanError')));
     }
   };
 
@@ -296,7 +302,7 @@ export function OpportunityDetail({
       })
       .catch((err) => {
         console.error('Failed to load opportunity:', err);
-        toast.error(t('loadOpportunityError'));
+        toast.error(serverError(err, t('loadOpportunityError')));
       })
       .finally(() => setLoading(false));
 
@@ -304,14 +310,18 @@ export function OpportunityDetail({
     getBriefQuota()
       .then(setQuota)
       .catch(() => setQuota(null));
-  }, [id, t]);
+  }, [id, t, serverError]);
 
   const handleSend = async () => {
     setSending(true);
     try {
       const result = await sendToWebhook(id);
       if (result.success === false) {
-        toast.error(result.error);
+        toast.error(
+          result.code === 'no_webhook'
+            ? t('noWorkflowConnected')
+            : serverError(result, result.error, result.status),
+        );
       } else {
         toast.success(t('sentToWorkflow'));
         const updated = await getOpportunity(id);
@@ -320,7 +330,7 @@ export function OpportunityDetail({
       }
     } catch (err) {
       console.error('Send failed:', err);
-      toast.error(t('sendError'));
+      toast.error(serverError(err, t('sendError')));
     } finally {
       setSending(false);
     }
@@ -331,8 +341,8 @@ export function OpportunityDetail({
       await updateOpportunityStatus(id, 'reviewed');
       setOpportunity(await getOpportunity(id));
       onChanged?.();
-    } catch {
-      toast.error(t('reviewedError'));
+    } catch (err) {
+      toast.error(serverError(err, t('reviewedError')));
     }
   };
 
@@ -376,7 +386,7 @@ export function OpportunityDetail({
       idempotencyKey: crypto.randomUUID(),
     }).catch((err: unknown) => ({
       ok: false as const,
-      error: err instanceof Error ? err.message : t('alternative.failed'),
+      error: caughtError(err, t('alternative.failed')),
       failure: 'failed' as const,
       quotaExhausted: false,
       noCluster: false,
@@ -410,14 +420,14 @@ export function OpportunityDetail({
               const restored = await getOpportunity(id);
               setOpportunity(restored);
               onChanged?.();
-            } catch {
-              toast.error(t('undoFailed'));
+            } catch (err) {
+              toast.error(serverError(err, t('undoFailed')));
             }
           },
         },
       });
-    } catch {
-      toast.error(t('dismissError'));
+    } catch (err) {
+      toast.error(serverError(err, t('dismissError')));
     }
   };
 
@@ -428,14 +438,14 @@ export function OpportunityDetail({
     try {
       const result = await sendOpportunityToActionCenter(id, assetKey);
       if ('error' in result) {
-        toast.error(result.error);
+        toast.error(serverError(result, result.error, result.status));
         return;
       }
       toast.success(result.created ? t('sentToActionCenter') : t('alreadyInActionCenter'));
       setOpportunity(await getOpportunity(id));
       onChanged?.();
-    } catch {
-      toast.error(t('sendToActionCenterError'));
+    } catch (err) {
+      toast.error(serverError(err, t('sendToActionCenterError')));
     } finally {
       setSendingAction(null);
     }
@@ -447,8 +457,8 @@ export function OpportunityDetail({
       setOpportunity(await getOpportunity(id));
       onChanged?.();
       toast.success(t('restoredToast'));
-    } catch {
-      toast.error(t('restoreError'));
+    } catch (err) {
+      toast.error(serverError(err, t('restoreError')));
     }
   };
 
@@ -462,7 +472,7 @@ export function OpportunityDetail({
       toast.success(t('briefGeneratedToast'));
     } catch (err) {
       console.error('Brief generation failed:', err);
-      toast.error(err instanceof Error ? err.message : t('briefGenerateError'));
+      toast.error(caughtError(err, t('briefGenerateError')));
       // Refresh the counter — the failure may have been a quota rejection.
       getBriefQuota()
         .then(setQuota)
@@ -519,7 +529,7 @@ export function OpportunityDetail({
       }
     } catch (err) {
       console.error('Export failed:', err);
-      toast.error(t('exportOne.failed'));
+      toast.error(serverError(err, t('exportOne.failed')));
     }
   };
 
@@ -541,12 +551,12 @@ export function OpportunityDetail({
       <div className="space-y-3">
         {/* The month's AI usage at the row's right, as on every page, also in
             the drawer, which covers the Content page's header; there it
-            leaves room for the drawer's close button (top-3 right-3, 28 px).
+            leaves room for the drawer's close button (top-3 end-3, 28 px).
             The banner follows the whole header block. */}
         <HeaderWithAiUsage
           banner={false}
           askChat={!inDrawer}
-          className={inDrawer ? 'pr-8' : undefined}
+          className={inDrawer ? 'pe-8' : undefined}
         >
           <div className="flex items-start gap-3">
             {!inDrawer && (
@@ -557,10 +567,12 @@ export function OpportunityDetail({
               </Link>
             )}
             <div className="min-w-0 flex-1">
-              <h1 className="text-xl font-bold tracking-tight">{opportunity.title}</h1>
+              <h1 className="text-xl font-bold tracking-tight">
+                {aiText(opportunity.id, 'title', opportunity.title)}
+              </h1>
               {sd.alternativeOf && (
                 <p className="mt-1 text-xs text-muted-foreground">
-                  <Badge variant="outline" className="mr-1.5 text-[10px] font-normal">
+                  <Badge variant="outline" className="me-1.5 text-[10px] font-normal">
                     {t('alternative.badge')}
                   </Badge>
                   {t('alternative.of')}{' '}
@@ -573,7 +585,9 @@ export function OpportunityDetail({
                 </p>
               )}
               {opportunity.description && (
-                <p className="text-sm text-muted-foreground mt-1">{opportunity.description}</p>
+                <p className="text-sm text-muted-foreground mt-1">
+                  {aiText(opportunity.id, 'description', opportunity.description)}
+                </p>
               )}
             </div>
           </div>
@@ -603,7 +617,7 @@ export function OpportunityDetail({
           </Badge>
           {/* The UI's language, not the browser's: an English page showed "25 Eyl". */}
           <span
-            className="ml-auto flex items-center gap-1.5 text-xs text-muted-foreground"
+            className="ms-auto flex items-center gap-1.5 text-xs text-muted-foreground"
             title={suggestedDate(opportunity.createdAt, locale).full}
           >
             <Clock className="h-3.5 w-3.5" />
@@ -760,6 +774,16 @@ export function OpportunityDetail({
         </div>
       )}
 
+      {/* An opportunity on a page of the brand's, from before groups of prompts
+          (no cluster): its page here too, as Write this opens it (Content
+          test 2026-11-19, item 17: the target URL showed only in Write this). */}
+      {!opportunity.clusterId &&
+        opportunity.decision &&
+        opportunity.decision !== 'create' &&
+        (sd.targetPages ?? []).some((p) => p?.url) && (
+          <TargetPagesCard decision={opportunity.decision} sourceData={sd} />
+        )}
+
       {opportunity.clusterId && (
         <div className="grid grid-cols-1 gap-4 @5xl:grid-cols-3">
           <div className="space-y-4 @5xl:col-span-2">
@@ -835,7 +859,10 @@ export function OpportunityDetail({
                   <StatCard
                     icon={Users}
                     label={t('detail.competitorGap')}
-                    value={`${sd.competitorGap > 0 ? '+' : ''}${Math.round(sd.competitorGap)}%`}
+                    // Points between two visibilities, never a % past 100 (Content test 2026-11-19).
+                    value={`${sd.competitorGap > 0 ? '+' : ''}${t('detail.gapPoints', {
+                      gap: Math.round(Math.max(-100, Math.min(100, sd.competitorGap))),
+                    })}`}
                   />
                 )}
                 {sd.topCompetitorVisibility !== undefined && (
@@ -977,10 +1004,7 @@ export function OpportunityDetail({
                 <>
                   <Sparkles className="h-10 w-10 text-muted-foreground/40 mb-3" />
                   <h3 className="text-sm font-medium mb-1">No Content Brief Yet</h3>
-                  <p className="text-xs text-muted-foreground mb-4 max-w-sm">
-                    Generate an AI-powered content brief with a suggested title, outline, target
-                    keywords, and competitor insights.
-                  </p>
+                  <p className="text-xs text-muted-foreground mb-4 max-w-sm">{t('briefEmpty')}</p>
                   {canManage ? (
                     <Button
                       onClick={guard(handleGenerateBrief, { action: tActions('generateBrief') })}
@@ -988,7 +1012,7 @@ export function OpportunityDetail({
                       className="gap-2"
                     >
                       {generatingBrief ? <LoadingDots /> : <Sparkles className="h-4 w-4" />}
-                      {generatingBrief ? 'Generating...' : 'Generate Content Brief'}
+                      {generatingBrief ? t('generatingBrief') : t('generateBrief')}
                     </Button>
                   ) : (
                     <p className="text-xs text-muted-foreground">{tManagers('generateBrief')}</p>
@@ -1023,7 +1047,7 @@ export function OpportunityDetail({
                   <p className="text-sm font-medium mb-1.5">
                     {idx + 1}. {section.heading}
                   </p>
-                  <ul className="space-y-1 ml-4">
+                  <ul className="space-y-1 ms-4">
                     {section.keyPoints.map((point, pIdx) => (
                       <li key={pIdx} className="text-xs text-muted-foreground list-disc">
                         {point}
@@ -1136,7 +1160,7 @@ function FromTaskCard({
             <>
               <dt className="text-muted-foreground">{t('how')}</dt>
               <dd>
-                <ol className="list-decimal space-y-0.5 pl-4">
+                <ol className="list-decimal space-y-0.5 ps-4">
                   {task.how.map((step, i) => (
                     <li key={i}>{step}</li>
                   ))}

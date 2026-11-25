@@ -21,7 +21,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Link } from '@/i18n/navigation';
 import { useUserRole } from '@/hooks/use-user-role';
 import { getMentionResponse } from '@/lib/actions/mentions';
-import { classifyDomain, extractHostname, SOURCE_CATEGORY_LABELS } from '@/lib/citations/classify';
+import { classifyDomain, extractHostname } from '@/lib/citations/classify';
 import { stripEntityMarkup } from '@/lib/entity-markup';
 import { mentionPlatformLabel } from '@/lib/mentions-headline';
 import type { MentionRow, MentionSentiment, SentimentOverride } from '@/lib/mentions-list';
@@ -104,6 +104,7 @@ export function ResponseDrawer({
 }) {
   const t = useTranslations('mentions.drawer');
   const tActions = useTranslations('mentions.actions');
+  const tCategories = useTranslations('citations.categories');
   // Suggesting content costs AI: admins and managers start it.
   const { canManage } = useUserRole();
   const locale = useLocale();
@@ -197,7 +198,7 @@ export function ResponseDrawer({
       >
         {row && (
           <>
-            <SheetHeader className="gap-2 border-b px-5 py-4 pr-12">
+            <SheetHeader className="gap-2 border-b px-5 py-4 pe-12">
               <SheetDescription className="flex flex-wrap items-center gap-1.5 text-foreground">
                 <span className={chip}>
                   <AIProviderAvatar
@@ -248,7 +249,7 @@ export function ResponseDrawer({
               />
 
               <Section title={t('mention')}>
-                <blockquote className="rounded-md border-l-2 border-primary bg-muted/40 px-3 py-2 text-sm leading-relaxed">
+                <blockquote className="rounded-md border-s-2 border-primary bg-muted/40 px-3 py-2 text-sm leading-relaxed">
                   <Highlighted text={row.excerpt} names={names} />
                 </blockquote>
                 <p className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
@@ -286,7 +287,7 @@ export function ResponseDrawer({
                 <Button
                   variant="ghost"
                   size="sm"
-                  className="-ml-2 h-7 px-2 text-xs"
+                  className="-ms-2 h-7 px-2 text-xs"
                   aria-expanded={showResponse}
                   onClick={() => setShowResponse((v) => !v)}
                 >
@@ -358,7 +359,7 @@ export function ResponseDrawer({
                                     'border-primary/30 bg-primary/10 text-foreground',
                                 )}
                               >
-                                {SOURCE_CATEGORY_LABELS[category]}
+                                {tCategories(category)}
                               </Badge>
                             </a>
                           </li>

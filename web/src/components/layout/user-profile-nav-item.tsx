@@ -21,7 +21,7 @@ import { cn } from '@/lib/utils';
 import { siteConfig } from '@/config/site';
 import { PLANS } from '@/config/plans';
 import { createClient } from '@/lib/supabase/client';
-import { startChatRun } from '@/lib/chat/start-chat';
+import { askInOneChat } from '@/lib/chat/start-chat';
 import { daysUntil, type SettingsDot, type SettingsDotPlace } from '@/lib/settings-dots';
 import { useAuthStore } from '@/stores/use-auth-store';
 import { useBrandStore } from '@/stores/use-brand-store';
@@ -45,12 +45,14 @@ import {
   teamSection,
 } from '@/app/[locale]/(dashboard)/dashboard/settings/_sections';
 import { MenuDot } from './menu-dot';
+import { UserMenuLanguage } from './user-menu-language';
+import { SuggestTranslationDialog } from '@/components/settings/suggest-translation';
 import { SettingsDotMark, useSettingsDotWords, useSettingsDots } from './settings-dots';
 
 const SETTINGS_HREF = '/dashboard/settings';
 
 /** Where the dot sits on the avatar and the gear. */
-const CORNER_DOT = 'absolute -right-0.5 -top-0.5 ring-2 ring-sidebar';
+const CORNER_DOT = 'absolute -end-0.5 -top-0.5 ring-2 ring-sidebar';
 
 const isMac = () => typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform);
 
@@ -145,7 +147,12 @@ export function UserProfileNavItem({
     window.open(href, '_blank', 'noopener,noreferrer');
   };
 
+  // The Language item reads its list when the menu first opens.
+  const [menuOpened, setMenuOpened] = useState(false);
+  // "Suggest a better translation" (LOC-009): its form stays outside the menu, which closes on a click.
+  const [suggestOpen, setSuggestOpen] = useState(false);
   const onOpenChange = (open: boolean) => {
+    if (open) setMenuOpened(true);
     if (!open || !chatAgentic) return;
     void fetch('/api/chat/whats-new?unread=true&limit=1&days=14')
       .then((res) => res.json())
@@ -155,14 +162,15 @@ export function UserProfileNavItem({
       .catch(() => undefined);
   };
 
-  // What's new asks Chat, as Chat Home's What's new chip does.
+  // What's new asks Chat, as Chat Home's What's new chip does, in the
+  // person's What's new chat when they have one.
   const whatsNew = async () => {
     onClick?.();
     if (isLocked) {
       openUpgrade();
       return;
     }
-    const started = await startChatRun(tHome('forYou.whatsNewMessage'), brandId ?? null);
+    const started = await askInOneChat(tHome('forYou.whatsNewMessage'), brandId ?? null);
     if (!started.ok) {
       if (started.code === 'subscription_inactive' || started.code === 'demo_brand') openUpgrade();
       else toast.error(started.error ?? tHome('startFailed'));
@@ -248,7 +256,7 @@ export function UserProfileNavItem({
             <button
               type="button"
               className={cn(
-                'flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-2 text-left text-sm transition-colors hover:bg-sidebar-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 data-[popup-open]:bg-sidebar-accent',
+                'flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-2 text-start text-sm transition-colors hover:bg-sidebar-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 data-[popup-open]:bg-sidebar-accent',
                 collapsed && 'justify-center px-0',
               )}
             />
@@ -308,6 +316,7 @@ export function UserProfileNavItem({
               )}
             </DropdownMenuItem>
           )}
+          <UserMenuLanguage open={menuOpened} onSuggest={() => setSuggestOpen(true)} />
           <DropdownMenuItem onClick={() => openTab(siteConfig.links.docs)}>
             <CircleHelp className="text-muted-foreground" />
             {tMenu('help')}
@@ -323,6 +332,7 @@ export function UserProfileNavItem({
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
+      <SuggestTranslationDialog open={suggestOpen} onOpenChange={setSuggestOpen} />
       {/* The gear opens Settings, as it always has. */}
       {!collapsed && (
         <Link

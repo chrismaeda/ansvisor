@@ -4479,6 +4479,7 @@ export type Database = {
           brand_id: string
           legacy: boolean
           prompt_id: string
+          provider: string | null
           region: string | null
           scraper_id: string
           submitted_at: string
@@ -4488,6 +4489,7 @@ export type Database = {
           brand_id: string
           legacy?: boolean
           prompt_id: string
+          provider?: string | null
           region?: string | null
           scraper_id: string
           submitted_at?: string
@@ -4497,6 +4499,7 @@ export type Database = {
           brand_id?: string
           legacy?: boolean
           prompt_id?: string
+          provider?: string | null
           region?: string | null
           scraper_id?: string
           submitted_at?: string
@@ -6843,6 +6846,57 @@ export type Database = {
           },
         ]
       }
+      notification_preferences: {
+        Row: {
+          brand_id: string | null
+          created_at: string
+          delivery: string
+          frequency: string
+          id: string
+          kind: string
+          organization_id: string
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          brand_id?: string | null
+          created_at?: string
+          delivery?: string
+          frequency: string
+          id?: string
+          kind: string
+          organization_id: string
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          brand_id?: string | null
+          created_at?: string
+          delivery?: string
+          frequency?: string
+          id?: string
+          kind?: string
+          organization_id?: string
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "notification_preferences_brand_id_fkey"
+            columns: ["brand_id"]
+            isOneToOne: false
+            referencedRelation: "brands"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "notification_preferences_organization_id_fkey"
+            columns: ["organization_id"]
+            isOneToOne: false
+            referencedRelation: "organizations"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       organization_ai_keys: {
         Row: {
           active: boolean
@@ -7115,6 +7169,7 @@ export type Database = {
           organization_id: string | null
           role: Database["public"]["Enums"]["user_role"]
           time_zone: string | null
+          ui_language: string | null
           updated_at: string
           work_areas: string[]
           work_areas_asked_at: string | null
@@ -7132,6 +7187,7 @@ export type Database = {
           organization_id?: string | null
           role?: Database["public"]["Enums"]["user_role"]
           time_zone?: string | null
+          ui_language?: string | null
           updated_at?: string
           work_areas?: string[]
           work_areas_asked_at?: string | null
@@ -7149,6 +7205,7 @@ export type Database = {
           organization_id?: string | null
           role?: Database["public"]["Enums"]["user_role"]
           time_zone?: string | null
+          ui_language?: string | null
           updated_at?: string
           work_areas?: string[]
           work_areas_asked_at?: string | null
@@ -7780,6 +7837,7 @@ export type Database = {
           created_at: string
           frequency: string
           recipients: string[] | null
+          traffic_digest: boolean
           updated_at: string
         }
         Insert: {
@@ -7787,6 +7845,7 @@ export type Database = {
           created_at?: string
           frequency?: string
           recipients?: string[] | null
+          traffic_digest?: boolean
           updated_at?: string
         }
         Update: {
@@ -7794,6 +7853,7 @@ export type Database = {
           created_at?: string
           frequency?: string
           recipients?: string[] | null
+          traffic_digest?: boolean
           updated_at?: string
         }
         Relationships: [
@@ -8575,6 +8635,62 @@ export type Database = {
             columns: ["brand_id"]
             isOneToOne: false
             referencedRelation: "brands"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      translation_suggestions: {
+        Row: {
+          created_at: string
+          current_text: string
+          id: string
+          locale: string
+          message_key: string | null
+          note: string
+          organization_id: string
+          path: string
+          reviewed_at: string | null
+          status: string
+          suggestion: string
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          created_at?: string
+          current_text: string
+          id?: string
+          locale: string
+          message_key?: string | null
+          note?: string
+          organization_id: string
+          path?: string
+          reviewed_at?: string | null
+          status?: string
+          suggestion: string
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          created_at?: string
+          current_text?: string
+          id?: string
+          locale?: string
+          message_key?: string | null
+          note?: string
+          organization_id?: string
+          path?: string
+          reviewed_at?: string | null
+          status?: string
+          suggestion?: string
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "translation_suggestions_organization_id_fkey"
+            columns: ["organization_id"]
+            isOneToOne: false
+            referencedRelation: "organizations"
             referencedColumns: ["id"]
           },
         ]
@@ -9559,6 +9675,15 @@ export type Database = {
         Args: { p_brand_id: string; p_competitor_id: string }
         Returns: Json
       }
+      head_to_head_window_daily: {
+        Args: {
+          p_brand_id: string
+          p_competitor_id: string
+          p_day_from: string | null
+          p_day_to: string | null
+        }
+        Returns: Json
+      }
       insights_aggregates: {
         Args: {
           p_brand_id: string
@@ -9975,6 +10100,10 @@ export type Database = {
           p_tool_key: string
         }
         Returns: string
+      }
+      save_notification_preferences: {
+        Args: { p_rows: Json }
+        Returns: undefined
       }
       seed_kpi_presets: {
         Args: { p_brand_id: string; p_kpis: Json }

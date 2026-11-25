@@ -1,16 +1,40 @@
 'use client';
 
+import { brandGoalText } from '@/lib/kpis/brand-goal';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslations } from 'next-intl';
+import { useServerErrorText } from '@/hooks/use-server-error';
 import { useRouter } from '@/i18n/navigation';
 import { toast } from 'sonner';
-import { ChevronRight, Paperclip, Plus, Trash2 } from 'lucide-react';
+import {
+  ChevronRight,
+  CircleDot,
+  Clock,
+  Copy,
+  Download,
+  FileSpreadsheet,
+  History,
+  MoreHorizontal,
+  Paperclip,
+  Plus,
+  Trash2,
+  Bot,
+  UserRound,
+} from 'lucide-react';
 import { RemovedNote } from '@/components/action-center/removed-note';
+import { LowConfidenceTag } from '@/components/action-center/low-confidence-tag';
 import { useUpgradeGate } from '@/components/providers/upgrade-gate';
 import { Badge } from '@/components/ui/badge';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
+import { DatePicker } from '@/components/ui/date-picker';
 import {
   Select,
   SelectContent,
@@ -42,6 +66,7 @@ import {
   type ActionTask,
 } from '@/lib/actions/action-center';
 import type { TeamMember } from '@/lib/actions/team';
+import type { VolumeEstimate } from '@/lib/volume-estimate';
 import { DismissReasonDialog } from './dismiss-reason-dialog';
 import {
   ACTION_STATUSES,
@@ -63,7 +88,7 @@ import {
 import { signalTexts } from '@/lib/signals/display';
 import { isKpiKey } from '@/lib/kpis/registry';
 import { isSuperseded, SignalStatusBadge } from './signal-table';
-import { ActionIcon, PriorityBadge, StalePill } from './action-table';
+import { ActionIcon } from './action-table';
 import {
   STALE_AFTER_DAYS,
   isStale,
@@ -71,12 +96,13 @@ import {
   priorityReasonText,
 } from '@/lib/action-center/priority';
 import { OpportunityContext } from './opportunity-context';
-import { ActionExportButtons } from './action-export-buttons';
-import { RunAgentButton } from './run-agent-button';
+import { useActionExport } from './action-export-buttons';
+import { RunAgentPopover, useCanRunAgent } from './run-agent-button';
 import { SupportingSignals } from './supporting-signals';
 import { AffectedTab } from './affected-tab';
-import { affectedChips, affectedTotal } from '@/lib/action-center/affected';
+import { affectedCounts, affectedTotal, type Affected } from '@/lib/action-center/affected';
 import { useActionStory } from './use-action-story';
+import { goalDatePassed, type ActionStory } from '@/lib/action-center/story';
 import { ImproveContext } from './improve-context';
 import { TopicGapContext } from './topic-gap-context';
 import { TopicOpportunityContext } from './topic-opportunity-context';
@@ -128,19 +154,21 @@ import { cn } from '@/lib/utils';
 import { useDotViewer } from '@/components/layout/menu-dot';
 import { PageDot } from '@/components/layout/page-dot';
 import { actionDots, localDay, pickDot } from '@/lib/page-dots';
+import { useActionAiText } from '@/hooks/use-action-ai-text';
 
 type DrawerTab = 'overview' | 'affected' | 'tasks' | 'signals' | 'history';
 const TABS: DrawerTab[] = ['overview', 'tasks', 'signals', 'history'];
 /** With something to list, Affected follows Overview (AC-003). */
 const TABS_WITH_AFFECTED: DrawerTab[] = ['overview', 'affected', 'tasks', 'signals', 'history'];
 
-/**
- * How long a due date has to stay put before it is saved. A date typed digit
- * by digit passes through other valid dates on its way (day 1 before 18):
- * only the one it settles on is saved.
- */
-const DUE_DATE_SETTLE_MS = 800;
-/** A year typed digit by digit starts at 0002; these keep it from being saved. */
+/** The header's counts, in the order they show (mockup 3). */
+const STAT_ENTITIES = ['prompts', 'pages', 'platforms', 'competitors', 'topics'] as const;
+
+/** Status, assignee and due date as small chips under the title (mockup 4). */
+const CHIP =
+  'h-7 gap-1 rounded-md border-dashed px-2 text-xs hover:bg-muted/50 [&_svg:not([class*=size-])]:size-3';
+
+/** The days the due date's picker offers. */
 const DUE_DATE_MIN = '2000-01-01';
 const DUE_DATE_MAX = '2100-12-31';
 
@@ -189,6 +217,7 @@ export function ActionDrawer({
   const tActions = useTranslations('readOnly.actions');
   // Check now (AC-010): the task being checked, and the card's words.
   const tTaskCard = useTranslations('actionCenter.actionsPage.drawer.task');
+  const serverError = useServerErrorText();
   const missingText = useMissingText();
   const [checking, setChecking] = useState<string | null>(null);
   // Dismissed from the status select: why, first (learning A5).
@@ -233,21 +262,16 @@ export function ActionDrawer({
       if (openId.current !== id) return null;
       setDetail(next);
       return next;
-    } catch {
-      toast.error(t('error.title'));
+    } catch (err) {
+      toast.error(serverError(err, t('error.title')));
       return null;
     }
-  }, [brandId, action, t]);
-
-  // A due date being typed, until it is saved (null: the saved one shows).
-  const [dueDraft, setDueDraft] = useState<string | null>(null);
-  const dueTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  }, [brandId, action, t, serverError]);
 
   useEffect(() => {
     openId.current = action?.id ?? null;
     setTab('overview');
     setDetail(null);
-    setDueDraft(null);
     setDrafts([]);
     if (action) void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -271,6 +295,9 @@ export function ActionDrawer({
 
   // The signals the action rests on, what they affect, their prompts' demand
   // and the Why and Goal they tell (AC-003), as the History drawer reads them.
+  // Its written title, "why" and goal in the reader's language (LOC-010).
+  const shownAction = useActionAiText([action]);
+
   const { affected, volumes, story, ready } = useActionStory(
     brandId,
     action,
@@ -279,18 +306,19 @@ export function ActionDrawer({
   );
 
   if (!action) return null;
-  const texts = actionTexts(action, tTexts);
+  const texts = actionTexts(shownAction(action), tTexts);
   const tags = actionContextTags(action, t);
   const tabs = affected && affectedTotal(affected) > 0 ? TABS_WITH_AFFECTED : TABS;
-  // Once the detail is in, each count opens the list behind it (AC-003).
-  const chips =
-    detail && affected
-      ? affectedChips(detail.signals, affected, action.id).map((chip) => ({
-          key: chip.entity,
-          label: t(`tags.${chip.entity}`, { count: chip.count }),
-          tab: chip.tab as DrawerTab,
-        }))
-      : [];
+  // Once the detail is in, what it is about as counts, each opening the
+  // Affected tab (AC-003); signals are counted on their own tab.
+  const counts = detail && affected ? affectedCounts(affected) : null;
+  const stats = counts
+    ? STAT_ENTITIES.filter((entity) => counts[entity] > 0).map((entity) => ({
+        key: entity,
+        count: counts[entity],
+        label: t(`drawer.stats.${entity}`, { count: counts[entity] }),
+      }))
+    : [];
   const relatedKpis: string[] = action.kpiKeys.filter(isKpiKey);
   // Start now (AC-ACTION-PLAN spec §10): an open action's writing work, at the top of Overview.
   const startNow =
@@ -333,7 +361,7 @@ export function ActionDrawer({
             ? tSend(result.error)
             : result.code && SEND_ERRORS.includes(result.code)
               ? tSend(`errors.${result.code}`)
-              : result.message,
+              : serverError(result, result.message),
         );
         return;
       }
@@ -406,8 +434,8 @@ export function ActionDrawer({
     setIsBusy(true);
     try {
       await fn();
-    } catch {
-      toast.error(t('updateFailed'));
+    } catch (err) {
+      toast.error(serverError(err, t('updateFailed')));
       setIsBusy(false);
       return false;
     }
@@ -440,19 +468,16 @@ export function ActionDrawer({
     onPatched(action.id, { ...patch, staleAt: null, updatedAt: new Date().toISOString() });
     try {
       await save();
-    } catch {
-      toast.error(t('updateFailed'));
+    } catch (err) {
+      toast.error(serverError(err, t('updateFailed')));
       onChanged();
       return;
     }
     void load();
   };
 
-  /** Saves a due date the field settled on, if it changed. */
-  const commitDueDate = (value: string) => {
-    clearTimeout(dueTimer.current);
-    setDueDraft(null);
-    const dueDate = value || null;
+  /** Saves the due date picked (null: cleared), if it changed; shown at once. */
+  const commitDueDate = (dueDate: string | null) => {
     if (dueDate === action.dueDate) return;
     void changeField({ dueDate }, () => setActionDueDate(brandId, action.id, dueDate));
   };
@@ -471,41 +496,49 @@ export function ActionDrawer({
         />
       )}
       <SheetContent className="flex flex-col gap-0 p-0 data-[side=right]:w-full data-[side=right]:sm:max-w-xl">
-        {/* pt-3: the top row's buttons line up with the sheet's close button. */}
-        <SheetHeader className="border-b px-6 pt-3 pb-4 pr-12">
-          {/* One row at 1024px too (W2-17): beside Run agent the action's number
-              alone, its "Action ID" label kept for hover and screen readers. */}
-          <div className="group/top flex flex-wrap items-center gap-2 text-xs">
+        {/* pt-3: the top row lines up with the sheet's close button. */}
+        <SheetHeader className="border-b px-6 pt-3 pb-4 pe-12">
+          {/* One quiet line (UX: drawer mockup 1): kind, priority and the
+              action's number; Run agent, Copy Data, Export and its previous
+              number sit in the ⋯ menu, so the title comes first. */}
+          <div className="flex min-h-7 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
             <Badge variant="outline" className="text-[10px]">
               {tCategories(action.category)}
             </Badge>
-            {action.priorityScore !== null && (
-              <PriorityBadge score={action.priorityScore} level={action.priorityLevel} />
-            )}
-            <div className="ml-auto flex items-center gap-2">
-              <RunAgentButton action={action} title={texts.title} variant="drawer" />
-              <ActionExportButtons
-                action={action}
-                detail={ready ? detail : null}
-                affected={affected}
-                volumes={volumes}
-                story={story}
-              />
+            {action.priorityScore !== null && action.priorityLevel !== null && (
               <span
-                className="whitespace-nowrap text-muted-foreground"
-                title={`${t('drawer.actionId')}: ${actionCode(action)}`}
+                data-priority-line=""
+                title={
+                  action.priorityReason?.confidence
+                    ? priorityConfidenceText(action.priorityReason.confidence, tPriority)
+                    : undefined
+                }
               >
-                <span className="group-has-[[data-run-agent]]/top:sr-only">
-                  {t('drawer.actionId')}:{' '}
-                </span>
-                {actionCode(action)}
+                {t.rich('drawer.priorityLine', {
+                  score: action.priorityScore,
+                  level: tPriority(`levels.${action.priorityLevel}`),
+                  b: (chunks) => (
+                    <b className="font-semibold text-foreground tabular-nums">{chunks}</b>
+                  ),
+                })}
               </span>
-              {previousActionCode(action) && (
-                <span className="whitespace-nowrap text-xs text-muted-foreground/70">
-                  {t('drawer.previousCode', { code: previousActionCode(action)! })}
-                </span>
-              )}
-            </div>
+            )}
+            <span
+              className="whitespace-nowrap"
+              title={`${t('drawer.actionId')}: ${actionCode(action)}`}
+            >
+              <span aria-hidden>· </span>
+              <span className="sr-only">{t('drawer.actionId')}: </span>
+              {actionCode(action)}
+            </span>
+            <ActionMoreMenu
+              action={action}
+              title={texts.title}
+              detail={ready ? detail : null}
+              affected={affected}
+              volumes={volumes}
+              story={story}
+            />
           </div>
           <div className="flex items-start gap-3">
             <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md border bg-muted/40">
@@ -516,7 +549,7 @@ export function ActionDrawer({
               />
             </div>
             <div className="min-w-0">
-              <SheetTitle className="flex items-center gap-2">
+              <SheetTitle className="flex items-center gap-2 text-base">
                 {texts.title}
                 <PageDot
                   dot={pickDot(
@@ -530,55 +563,47 @@ export function ActionDrawer({
               </SheetDescription>
             </div>
           </div>
-          <div className="flex flex-wrap gap-1">
-            {chips.length > 0
-              ? chips.map((chip) => (
-                  <Badge
-                    key={chip.key}
-                    variant="outline"
-                    className="cursor-pointer text-[10px] hover:bg-muted"
-                    render={<button type="button" onClick={() => setTab(chip.tab)} />}
-                  >
-                    {chip.label}
-                  </Badge>
-                ))
-              : tags.map((tag) => (
+          {/* What it is about, as counts (mockup 3): each opens the list behind it. */}
+          {stats.length > 0 ? (
+            <div className="grid grid-cols-3 gap-2" data-drawer-stats="">
+              {stats.map((stat) => (
+                <button
+                  key={stat.key}
+                  type="button"
+                  onClick={() => setTab('affected')}
+                  className="rounded-md bg-muted/60 px-3 py-2 text-start transition-colors hover:bg-muted"
+                >
+                  <span className="block text-lg font-semibold leading-tight tabular-nums">
+                    {stat.count}
+                  </span>
+                  <span className="block truncate text-[11px] text-muted-foreground">
+                    {stat.label}
+                  </span>
+                </button>
+              ))}
+            </div>
+          ) : (
+            !detail &&
+            tags.length > 0 && (
+              <div className="flex flex-wrap gap-1">
+                {tags.map((tag) => (
                   <Badge key={tag} variant="outline" className="text-[10px]">
                     {tag}
                   </Badge>
                 ))}
-            <RemovedNote payload={action.payload ?? {}} />
-            {isStale(action) && <StalePill />}
-          </div>
-        </SheetHeader>
-
-        {isStale(action) && (
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-amber-500/30 bg-amber-500/10 px-6 py-2.5 text-xs">
-            <p className="min-w-0 flex-1 text-amber-700 dark:text-amber-400">
-              {t('stale.notice', { days: STALE_AFTER_DAYS })}
-            </p>
-            <Button
-              size="sm"
-              variant="outline"
-              className="h-7 text-xs"
-              onClick={guard(
-                () =>
-                  void changeField({ staleAt: null }, () => keepActionRelevant(brandId, action.id)),
-                { action: tActions('changeActionStatus') },
-              )}
-            >
-              {t('stale.keep')}
-            </Button>
-          </div>
-        )}
-
-        {/* Who has it, where it stands and by when: ahead of the tabs, so they
-            read and change without scrolling past the content. */}
-        <div className="grid gap-3 border-b px-6 py-3 sm:grid-cols-3">
-          <div>
-            <Label htmlFor="action-drawer-status" className="text-xs text-muted-foreground">
-              {t('drawer.statusLabel')}
-            </Label>
+              </div>
+            )
+          )}
+          <RemovedNote
+            action={action}
+            onReplanned={async () => {
+              await load();
+              onChanged();
+            }}
+          />
+          {/* Who has it, where it stands and by when (mockup 4): small chips
+              on one line that open the same choices. */}
+          <div className="flex flex-wrap items-center gap-1.5" data-drawer-fields="">
             <Select
               value={action.status}
               onValueChange={guard(
@@ -596,7 +621,14 @@ export function ActionDrawer({
                 label: t(`status.${status}`),
               }))}
             >
-              <SelectTrigger id="action-drawer-status" className="mt-1 h-8 w-full text-xs">
+              <SelectTrigger
+                id="action-drawer-status"
+                size="sm"
+                aria-label={t('drawer.statusLabel')}
+                title={t('drawer.statusLabel')}
+                className={CHIP}
+              >
+                <CircleDot aria-hidden className="size-3 text-muted-foreground" />
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -607,11 +639,6 @@ export function ActionDrawer({
                 ))}
               </SelectContent>
             </Select>
-          </div>
-          <div>
-            <Label htmlFor="action-drawer-assignee" className="text-xs text-muted-foreground">
-              {t('drawer.assignee')}
-            </Label>
             <Select
               value={action.assignee?.id ?? 'unassigned'}
               onValueChange={guard(
@@ -631,7 +658,14 @@ export function ActionDrawer({
                 })),
               ]}
             >
-              <SelectTrigger id="action-drawer-assignee" className="mt-1 h-8 w-full text-xs">
+              <SelectTrigger
+                id="action-drawer-assignee"
+                size="sm"
+                aria-label={t('drawer.assignee')}
+                title={t('drawer.assignee')}
+                className={CHIP}
+              >
+                <UserRound aria-hidden className="size-3 text-muted-foreground" />
                 <SelectValue placeholder={t('drawer.assignTo')} />
               </SelectTrigger>
               <SelectContent>
@@ -643,43 +677,64 @@ export function ActionDrawer({
                 ))}
               </SelectContent>
             </Select>
-          </div>
-          <div>
-            <Label htmlFor="action-drawer-due-date" className="text-xs text-muted-foreground">
-              {t('drawer.dueDate')}
-            </Label>
-            <Input
+            {/* The app's own date picker, in its language (UX audit AC-25). */}
+            <DatePicker
               id="action-drawer-due-date"
-              type="date"
-              className="mt-1 h-8 text-xs"
+              aria-label={t('drawer.dueDate')}
+              className={cn(CHIP, 'w-auto')}
               min={DUE_DATE_MIN}
               max={DUE_DATE_MAX}
-              value={dueDraft ?? action.dueDate ?? ''}
-              onChange={guard(
-                (e: React.ChangeEvent<HTMLInputElement>) => {
-                  const { value, validity } = e.target;
-                  setDueDraft(value);
-                  clearTimeout(dueTimer.current);
-                  // Cleared, or a whole date in range: saved once it settles.
-                  if (validity.valid) {
-                    dueTimer.current = setTimeout(() => commitDueDate(value), DUE_DATE_SETTLE_MS);
-                  }
-                },
-                { action: tActions('setDueDate') },
-              )}
-              onBlur={(e) => {
-                if (dueDraft === null) return;
-                // Leaving the field saves what it holds now; a half-typed or
-                // out-of-range date goes back to the saved one.
-                if (e.target.validity.valid) commitDueDate(e.target.value);
-                else {
-                  clearTimeout(dueTimer.current);
-                  setDueDraft(null);
-                }
-              }}
+              clearable
+              placeholder={t('drawer.addDueDate')}
+              value={action.dueDate ?? null}
+              onChange={guard((day: string | null) => commitDueDate(day), {
+                action: tActions('setDueDate'),
+              })}
             />
           </div>
-        </div>
+          {/* Stale (mockup 5): one sentence, keep it or dismiss it. */}
+          {isStale(action) && (
+            <div
+              data-stale-notice=""
+              className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-xs"
+            >
+              <p
+                className="flex min-w-0 flex-1 items-center gap-1.5 text-amber-700 dark:text-amber-400"
+                title={t('stale.hint', { days: STALE_AFTER_DAYS })}
+              >
+                <Clock aria-hidden className="size-3.5 shrink-0" />
+                {t('stale.notice', { days: STALE_AFTER_DAYS })}
+              </p>
+              <div className="flex items-center gap-1.5">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-6 text-xs"
+                  title={t('stale.keepHint')}
+                  onClick={guard(
+                    () =>
+                      void changeField({ staleAt: null }, () =>
+                        keepActionRelevant(brandId, action.id),
+                      ),
+                    { action: tActions('changeActionStatus') },
+                  )}
+                >
+                  {t('stale.keep')}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-6 text-xs"
+                  onClick={guard(() => setDismissing(true), {
+                    action: tActions('changeActionStatus'),
+                  })}
+                >
+                  {t('stale.dismiss')}
+                </Button>
+              </div>
+            </div>
+          )}
+        </SheetHeader>
 
         <nav className="flex gap-4 border-b px-6" aria-label={t('table.action')}>
           {tabs.map((key) => (
@@ -695,9 +750,17 @@ export function ActionDrawer({
                   : 'border-transparent text-muted-foreground hover:text-foreground',
               )}
             >
-              {t(`drawer.tabs.${key}`)}
-              {key === 'tasks' && detail ? ` (${detail.tasks.length})` : ''}
+              {key === 'tasks' && detail
+                ? // Progress, not only how many (mockup: "Tasks 0/8").
+                  t(
+                    'drawer.tabs.tasksProgress',
+                    taskProgress(detail.tasks.map((task) => task.status)),
+                  )
+                : t(`drawer.tabs.${key}`)}
               {key === 'affected' && affected ? ` (${affectedTotal(affected)})` : ''}
+              {key === 'signals' && detail && detail.signals.length > 0
+                ? ` (${detail.signals.length})`
+                : ''}
             </button>
           ))}
         </nav>
@@ -717,38 +780,61 @@ export function ActionDrawer({
                   <Separator />
                 </>
               )}
-              {action.priorityReason && (
+              {/* What happened (mockup 7): why it ranks where it does and the
+                  signals behind it, in one place. The Why itself is under the
+                  title, so it isn't said twice. */}
+              {(action.priorityReason || detail.signals.length > 0) && (
                 <>
                   <section>
-                    <p className="text-xs font-medium text-muted-foreground">{t('priority.why')}</p>
-                    <p className="mt-1">{priorityReasonText(action.priorityReason, tPriority)}</p>
-                    {action.priorityReason.confidence && (
-                      <p className="mt-1 text-xs text-muted-foreground">
-                        {priorityConfidenceText(action.priorityReason.confidence, tPriority)}
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <p className="text-xs font-medium text-muted-foreground">
+                        {t('drawer.whatHappened')}
                       </p>
+                      <LowConfidenceTag confidence={action.priorityReason?.confidence} />
+                    </div>
+                    {action.priorityReason && (
+                      <p className="mt-1">{priorityReasonText(action.priorityReason, tPriority)}</p>
                     )}
+                    {detail.signals.length > 0 ? (
+                      <SupportingSignals
+                        actionId={action.id}
+                        signals={detail.signals}
+                        onOpenSignal={openSignal}
+                        onShowAll={() => setTab('signals')}
+                      />
+                    ) : null}
                   </section>
                   <Separator />
                 </>
               )}
               <section>
-                <p className="text-xs font-medium text-muted-foreground">{t('drawer.why')}</p>
-                <p className="mt-1">{story?.why ?? texts.description}</p>
-                {detail.signals.length > 0 && (
-                  <SupportingSignals
-                    actionId={action.id}
-                    signals={detail.signals}
-                    onOpenSignal={openSignal}
-                    onShowAll={() => setTab('signals')}
-                  />
-                )}
-              </section>
-              <Separator />
-              <section>
-                <p className="text-xs font-medium text-muted-foreground">{t('drawer.goal')}</p>
+                <p className="text-xs font-medium text-muted-foreground">{t('drawer.doneWhen')}</p>
                 <p className="mt-1">
-                  {story?.goal ?? actionGoal(action.kind, tTexts, action.payload)}
+                  {story?.goal ?? actionGoal(action.kind, tTexts, shownAction(action).payload)}
                 </p>
+                {/* A passed goal date is said, never moved (UX audit AC-21, D9). */}
+                {goalDatePassed(story, action.status) && (
+                  <p className="mt-1.5 flex flex-wrap items-center gap-x-2 text-xs text-amber-700 dark:text-amber-400">
+                    <span className="font-medium">{t('drawer.goalPassed')}</span>
+                    <button
+                      type="button"
+                      className="underline underline-offset-2 hover:text-amber-800 dark:hover:text-amber-300"
+                      onClick={() => {
+                        const field = document.getElementById(
+                          'action-drawer-due-date',
+                        ) as HTMLInputElement | null;
+                        field?.focus();
+                        try {
+                          field?.showPicker?.();
+                        } catch {
+                          // Not every browser opens the picker on request; the field has focus.
+                        }
+                      }}
+                    >
+                      {t('drawer.setNewDate')}
+                    </button>
+                  </p>
+                )}
               </section>
               <Separator />
               <section>
@@ -760,8 +846,12 @@ export function ActionDrawer({
                       .map((kpi) => (
                         <div key={kpi.kpiKey} className="rounded-md border px-3 py-2">
                           <p className="text-xs font-medium">{tRegistry(`${kpi.kpiKey}.name`)}</p>
+                          {/* The brand's monthly goal, said so (AC-22, D11). */}
                           <p className="text-xs text-muted-foreground">
-                            {t('drawer.kpiTarget', { target: kpi.target })}
+                            {t('drawer.kpiBrandGoal', {
+                              target: brandGoalText(kpi.kpiKey, kpi.target),
+                              timeframe: kpi.timeframe,
+                            })}
                           </p>
                         </div>
                       ))}
@@ -999,7 +1089,7 @@ export function ActionDrawer({
                     key={signal.id}
                     type="button"
                     onClick={() => openSignal(signal.id)}
-                    className="block w-full rounded-md border px-3 py-2 text-left transition-colors hover:bg-muted/40"
+                    className="block w-full rounded-md border px-3 py-2 text-start transition-colors hover:bg-muted/40"
                   >
                     <div className="flex items-center justify-between gap-2">
                       <p className="truncate text-xs font-medium">{st.title}</p>
@@ -1116,7 +1206,7 @@ function TaskRow({
           onClick={() => !editing && setOpen((current) => !current)}
           aria-expanded={open}
           title={open ? t('drawer.task.hideDetails') : t('drawer.task.showDetails')}
-          className="flex min-w-0 flex-1 items-start gap-1 rounded px-1 py-1 text-left text-sm leading-snug hover:bg-muted/60"
+          className="flex min-w-0 flex-1 items-start gap-1 rounded px-1 py-1 text-start text-sm leading-snug hover:bg-muted/60"
         >
           <ChevronRight
             className={cn(
@@ -1299,7 +1389,7 @@ function AddTaskForm({
         onClick={guard(() => setDraft(''), { action: tActions('addTasks') })}
         className="mt-3 h-8 w-full text-xs"
       >
-        <Plus className="mr-1.5 h-3.5 w-3.5" />
+        <Plus className="me-1.5 h-3.5 w-3.5" />
         {t('drawer.addTask')}
       </Button>
     );
@@ -1351,6 +1441,97 @@ function AddTaskForm({
       >
         {t('drawer.addTaskCancel')}
       </Button>
+    </div>
+  );
+}
+
+/**
+ * The header's ⋯ menu (mockup 1): Run agent, Copy Data, Export CSV and Excel,
+ * and the number the action had before, in one place rather than a row of
+ * buttons ahead of the title. Run agent opens its picker under the menu's
+ * button; Copy Data its dialog.
+ */
+function ActionMoreMenu({
+  action,
+  title,
+  detail,
+  affected,
+  volumes,
+  story,
+}: {
+  action: ActionItem;
+  title: string;
+  detail: ActionDetail | null;
+  affected: Affected | null;
+  volumes: Map<string, VolumeEstimate> | null;
+  story: ActionStory | null;
+}) {
+  const t = useTranslations('actionCenter.actionsPage');
+  const tExport = useTranslations('actionCenter.actionsPage.export');
+  const tRun = useTranslations('actionCenter.actionsPage.runAgent');
+  const tActions = useTranslations('readOnly.actions');
+  const { isLocked, openUpgrade } = useUpgradeGate();
+  const canRunAgent = useCanRunAgent(action);
+  const [picking, setPicking] = useState(false);
+  const anchor = useRef<HTMLButtonElement>(null);
+  const exports = useActionExport({ action, detail, affected, volumes, story });
+  const previous = previousActionCode(action);
+
+  return (
+    <div className="ms-auto">
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          ref={anchor}
+          data-action-more=""
+          aria-label={t('drawer.more')}
+          title={t('drawer.more')}
+          render={<Button variant="outline" size="icon" className="h-7 w-7" />}
+        >
+          <MoreHorizontal className="h-3.5 w-3.5" aria-hidden />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="w-48">
+          {canRunAgent && (
+            <>
+              <DropdownMenuItem
+                data-action="actionCenter.runAgent"
+                aria-label={tRun('buttonLabel', { title })}
+                onClick={() =>
+                  isLocked ? openUpgrade(tActions('runAgentOnAction')) : setPicking(true)
+                }
+              >
+                <Bot className="me-2 h-4 w-4" aria-hidden />
+                {tRun('button')}
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+            </>
+          )}
+          <DropdownMenuItem disabled={exports.disabled} onClick={exports.copyData}>
+            <Copy className="me-2 h-4 w-4" aria-hidden />
+            {tExport('copyAll')}
+          </DropdownMenuItem>
+          <DropdownMenuItem disabled={exports.disabled} onClick={exports.downloadCsv}>
+            <Download className="me-2 h-4 w-4" aria-hidden />
+            {tExport('csv')}
+          </DropdownMenuItem>
+          <DropdownMenuItem disabled={exports.disabled} onClick={exports.downloadExcel}>
+            <FileSpreadsheet className="me-2 h-4 w-4" aria-hidden />
+            {tExport('excel')}
+          </DropdownMenuItem>
+          {previous && (
+            <>
+              <DropdownMenuSeparator />
+              <p className="flex items-center px-1.5 py-1 text-xs text-muted-foreground">
+                <History className="me-2 h-3.5 w-3.5" aria-hidden />
+                {t('drawer.previousCode', { code: previous })}
+              </p>
+            </>
+          )}
+        </DropdownMenuContent>
+      </DropdownMenu>
+      {canRunAgent && (
+        <RunAgentPopover action={action} open={picking} onOpenChange={setPicking} anchor={anchor} />
+      )}
+      {exports.dialog}
     </div>
   );
 }

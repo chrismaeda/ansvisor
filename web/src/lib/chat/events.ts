@@ -71,6 +71,11 @@ export interface ChatStepScope {
   /** Only when the read isn't for the chat's brand. */
   brand?: string;
   /**
+   * The one record a read read, by name, once it is done: "AC-12" for an
+   * action. "Data used" names it rather than the source (UX audit CH-10).
+   */
+  record?: string;
+  /**
    * What rowCount counts when it isn't rows: saved notes ("Memory · 3 items",
    * CHAT-14 item 17), or the parts a run split its work into (CHAT-27 item 7).
    */
@@ -247,7 +252,7 @@ export interface ChatConfirmForm {
 
 /**
  * What a change sent to the Action Center (CHAT-09 item 19): a new action,
- * or a finding added to one that already covered it, with Open in Actions.
+ * or a finding added to one that already covered it, with Open in Action Center.
  */
 export interface ChatActionSent {
   kind: 'action_created' | 'action_added';

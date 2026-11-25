@@ -100,6 +100,8 @@ export function AddOnsCard() {
 
   // Nothing until it's known whether the workspace has the section.
   if (!read || (!read.ok && read.failure === 'off')) return null;
+  // Nothing on sale here, no credit left and nothing bought: no card.
+  if (read.ok && !hasBillingContent(read.addOns)) return null;
 
   return (
     <Card id="add-ons" className="scroll-mt-6">
@@ -118,6 +120,22 @@ export function AddOnsCard() {
   );
 }
 
+/**
+ * The pack kinds Billing sells. Storage packs left Billing (they read as
+ * confusing next to the plan); they're still sold where storage runs out,
+ * in the Get more window.
+ */
+const BILLING_KINDS: readonly AddOnKind[] = ['ai'];
+
+/** Whether Billing's card has anything to show: a pack on sale, credit left or a purchase. */
+function hasBillingContent(addOns: BillingAddOns): boolean {
+  return (
+    addOns.packs.some((p) => BILLING_KINDS.includes(p.kind)) ||
+    addOns.credit != null ||
+    (addOns.purchases?.length ?? 0) > 0
+  );
+}
+
 function AddOnsBody({
   addOns,
   paidNote,
@@ -128,7 +146,10 @@ function AddOnsBody({
   onChange: () => void;
 }) {
   const t = useTranslations('settings.addOns');
-  const [tab, setTab] = useState<AddOnKind>('ai');
+  // The old AI packs left the sale (00547; Growth's top-ups are on Add more
+  // to your plan): a tab with nothing on it isn't shown, nor opened on.
+  const kinds = BILLING_KINDS.filter((kind) => addOns.packs.some((p) => p.kind === kind));
+  const [tab, setTab] = useState<AddOnKind>(() => kinds[0] ?? 'ai');
   // The pack picked on each tab; its Most picked one to start with.
   const [picked, setPicked] = useState<Record<AddOnKind, string | null>>(() => ({
     ai: firstPick(addOns.packs, 'ai'),
@@ -159,65 +180,69 @@ function AddOnsBody({
       )}
       {paidNote && <p className="text-sm text-muted-foreground">{t('paidNote')}</p>}
 
-      <div className="space-y-3">
-        <div
-          role="group"
-          aria-label={t('tabs.label')}
-          className="inline-flex rounded-lg border bg-muted/40 p-0.5"
-        >
-          {(['ai', 'storage'] as const).map((kind) => (
-            <button
-              key={kind}
-              type="button"
-              aria-pressed={tab === kind}
-              onClick={() => setTab(kind)}
+      {kinds.length > 0 && (
+        <>
+          <div className="space-y-3">
+            <div
+              role="group"
+              aria-label={t('tabs.label')}
+              className="inline-flex rounded-lg border bg-muted/40 p-0.5"
+            >
+              {kinds.map((kind) => (
+                <button
+                  key={kind}
+                  type="button"
+                  aria-pressed={tab === kind}
+                  onClick={() => setTab(kind)}
+                  className={cn(
+                    'rounded-md px-3 py-1 text-sm font-medium transition-colors',
+                    // Picked: black in light, white in dark, as the plan tabs above (#1806).
+                    tab === kind
+                      ? 'bg-primary text-primary-foreground shadow-sm'
+                      : 'text-muted-foreground hover:text-foreground',
+                  )}
+                >
+                  {t(`tabs.${kind}`)}
+                </button>
+              ))}
+            </div>
+
+            <div
+              role="radiogroup"
+              aria-label={t('packsLabel', { kind: tab })}
               className={cn(
-                'rounded-md px-3 py-1 text-sm font-medium transition-colors',
-                // Picked: black in light, white in dark, as the plan tabs above (#1806).
-                tab === kind
-                  ? 'bg-primary text-primary-foreground shadow-sm'
-                  : 'text-muted-foreground hover:text-foreground',
+                'grid grid-cols-2 gap-3 pt-2',
+                tab === 'ai' ? 'sm:grid-cols-4' : 'sm:grid-cols-3',
               )}
             >
-              {t(`tabs.${kind}`)}
-            </button>
-          ))}
-        </div>
+              {packs.map((pack) => (
+                <PackCard
+                  key={pack.id}
+                  pack={pack}
+                  selected={canBuy && chosen?.id === pack.id}
+                  selectable={canBuy}
+                  onSelect={() => setPicked((now) => ({ ...now, [tab]: pack.id }))}
+                />
+              ))}
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {t(tab === 'ai' ? 'monthlyLimitNote' : 'storageNote')}
+            </p>
+          </div>
 
-        <div
-          role="radiogroup"
-          aria-label={t('packsLabel', { kind: tab })}
-          className={cn(
-            'grid grid-cols-2 gap-3 pt-2',
-            tab === 'ai' ? 'sm:grid-cols-4' : 'sm:grid-cols-3',
+          {canBuy ? (
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t pt-4">
+              <p className="text-xs text-muted-foreground">{t('paidWith')}</p>
+              <Button onClick={onContinue} disabled={!chosen || busy}>
+                {busy && !confirming ? t('starting') : t('continue')}
+              </Button>
+            </div>
+          ) : (
+            <p className="border-t pt-4 text-sm text-muted-foreground">
+              {!addOns.isAdmin ? t('askAdmin') : addOns.buy === 'trial' ? t('trial') : t('noPlan')}
+            </p>
           )}
-        >
-          {packs.map((pack) => (
-            <PackCard
-              key={pack.id}
-              pack={pack}
-              selected={canBuy && chosen?.id === pack.id}
-              selectable={canBuy}
-              onSelect={() => setPicked((now) => ({ ...now, [tab]: pack.id }))}
-            />
-          ))}
-        </div>
-        <p className="text-xs text-muted-foreground">
-          {t(tab === 'ai' ? 'monthlyLimitNote' : 'storageNote')}
-        </p>
-      </div>
-
-      {canBuy ? (
-        <div className="flex flex-wrap items-center justify-between gap-3 border-t pt-4">
-          <p className="text-xs text-muted-foreground">{t('paidWith')}</p>
-          <Button onClick={onContinue} disabled={!chosen || busy}>
-            {busy && !confirming ? t('starting') : t('continue')}
-          </Button>
-        </div>
-      ) : (
-        <p className="border-t pt-4 text-sm text-muted-foreground">
-          {!addOns.isAdmin ? t('askAdmin') : addOns.buy === 'trial' ? t('trial') : t('noPlan')}
-        </p>
+        </>
       )}
 
       {message && (
@@ -359,7 +384,7 @@ export function PackCard({
       disabled={!live}
       onClick={onSelect}
       className={cn(
-        'relative rounded-xl border bg-card p-3 text-left transition-colors',
+        'relative rounded-xl border bg-card p-3 text-start transition-colors',
         live && 'hover:bg-accent/50',
         !live && 'cursor-default',
         !pack.available && 'opacity-60',
@@ -372,7 +397,7 @@ export function PackCard({
       {adds && <span className="mt-0.5 block text-xs">{adds}</span>}
       <span className="mt-1 block text-[11px] text-muted-foreground">{validity}</span>
       {pack.mostPicked && (
-        <span className="absolute -top-2.5 right-2 rounded-full bg-emerald-100 px-2 text-[10.5px] font-medium text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-400">
+        <span className="absolute -top-2.5 end-2 rounded-full bg-emerald-100 px-2 text-[10.5px] font-medium text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-400">
           {t('mostPicked')}
         </span>
       )}
@@ -397,7 +422,7 @@ function PurchaseHistory({ purchases }: { purchases: AddOnPurchaseView[] }) {
               <TableHead>{t('price')}</TableHead>
               <TableHead>{t('status')}</TableHead>
               <TableHead>{t('left')}</TableHead>
-              <TableHead className="text-right">{t('invoice')}</TableHead>
+              <TableHead className="text-end">{t('invoice')}</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -422,7 +447,7 @@ function PurchaseHistory({ purchases }: { purchases: AddOnPurchaseView[] }) {
                       ? t('until', { date: formatDate(p.until) })
                       : '—'}
                 </TableCell>
-                <TableCell className="text-right">
+                <TableCell className="text-end">
                   {p.hasInvoice ? (
                     <a
                       href={`/api/add-ons/invoice/${p.id}`}

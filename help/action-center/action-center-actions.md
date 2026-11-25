@@ -1,11 +1,11 @@
 ---
 title: Work with Action Center actions
 route: /dashboard/action-center/actions
-keywords: [actions, today, todays focus, agent work, i approve first, agent starts on its own, action status, assign action, dismiss action, export actions, top actions, run agent, run with chat, stale actions, still relevant, confidence, sort actions, recently updated, action number, find action by number, action code, previously]
+keywords: [actions, today, todays focus, agent work, i approve first, agent starts on its own, action status, assign action, dismiss action, export actions, top actions, run agent, run with chat, stale actions, still relevant, confidence, sort actions, recently updated, action number, find action by number, action code, previously, translated, your language, new since your last visit, closed this week, deleted actions, missing actions]
 synonyms: [recommendations, work items, to-dos, action list, let an agent do this, agent on an action, what should I do today, what to do first, who starts agent work, order actions, newest first, oldest first]
 plan: all
-updated: 2026-11-14
-last_checked: 2026-11-14
+updated: 2026-11-21
+last_checked: 2026-11-19
 owner: Cihan
 app_version: 0.3.0
 approved: true
@@ -15,16 +15,16 @@ An action is one piece of work with an outcome, built from the evidence behind i
 
 ## Today's focus
 
-What to do today is on the **Today** tab: **Today's focus** lists your three highest-impact open actions that are yours or no one's yet, ranked as your daily suggestion in Chat is. That's the **Priority Score**, plus a little for each day an action has waited and for writing you can start in the Content Editor now. The **Actions** tab lists every action; sort it by Priority to see what comes next.
+What to do today is on the **Today** tab: **Today's focus** lists your three highest-impact open actions that are yours or no one's yet, ranked as your daily suggestion in Chat is. That's the **Priority Score**, plus a little for each day an action has waited and for writing you can start in the Content Editor now. The **Actions** tab lists every open action; sort it by Priority to see what comes next.
 
 ## Agent work
 
 When Chat is on, the **Agent work** gear beside **Today's focus** sets how far your workspace's agents go without a person:
 
-- **I approve first**, where every workspace starts: every change an agent makes waits for someone to approve it, whatever the agent's mode.
-- **Agent starts on its own**: each agent works in its own mode, **Ask me first**, **Auto** or **Full auto**.
+- **I approve first**, where every workspace starts: each change an agent makes waits for someone's OK.
+- **Agent starts on its own**: each agent follows its own mode, **Ask me first**, **Auto** or **Full auto**.
 
-Neither changes going live: an agent publishes or sends only with a person's click, unless an Admin let it publish on its own. Only Admins change the setting; everyone sees it, with who changed it last and when. It is also in **Settings › Chat**.
+Either way, agents always ask before publishing or sending. The exception is an agent an Admin has allowed to publish and send on its own. Only Admins change the setting; everyone sees it, with who changed it last and when. The panel opens above the gear, clear of the focus rows' buttons. It is also in **Settings › Chat**.
 
 ## Action categories
 
@@ -55,7 +55,16 @@ The cards at the top count and filter the list, all but **Highest Priority**. Cl
 - **In Progress**: actions someone is working on.
 - **Highest Priority**: the highest level among open actions; it doesn't filter.
 
-Below them, filter by category, **Priority**, **Status** (including **Stale**) and **Assignee**, or search. Each row shows the action's code under its title, such as AC-07, the code Chat uses for it: search for AC-07 or 7 to find it. For an online shop, the **From Products** chip lists only the actions sent from Products.
+Below them, filter by category, **Priority**, **Status** (including **Open** and **Stale**) and **Assignee**, or search. **Status** starts on **Open** (new, in progress and on hold, anyone's), the number Today shows; pick **All** to add closed ones. Each row shows the action's code under its title, such as AC-07, the code Chat uses for it: search for AC-07 or 7 to find it. For an online shop, the **From Products** chip lists only the actions sent from Products.
+
+## New and closed actions
+
+Above the list, a short line reads like "55 open · 12 closed this week · 3 new since your last visit". The open count doesn't always grow: a new finding on a subject with an open action joins that action, and completed or dismissed actions leave the count.
+
+- **New**: a mark beside the title of each action created since your last visit to the list, on this browser. It shows for the whole visit and is gone on the next one. An older action that a new signal updated moves to the top without it.
+- **Closed this week**: actions completed or dismissed in the last 7 days. Click it to list them; **Clear filters** goes back.
+
+Actions are never removed on their own. Closed ones stay under **Status: All**, with what happened in each one's **History**.
 
 ## Action codes
 
@@ -79,23 +88,39 @@ Dismissing asks why: it doesn't matter to us, it's already done, the data behind
 
 ## Stale actions
 
-An action that has stayed **New** for 30 days, with no one assigning, editing, sending or updating its tasks, is marked **Stale** each night. It isn't closed or dismissed: it shows a **Stale** label next to its status, and the **Status** filter's **Stale** lists them all.
+An action that has stayed **New** for 30 days, with no one assigning, editing, sending or updating its tasks, is marked **Stale** each night. It isn't closed or dismissed: its row keeps one status, **New**, with "No update in 44 d" under it, the open action shows a **Stale** label, and the **Status** filter's **Stale** lists them all.
 
-If it still matters, click **Still relevant** in the open action, or in the row menu. The label goes, its 30 days start again, and History says who kept it. Any other change to the action, or moving it out of New, clears the label too. If it no longer matters, dismiss it.
+If it still matters, click **Keep** in the open action, or **Still relevant** in the row menu. The hint and label go, its 30 days start again, and History says who kept it. Any other change to the action, or moving it out of New, clears the label too. If it no longer matters, click **Dismiss**.
+
+An open action whose signals have all resolved shows **Signal resolved, review** instead of a signal count. It stays open: check whether the work is done, then complete or dismiss it.
+
+## The top of an action
+
+Click a row to open the action. Its top line shows the priority and the action's code, and **⋯** beside them holds **Run agent**, **Copy Data** and the exports. Under the title, small boxes count what it affects (prompts, pages, platforms and so on), and you set **Status**, **Assignee** and **Due date**.
 
 ## Inside an action
 
-Click a row to open the action. Under its title you set **Status**, **Assignee** and **Due date**. Its tabs:
+An open action's tabs:
 
-- **Overview**: **Why this priority?**, with how sure the score is (low, medium or high confidence, and why, such as one kind of finding from one source), **Why this action?** with the signals behind it, the **Goal** (what done looks like, with a date) and the linked **KPIs**.
+- **Overview**: **Why this priority?**, with how sure the score is (low, medium or high confidence, and why, such as one kind of finding from one source), **Why this action?** with the signals behind it, the **Goal**, with **Done when** (what done looks like, with a date) and the linked **KPIs**.
 - **Affected**: the prompts, pages, topics, competitors or platforms it is about, with each prompt's demand.
-- **Tasks**: the work, step by step.
+- **Tasks**: the work, step by step, with how many are done, such as **Tasks 2/5**.
 - **Signals**: the evidence. Click one to open it on the Signals tab.
 - **History**: every change, from status and assignee changes to tasks updated or sent.
 
+The title's count, **Why this action?**, the **Goal**'s "5 of 7 prompts" and the AI searches a month all count the same prompts as the **Affected** tab, so the monthly searches are the sum of its rows.
+
+## A goal date that has passed
+
+The **Goal** is set for the action's due date, or 30 days after it was raised. Once that day has gone and the action is still open, **Goal date passed** shows under it, with **Set a new date**, which takes you to **Due date**. The date never moves on its own, so a missed goal stays visible.
+
+## In your language
+
+Most of an action's words come from the interface, so they follow your language. Actions sent from Chat or Improve carry a title, a "why" and a goal written in English, and an action sent from a content opportunity carries the opportunity's title. When your interface language is another, these show in your language: in English for a moment the first time, then translated. Each is translated once and kept for teammates who use the same language.
+
 ## Run an agent on an action
 
-When Chat is on, Admins and Managers see **Run agent** on each open action: an agent button next to its title in the list, and at the top of the open action.
+When Chat is on, Admins and Managers see **Run agent** on each open action: an agent button next to its title in the list, and in the **⋯** menu at the top of the open action.
 
 It lists your agents that work on the action's brand, the ones used on this kind of action first. Pick one, and Chat starts a run on this action alone and opens it beside the action. **Run with Chat** does the same without an agent, in your default mode. **Create an agent for this kind of action** starts a new agent from a fitting skill.
 
@@ -103,20 +128,20 @@ The run drafts the work, but closing tasks stays your click. If the action is co
 
 ## Assign work
 
-An action with no one on it belongs to **Everyone** in the workspace until someone takes it. Pick a teammate in the action's **Assignee** field, and set a **Due date** if it has one. The **Assignee** filter on the Actions tab shows one person's actions, or **Everyone** for the unassigned ones.
+An action with no one on it belongs to **Everyone** in the workspace until someone takes it. Pick a teammate in the action's **Assignee** field, and set a **Due date** if it has one: click the date to open a calendar in your language, pick a day with the mouse or the arrow keys and Enter, or use **Today**; **Clear** removes it. The date saves as you pick it. The **Assignee** filter on the Actions tab shows one person's actions, or **Everyone** for the unassigned ones.
 
 ## Export actions
 
 **Export CSV** on the Actions tab downloads the actions in the current view, as filtered, with their number, priority, status, assignee, due date, task progress and affected items.
 
-Inside an action, **Copy Data** gives the whole action as Markdown to paste into a doc or ticket, and **Export** downloads it as **Export CSV** or **Export Excel**. The Excel file has one sheet each for the action, its affected items, tasks, signals and history.
+Inside an action, the **⋯** menu's **Copy Data** gives the whole action as Markdown to paste into a doc or ticket, and **Export CSV** or **Export Excel** downloads it. The Excel file has one sheet each for the action, its affected items, tasks, signals and history.
 
 ## Send work here from other pages
 
 Most actions come from signals each night, but you can also send work to the Action Center:
 
 - **Mentions**: select answers, or open one, and click **Send to Action Center**.
-- **Content**: **Send to Actions** on a content opportunity, or **Assign to…** on a Content Plan row.
+- **Content**: **Send to Action Center** on a content opportunity, or **Assign to…** on a Content Plan row.
 - **New content**: send it to a teammate with **Send to Action Center**.
 - **Site Audit**: **Send to Action Center** on a page's audit report.
 - **AI Referral Traffic**: select pages and click **Send to Action Center**.

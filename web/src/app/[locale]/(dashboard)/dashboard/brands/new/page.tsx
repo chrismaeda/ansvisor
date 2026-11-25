@@ -50,6 +50,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { toast } from 'sonner';
+import { useCaughtErrorText, useServerErrorText } from '@/hooks/use-server-error';
 import { ArrowLeft, Check, Globe, Loader2, Plus, Sparkles, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import {
@@ -134,6 +135,8 @@ export default function NewBrandPage() {
   // Prompts past the plan's limit are saved waiting for a spot, not held back.
   const tWaiting = useTranslations('prompts.waiting');
   const t = useTranslations('brands.new');
+  const serverError = useServerErrorText();
+  const caughtError = useCaughtErrorText();
   const tPrompts = useTranslations('onboarding.prompts');
   // The state picker's own "no state" choice, ahead of the states themselves.
   const stateItems = [{ value: 'nationwide', label: t('step2.nationwide') }, ...US_STATE_ITEMS];
@@ -347,7 +350,7 @@ export default function NewBrandPage() {
         });
         if ('error' in result) {
           BRAND_ADD.failed(result.code);
-          toast.error(result.error);
+          toast.error(serverError(result, result.error));
           return;
         }
         const { brand } = result;
@@ -365,7 +368,7 @@ export default function NewBrandPage() {
       }
     } catch (err) {
       BRAND_ADD.failed();
-      toast.error(err instanceof Error ? err.message : t('errors.saveBrand'));
+      toast.error(caughtError(err, t('errors.saveBrand')));
     } finally {
       setIsLoading(false);
     }
@@ -490,7 +493,11 @@ export default function NewBrandPage() {
         BRAND_ADD.failed(result.code);
         // No technical toasts on this step: actionable failures (plan limit)
         // show verbatim inline, anything else gets a friendly retry message.
-        setSaveError(result.code === 'plan_limit' ? result.error : t('errors.savePrompts'));
+        setSaveError(
+          result.code === 'plan_limit'
+            ? serverError(result, result.error)
+            : t('errors.savePrompts'),
+        );
         return;
       }
       trackSavedWaiting('new_brand', result.waiting ?? 0);
@@ -647,7 +654,7 @@ export default function NewBrandPage() {
       router.push('/dashboard');
     } catch (err) {
       BRAND_ADD.failed();
-      toast.error(err instanceof Error ? err.message : t('errors.saveCompetitors'));
+      toast.error(caughtError(err, t('errors.saveCompetitors')));
       setSavingCompetitors(false);
     }
   };
@@ -719,7 +726,7 @@ export default function NewBrandPage() {
             <div className="space-y-2">
               <Label htmlFor="website">{t('step1.website')}</Label>
               <div className="flex">
-                <span className="inline-flex items-center rounded-l-md border border-r-0 bg-muted px-3 text-sm text-muted-foreground">
+                <span className="inline-flex items-center rounded-s-md border border-e-0 bg-muted px-3 text-sm text-muted-foreground">
                   {t('step1.protocol')}
                 </span>
                 <Input
@@ -727,7 +734,7 @@ export default function NewBrandPage() {
                   placeholder={t('step1.websitePlaceholder')}
                   value={website}
                   onChange={(e) => setWebsite(e.target.value)}
-                  className="rounded-l-none"
+                  className="rounded-s-none"
                 />
               </div>
             </div>
@@ -745,7 +752,7 @@ export default function NewBrandPage() {
                 onChange={(e) => setDescription(e.target.value)}
                 rows={3}
               />
-              <ul className="text-xs text-muted-foreground space-y-1 list-disc ml-4">
+              <ul className="text-xs text-muted-foreground space-y-1 list-disc ms-4">
                 <li>{t('step1.hintIndustry')}</li>
                 <li>{t('step1.hintAudience')}</li>
               </ul>
@@ -855,7 +862,7 @@ export default function NewBrandPage() {
             >
               {isLoading ? (
                 <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  <Loader2 className="me-2 h-4 w-4 animate-spin" />
                   {t('step2.settingUp')}
                 </>
               ) : (
@@ -929,7 +936,7 @@ export default function NewBrandPage() {
                         key={topic}
                         onClick={() => toggleTopic(topic)}
                         className={cn(
-                          'flex items-center gap-3 w-full rounded-lg border px-4 py-3 text-left text-sm transition-colors',
+                          'flex items-center gap-3 w-full rounded-lg border px-4 py-3 text-start text-sm transition-colors',
                           isSelected
                             ? 'border-primary bg-primary/5'
                             : 'border-border hover:border-muted-foreground/30',
@@ -978,7 +985,7 @@ export default function NewBrandPage() {
               >
                 {loadingPrompts ? (
                   <>
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    <Loader2 className="me-2 h-4 w-4 animate-spin" />
                     {t('step3.generating')}
                   </>
                 ) : (
@@ -1093,7 +1100,7 @@ export default function NewBrandPage() {
           >
             {isLoading ? (
               <>
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                <Loader2 className="me-2 h-4 w-4 animate-spin" />
                 {t('step4.saving')}
               </>
             ) : (
@@ -1241,7 +1248,7 @@ export default function NewBrandPage() {
               <Button className="w-full" onClick={handleFinish} disabled={savingCompetitors}>
                 {savingCompetitors ? (
                   <>
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    <Loader2 className="me-2 h-4 w-4 animate-spin" />
                     {t('step5.finishing')}
                   </>
                 ) : selectedCompetitorCount > 0 ? (

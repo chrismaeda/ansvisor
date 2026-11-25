@@ -34,6 +34,8 @@ function action(status: string, dismissReason?: string | null) {
 }
 
 let actionRows: Record<string, unknown>[] = [];
+/** The `or` filters the actions read was given: History's window. */
+const windows: string[] = [];
 
 vi.mock('@/lib/supabase/server', () => ({
   createClient: vi.fn(async () => ({
@@ -50,6 +52,10 @@ vi.mock('@/lib/supabase/server', () => ({
         in: () => chain,
         gte: () => chain,
         lte: () => chain,
+        or: (filter: string) => {
+          if (table === 'actions') windows.push(filter);
+          return chain;
+        },
         order: () => chain,
         limit: () => chain,
         then: (resolve: (v: unknown) => void) => {
@@ -80,6 +86,7 @@ beforeEach(() => {
   without00366 = false;
   readError = null;
   selected.length = 0;
+  windows.length = 0;
   actionRows = [];
 });
 
@@ -109,6 +116,25 @@ describe('getActionHistory', () => {
     expect(item.dismissReason).toBeNull();
   });
 
+  it('gives a Visibility score result in points, not percent (AC-02)', async () => {
+    actionRows = [
+      {
+        ...action('completed'),
+        validation: {
+          metrics: [
+            { metric: 'ai_visibility', before: 27.4, after: 29.9, unit: 'percent' },
+            { metric: 'share_of_voice', before: 10, after: 12, unit: 'percent' },
+          ],
+        },
+      },
+    ];
+    const [item] = await getActionHistory('b1');
+    expect(item.results.map((m) => [m.metric, m.unit, m.delta])).toEqual([
+      ['ai_visibility', 'points', 2.5],
+      ['share_of_voice', 'percent', 2],
+    ]);
+  });
+
   it('fails on any other error, without reading again', async () => {
     readError = { code: '57014', message: 'canceling statement due to statement timeout' };
     await expect(getActionHistory('b1')).rejects.toThrow('statement timeout');
@@ -119,5 +145,17 @@ describe('getActionHistory', () => {
     readError = { code: '42703', message: 'column actions.priority_level does not exist' };
     await expect(getActionHistory('b1')).rejects.toThrow('priority_level');
     expect(selected).toHaveLength(1);
+  });
+
+  it('reads the window by when each action was completed or last changed (UX audit AC-60, D13)', async () => {
+    await getActionHistory('b1', { from: '2026-09-01T00:00:00Z', to: '2026-09-30T23:59:59Z' });
+    expect(windows).toEqual([
+      'and(status.eq.completed,completed_at.gte."2026-09-01T00:00:00Z",completed_at.lte."2026-09-30T23:59:59Z"),' +
+        'and(status.in.(dismissed,in_progress,on_hold),updated_at.gte."2026-09-01T00:00:00Z",updated_at.lte."2026-09-30T23:59:59Z")',
+    ]);
+    // Without a range, no window: every action History covers.
+    windows.length = 0;
+    await getActionHistory('b1');
+    expect(windows).toEqual([]);
   });
 });

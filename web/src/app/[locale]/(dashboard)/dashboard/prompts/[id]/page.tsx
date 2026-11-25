@@ -25,6 +25,7 @@ import {
 } from '@/components/ui/table';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Input } from '@/components/ui/input';
+import { DatePicker } from '@/components/ui/date-picker';
 import {
   Activity,
   ArrowLeft,
@@ -125,6 +126,7 @@ function DateRangeBar({
   onCustomFrom: (v: string) => void;
   onCustomTo: (v: string) => void;
 }) {
+  const tCommon = useTranslations('common');
   return (
     <div className="flex flex-wrap items-end gap-3">
       <div>
@@ -151,20 +153,20 @@ function DateRangeBar({
         <>
           <div>
             <label className="mb-1.5 block text-xs font-medium text-muted-foreground">From</label>
-            <Input
-              type="date"
-              value={customFrom}
-              onChange={(e) => onCustomFrom(e.target.value)}
-              className="h-8 w-36 text-xs"
+            <DatePicker
+              aria-label={tCommon('from')}
+              value={customFrom || null}
+              onChange={(day) => onCustomFrom(day ?? '')}
+              className="w-36"
             />
           </div>
           <div>
             <label className="mb-1.5 block text-xs font-medium text-muted-foreground">To</label>
-            <Input
-              type="date"
-              value={customTo}
-              onChange={(e) => onCustomTo(e.target.value)}
-              className="h-8 w-36 text-xs"
+            <DatePicker
+              aria-label={tCommon('to')}
+              value={customTo || null}
+              onChange={(day) => onCustomTo(day ?? '')}
+              className="w-36"
             />
           </div>
         </>
@@ -238,7 +240,7 @@ function VisibilityBar({ score }: { score: number }) {
           style={{ width: `${Math.min(100, Math.max(0, rounded))}%` }}
         />
       </div>
-      <span className="w-8 text-right text-xs font-semibold tabular-nums">{rounded}</span>
+      <span className="w-8 text-end text-xs font-semibold tabular-nums">{rounded}</span>
     </div>
   );
 }
@@ -293,7 +295,7 @@ function TopSourceDomainsTable({
             <TableHead className="text-xs">Domain</TableHead>
             <TableHead className="text-xs">Platforms</TableHead>
             <TableHead className="text-xs">Usage</TableHead>
-            <TableHead className="text-right text-xs">Citations</TableHead>
+            <TableHead className="text-end text-xs">Citations</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -329,9 +331,7 @@ function TopSourceDomainsTable({
               <TableCell>
                 <UsageBar pct={row.usagePct} />
               </TableCell>
-              <TableCell className="text-right text-xs tabular-nums">
-                {row.totalCitations}
-              </TableCell>
+              <TableCell className="text-end text-xs tabular-nums">{row.totalCitations}</TableCell>
             </TableRow>
           ))}
         </TableBody>
@@ -369,7 +369,7 @@ function TopSourceUrlsTable({
             <TableHead className="text-xs">URL</TableHead>
             <TableHead className="text-xs">Platforms</TableHead>
             <TableHead className="text-xs">Usage</TableHead>
-            <TableHead className="text-right text-xs">Citations</TableHead>
+            <TableHead className="text-end text-xs">Citations</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -417,9 +417,7 @@ function TopSourceUrlsTable({
               <TableCell>
                 <UsageBar pct={row.usagePct} />
               </TableCell>
-              <TableCell className="text-right text-xs tabular-nums">
-                {row.totalCitations}
-              </TableCell>
+              <TableCell className="text-end text-xs tabular-nums">{row.totalCitations}</TableCell>
             </TableRow>
           ))}
         </TableBody>
@@ -540,11 +538,11 @@ function PlatformResultGroup({
           </div>
         </div>
         <div className="hidden items-center gap-5 sm:flex">
-          <div className="text-right">
+          <div className="text-end">
             <p className="text-[10px] text-muted-foreground">Mentions</p>
             <p className="text-xs font-semibold tabular-nums">{group.totalMentions}</p>
           </div>
-          <div className="text-right">
+          <div className="text-end">
             <p className="text-[10px] text-muted-foreground">Citations</p>
             <p className="text-xs font-semibold tabular-nums">{group.totalCitations}</p>
           </div>
@@ -974,7 +972,7 @@ export default function PromptDetailPage() {
           <Button
             variant="ghost"
             size="sm"
-            className="-ml-2 gap-2 text-muted-foreground hover:text-foreground"
+            className="-ms-2 gap-2 text-muted-foreground hover:text-foreground"
             onClick={() => router.back()}
           >
             <ArrowLeft className="h-4 w-4" />

@@ -36,6 +36,7 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { listRoleMembers, type RoleMember } from '@/lib/actions/chat-access';
+import { useCaughtErrorText, useServerErrorText } from '@/hooks/use-server-error';
 import { MemberBrandsCell } from '@/components/chat-access/roles-access-section';
 import {
   listMembers,
@@ -53,6 +54,7 @@ import {
   type TeamMember,
   type TeamInvitation,
   type TeamInfo,
+  type TeamErrorCode,
   type TeamRole,
 } from '@/lib/actions/team';
 import {
@@ -115,6 +117,7 @@ export function TeamSection({
   withChatAccess?: boolean;
 } = {}) {
   const t = useTranslations('settings');
+  const caughtError = useCaughtErrorText();
   const tAccess = useTranslations('chatAccess');
   const router = useRouter();
   const [members, setMembers] = useState<TeamMember[]>([]);
@@ -135,11 +138,11 @@ export function TeamSection({
       setCurrentRole(me?.role ?? null);
       if (me?.role === 'admin' && inf.multiBrand) setBrands(await listShareableBrands());
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : t('team_loadFailed'));
+      toast.error(caughtError(error, t('team_loadFailed')));
     } finally {
       setIsLoading(false);
     }
-  }, [t]);
+  }, [t, caughtError]);
 
   useEffect(() => {
     loadData();
@@ -178,7 +181,7 @@ export function TeamSection({
             <CardTitle>{t('team')}</CardTitle>
             <CardDescription>
               {t('team_description')}
-              {seatsLabel && <span className="ml-1 text-foreground">· {seatsLabel}</span>}
+              {seatsLabel && <span className="ms-1 text-foreground">· {seatsLabel}</span>}
             </CardDescription>
           </div>
           {isAdmin && info && (
@@ -263,7 +266,7 @@ export function TeamSection({
                     onClick={() => router.push('/dashboard/settings?tab=billing')}
                   >
                     {t('team_upgrade')}
-                    <ArrowUpRight className="ml-1 h-3.5 w-3.5" />
+                    <ArrowUpRight className="ms-1 h-3.5 w-3.5" />
                   </Button>
                 </div>
               )}
@@ -297,9 +300,27 @@ export function TeamSection({
   );
 }
 
+/**
+ * A team action's refusal in the person's language (LOC-008): its own
+ * code's words, else the shared map (lib/server-error.ts), else the
+ * server's sentence.
+ */
+function useTeamErrorText() {
+  const t = useTranslations('settings.teamErrors');
+  const serverError = useServerErrorText();
+  return useCallback(
+    (result: { error: string; code?: TeamErrorCode }) =>
+      result.code && result.code !== 'not_found'
+        ? t(result.code)
+        : serverError(result, result.error),
+    [t, serverError],
+  );
+}
+
 /** A member's role change and removal, for either layout. */
 function useMemberActions(member: TeamMember, onChanged: () => void) {
   const t = useTranslations('settings');
+  const caughtError = useCaughtErrorText();
   const [pendingRole, setPendingRole] = useState<TeamRole | null>(null);
   const [removing, setRemoving] = useState(false);
   const [removeDialogOpen, setRemoveDialogOpen] = useState(false);
@@ -312,7 +333,7 @@ function useMemberActions(member: TeamMember, onChanged: () => void) {
       toast.success(t('team_roleUpdated'));
       onChanged();
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : t('team_roleUpdateFailed'));
+      toast.error(caughtError(error, t('team_roleUpdateFailed')));
     } finally {
       setPendingRole(null);
     }
@@ -326,7 +347,7 @@ function useMemberActions(member: TeamMember, onChanged: () => void) {
       setRemoveDialogOpen(false);
       onChanged();
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : t('team_memberRemoveFailed'));
+      toast.error(caughtError(error, t('team_memberRemoveFailed')));
     } finally {
       setRemoving(false);
     }
@@ -448,7 +469,7 @@ function RemoveMember({ member, actions }: { member: TeamMember; actions: Member
           <Button variant="destructive" onClick={actions.remove} disabled={actions.removing}>
             {actions.removing ? (
               <>
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                <Loader2 className="me-2 h-4 w-4 animate-spin" />
                 {t('team_removing')}
               </>
             ) : (
@@ -557,7 +578,7 @@ function MemberTableRow({
             ? format.relativeTime(new Date(chat.lastActiveAt))
             : tAccess('roles.neverSignedIn')}
       </TableCell>
-      <TableCell className="w-10 text-right">
+      <TableCell className="w-10 text-end">
         {canEdit && <RemoveMember member={member} actions={actions} />}
       </TableCell>
     </TableRow>
@@ -577,6 +598,7 @@ function InvitationRow({
   onChanged: () => void;
 }) {
   const t = useTranslations('settings');
+  const caughtError = useCaughtErrorText();
   const tBrands = useTranslations('settings.teamBrands');
   const [busy, setBusy] = useState<'revoke' | 'resend' | null>(null);
   // A read-only workspace (plan not active): Resend opens the upgrade dialog
@@ -591,7 +613,7 @@ function InvitationRow({
       toast.success(t('team_invitationRevoked'));
       onChanged();
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : t('team_invitationRevokeFailed'));
+      toast.error(caughtError(error, t('team_invitationRevokeFailed')));
     } finally {
       setBusy(null);
     }
@@ -605,7 +627,7 @@ function InvitationRow({
       toast.success(t('team_invitationResent'));
       onChanged();
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : t('team_invitationResendFailed'));
+      toast.error(caughtError(error, t('team_invitationResendFailed')));
     } finally {
       setBusy(null);
     }
@@ -654,14 +676,14 @@ function InvitationRow({
             <DropdownMenuItem
               onClick={guard(handleResend, { action: tActions('resendInvitations') })}
             >
-              <RefreshCw className="mr-2 h-4 w-4" />
+              <RefreshCw className="me-2 h-4 w-4" />
               {t('team_resendInvite')}
             </DropdownMenuItem>
             <DropdownMenuItem
               onClick={handleRevoke}
               className="text-destructive focus:text-destructive"
             >
-              <Trash2 className="mr-2 h-4 w-4" />
+              <Trash2 className="me-2 h-4 w-4" />
               {t('team_revoke')}
             </DropdownMenuItem>
           </DropdownMenuContent>
@@ -684,6 +706,8 @@ function InviteDialog({
   onInvited: () => void;
 }) {
   const t = useTranslations('settings');
+  const caughtError = useCaughtErrorText();
+  const teamError = useTeamErrorText();
   const [open, setOpen] = useState(false);
   const [email, setEmail] = useState('');
   const [role, setRole] = useState<TeamRole>('analyst');
@@ -717,7 +741,7 @@ function InviteDialog({
         role === 'admin' ? ALL_BRANDS : brandAccess,
       );
       if ('error' in result) {
-        toast.error(result.error);
+        toast.error(teamError(result));
         return;
       }
       setInviteLink(result.inviteLink);
@@ -725,7 +749,7 @@ function InviteDialog({
       toast.success(result.emailSent ? t('team_invitationSent') : t('team_inviteCreated'));
       onInvited();
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : t('team_invitationSendFailed'));
+      toast.error(caughtError(error, t('team_invitationSendFailed')));
     } finally {
       setSubmitting(false);
     }
@@ -753,7 +777,7 @@ function InviteDialog({
       <DialogTrigger
         render={
           <Button size="sm" disabled={!canInvite}>
-            <UserPlus className="mr-2 h-4 w-4" />
+            <UserPlus className="me-2 h-4 w-4" />
             {t('team_inviteMember')}
           </Button>
         }
@@ -830,7 +854,7 @@ function InviteDialog({
               <Button onClick={handleSubmit} disabled={submitting || !brandsComplete}>
                 {submitting ? (
                   <>
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    <Loader2 className="me-2 h-4 w-4 animate-spin" />
                     {t('team_sending')}
                   </>
                 ) : (
@@ -860,6 +884,8 @@ function EditBrandsDialog({
   onChanged: () => void;
 }) {
   const t = useTranslations('settings.teamBrands');
+  const caughtError = useCaughtErrorText();
+  const teamError = useTeamErrorText();
   const tSettings = useTranslations('settings');
   const tActions = useTranslations('readOnly.actions');
   const { isLocked, openUpgrade } = useUpgradeGate();
@@ -873,14 +899,14 @@ function EditBrandsDialog({
     try {
       const result = await setMemberBrands(member.userId, value);
       if ('error' in result) {
-        toast.error(result.error);
+        toast.error(teamError(result));
         return;
       }
       toast.success(t('saved', { name }));
       setOpen(false);
       onChanged();
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : t('saveFailed'));
+      toast.error(caughtError(error, t('saveFailed')));
     } finally {
       setSaving(false);
     }
@@ -925,7 +951,7 @@ function EditBrandsDialog({
           <Button onClick={save} disabled={saving || !isBrandChoiceComplete(value, false)}>
             {saving ? (
               <>
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                <Loader2 className="me-2 h-4 w-4 animate-spin" />
                 {t('saving')}
               </>
             ) : (

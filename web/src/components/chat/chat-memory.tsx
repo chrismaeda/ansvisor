@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { useTranslations } from 'next-intl';
+import { useServerErrorText } from '@/hooks/use-server-error';
 import { toast } from 'sonner';
 import { ArrowUpRight, Pencil, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -38,14 +39,22 @@ const SCOPES: MemoryScope[] = ['user', 'brand', 'workspace'];
 
 type Load = { status: 'loading' } | { status: 'error' } | { status: 'ready'; list: MemoryList };
 
-/** A refusal's words from the API, or the page's own. */
-async function refusalOf(res: Response | null, fallback: string): Promise<string> {
+/**
+ * A refusal's words: a mapped code's in the person's language (`say`, LOC-008),
+ * else the API's, else the page's own.
+ */
+async function refusalOf(
+  res: Response | null,
+  fallback: string,
+  say: (body: unknown, fallback: string, status?: number) => string,
+): Promise<string> {
   const body = res ? ((await res.json().catch(() => null)) as { error?: unknown } | null) : null;
-  return typeof body?.error === 'string' ? body.error : fallback;
+  return say(body, typeof body?.error === 'string' ? body.error : fallback, res?.status ?? 0);
 }
 
 export function ChatMemory() {
   const t = useTranslations('chatMemory.page');
+  const serverError = useServerErrorText();
   const tCard = useTranslations('chatMemory.card');
   const tActions = useTranslations('readOnly.actions');
   const { guard } = useUpgradeGate();
@@ -90,7 +99,7 @@ export function ChatMemory() {
       body: JSON.stringify({ personal: next }),
     }).catch(() => null);
     if (!res?.ok) {
-      toast.error(await refusalOf(res, t('failed')));
+      toast.error(await refusalOf(res, t('failed'), serverError));
       read();
     }
   };
@@ -106,7 +115,7 @@ export function ChatMemory() {
       }).catch(() => null);
       setBusy(false);
       if (!res?.ok) {
-        toast.error(await refusalOf(res, t('failed')));
+        toast.error(await refusalOf(res, t('failed'), serverError));
         return;
       }
       setEditing(null);
@@ -122,13 +131,13 @@ export function ChatMemory() {
         () => null,
       );
       if (!res?.ok) {
-        toast.error(await refusalOf(res, t('failed')));
+        toast.error(await refusalOf(res, t('failed'), serverError));
         return;
       }
       toast(t('restored'));
       read();
     },
-    [read, t],
+    [read, serverError, t],
   );
 
   /** Deletes at once (item 23): the row goes, and Undo brings it back for 10 seconds. */
@@ -138,7 +147,7 @@ export function ChatMemory() {
     const res = await fetch(`/api/chat/memory/${item.id}`, { method: 'DELETE' }).catch(() => null);
     setBusy(false);
     if (!res?.ok) {
-      toast.error(await refusalOf(res, t('failed')));
+      toast.error(await refusalOf(res, t('failed'), serverError));
       return;
     }
     if (list) {
@@ -192,8 +201,8 @@ export function ChatMemory() {
           <p className="text-[13px] text-muted-foreground">{t('subtitle')}</p>
         </div>
         {list && !hidden && (
-          <div className="ml-auto flex items-center gap-2.5 text-[13px]">
-            <span className="text-right">
+          <div className="ms-auto flex items-center gap-2.5 text-[13px]">
+            <span className="text-end">
               {t('useMemory')}
               <span className="block text-xs text-muted-foreground">{t('useMemoryNote')}</span>
             </span>
@@ -252,14 +261,14 @@ export function ChatMemory() {
               >
                 {tabLabel(scope)}
                 {list && (
-                  <i className="ml-1 rounded-md bg-foreground/10 px-[5px] text-[11px] font-medium not-italic text-foreground/80 tabular-nums">
+                  <i className="ms-1 rounded-md bg-foreground/10 px-[5px] text-[11px] font-medium not-italic text-foreground/80 tabular-nums">
                     {count(scope)}
                   </i>
                 )}
               </button>
             ))}
             {list && (tab !== 'brand' || list.brand) && (
-              <span className="ml-auto text-xs text-muted-foreground tabular-nums">
+              <span className="ms-auto text-xs text-muted-foreground tabular-nums">
                 {t('used', {
                   used: list.used[tab].toLocaleString('en-US'),
                   max: list.limits.scope.toLocaleString('en-US'),
@@ -337,7 +346,7 @@ export function ChatMemory() {
                               max: MAX_MEMORY_LINE,
                             })}
                           </span>
-                          <span className="ml-auto flex gap-1.5">
+                          <span className="ms-auto flex gap-1.5">
                             <Button
                               size="sm"
                               variant="outline"

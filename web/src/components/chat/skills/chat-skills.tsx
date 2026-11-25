@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslations } from 'next-intl';
+import { useServerErrorText } from '@/hooks/use-server-error';
 import { toast } from 'sonner';
 import { Bot, ChevronDown, Search } from 'lucide-react';
 import { FormSwitch } from '@/components/chat/agents/agent-form-triggers';
@@ -87,15 +88,19 @@ async function readConnected(brandId: string): Promise<Set<string> | null> {
 }
 
 /** Turns a skill on or off; the API's words when it refused. */
-async function patchEnabled(url: string, enabled: boolean): Promise<string | null> {
+async function patchEnabled(
+  url: string,
+  enabled: boolean,
+): Promise<{ error?: string; code?: string; status?: number } | null> {
   const res = await fetch(url, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ enabled }),
   }).catch(() => null);
   if (res?.ok) return null;
-  const body = (await res?.json().catch(() => null)) as { error?: string } | null;
-  return body?.error ?? '';
+  const body = (await res?.json().catch(() => null)) as { error?: string; code?: string } | null;
+  // The code too, for the toast to say a mapped refusal in the person's language (LOC-008).
+  return { ...(body ?? {}), status: res?.status ?? 0 };
 }
 
 const matches = (query: string, skill: { name: string; title: string; description: string }) => {
@@ -110,6 +115,7 @@ const matches = (query: string, skill: { name: string; title: string; descriptio
 
 export function ChatSkills() {
   const t = useTranslations('chatSkills.page');
+  const serverError = useServerErrorText();
   const router = useRouter();
   const brandId = useBrandStore((s) => s.activeBrandId);
   const { isLocked, openUpgrade } = useUpgradeGate();
@@ -168,7 +174,7 @@ export function ChatSkills() {
       setStarting(null);
       // A read-only workspace, or a skill run on the demo brand: the plans.
       if (started.code === 'subscription_inactive' || started.code === 'demo_brand') openUpgrade();
-      else toast.error(started.error ?? t('runFailed'));
+      else toast.error(serverError(started, started.error ?? t('runFailed')));
       return;
     }
     router.push(`/dashboard/chat/${started.chatId}`);
@@ -182,7 +188,7 @@ export function ChatSkills() {
       enabled,
     );
     if (refused !== null) {
-      toast.error(refused || t('changeFailed'));
+      toast.error(serverError(refused, refused.error || t('changeFailed'), refused.status));
       return;
     }
     toast.success(t(enabled ? 'turnedOn' : 'turnedOff', { name: skill.name }));
@@ -192,7 +198,7 @@ export function ChatSkills() {
   async function toggleOwn(skill: WorkspaceSkillView, enabled: boolean) {
     const refused = await patchEnabled(`/api/chat/skills/${skill.id}`, enabled);
     if (refused !== null) {
-      toast.error(refused || t('changeFailed'));
+      toast.error(serverError(refused, refused.error || t('changeFailed'), refused.status));
       return;
     }
     toast.success(t(enabled ? 'turnedOn' : 'turnedOff', { name: skill.name }));
@@ -221,7 +227,7 @@ export function ChatSkills() {
           <h1 className="text-2xl font-bold tracking-[-.6px]">{t('title')}</h1>
           <p className="text-[13px] text-muted-foreground">{t('subtitle')}</p>
         </div>
-        <div className="ml-auto flex items-center gap-2">
+        <div className="ms-auto flex items-center gap-2">
           <Link
             href="/dashboard/agents"
             data-action="skills.openAgents"
@@ -322,7 +328,7 @@ export function ChatSkills() {
               </button>
             ))}
             {tab === 'mine' && list.limit.max !== null && (
-              <span className="ml-auto self-center text-xs text-muted-foreground tabular-nums">
+              <span className="ms-auto self-center text-xs text-muted-foreground tabular-nums">
                 {t('limit', { used: list.limit.used, max: list.limit.max })}
               </span>
             )}
@@ -336,7 +342,7 @@ export function ChatSkills() {
                 <div className="relative w-full max-w-[260px]">
                   <Search
                     aria-hidden
-                    className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground"
+                    className="pointer-events-none absolute top-1/2 start-2.5 size-3.5 -translate-y-1/2 text-muted-foreground"
                   />
                   <Input
                     value={query}
@@ -344,7 +350,7 @@ export function ChatSkills() {
                     placeholder={t('search')}
                     aria-label={t('search')}
                     data-action="skills.search"
-                    className="h-8 pl-8 text-[13px]"
+                    className="h-8 ps-8 text-[13px]"
                   />
                 </div>
                 {tab === 'ansvisor' &&
@@ -454,7 +460,7 @@ function CardHead({ name, badge }: { name: string; badge?: React.ReactNode }) {
   );
 }
 
-const BADGE = 'ml-auto shrink-0 rounded-full px-2 py-0.5 text-[10.5px] font-medium';
+const BADGE = 'ms-auto shrink-0 rounded-full px-2 py-0.5 text-[10.5px] font-medium';
 
 /** The card's title: it opens the skill's details. */
 function CardTitle({ title, onOpen }: { title: string; onOpen: () => void }) {
@@ -463,7 +469,7 @@ function CardTitle({ title, onOpen }: { title: string; onOpen: () => void }) {
       type="button"
       data-action="skills.details"
       onClick={onOpen}
-      className="text-left text-[14px] font-semibold outline-none hover:underline focus-visible:ring-[3px] focus-visible:ring-ring/50"
+      className="text-start text-[14px] font-semibold outline-none hover:underline focus-visible:ring-[3px] focus-visible:ring-ring/50"
     >
       {title}
     </button>
@@ -493,6 +499,9 @@ function LibraryCard({
   const t = useTranslations('chatSkills.page');
   const tNames = useTranslations('chatAgents.connections.names');
   const uses = skillOf(skill.name)?.uses ?? [];
+  // A connection's name; "Any catalog source" says what counts here (UX audit CH-13).
+  const nameOf = (key: string) =>
+    key === 'catalog' ? t('catalog.name') : tNames.has(key) ? tNames(key) : key;
   // A Required connection the brand lacks: Connect stands in for Run and Schedule (mockup).
   const missing = kinds
     ? uses.find((use) => use.required && !kinds.has(connectionKindOf(use.key) ?? use.key))
@@ -517,7 +526,7 @@ function LibraryCard({
         <div className="flex flex-wrap gap-1.5" data-slot="skill-connections">
           {uses.map((use) => {
             const on = kinds?.has(connectionKindOf(use.key) ?? use.key);
-            const name = tNames.has(use.key) ? tNames(use.key) : use.key;
+            const name = nameOf(use.key);
             return (
               <span
                 key={use.key}
@@ -542,11 +551,11 @@ function LibraryCard({
           <Link
             href={INTEGRATIONS_HREF}
             data-action="skills.connect"
-            className={cn(buttonVariants({ variant: 'outline', size: 'sm' }))}
+            className={cn(buttonVariants({ size: 'sm' }))}
           >
-            {t('connect', {
-              name: tNames.has(missing.key) ? tNames(missing.key) : missing.key,
-            })}
+            {missing.key === 'catalog'
+              ? t('catalog.connect')
+              : t('connect', { name: nameOf(missing.key) })}
           </Link>
         ) : (
           skill.enabled && (
@@ -568,22 +577,40 @@ function LibraryCard({
         <Link
           href={`/dashboard/agents/new?skill=${encodeURIComponent(skill.name)}`}
           data-action="skills.createAgent"
-          className={cn(buttonVariants({ variant: 'ghost', size: 'sm' }))}
+          className={cn(buttonVariants({ variant: 'outline', size: 'sm' }))}
         >
           {t('createAgent')}
         </Link>
-        {canToggle && (
-          <span className="ml-auto">
-            <FormSwitch
-              checked={skill.enabled}
-              label={t('toggle', { name: skill.name })}
-              action="skills.toggle"
-              onChange={onToggle}
-            />
-          </span>
-        )}
+        {canToggle && <SkillSwitch checked={skill.enabled} name={skill.name} onToggle={onToggle} />}
       </div>
     </div>
+  );
+}
+
+/**
+ * A skill's on/off switch, named on screen "Enabled" (UX audit CH-12); a
+ * click on the word works the switch too.
+ */
+function SkillSwitch({
+  checked,
+  name,
+  onToggle,
+}: {
+  checked: boolean;
+  name: string;
+  onToggle: (enabled: boolean) => void;
+}) {
+  const t = useTranslations('chatSkills.page');
+  return (
+    <label className="ms-auto flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground">
+      {t('enabled')}
+      <FormSwitch
+        checked={checked}
+        label={t('toggle', { name })}
+        action="skills.toggle"
+        onChange={onToggle}
+      />
+    </label>
   );
 }
 
@@ -680,14 +707,7 @@ function OwnCard({
           </Link>
         )}
         {skill.can.toggle && skill.status === 'approved' && (
-          <span className="ml-auto">
-            <FormSwitch
-              checked={skill.enabled}
-              label={t('toggle', { name: skill.name })}
-              action="skills.toggle"
-              onChange={onToggle}
-            />
-          </span>
+          <SkillSwitch checked={skill.enabled} name={skill.name} onToggle={onToggle} />
         )}
       </div>
     </div>
@@ -728,6 +748,7 @@ function SkillDetails({
   onChanged: () => void;
 }) {
   const t = useTranslations('chatSkills.page');
+  const serverError = useServerErrorText();
   const own = 'id' in skill ? skill : null;
   const [busy, setBusy] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -746,7 +767,7 @@ function SkillDetails({
     } | null;
     setBusy(false);
     if (!res?.ok || !body?.ok) {
-      toast.error(body?.error ?? t('changeFailed'));
+      toast.error(serverError(body, body?.error ?? t('changeFailed'), res?.status));
       return;
     }
     toast.success(body.requested ? t('details.requested') : t('details.shared'));
@@ -760,7 +781,7 @@ function SkillDetails({
     const body = (await res?.json().catch(() => null)) as { error?: string } | null;
     setBusy(false);
     if (!res?.ok) {
-      toast.error(body?.error ?? t('changeFailed'));
+      toast.error(serverError(body, body?.error ?? t('changeFailed'), res?.status));
       return;
     }
     toast.success(t('details.deleted', { name: own.name }));
@@ -798,7 +819,7 @@ function SkillDetails({
         {own && own.warnings.length > 0 && (
           <div className="rounded-lg border border-amber-200 bg-amber-50/60 p-3 text-[12.5px] dark:border-amber-900 dark:bg-amber-950/30">
             <p className="font-medium">{t('details.warnings')}</p>
-            <ul className="mt-1 list-disc space-y-0.5 pl-4 text-muted-foreground">
+            <ul className="mt-1 list-disc space-y-0.5 ps-4 text-muted-foreground">
               {own.warnings.map((warning) => (
                 <li key={warning}>{warning}</li>
               ))}

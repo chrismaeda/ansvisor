@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { toast } from 'sonner';
+import { refusalError } from '@/lib/server-error';
+import { useCaughtErrorText } from '@/hooks/use-server-error';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -181,6 +183,7 @@ function ProviderIcon({ provider }: { provider: AiProvider }) {
 export function AiProvidersSection() {
   const t = useTranslations('settings');
   const tCommon = useTranslations('common');
+  const caughtError = useCaughtErrorText();
   const { canAdmin } = useUserRole();
   const [saved, setSaved] = useState<SavedProvider[] | null>(null);
   const [access, setAccess] = useState<OwnKeyAccess>({ state: 'open' });
@@ -211,15 +214,15 @@ export function AiProvidersSection() {
         guard?: OwnKeyGuard | null;
         error?: string;
       };
-      if (!res.ok) throw new Error(body.error || 'Failed to load');
+      if (!res.ok) throw refusalError(body, t('agent_loadFailed'), res.status);
       setSaved(body.providers ?? []);
       setAccess(body.access ?? { state: 'open' });
       setKeyGuard('guard' in body ? (body.guard ?? null) : undefined);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to load');
+      toast.error(caughtError(err, t('agent_loadFailed')));
       setSaved((current) => current ?? []);
     }
-  }, []);
+  }, [t, caughtError]);
 
   useEffect(() => {
     void load();
@@ -240,12 +243,12 @@ export function AiProvidersSection() {
         await load();
         return;
       }
-      if (!res.ok) throw new Error(body.error || 'Failed to save');
+      if (!res.ok) throw refusalError(body, t('agent_saveFailed'), res.status);
       toast.success(withResumed(t('agent_switched', { provider: name(provider) }), body.resumed));
       if (body.check === 'no_credit') toast.warning(keyError(provider, 'no_credit'));
       await load();
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to save');
+      toast.error(caughtError(err, t('agent_saveFailed')));
     } finally {
       setSwitching(null);
     }
@@ -277,7 +280,7 @@ export function AiProvidersSection() {
         class?: KeyFailureClass;
         resumed?: number;
       };
-      if (!res.ok) throw new Error(body.error || 'Failed to test');
+      if (!res.ok) throw refusalError(body, t('agent_testFailed'), res.status);
       if (body.outcome === 'working') {
         toast.success(
           withResumed(t('agent_testWorks', { provider: name(provider) }), body.resumed),
@@ -289,7 +292,7 @@ export function AiProvidersSection() {
       }
       await load();
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to test');
+      toast.error(caughtError(err, t('agent_testFailed')));
     } finally {
       setTesting(null);
     }
@@ -302,11 +305,11 @@ export function AiProvidersSection() {
         method: 'DELETE',
       });
       const body = (await res.json().catch(() => ({}))) as { error?: string };
-      if (!res.ok) throw new Error(body.error || 'Failed to clear');
+      if (!res.ok) throw refusalError(body, t('agent_clearFailed'), res.status);
       toast.success(t('agent_removed'));
       await load();
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to clear');
+      toast.error(caughtError(err, t('agent_clearFailed')));
     } finally {
       setRemoving(false);
       setRemoveOpen(false);
@@ -420,7 +423,7 @@ export function AiProvidersSection() {
                         </div>
 
                         {canAdmin && editing !== provider && (
-                          <div className="flex shrink-0 items-center gap-2 pl-13 @lg:pl-0">
+                          <div className="flex shrink-0 items-center gap-2 ps-13 @lg:ps-0">
                             {row && !row.active && !locked && (
                               <Button
                                 variant="outline"
@@ -431,7 +434,7 @@ export function AiProvidersSection() {
                                 })}
                               >
                                 {switching === provider && (
-                                  <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+                                  <Loader2 className="me-2 h-3.5 w-3.5 animate-spin" />
                                 )}
                                 {t('agent_useForChat')}
                               </Button>
@@ -447,7 +450,7 @@ export function AiProvidersSection() {
                                 })}
                               >
                                 {testing === provider && (
-                                  <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+                                  <Loader2 className="me-2 h-3.5 w-3.5 animate-spin" />
                                 )}
                                 {testing === provider ? t('agent_testing') : t('agent_test')}
                               </Button>
@@ -538,7 +541,7 @@ export function AiProvidersSection() {
                     if (confirmRemove) void handleRemove(confirmRemove);
                   }}
                 >
-                  {removing && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                  {removing && <Loader2 className="me-2 h-4 w-4 animate-spin" />}
                   {t('remove')}
                 </Button>
               </DialogFooter>
@@ -571,6 +574,7 @@ function ProviderKeyForm({
 }) {
   const t = useTranslations('settings');
   const tCommon = useTranslations('common');
+  const caughtError = useCaughtErrorText();
   const [apiKey, setApiKey] = useState('');
   const [endpoint, setEndpoint] = useState(saved.endpoint ?? '');
   const [deployment, setDeployment] = useState(saved.deployment ?? '');
@@ -614,7 +618,7 @@ function ProviderKeyForm({
         setInvalid(body.field);
         return;
       }
-      if (!res.ok) throw new Error(body.error || 'Failed to save');
+      if (!res.ok) throw refusalError(body, t('agent_saveFailed'), res.status);
       if (body.check === 'no_credit') {
         toast.warning(t('agent_savedNoCredit', { provider: providerName }));
       } else if (body.check === 'unchecked') {
@@ -629,7 +633,7 @@ function ProviderKeyForm({
       }
       await onSaved();
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to save');
+      toast.error(caughtError(err, t('agent_saveFailed')));
     } finally {
       setSaving(false);
     }
@@ -741,7 +745,7 @@ function ProviderKeyForm({
           {tCommon('cancel')}
         </Button>
         <Button type="submit" size="sm" disabled={saving || !apiKey.trim()}>
-          {saving && <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />}
+          {saving && <Loader2 className="me-2 h-3.5 w-3.5 animate-spin" />}
           {tCommon('save')}
         </Button>
       </div>

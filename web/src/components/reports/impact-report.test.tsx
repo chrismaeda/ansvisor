@@ -21,6 +21,11 @@ vi.mock('@/i18n/navigation', () => ({
     </a>
   ),
 }));
+vi.mock('@/components/ai-usage/ai-usage-meter', () => ({
+  HeaderWithAiUsage: ({ children }: { children: ReactNode }) => (
+    <div data-slot="header-with-ai-usage">{children}</div>
+  ),
+}));
 const read = vi.hoisted(() => vi.fn());
 vi.mock('@/lib/actions/impact-report', () => ({ readImpactReport: read }));
 const download = vi.hoisted(() => ({ saveBlob: vi.fn() }));
@@ -135,6 +140,7 @@ const report = (more: Partial<ImpactReport> = {}): ImpactReport => ({
   traffic: { current: 120, previous: 100, pages: 2 },
   generatedAt: '2026-10-31T09:14:00.000Z',
   dataAsOf: '2026-10-31T08:00:00.000Z',
+  everShipped: true,
   ...more,
 });
 
@@ -197,7 +203,8 @@ describe('ImpactReportView', () => {
     expect(kpis).toContain('Actions shipped3Sep: 10');
     expect(kpis).toContain('Improved1 of 1verdict at 14 days · 1 pending');
     expect(kpis).toContain('AI traffic to changed pages+20%Google Analytics · vs September');
-    expect(text()).toContain('Correlation, not causation');
+    // The method sits in How we measure, not in a row of chips (UX audit RP-15).
+    expect(text()).not.toContain('Correlation, not causation');
     expect(
       [...document.querySelectorAll('[data-action="impact.filterOutcome"]')].map(
         (b) => b.textContent,
@@ -539,7 +546,49 @@ describe('ImpactReportView', () => {
       '/dashboard/settings/integrations',
     );
     expect(text()).toContain('Nothing shipped in October 2026.');
+    // The next step, and where to take it (UX audit RP-15).
+    expect(text()).toContain("Ship an action to start measuring impact. Open Today's focus");
+    expect($('[data-action="impact.openFocus"]')?.getAttribute('href')).toBe(
+      '/dashboard/action-center/today',
+    );
     expect(($('[data-action="impact.export"]') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('has the usual header: Back to Reports, with the AI usage meter and Ask Chat (RP-15)', async () => {
+    await render();
+    const header = $('[data-slot="header-with-ai-usage"]')!;
+    expect(header.querySelector('h1')?.textContent).toBe('What Ansvisor did for you');
+    const back = header.querySelector('[data-action="impact.backToReports"]')!;
+    expect(back.getAttribute('href')).toBe('/dashboard/reports');
+    expect(back.textContent).toBe('Back to Reports');
+  });
+
+  it('explains the method and what shipped means in How we measure (RP-15)', async () => {
+    await render();
+    await click($('[data-action="impact.howWeMeasure"]')!);
+    const method = document.querySelector('[data-slot="impact-method"]')!.textContent;
+    expect(method).toContain('Shipped means the change went live');
+    expect(method).toContain('Baseline: 14 days before ship');
+    expect(method).toContain('Control: untouched similar prompts');
+    expect(method).toContain('Correlation, not causation');
+  });
+
+  it('says it fills in after the first ship on a brand that never shipped, not a page of zeros', async () => {
+    read.mockResolvedValue({
+      ok: true,
+      report: report({
+        rows: [],
+        summary: { shipped: 0, previous: 0, improved: 0, judged: 0, pending: 0 },
+        traffic: null,
+        dataAsOf: null,
+        everShipped: false,
+      }),
+    });
+    await render();
+    expect(host.querySelector('[data-slot="impact-first-ship"]')?.textContent).toBe(
+      "Nothing has shipped on this brand yetThis report fills in after your first Send to CMS or an agent's first go-live.",
+    );
+    expect(host.querySelector('table')).toBeNull();
   });
 
   it('says it couldn’t load, and tries again', async () => {

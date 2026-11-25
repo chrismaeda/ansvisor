@@ -436,7 +436,7 @@ export async function updatePrompt(
 
 export type UpdatePromptLocationsResult =
   | { prompt: Prompt }
-  | { error: string; code?: 'plan_limit' };
+  | { error: string; code?: 'plan_limit'; limit?: 'locations' };
 
 /**
  * Retarget a prompt's tracking locations (#691).
@@ -488,7 +488,7 @@ export async function updatePromptLocations(
     const plan = await getOrgPlan(orgId);
     const usage = await getOrgLocationUsage(supabase, orgId);
     const limitError = locationLimitMessage(plan, usage.total, delta);
-    if (limitError) return { error: limitError, code: 'plan_limit' };
+    if (limitError) return { error: limitError, code: 'plan_limit', limit: 'locations' };
   }
 
   const { data, error } = await supabase
@@ -528,7 +528,7 @@ export interface BulkLocationSummary {
 
 export type BulkUpdatePromptLocationsResult =
   | BulkLocationSummary
-  | { error: string; code?: 'plan_limit' };
+  | { error: string; code?: 'plan_limit'; limit?: 'locations' };
 
 /**
  * Add or remove one or more tracking locations across a selection of prompts
@@ -605,7 +605,7 @@ export async function bulkUpdatePromptLocations(
       getOrgLocationUsage(supabase, orgId),
     ]);
     const limitError = locationLimitMessage(orgPlan, usage.total, plan.delta);
-    if (limitError) return { error: limitError, code: 'plan_limit' };
+    if (limitError) return { error: limitError, code: 'plan_limit', limit: 'locations' };
   }
 
   const { data: written, error } = await supabase.rpc('apply_prompt_locations', {
@@ -679,10 +679,16 @@ export async function bulkUpdatePromptTags(
 
   let updated = 0;
   for (const change of plan.changes) {
-    const { error } = await supabase
+    // The select RLS policy is wider than the update one ("prompts:
+    // admin/manager update"), so an organization member without the manager
+    // role reads the prompts here but their update matches no row — and
+    // PostgREST reports that as success with zero rows. Count the rows each
+    // write actually changed, not the requests sent.
+    const { data, error } = await supabase
       .from('prompts')
       .update({ tags: change.tags })
-      .eq('id', change.promptId);
+      .eq('id', change.promptId)
+      .select('id');
     if (error) {
       return {
         error:
@@ -691,7 +697,7 @@ export async function bulkUpdatePromptTags(
             : error.message,
       };
     }
-    updated++;
+    updated += data?.length ?? 0;
   }
 
   revalidatePath('/dashboard/brands');
@@ -920,7 +926,9 @@ export async function addPromptToBrand(
   return result.waiting ? { prompt: result.prompt, waiting: true } : { prompt: result.prompt };
 }
 
-export type SetPromptActiveResult = { prompt: Prompt } | { error: string; code?: 'plan_limit' };
+export type SetPromptActiveResult =
+  | { prompt: Prompt }
+  | { error: string; code?: 'plan_limit'; limit?: 'locations' };
 
 type ResumeRow = {
   regions: unknown;
@@ -936,7 +944,7 @@ type ResumeRow = {
 async function resumeLimitError(
   supabase: Awaited<ReturnType<typeof createClient>>,
   rows: ResumeRow[],
-): Promise<{ error: string; code?: 'plan_limit' } | null> {
+): Promise<{ error: string; code?: 'plan_limit'; limit?: 'locations' } | null> {
   const adding = activationDelta(
     rows.map((row) => ({
       isActive: row.is_active !== false,
@@ -964,7 +972,7 @@ async function resumeLimitError(
   } catch {
     return { error: "Couldn't check your plan's prompt limit. Please try again." };
   }
-  return limitError ? { code: 'plan_limit', error: limitError } : null;
+  return limitError ? { code: 'plan_limit', limit: 'locations', error: limitError } : null;
 }
 
 /**
@@ -1422,7 +1430,9 @@ export async function deletePrompt(id: string): Promise<void> {
   if (error) throw new Error(error.message);
 }
 
-export type SetPromptsActiveResult = { updated: number } | { error: string; code?: 'plan_limit' };
+export type SetPromptsActiveResult =
+  | { updated: number }
+  | { error: string; code?: 'plan_limit'; limit?: 'locations' };
 
 /**
  * Pause or resume several prompts in one write, from the prompts table's
@@ -1860,6 +1870,22 @@ export async function getTrackedPromptCount(brandId: string): Promise<number> {
     .from('prompts')
     .select('id, prompt_sets!inner(brand_id)', { count: 'exact', head: true })
     .eq('prompt_sets.brand_id', brandId);
+  if (error) throw new Error(error.message);
+  return count ?? 0;
+}
+
+/**
+ * The brand's tracked prompts as Today counts them (UX audit CP-03,
+ * decision D4): the active ones only. A paused prompt, and one waiting for a
+ * spot under the plan's limit (00535), is left out.
+ */
+export async function getActivePromptCount(brandId: string): Promise<number> {
+  const supabase = await createClient();
+  const { count, error } = await supabase
+    .from('prompts')
+    .select('id, prompt_sets!inner(brand_id)', { count: 'exact', head: true })
+    .eq('prompt_sets.brand_id', brandId)
+    .eq('is_active', true);
   if (error) throw new Error(error.message);
   return count ?? 0;
 }

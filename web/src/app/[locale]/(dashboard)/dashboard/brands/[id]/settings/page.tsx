@@ -75,6 +75,7 @@ import { ClientLogoCard } from './_client-logo-card';
 import { PeopleTab } from './_people-tab';
 import { IntegrationsTab } from './_integrations-tab';
 import { trackingSnippetTag } from '@/lib/conversion-tracking';
+import { useCaughtErrorText, useServerErrorText } from '@/hooks/use-server-error';
 
 interface PageProps {
   params: Promise<{ id: string }>;
@@ -213,6 +214,7 @@ function GeneralTab({
   onUpdate: (updates: Partial<Brand>) => void;
 }) {
   const t = useTranslations('brands');
+  const caughtError = useCaughtErrorText();
   const { canManage } = useUserRole();
   // A read-only workspace (plan not active): the settings show; Save opens
   // the upgrade dialog instead.
@@ -264,7 +266,7 @@ function GeneralTab({
       });
       toast.success(t('settings.saved'));
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to save changes.');
+      toast.error(caughtError(err, t('settings.errors.save')));
     } finally {
       setIsSaving(false);
     }
@@ -440,6 +442,7 @@ function ShoppingModeCard({
   onUpdate: (updates: Partial<Brand>) => void;
 }) {
   const t = useTranslations('brands');
+  const caughtError = useCaughtErrorText();
   // Admins and managers, as the brands, prompts and brand_platforms writes allow.
   const { canManage } = useUserRole();
   // ChatGPT Shopping is tracked only on plans with the Shopping page (#1212):
@@ -467,7 +470,7 @@ function ShoppingModeCard({
       }
     } catch (err) {
       setEnabled(previous);
-      toast.error(err instanceof Error ? err.message : t('settings.shopping.saveFailed'));
+      toast.error(caughtError(err, t('settings.shopping.saveFailed')));
     } finally {
       setSaving(false);
     }
@@ -512,7 +515,7 @@ function ShoppingModeCard({
               <p className="text-xs text-muted-foreground">{t('settings.shopping.managersOnly')}</p>
             )}
           </div>
-          {saving && <Loader2 className="ml-auto h-4 w-4 animate-spin text-muted-foreground" />}
+          {saving && <Loader2 className="ms-auto h-4 w-4 animate-spin text-muted-foreground" />}
         </div>
       </CardContent>
     </Card>
@@ -536,6 +539,8 @@ function PauseBrandCard({
   // for Pause to stop.
   const { guard } = useUpgradeGate();
   const tActions = useTranslations('readOnly.actions');
+  const caughtError = useCaughtErrorText();
+  const tErrors = useTranslations('brands.settings.errors');
 
   async function handleToggle(nextActive: boolean) {
     if (!canAdmin) return;
@@ -545,7 +550,7 @@ function PauseBrandCard({
       onUpdate({ isActive: nextActive });
       toast.success(nextActive ? 'Tracking resumed' : 'Tracking paused');
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to save');
+      toast.error(caughtError(err, tErrors('save')));
     } finally {
       setSaving(false);
     }
@@ -614,6 +619,7 @@ function DomainsTab({
   onUpdate: (updates: Partial<Brand>) => void;
 }) {
   const t = useTranslations('brands');
+  const caughtError = useCaughtErrorText();
   const { canManage } = useUserRole();
   // A read-only workspace (plan not active): Save opens the upgrade dialog instead.
   const { guard } = useUpgradeGate();
@@ -673,7 +679,7 @@ function DomainsTab({
       });
       toast.success(t('settings.saved'));
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to save domains.');
+      toast.error(caughtError(err, t('settings.errors.saveDomains')));
     } finally {
       setIsSaving(false);
     }
@@ -780,6 +786,8 @@ function DomainsTab({
 
 function CompetitorsTab({ brandId }: { brandId: string }) {
   const t = useTranslations('brands');
+  const caughtError = useCaughtErrorText();
+  const serverError = useServerErrorText();
   const { canManage } = useUserRole();
   // A read-only workspace (plan not active): Add and Remove (before its
   // confirm) open the upgrade dialog instead.
@@ -805,14 +813,14 @@ function CompetitorsTab({ brandId }: { brandId: string }) {
         const data = await getCompetitors(brandId);
         if (isCancelled?.()) return;
         setCompetitors(data);
-      } catch {
+      } catch (err) {
         if (isCancelled?.()) return;
-        toast.error('Failed to load competitors');
+        toast.error(serverError(err, t('settings.errors.loadCompetitors')));
       } finally {
         if (!isCancelled?.()) setIsLoading(false);
       }
     },
-    [brandId],
+    [brandId, serverError, t],
   );
 
   useEffect(() => {
@@ -839,7 +847,7 @@ function CompetitorsTab({ brandId }: { brandId: string }) {
       setNewTypeKey((k) => k + 1);
       toast.success(`${added.name} added`);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to add competitor');
+      toast.error(caughtError(err, t('settings.errors.addCompetitor')));
     } finally {
       setIsAdding(false);
     }
@@ -852,8 +860,8 @@ function CompetitorsTab({ brandId }: { brandId: string }) {
       setCompetitors((prev) => prev.filter((c) => c.id !== id));
       setDeletingId(null);
       toast.success('Competitor removed');
-    } catch {
-      toast.error('Failed to remove competitor');
+    } catch (err) {
+      toast.error(serverError(err, t('settings.errors.removeCompetitor')));
     }
   };
 
@@ -1120,7 +1128,7 @@ function TrackingTab({ brand }: { brand: Brand }) {
                   <Button
                     variant="ghost"
                     size="icon"
-                    className="absolute top-2 right-2 h-7 w-7"
+                    className="absolute top-2 end-2 h-7 w-7"
                     onClick={() => copyToClipboard(snippet, 'snippet')}
                     aria-label="Copy tracking script"
                   >
@@ -1137,7 +1145,7 @@ function TrackingTab({ brand }: { brand: Brand }) {
             {/* How it works */}
             <div className="rounded-lg border p-4 space-y-2">
               <p className="text-sm font-medium">How it works</p>
-              <ul className="text-xs text-muted-foreground space-y-1 list-disc pl-4">
+              <ul className="text-xs text-muted-foreground space-y-1 list-disc ps-4">
                 <li>
                   The script detects visitors coming from AI platforms (ChatGPT, Perplexity, Claude,
                   Gemini, Copilot, etc.)
@@ -1174,6 +1182,8 @@ function DangerTab({
   onDelete: (pending: boolean) => Promise<void>;
 }) {
   const t = useTranslations('brands');
+  const caughtError = useCaughtErrorText();
+  const serverError = useServerErrorText();
   const { canAdmin } = useUserRole();
   const [confirmValue, setConfirmValue] = useState('');
   const [isDeleting, setIsDeleting] = useState(false);
@@ -1190,13 +1200,13 @@ function DangerTab({
     try {
       const result = await deleteBrand(brand.id);
       if ('error' in result) {
-        toast.error(result.error);
+        toast.error(serverError(result, result.error));
         setIsDeleting(false);
         return;
       }
       await onDelete(Boolean(result.pending));
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to delete brand.');
+      toast.error(caughtError(err, t('settings.errors.deleteBrand')));
       setIsDeleting(false);
     }
   };

@@ -88,9 +88,13 @@ describe('a stale action (00432)', () => {
   const stale: ActionItem = { ...action, status: 'new', staleAt: '2026-10-31T03:00:00.000Z' };
   const onKeep = vi.fn();
 
-  it('shows Stale beside New, and offers Still relevant in its menu', async () => {
+  it('shows one status, New, with how long no one updated it, and offers Still relevant in its menu', async () => {
     render({ actions: [stale], onKeep });
-    expect(container.textContent).toContain('NewStale');
+    // One primary status; staleness is a hint under it, not a second badge (AC-10).
+    expect(container.textContent).not.toContain('NewStale');
+    expect(container.querySelector('[data-stale-hint]')?.textContent).toMatch(
+      /^No update in \d+ d$/,
+    );
     const items = await openMenu();
     expect(items.map((item) => item.textContent)).toEqual([
       'In Progress',
@@ -106,7 +110,7 @@ describe('a stale action (00432)', () => {
 
   it('is neither once it left New, nor without the stamp', async () => {
     render({ actions: [{ ...stale, status: 'on_hold' }], onKeep });
-    expect(container.textContent).not.toContain('Stale');
+    expect(container.querySelector('[data-stale-hint]')).toBeNull();
     expect((await openMenu()).map((item) => item.textContent)).not.toContain('Still relevant');
   });
 
@@ -396,5 +400,25 @@ describe('ActionTable sortable headers', () => {
     render();
     expect(head('Updated').querySelector('button')).toBeNull();
     expect(container.querySelector('thead [aria-sort]')).toBeNull();
+  });
+});
+
+describe('ActionTable New mark', () => {
+  it('says New beside the title of an action created since the last visit, and only there', () => {
+    render({
+      actions: [action, { ...action, id: 'a2', actionNo: 8 }],
+      newIds: new Set(['a2']),
+    });
+    const rows = [...container.querySelectorAll('tbody tr')];
+    expect(rows[0].querySelector('[data-new-mark]')).toBeNull();
+    const mark = rows[1].querySelector('[data-new-mark]')!;
+    expect(mark.textContent).toBe('New');
+    expect(mark.getAttribute('title')).toBe('Created since your last visit');
+    expect(mark.className).toContain('bg-primary');
+  });
+
+  it('marks nothing without the set', () => {
+    render();
+    expect(container.querySelector('[data-new-mark]')).toBeNull();
   });
 });

@@ -4,8 +4,8 @@ route: /dashboard/chat
 keywords: [chat, ask chat, date range, time range, which time range, default range, last 7d, last 30d, last 24h, custom range, range above the box, add date range, change range, welcome card, preparing your data, quick tour, product tour, task finisher, download answer, save to files, export chat, storage, output card, open in content editor, side panel, chat panel, ctrl j, ask about this, page context, page filters, page dates, as on the page, agent, new chat, open a chat, chat menu, governance, open governance, settings in the chat menu, general settings, agents at work, hide menu, inbox, chat home, for you now, weekly report, pin chat, rename chat, share chat, archive chat, delete chat, run mode, full auto, stop chat, steer, attach files, attach image, send image, read pdf, upload failed, reference data, data used, work in parts, working on parts, split into parts, at the same time, retry, error, reconnecting, question, chat asks, recommended option, skip question, next moves, what to do next, add prompts, pause prompts, add topic, rename topic, add competitors, remove competitor, undo, change draft, send to cms, make report, site audit, open page, read web page, fetch page, why did it change, why did visibility drop, explain change, what explains the change, cited before, cited now, since you left, send to action center, add to action, attach to task, ready for review, complete tasks, /tasks, task strip, tasks ready, close tasks, attach to task and mark done, attach only, mark task done, ai limit, part of a job, remaining ai usage, do the first now, shortcuts, slash menu, /start, /analyze, /new-report, /create, /optimize, /opportunities, /audit, /image, get started, create a report, optimize a page, find opportunities, improve with audit, brand facts, approved facts, /facts, /wrongclaim, fact check, api key in message, paste api key, remove key, where pages open, open here, page beside the chat, back to chat, keep working in chat, page version, what changed, placeholder, undo version, show all questions, mark ready, set ready, voice, microphone, speak, dictate, send to webhook, webhook, workflow webhook, audit card, audit in chat, audit score in chat, open report, agents for you, recommended agents, new member, new teammate, hide agents for you, rules pill, quality pill, rules met, check it against the rules, check rules, open rules, optimize, optimize here, optimize page, rewrite page, optimize in content editor, optimize in the editor here, page chip, suggestions from chat, accept suggestion, reject suggestion, action number, ac number, action code, what is ac, open action from answer, action link, most important actions, what should i do first, top actions, action title, signal code, what is s-07, look up a prompt, find a prompt, cited domain, cited page, find a draft, find a report, same numbers as the page, top 5 prompts, first ones on the page, ranks like the page, latest tracking run, these, items on screen, rows on screen, my sort, my search, open tab, this one, open competitor, every page, ask about today, today's focus, first focus card, my agents, agent runs, what did my agent do, action history, closed actions, signals summary, this topic, this product, this report, this prompt, topic page, product page, report page]
 synonyms: [assistant, ai agent, agent chat, ask ansvisor]
 plan: all
-updated: 2026-11-17
-last_checked: 2026-11-17
+updated: 2026-11-22
+last_checked: 2026-11-22
 owner: Cihan
 app_version: 0.3.0
 approved: true
@@ -42,7 +42,7 @@ In the free trial, and while you explore the demo brand, a welcome card sits abo
 
 Type in the box and press Enter, or click the arrow. Shift+Enter adds a line. The arrow stays off while the box is empty.
 
-On the left under the box, pick how much Chat does on its own: **Ask me first** asks before every step; **Auto, ask before changes** (shown as **Ask before changes**) reads freely and asks before every change; **Full auto** makes changes without asking. In your own chats nothing is published or sent without your click. Agents an Admin allows can publish alone (see **Agents**). Every change is logged in **Activity**. **Full auto** needs the Growth plan, and an Admin can turn it off for everyone but Admins in **Settings › Chat**.
+Under the box, pick how much Chat does on its own: **Ask me first** asks before every step; **Auto, ask before changes** (shown as **Run mode: Ask before changes**) reads freely and asks before every change; **Full auto** makes changes without asking. In your own chats nothing is published or sent without your click. Agents an Admin allows can publish alone (see **Agents**). Every change is logged in **Activity**. **Full auto** needs the Growth plan, and an Admin can turn it off for everyone but Admins in **Settings › Chat**.
 
 Analysts and Agency partners only read; there it says **Read-only**, linking to their role.
 
@@ -70,7 +70,7 @@ Chat also sees the open tab, the sort and search you picked, and the items on sc
 
 ## Chats in the panel
 
-A chat you start in the panel is saved like any other: it is in **Chat**, where you can carry on with it. If you used a panel chat in the last 30 minutes, the panel opens on it again.
+Panel chats are saved in **Chat** too. The panel opens on the chat you used in the last 30 minutes, else on your latest chat from this page and brand, even days later. Each draft or report counts as its own page. **New chat** starts fresh.
 
 Once the panel has a chat, its **⋯** menu offers **Open as full page**, **Open in new window**, and for your own chats **Pin**, **Rename**, **Share with team**, **Archive** and **Delete**. On the full page, **↙ Back to** the page you came from takes you back there, with the chat in the panel as it is now.
 
@@ -136,7 +136,7 @@ Each change is in the **Activity** log, with **Undo** for 7 days (30 days for pa
 
 ## Send a finding to Action Center
 
-Admins and Managers see **Send to Action Center** under Chat's latest answer. Chat proposes the finding as an action: its title, category, the prompts, pages and competitors it is about, and its tasks. Each task names its page and says when it is done. You approve it on its card, except in **Full auto**. Action Center sets its Priority Score, and **Open in Actions** opens it.
+Admins and Managers see **Send to Action Center** under Chat's latest answer. Chat proposes the finding as an action: its title, category, the prompts, pages and competitors it is about, and its tasks. Each task names its page and says when it is done. You approve it on its card, except in **Full auto**. Action Center sets its Priority Score, and **Open in Action Center** opens it.
 
 If an open action already covers these prompts, pages or competitors, Chat offers to add the finding to it instead. That action's targets don't change. **Create anyway** is offered only when the new finding covers something the open action doesn't.
 
@@ -322,9 +322,9 @@ The steps it finished show as one grey line above the answer, such as **✓ Read
 
 ## Data used and action links
 
-Once Chat is done, **Data used** under the answer names each source it read and each page it opened. The answer says when it was generated and how fresh the data was, in your time zone.
+Once Chat is done, **Data used** under the answer names each source it read and each page it opened. When it read one record, it names that record: an action by its code, such as **AC-12**, or a report by its title. The answer says when it was generated and how fresh the data was, in your time zone.
 
-Each Action Center action an answer names comes with its title, and its code, such as AC-07, is a link: click it to open that action in Action Center in a new tab. When the code could also be an action's earlier code, the Actions list opens with both.
+Each Action Center action an answer names comes with its title, and its code, such as AC-07, is a link, also when it's written as code: click it to open that action in Action Center in a new tab. When the code could also be an action's earlier code, the Actions list opens with both.
 
 ## Big requests in parts
 
@@ -350,7 +350,7 @@ While the key isn't working, a line above the message box says why. You can stil
 
 Chat draws on your workspace's monthly AI usage, shared by every seat. The model button's menu ends with **AI usage this month**: a bar, the share used and when it resets. From 80% a dot on the model button turns amber (red once used up), and a line above the box says so once a month, on whichever device you are on; **×** closes it.
 
-Once the usage is used up, Chat pauses: the box is off, and a red line above it says until when. **Get more AI credits** there opens a window with your plan and the credit packs, and it opens once by itself the first time Chat stops. Admins buy packs; everyone else sees them and can **Ask your Admin**. On Enterprise, admins can also use their own AI key. In the free trial, starting the plan gives its full monthly AI usage.
+Once the usage is used up, Chat pauses: the box is off, and a red line above it says until when. **Get more AI credits** there opens a window with your plan and, on Growth, AI usage top-ups; it opens once by itself the first time Chat stops. Admins buy one; others can **Ask your Admin**. On Enterprise, admins can also use their own AI key. In the free trial, starting the plan gives its full monthly AI usage.
 
 ## When only part of a job fits
 
@@ -360,7 +360,7 @@ An agent's run, with no one there to ask, does the parts that fit, keeps what it
 
 ## Inbox
 
-**Inbox** in the chat menu lists what your agents did: chats waiting for your OK first, with **Review**, then chats still working, with their progress and **Watch**, then results you haven't opened yet, with **Open**. Click a row to open its chat. A result leaves the Inbox once you open it. The Inbox shows the brand you have selected: another brand's chats are on that brand's Inbox. The count next to **Inbox** shows how many items there are, with an amber dot when something needs you. Daily suggestions aren't in that count: the **Daily suggestions** tab shows theirs.
+**Inbox** in the chat menu lists what your agents did: chats waiting for your OK first, with **Review**, then chats still working, with their progress and **Watch**, then results you haven't opened yet, with **Open**. Click a row to open its chat. A result leaves the Inbox once you open it. The Inbox shows the brand you have selected: another brand's chats are on that brand's Inbox. The count next to **Inbox**, with an amber dot, shows how many chats need you, the same number as the **Needs you** tab; with nothing waiting for you there's no count.
 
 Tabs on top, each with its count, show **All**, your **Daily suggestions**, what **Needs you** and your **Runs**.
 
@@ -368,9 +368,11 @@ Tabs on top, each with its count, show **All**, your **Daily suggestions**, what
 
 The chat menu on the left of Chat lists your chats. **New chat** starts a new one. **Home** and **Inbox** come first. **Settings**, closed until you click it, holds **General** (your own Chat settings), the **Activity** log, **What Chat can do** and the **Tool policy**.
 
-**Agents at work** lists the chats that need your OK, the ones still working, and finished results you haven't opened yet, with the step each one is on. It shows three at a time: **See all** lists the rest. A dot shows each chat's state; click **?** to see what the dots mean.
+## Agents at work and Chats
 
-**Chats** lists every other chat, newest first, under **Pinned**, **Today**, **Yesterday**, **Previous 7 days**, **Previous 30 days**, then by month. A chat a teammate shared shows their initials. **Search chats** above them finds a chat by its words, and **All chats** and **Archived** at the end list every chat.
+**Agents at work** lists the chats that need your OK and the ones still working or paused, with the step each one is on. A finished chat isn't listed there: it stays under its day with a green dot until you open it, and the **Inbox** lists it too. It shows three at a time: **See all** lists the rest. A dot shows each chat's state; click **?** to see what the dots mean.
+
+**Chats** lists every other chat, newest first, under **Pinned**, **Today**, **Yesterday**, **Previous 7 days**, **Previous 30 days**, then by month. A chat a teammate shared shows their initials. **Search chats** at the top finds a chat by its words, and **All chats** and **Archived** at the end list every chat.
 
 ## Dots on chats
 
@@ -382,7 +384,7 @@ Click **Settings** in the chat menu to show or hide its pages: **General**, your
 
 ## Hide the chat menu
 
-Click the panel button next to **New chat**, or press Ctrl+\ (⌘\ on a Mac), to hide the menu and give the chat the whole width. A small bar at the top then keeps **New chat** and your runs at hand. Chat remembers your choice on every device. On a narrow window the menu opens over the page instead. Ctrl+Shift+O (⌘⇧O) starts a new chat from anywhere in Chat.
+Click the panel button next to **New chat**, or press Ctrl+\ (⌘\ on a Mac), to hide the menu and give the chat the whole width. A small bar at the top then keeps **New chat** and your runs at hand. The runs button, at the top right while the menu shows, reads **Runs · 2 running**, or **Runs · none running**; click it to see each run. Chat remembers your choice on every device. On a narrow window the menu opens over the page instead. Ctrl+Shift+O (⌘⇧O) starts a new chat from anywhere in Chat.
 
 ## Move around Chat
 
@@ -390,7 +392,11 @@ Pages under Chat, such as **Inbox** and **All chats**, show **← Back to Chat**
 
 Esc closes only the box or menu on top, such as search or a **⋯** menu, and never leaves the page.
 
-In Chat, the main menu on the left is a narrow bar of icons, so the chat has room. Point at it to see it whole, or click the Ansvisor logo to keep it open; click the logo again to make it narrow. Chat remembers your choice on every device.
+## The main menu in Chat
+
+In Chat, the main menu on the left is a narrow bar of icons, so the chat has room. It stays narrow when you point at it, so it never covers the chat menu; point at an icon to see its name. Click the Ansvisor logo to open the menu whole, and again to make it narrow. Chat remembers your choice on every device.
+
+On other pages, a narrow main menu opens over the page when you rest the pointer on it, and closes when you move away, press Esc or click outside it.
 
 ## Manage a chat
 
@@ -418,7 +424,11 @@ Every role can copy, download and save answers it can open.
 
 When Chat makes something for you, such as a page saved as a Content draft, it shows under the answer as a card with its name and type. It is also kept in **Files** for your whole workspace, and the card says **In Files**. From the card, **Copy** copies it, **Download** gives it in the formats it has (for a page: HTML, Markdown, Word or PDF), and **Open in Content Editor** opens the page to keep working on it. When storage is full, the card says it wasn't saved to Files, with **Get more storage** to add a storage pack. Click **Files** in the chat menu to find, copy or download everything kept there.
 
-The pen button under an answer, **Open in Content Editor**, turns the answer itself into a new Content draft in your brand and opens it.
+The pen button under an answer, **Open in Content Editor**, turns the answer itself into a new Content draft in your brand and opens it. It shows only on an answer that reads as a page.
+
+## A page's title from Chat
+
+A page Chat saves gets a real page title: the answer's first heading, else your question when you asked one, else **Untitled page** for you to name. A line of the answer or a request, such as "Find content opportunities", is never saved as a title.
 
 ## Share a chat with your team
 

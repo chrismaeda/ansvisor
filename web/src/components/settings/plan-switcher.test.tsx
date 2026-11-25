@@ -159,22 +159,29 @@ describe('the plan cards', () => {
         '10 content briefs a month',
         '100 site audits a month',
         '1x AI usage',
+        'Up to 25 new pages or 50 page optimizations a month',
         'MCP & API access',
       ],
+      // Growth's brands, prompts and AI usage grow with add-ons (00546).
       Growth: [
-        '4 brands',
+        '4 brands+ add-ons',
         'Unlimited seats',
-        '200 prompts tracked',
+        '250 prompts tracked+ add-ons',
         'ChatGPT, Gemini, Google AI Mode and Google AI Overviews tracking',
         '50 content briefs a month',
         '500 site audits a month',
-        '5x AI usage',
+        '5x AI usage+ add-ons',
+        'Up to 125 new pages or 250 page optimizations a month',
         'Multi-region tracking',
         'White-label reports & exports',
         'Looker Studio',
       ],
     });
     expect(container.textContent).not.toContain('8 answer engines');
+    // Starter's lines grow by upgrading, not by add-ons.
+    expect(cards().Starter.some((line: string) => line.includes('+ add-ons'))).toBe(false);
+    const mark = container.querySelector('[data-slot="expandable-mark"]');
+    expect(mark?.getAttribute('title')).toContain('on Settings › Billing');
     // AI usage says what it covers on hover.
     const ai = [...container.querySelectorAll('li span')].find(
       (el) => el.textContent === '5x AI usage',
@@ -185,14 +192,25 @@ describe('the plan cards', () => {
     expect(container.textContent).toContain(
       'For small teams getting started with AI visibility monitoring and optimization.',
     );
+    // The content estimate says it shares the AI allowance.
+    const pages = [...container.querySelectorAll('li span')].find((el) =>
+      el.textContent?.startsWith('Up to 125 new pages'),
+    );
+    expect(pages?.getAttribute('title')).toContain('shared with Chat and agents');
   });
 
   it('lists Chat and Agents once the new Chat is on, Full auto from Growth up', async () => {
     await render('starter', { chatAgentic: true });
     const { Starter, Growth } = cards();
-    expect(Starter.slice(6)).toEqual(['1x AI usage', 'Chat and Agents', 'MCP & API access']);
+    expect(Starter.slice(6)).toEqual([
+      '1x AI usage',
+      'Up to 25 new pages or 50 page optimizations a month',
+      'Chat and Agents',
+      'MCP & API access',
+    ]);
     expect(Growth.slice(6)).toEqual([
-      '5x AI usage',
+      '5x AI usage+ add-ons',
+      'Up to 125 new pages or 250 page optimizations a month',
       'Chat and Agents',
       'Full auto, with agents that publish on their own',
       'Multi-region tracking',
@@ -248,7 +266,7 @@ describe('the plan cards', () => {
     await render('growth');
     expect(container.textContent).toContain('Need a custom plan?');
     expect(container.textContent).toContain(
-      'For large companies and agencies managing AI visibility at scale. Starting at $499/month.',
+      'For large companies and agencies managing AI visibility at scale. Starting at $1,999/month.',
     );
     // Its AI usage is set per customer, from Enterprise's $50 (10x Starter's).
     const ai = [...container.querySelectorAll('li span')].find(
@@ -260,9 +278,10 @@ describe('the plan cards', () => {
     expect(ai?.getAttribute('title')).toContain('Ansvisor sets the amount with you.');
     expect(container.textContent).not.toContain('10x AI usage');
     for (const point of [
-      'Unlimited brands in a custom workspace',
-      'All answer engines, Claude included',
-      'SSO / SAML and custom feature requests',
+      '1 brand and 3,000 prompts to start, more by contract',
+      'Every answer engine, Claude by contract',
+      'SSO / SAML, priority support and an SLA',
+      'Invoice billing and API access',
     ]) {
       expect(container.textContent).toContain(point);
     }
@@ -738,6 +757,32 @@ describe('cancelling', () => {
       plan: 'growth',
       interval: 'year',
     });
+  });
+
+  it("says a refused reactivation in the UI's words when its code is known, else the server's (LOC-008)", async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        Response.json({ error: 'Too many requests', code: 'rate_limited' }, { status: 429 }),
+      ),
+    );
+    await render('growth', { cancelAtPeriodEnd: true });
+    await click('Reactivate Subscription');
+    expect(toast.error).toHaveBeenLastCalledWith(messages.serverErrors.rate_limited);
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => Response.json({ error: 'Stripe is unhappy' }, { status: 500 })),
+    );
+    await click('Reactivate Subscription');
+    expect(toast.error).toHaveBeenLastCalledWith('Stripe is unhappy');
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => Response.json({}, { status: 500 })),
+    );
+    await click('Reactivate Subscription');
+    expect(toast.error).toHaveBeenLastCalledWith(messages.settings.reactivateFailed);
   });
 });
 

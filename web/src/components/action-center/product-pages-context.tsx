@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import { useTranslations } from 'next-intl';
+import { useServerErrorText } from '@/hooks/use-server-error';
 import { toast } from 'sonner';
 import { setProductGroupSize } from '@/lib/actions/action-center';
 import { pagePath } from '@/lib/content/overlap';
@@ -72,6 +73,7 @@ export function ProductPagesContext({
   onChanged: () => void | Promise<void>;
 }) {
   const t = useTranslations('actionCenter.actionsPage.drawer.productPages');
+  const serverError = useServerErrorText();
   const products = productPagesOf(payload);
   const size = groupSizeOf(payload);
   const [busy, setBusy] = useState(false);
@@ -83,8 +85,8 @@ export function ProductPagesContext({
       await setProductGroupSize(brandId, actionId, next);
       toast.success(t('groupSizeSaved', { size: next }));
       await onChanged();
-    } catch {
-      toast.error(t('groupSizeFailed'));
+    } catch (err) {
+      toast.error(serverError(err, t('groupSizeFailed')));
     } finally {
       setBusy(false);
     }
@@ -123,7 +125,7 @@ export function ProductPagesContext({
               disabled={!editable || busy}
               onClick={() => void pick(option)}
               className={cn(
-                'px-2.5 py-1 text-xs tabular-nums first:rounded-l-md last:rounded-r-md disabled:cursor-not-allowed',
+                'px-2.5 py-1 text-xs tabular-nums first:rounded-s-md last:rounded-e-md disabled:cursor-not-allowed',
                 option === size
                   ? 'bg-primary text-primary-foreground'
                   : 'text-muted-foreground hover:bg-muted',

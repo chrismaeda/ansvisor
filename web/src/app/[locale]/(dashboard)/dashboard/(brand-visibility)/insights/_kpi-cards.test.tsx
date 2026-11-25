@@ -41,7 +41,7 @@ const onNavigate = vi.fn();
 function render(
   trackedPrompts: TrackedPromptsKpi,
   over: Partial<InsightsSummary> = {},
-  props: { mentionsHref?: string } = {},
+  props: { mentionsHref?: string; trendPending?: boolean } = {},
 ) {
   act(() => {
     root.render(
@@ -139,6 +139,18 @@ describe('the Mentions and Citations cards', () => {
     expect(onNavigate).toHaveBeenLastCalledWith('/dashboard/mentions?range=7d');
   });
 
+  it('show Visibility as loading while its trend is read again, and "No data" without it', () => {
+    render(plan(47, 50), {}, { trendPending: true });
+    const card = () =>
+      container.querySelector('[data-slot="kpi-pending"]')?.closest('[data-slot="card"]');
+    expect(card()).toBeTruthy();
+    expect(card()!.textContent).toContain('Visibility');
+    expect(card()!.textContent).not.toContain('No data');
+    render(plan(47, 50));
+    expect(container.querySelector('[data-slot="kpi-pending"]')).toBeNull();
+    expect(container.textContent).toContain('No data');
+  });
+
   it('say nothing of a change they do not have', () => {
     render(plan(47, 50), { mentionsChange: null, citationsChange: null });
     expect(container.textContent).not.toContain('vs previous period');
@@ -149,7 +161,11 @@ describe('InfoTip', () => {
   /** Hovers an icon whose box starts at `left`, and returns where the tooltip is centred. */
   function tooltipCentreFor(left: number) {
     act(() => {
-      root.render(<InfoTip content="What this counts" />);
+      root.render(
+        <NextIntlClientProvider locale="en" messages={messages} timeZone="UTC">
+          <InfoTip content="What this counts" />
+        </NextIntlClientProvider>,
+      );
     });
     const icon = container.querySelector<HTMLElement>('[aria-label="More information"]')!;
     icon.getBoundingClientRect = () => ({ left, width: 12, bottom: 100 }) as DOMRect;

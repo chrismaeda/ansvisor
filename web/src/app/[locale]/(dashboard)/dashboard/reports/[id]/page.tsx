@@ -3,6 +3,7 @@
 import { useState, useEffect } from 'react';
 import { useParams } from 'next/navigation';
 import { useTranslations } from 'next-intl';
+import { useServerErrorText } from '@/hooks/use-server-error';
 import dynamic from 'next/dynamic';
 import { Link } from '@/i18n/navigation';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -19,8 +20,8 @@ const TrendChart = dynamic(
 import { toast } from 'sonner';
 import { getReport, type Report } from '@/lib/actions/reports';
 import { getReportBranding } from '@/lib/actions/white-label';
-import { reportFileName, reportLook, type ReportBranding } from '@/lib/white-label/kit';
-import { pdfImage } from '@/lib/white-label/pdf-image';
+import { reportLook, type ReportBranding } from '@/lib/white-label/kit';
+import { saveReportPdf } from '../_save-pdf';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import {
@@ -34,14 +35,18 @@ import {
 import { ArrowLeft, FileDown, Loader2, RotateCw } from 'lucide-react';
 import { formatDate, formatMoney, formatNumber, percentChange } from '@/lib/format';
 import { getPlatformName } from '@/lib/traffic-platforms';
+import { LEADERBOARD_MIN_PROMPTS, leaderboardRows } from '@/lib/reports/leaderboard';
 import { cn } from '@/lib/utils';
 import { PLATFORM_LABELS } from '@/config/platform-labels';
 import { REPORT_TEMPLATES } from '@/lib/reports/templates';
 import { auditScoreView } from '@/lib/reports/audit-score';
+import { kpiGridClasses, visibilityKpis } from '@/lib/reports/visibility-kpis';
 import { ScoreRangeMark, useScoreRangeTip } from '@/components/audit/score-range';
 import { HeaderWithAiUsage } from '@/components/ai-usage/ai-usage-meter';
 import { useChatPageContext } from '@/components/chat/panel/chat-panel-context';
 import { rangeChipLabel } from '@/lib/chat/page-context';
+import { shownMentionEvidence } from '@/lib/reports/mention-evidence';
+import { useUserRole } from '@/hooks/use-user-role';
 
 const KNOWN_TEMPLATE_IDS = new Set<string>(REPORT_TEMPLATES.map((tpl) => tpl.id));
 
@@ -59,7 +64,11 @@ function Delta({
   unit?: '%' | '';
 }) {
   if (zeroBaseCount !== undefined) {
-    return <span className="text-xs font-medium text-emerald-600">+{zeroBaseCount} new</span>;
+    return (
+      <span className="text-xs font-medium text-emerald-600">
+        +{formatNumber(zeroBaseCount)} new
+      </span>
+    );
   }
   if (value === null) return null;
   const up = value >= 0;
@@ -145,6 +154,7 @@ export default function ReportDetailPage() {
   const t = useTranslations('reports');
   const tCommon = useTranslations('common');
   const rangeTip = useScoreRangeTip();
+  const { canAdmin } = useUserRole();
 
   const [report, setReport] = useState<Report | null>(null);
   const [loading, setLoading] = useState(true);
@@ -187,6 +197,7 @@ export default function ReportDetailPage() {
   // saved report it holds open by its id, and the days it covers. Its sections are a snapshot:
   // get_report reads them whole, so no row is sent.
   const tChatRange = useTranslations('chatPanel.range');
+  const serverError = useServerErrorText();
   const period = report && {
     from: report.dateFrom.slice(0, 10),
     to: report.dateTo.slice(0, 10),
@@ -243,6 +254,10 @@ export default function ReportDetailPage() {
 
   const { payload } = report;
   const maxSov = Math.max(...(payload.shareOfVoice?.byPlatform.map((p) => p.sov) ?? []), 1);
+  // The Visibility score and Prompts with a mention, then Mentions, Brand
+  // Citations and Positive Sentiment.
+  const visibilityTiles = visibilityKpis(payload.visibilityRate);
+  const kpiGrid = kpiGridClasses(visibilityTiles.length + 3);
   // Reports generated before #492 stored competitor entries without these
   // fields even though the type now declares them required — check at
   // runtime rather than trusting the type for immutable, pre-existing data.
@@ -251,6 +266,7 @@ export default function ReportDetailPage() {
     typeof payload.competitors[0].visibilityRate === 'number' &&
     typeof payload.competitors[0].promptCount === 'number',
   );
+  const hasCompetitorScore = Boolean(payload.competitors?.some((c) => typeof c.score === 'number'));
   // Same story for prompt/topic performance: reports generated before the
   // rate switch stored an all-runs average score, which is 0-100 intensity —
   // not a percentage — so those payloads keep their old (unsuffixed) cells.
@@ -267,9 +283,7 @@ export default function ReportDetailPage() {
   const auditScore = payload.auditScore ? auditScoreView(payload.auditScore) : null;
 
   // Render a true vector PDF from the saved payload with @react-pdf/renderer
-  // (selectable text, exact layout — no screenshot artifacts). The renderer
-  // and the document component both load on demand: PDF export is rare and
-  // the library is heavy.
+  // (selectable text, exact layout — no screenshot artifacts); see _save-pdf.
   const handleDownloadPdf = async () => {
     setDownloading(true);
     try {
@@ -285,22 +299,10 @@ export default function ReportDetailPage() {
         kit = read.branding;
         setBranding(kit);
       }
-      const [{ reportPdf }, logo, clientLogo] = await Promise.all([
-        import('./_report-pdf'),
-        pdfImage(kit?.logo ?? null),
-        pdfImage(kit?.clientLogo ?? null),
-      ]);
-      const blob = await reportPdf(report, kit && { ...kit, logo, clientLogo });
-
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = reportFileName(kit, payload.brandName, report.dateTo);
-      a.click();
-      URL.revokeObjectURL(url);
+      await saveReportPdf(report, kit);
     } catch (err) {
       console.error('PDF download error:', err);
-      toast.error(t('downloadFailed'));
+      toast.error(serverError(err, t('downloadFailed')));
     } finally {
       setDownloading(false);
     }
@@ -339,24 +341,21 @@ export default function ReportDetailPage() {
         </div>
       </HeaderWithAiUsage>
 
+      {/* A section that could not be gathered, even on a second try, is left
+          out of the report a client reads (UX audit RP-06). Only an Admin
+          sees a quiet note, outside the report and the PDF. */}
+      {canAdmin && payload.missingSections && payload.missingSections.length > 0 && (
+        <p className="text-xs text-muted-foreground">
+          {t('missingSectionsAdmin', {
+            sections: payload.missingSections.map((s) => t(`sections.${s}`)).join(', '),
+          })}
+        </p>
+      )}
+
       {/* Everything below renders from the immutable saved payload; the
           container id is the future PDF capture root. */}
       <div id="report-root" className="space-y-6">
         {branding && <ReportCover branding={branding} brandName={payload.brandName} />}
-
-        {/* A section that could not be gathered is named here rather than
-            silently absent — otherwise the report reads as though the brand
-            had no data for it. */}
-        {payload.missingSections && payload.missingSections.length > 0 && (
-          <Card className="border-amber-500/40">
-            <CardContent className="py-4 text-sm text-muted-foreground">
-              {t('missingSections')}{' '}
-              <span className="text-foreground">
-                {payload.missingSections.map((s) => t(`sections.${s}`)).join(', ')}
-              </span>
-            </CardContent>
-          </Card>
-        )}
 
         <Card>
           <CardHeader>
@@ -373,45 +372,31 @@ export default function ReportDetailPage() {
             gather their own sections, and older (immutable) reports may
             predate a field entirely. */}
         {payload.insights && (
-          <div
-            className={cn(
-              'grid gap-4',
-              payload.visibilityRate
-                ? 'grid-cols-2 sm:grid-cols-3 xl:grid-cols-5'
-                : 'sm:grid-cols-2 lg:grid-cols-4',
-            )}
-          >
-            {payload.visibilityRate ? (
-              <>
+          <div className={cn('grid gap-4', kpiGrid.grid)}>
+            {visibilityTiles.map((tile) =>
+              tile.kind === 'score' ? (
                 <KpiCard
-                  label={t('kpi.visibilityRate')}
-                  value={
-                    typeof payload.visibilityRate.score === 'number'
-                      ? String(payload.visibilityRate.score)
-                      : `${payload.visibilityRate.ratePct}%`
-                  }
+                  key={tile.kind}
+                  label={t('kpi.visibilityScore')}
+                  value={t('kpi.scoreValue', { score: String(tile.score) })}
                   change={null}
-                  sub={t('kpi.visibilityRateSub', {
-                    visible: payload.visibilityRate.visiblePrompts,
-                    total: payload.visibilityRate.promptCount,
+                />
+              ) : (
+                <KpiCard
+                  key={tile.kind}
+                  label={t('kpi.promptsWithMention')}
+                  value={`${tile.ratePct}%`}
+                  change={null}
+                  sub={t('kpi.promptsWithMentionSub', {
+                    visible: tile.visible,
+                    total: tile.total,
                   })}
                 />
-                <KpiCard
-                  label={t('kpi.avgScore')}
-                  value={`${payload.insights.avgVisibilityScore}%`}
-                  change={payload.insights.visibilityChange}
-                />
-              </>
-            ) : (
-              <KpiCard
-                label={t('kpi.visibility')}
-                value={`${payload.insights.avgVisibilityScore}%`}
-                change={payload.insights.visibilityChange}
-              />
+              ),
             )}
             <KpiCard
               label={t('kpi.mentions')}
-              value={String(payload.insights.totalMentions)}
+              value={formatNumber(payload.insights.totalMentions)}
               change={payload.insights.mentionsChange}
               zeroBaseCount={
                 Object.hasOwn(payload.insights, 'prevMentions') &&
@@ -423,7 +408,7 @@ export default function ReportDetailPage() {
             />
             <KpiCard
               label={t('kpi.citations')}
-              value={String(payload.insights.totalCitations)}
+              value={formatNumber(payload.insights.totalCitations)}
               change={payload.insights.citationsChange}
               zeroBaseCount={
                 Object.hasOwn(payload.insights, 'prevCitations') &&
@@ -438,14 +423,7 @@ export default function ReportDetailPage() {
               value={`${payload.insights.positiveSentimentPct}%`}
               change={payload.insights.sentimentChange}
             />
-            <p
-              className={cn(
-                'text-xs text-muted-foreground',
-                payload.visibilityRate
-                  ? 'col-span-2 sm:col-span-3 xl:col-span-5'
-                  : 'sm:col-span-2 lg:col-span-4',
-              )}
-            >
+            <p className={cn('text-xs text-muted-foreground', kpiGrid.note)}>
               {t('kpiCitationsNote')}
             </p>
           </div>
@@ -476,14 +454,17 @@ export default function ReportDetailPage() {
               ) : (
                 payload.shareOfVoice.byPlatform.map((p) => (
                   <div key={p.provider} className="flex items-center gap-3">
-                    <span className="w-32 shrink-0 truncate text-sm">{p.provider}</span>
+                    {/* Wide enough for "Google AI Overviews" (UX audit RP-14). */}
+                    <span className="w-44 shrink-0 truncate text-sm" title={p.provider}>
+                      {p.provider}
+                    </span>
                     <div className="h-2 flex-1 overflow-hidden rounded-full bg-muted">
                       <div
                         className="h-full rounded-full bg-primary"
                         style={{ width: `${Math.min((p.sov / maxSov) * 100, 100)}%` }}
                       />
                     </div>
-                    <span className="w-14 shrink-0 text-right text-sm font-medium">{p.sov}%</span>
+                    <span className="w-14 shrink-0 text-end text-sm font-medium">{p.sov}%</span>
                   </div>
                 ))
               )}
@@ -495,6 +476,12 @@ export default function ReportDetailPage() {
           <Card>
             <CardHeader>
               <CardTitle className="text-base">{t('competitorLeaderboard')}</CardTitle>
+              {/* Names the metric the rows are ranked by and the sample rule (RP-07, D8). */}
+              {payload.competitors.some((c) => typeof c.score === 'number') && (
+                <p className="text-sm text-muted-foreground">
+                  {t('leaderboardRankNote', { min: LEADERBOARD_MIN_PROMPTS })}
+                </p>
+              )}
             </CardHeader>
             <CardContent>
               {payload.competitors.length === 0 ? (
@@ -504,31 +491,41 @@ export default function ReportDetailPage() {
                   <TableHeader>
                     <TableRow>
                       <TableHead>{t('columns.brand')}</TableHead>
-                      <TableHead className="text-right">
-                        {hasCompetitorVisibilityRate
-                          ? t('kpi.visibilityRate')
-                          : t('kpi.visibility')}
+                      <TableHead className="text-end">
+                        {hasCompetitorScore
+                          ? t('kpi.visibilityScore')
+                          : hasCompetitorVisibilityRate
+                            ? t('kpi.promptsWithMention')
+                            : t('kpi.avgScore')}
                       </TableHead>
-                      <TableHead className="text-right">{t('columns.change')}</TableHead>
-                      <TableHead className="text-right">{t('kpi.mentions')}</TableHead>
-                      <TableHead className="text-right">{t('kpi.citations')}</TableHead>
+                      <TableHead className="text-end">{t('columns.change')}</TableHead>
+                      <TableHead className="text-end">{t('kpi.mentions')}</TableHead>
+                      <TableHead className="text-end">{t('kpi.citations')}</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {payload.competitors.map((c) => (
+                    {leaderboardRows(payload.competitors).map(({ entry: c, lowSample }) => (
                       <TableRow key={c.name} className={cn(c.isOwnBrand && 'bg-primary/5')}>
                         <TableCell className={cn('font-medium', c.isOwnBrand && 'text-primary')}>
                           {c.name}
                           {c.isOwnBrand && (
-                            <span className="ml-2 text-xs text-muted-foreground">{t('you')}</span>
+                            <span className="ms-2 text-xs text-muted-foreground">{t('you')}</span>
+                          )}
+                          {lowSample && (
+                            <span
+                              className="ms-2 rounded border px-1.5 py-0.5 text-xs font-normal text-muted-foreground"
+                              title={t('lowSampleTip', { min: LEADERBOARD_MIN_PROMPTS })}
+                            >
+                              {t('lowSample')}
+                            </span>
                           )}
                         </TableCell>
-                        <TableCell className="text-right">
+                        <TableCell className="text-end">
                           {typeof c.score === 'number' ? (
                             <>
                               <div>{c.score}</div>
                               <div className="text-xs font-normal text-muted-foreground">
-                                {t('kpi.visibilityRateSub', {
+                                {t('kpi.leaderboardPromptsSub', {
                                   visible: c.visiblePrompts,
                                   total: c.promptCount,
                                 })}
@@ -538,21 +535,21 @@ export default function ReportDetailPage() {
                             <>
                               <div>{c.visibilityRate}%</div>
                               <div className="text-xs font-normal text-muted-foreground">
-                                {t('kpi.visibilityRateSub', {
+                                {t('kpi.promptsWithMentionSub', {
                                   visible: c.visiblePrompts,
                                   total: c.promptCount,
                                 })}
                               </div>
                             </>
                           ) : (
-                            `${c.avgVisibilityScore}%`
+                            c.avgVisibilityScore
                           )}
                         </TableCell>
-                        <TableCell className="text-right">
-                          <Delta value={c.change} />
+                        <TableCell className="text-end">
+                          <Delta value={typeof c.score === 'number' ? c.scoreChange : c.change} />
                         </TableCell>
-                        <TableCell className="text-right">{c.totalMentions}</TableCell>
-                        <TableCell className="text-right">{c.totalCitations}</TableCell>
+                        <TableCell className="text-end">{formatNumber(c.totalMentions)}</TableCell>
+                        <TableCell className="text-end">{formatNumber(c.totalCitations)}</TableCell>
                       </TableRow>
                     ))}
                   </TableBody>
@@ -572,11 +569,11 @@ export default function ReportDetailPage() {
                 <TableHeader>
                   <TableRow>
                     <TableHead>{t('columns.topic')}</TableHead>
-                    <TableHead className="w-28 text-right">
+                    <TableHead className="w-28 text-end">
                       {hasTopicVisibilityRate ? t('kpi.visibilityRate') : t('kpi.visibility')}
                     </TableHead>
-                    <TableHead className="w-24 text-right">{t('columns.change')}</TableHead>
-                    <TableHead className="w-24 text-right">{t('columns.results')}</TableHead>
+                    <TableHead className="w-24 text-end">{t('columns.change')}</TableHead>
+                    <TableHead className="w-24 text-end">{t('columns.results')}</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -585,19 +582,17 @@ export default function ReportDetailPage() {
                       <TableCell className="max-w-[280px] truncate font-medium">
                         {tp.name}
                       </TableCell>
-                      <TableCell className="text-right">
+                      <TableCell className="text-end">
                         {typeof tp.score === 'number'
                           ? tp.score
                           : typeof tp.visibilityRate === 'number'
                             ? `${tp.visibilityRate}%`
                             : `${tp.avgVisibility}/100`}
                       </TableCell>
-                      <TableCell className="text-right">
+                      <TableCell className="text-end">
                         <Delta value={tp.change} />
                       </TableCell>
-                      <TableCell className="text-right text-muted-foreground">
-                        {tp.results}
-                      </TableCell>
+                      <TableCell className="text-end text-muted-foreground">{tp.results}</TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
@@ -627,12 +622,12 @@ export default function ReportDetailPage() {
                           <TableHeader>
                             <TableRow>
                               <TableHead>{t('columns.prompt')}</TableHead>
-                              <TableHead className="w-24 text-right">
+                              <TableHead className="w-24 text-end">
                                 {hasPromptVisibilityRate
                                   ? t('kpi.visibilityRate')
                                   : t('kpi.visibility')}
                               </TableHead>
-                              <TableHead className="w-16 text-right">{t('columns.runs')}</TableHead>
+                              <TableHead className="w-16 text-end">{t('columns.runs')}</TableHead>
                             </TableRow>
                           </TableHeader>
                           <TableBody>
@@ -641,15 +636,15 @@ export default function ReportDetailPage() {
                                 <TableCell className="max-w-[280px] truncate font-medium">
                                   {p.text}
                                 </TableCell>
-                                <TableCell className="text-right">
+                                <TableCell className="text-end">
                                   {typeof p.score === 'number'
                                     ? p.score
                                     : typeof p.visibilityRate === 'number'
                                       ? `${p.visibilityRate}%`
                                       : `${p.avgVisibility}/100`}
                                 </TableCell>
-                                <TableCell className="text-right text-muted-foreground">
-                                  {p.runs}
+                                <TableCell className="text-end text-muted-foreground">
+                                  {formatNumber(p.runs)}
                                 </TableCell>
                               </TableRow>
                             ))}
@@ -666,7 +661,9 @@ export default function ReportDetailPage() {
           <Card>
             <CardHeader>
               <CardTitle className="text-base">{t('mentionEvidence')}</CardTitle>
-              <p className="text-sm text-muted-foreground">{t('mentionEvidenceDescription')}</p>
+              <p className="text-sm text-muted-foreground">
+                {t('mentionEvidenceDescription')} {t('newestFirst')}
+              </p>
             </CardHeader>
             <CardContent>
               <Table>
@@ -679,7 +676,7 @@ export default function ReportDetailPage() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {payload.mentionEvidence.map((m, idx) => (
+                  {shownMentionEvidence(payload.mentionEvidence).map((m, idx) => (
                     <TableRow key={`${m.promptText}-${idx}`}>
                       <TableCell className="max-w-[220px] truncate font-medium">
                         {m.promptText}
@@ -730,7 +727,7 @@ export default function ReportDetailPage() {
                   <TableRow>
                     <TableHead>{t('columns.query')}</TableHead>
                     <TableHead>{t('columns.engines')}</TableHead>
-                    <TableHead className="w-32 text-right">{t('columns.timesSearched')}</TableHead>
+                    <TableHead className="w-32 text-end">{t('columns.timesSearched')}</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -742,7 +739,7 @@ export default function ReportDetailPage() {
                       <TableCell className="text-muted-foreground">
                         {q.engines.map((e) => PLATFORM_LABELS[e] ?? e).join(', ')}
                       </TableCell>
-                      <TableCell className="text-right">{q.timesSearched}</TableCell>
+                      <TableCell className="text-end">{formatNumber(q.timesSearched)}</TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
@@ -756,7 +753,9 @@ export default function ReportDetailPage() {
             <CardHeader>
               <CardTitle className="flex items-baseline gap-2 text-base">
                 {t('aiTraffic')}
-                <span className="text-2xl font-bold">{payload.aiTraffic.totalVisits}</span>
+                <span className="text-2xl font-bold">
+                  {formatNumber(payload.aiTraffic.totalVisits)}
+                </span>
                 <Delta value={payload.aiTraffic.change} />
                 {/* No % on a handful of visits, as on the AI Traffic page. */}
                 {payload.aiTraffic.changeNote === 'new' && (
@@ -785,7 +784,7 @@ export default function ReportDetailPage() {
                   payload.aiTraffic.platformBreakdown.map((p) => (
                     <div key={p.platform} className="flex items-center justify-between text-sm">
                       <span className="truncate">{PLATFORM_LABELS[p.platform] ?? p.platform}</span>
-                      <span className="font-medium tabular-nums">{p.visits}</span>
+                      <span className="font-medium tabular-nums">{formatNumber(p.visits)}</span>
                     </div>
                   ))
                 )}
@@ -800,7 +799,9 @@ export default function ReportDetailPage() {
                   payload.aiTraffic.topPages.map((p) => (
                     <div key={p.url} className="flex items-center justify-between gap-3 text-sm">
                       <span className="min-w-0 truncate text-muted-foreground">{p.url}</span>
-                      <span className="shrink-0 font-medium tabular-nums">{p.visits}</span>
+                      <span className="shrink-0 font-medium tabular-nums">
+                        {formatNumber(p.visits)}
+                      </span>
                     </div>
                   ))
                 )}
@@ -944,7 +945,7 @@ export default function ReportDetailPage() {
                   {t('shopping.products')}
                 </p>
                 <p className="mt-1 text-2xl font-bold">
-                  {payload.shoppingVisibility.productsSurfaced}
+                  {formatNumber(payload.shoppingVisibility.productsSurfaced)}
                 </p>
               </div>
               <div>
@@ -1017,8 +1018,8 @@ export default function ReportDetailPage() {
                     <TableRow>
                       <TableHead>{t('columns.domain')}</TableHead>
                       <TableHead>{t('columns.sourceType')}</TableHead>
-                      <TableHead className="text-right">{t('columns.citations')}</TableHead>
-                      <TableHead className="text-right">{t('columns.usage')}</TableHead>
+                      <TableHead className="text-end">{t('columns.citations')}</TableHead>
+                      <TableHead className="text-end">{t('columns.usage')}</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -1028,8 +1029,8 @@ export default function ReportDetailPage() {
                         <TableCell className="capitalize text-muted-foreground">
                           {d.category}
                         </TableCell>
-                        <TableCell className="text-right">{d.totalCitations}</TableCell>
-                        <TableCell className="text-right">{d.usagePct}%</TableCell>
+                        <TableCell className="text-end">{formatNumber(d.totalCitations)}</TableCell>
+                        <TableCell className="text-end">{d.usagePct}%</TableCell>
                       </TableRow>
                     ))}
                   </TableBody>
@@ -1050,7 +1051,7 @@ export default function ReportDetailPage() {
                 <TableHeader>
                   <TableRow>
                     <TableHead>{t('columns.url')}</TableHead>
-                    <TableHead className="w-24 text-right">{t('columns.citations')}</TableHead>
+                    <TableHead className="w-24 text-end">{t('columns.citations')}</TableHead>
                     <TableHead className="w-[280px]">{t('columns.citedIn')}</TableHead>
                   </TableRow>
                 </TableHeader>
@@ -1071,7 +1072,7 @@ export default function ReportDetailPage() {
                           {c.domain}
                         </span>
                       </TableCell>
-                      <TableCell className="text-right">{c.totalCitations}</TableCell>
+                      <TableCell className="text-end">{formatNumber(c.totalCitations)}</TableCell>
                       <TableCell className="whitespace-normal text-xs text-muted-foreground">
                         {c.sourcedPrompts.join(' · ')}
                       </TableCell>

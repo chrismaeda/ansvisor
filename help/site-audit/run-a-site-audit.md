@@ -1,11 +1,11 @@
 ---
 title: Run a site audit
 route: /dashboard/audit
-keywords: [site audit, run audit, audit a page, auto-audit, audit settings, audit again, bulk audit, audit all]
+keywords: [site audit, run audit, audit a page, auto-audit, audit settings, audit again, bulk audit, audit all, your language]
 synonyms: [page audit, check my page, scan a page, AI readiness check]
 plan: all
-updated: 2026-11-17
-last_checked: 2026-11-17
+updated: 2026-11-19
+last_checked: 2026-11-19
 owner: Cihan
 app_version: 0.3.0
 approved: true
@@ -41,11 +41,25 @@ Pages audited in the last 7 days are left out, since a page that hasn't changed 
 
 When fewer audits are left than pages, the most valuable go now (on Pages, the first in the list) and the rest wait for next month.
 
+## Following a bulk audit
+
+While a bulk audit runs, a bar above the lists shows **12 of 235 done · about 70 min left**. The time left is worked out from how fast the audits have finished since you opened the page, so it appears once the first one is done and settles as more finish. Audits run a few at a time, so a large batch takes a while.
+
+Click **This batch** to list only the pages in the bulk audit on **Pages**, and **All pages** to go back. When every audit is done the bar says so until you dismiss it.
+
+## The Pages list during a bulk audit
+
+While audits run, the **Pages** list updates in place: each page's status changes on its row, and the rows you loaded with **Load more** stay where they are. Your selection stays too, however many pages it holds. A page leaves the selection only when its audit starts, since a page being audited can't be audited again.
+
 ## Auditing a page again
 
 A page has one audit running at a time. Starting it again, from any of these places, opens the audit already running and uses no audit, however the address is written: with or without www, a last slash or a tracking parameter.
 
 When a page was audited in the last 10 minutes, Site Audit asks first: **Open it** shows that audit, and **Audit again** starts a new one. Pages started together leave those out and say so, with **Audit again**.
+
+## Which address is audited
+
+A page is audited at the address your site itself uses, with or without www. Site Audit follows the page's canonical tag when it names the same page, and keeps to the host your earlier audits showed. The address in the **Pages** list, and in the report, is that one, so a site that answers at www.example.com is audited and shown there, not at example.com. Pages are still one page whichever way they are written.
 
 ## Your monthly audits
 
@@ -56,6 +70,10 @@ Each completed audit uses one of your plan's monthly audits. An audit still runn
 Auto-audit spends a quarter of your monthly audits on the top pages of the **Opportunities** tab, in five runs on days 1, 7, 14, 21 and 28 of your billing month. On a plan without a monthly limit, auto-audit is off until you turn it on.
 
 Pages you fixed go first: a page whose Site Audit fix you completed in the Action Center in the last 30 days, and that hasn't been audited since, so the action's result says whether the fix took. Pinned pages come next. Pages audited in the last 30 days wait for a later run. After a run, a notice sums it up with **View pages**, and its audits show **Auto** in the Pages list.
+
+## Reports in your language
+
+The report's categories and checks (each check's name, what it looks for, why it matters and how to fix it) follow your interface language. A check added since your language was last updated shows in English until it's translated.
 
 ## Site Audit settings
 

@@ -590,9 +590,7 @@ describe('ChatInboxView', () => {
         ]}
       />,
     );
-    expect(text()).toContain(
-      '1 needs you · 1 running · 1 done today. Results from your agents land here.',
-    );
+    expect(text()).toContain('1 needs you. Results from your agents land here.');
     expect(text()).toContain('Waiting for your OK · step 4 of 6');
     expect(text()).toContain('10 min ago');
     const buttons = [...host.querySelectorAll('[data-action^="inbox."]')]
@@ -784,6 +782,10 @@ describe('Home by focus (CHAT-24 §4)', () => {
     expect(host.querySelector('h1 + p')?.textContent).toBe(
       'Kestrel CRM’s mention rate rose 4 points this week.',
     );
+    // The rival opens its numbers on Competitors (CH-06).
+    const rival = host.querySelector<HTMLAnchorElement>('[data-action="home.openRival"]')!;
+    expect(rival.textContent).toBe('Kestrel CRM');
+    expect(rival.getAttribute('href')).toBe('/dashboard/competitors');
     await render(
       view({
         focus: focus('comp'),
@@ -946,6 +948,42 @@ describe('a chat started from ChatHome', () => {
     const urls = vi.mocked(globalThis.fetch).mock.calls.map(([url]) => String(url));
     expect(urls).toContain('/api/chat/runs');
     expect(host.querySelector('h1')).not.toBeNull();
+  });
+
+  it("goes on in the person's What's new chat when they have one, never a new one", async () => {
+    const bodies: unknown[] = [];
+    globalThis.fetch = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.startsWith('/api/chat/whats-new')) {
+        return Response.json({ ok: true, hasUnread: false, entries: [] });
+      }
+      if (url.startsWith('/api/chat/conversations/ask-again?')) {
+        return Response.json({ ok: true, id: 'chat-wn' });
+      }
+      if (url === '/api/chat/runs') {
+        bodies.push(JSON.parse(String(init?.body)));
+        return new Response('', { headers: { 'x-chat-conversation': 'chat-wn' } });
+      }
+      return Response.json({ ok: false });
+    }) as unknown as typeof fetch;
+    await render(
+      <HomeDraftProvider>
+        <ChatHome firstName="Alex" />
+        <Chat />
+      </HomeDraftProvider>,
+    );
+    await act(async () => undefined);
+    await act(async () =>
+      host.querySelector<HTMLElement>('[data-action="home.whatsNew"]')!.click(),
+    );
+    await act(async () => undefined);
+    expect(sent).toEqual([]);
+    expect(bodies).toEqual([
+      expect.objectContaining({
+        message: 'What’s new in Ansvisor and how can it help me?',
+        conversationId: 'chat-wn',
+      }),
+    ]);
+    expect(nav.push).toHaveBeenCalledWith('/dashboard/chat/chat-wn');
   });
 });
 

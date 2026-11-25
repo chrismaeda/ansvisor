@@ -2,7 +2,15 @@ import supabaseAdmin from '../../config/supabase.js';
 import { logger } from '../logger.js';
 import { readAllRpcRows } from '../rpc-pages.js';
 import { isCloud, isSubscriptionActive } from '../../config/plans.js';
+import { addressesByLanguage } from '../i18n.js';
 import { appUrl, resolveRecipients } from '../pulse/engine.js';
+import {
+  brandChoices,
+  chose,
+  emailsOf,
+  uniqueAddresses,
+  withoutSavers,
+} from '../pulse/audience.js';
 import { untrackedGoogleQueries } from '../untracked-queries.js';
 import {
   brokenCandidates,
@@ -21,7 +29,9 @@ import { renderTrafficDigestEmail, sendTrafficDigestEmail } from './email.js';
  * The AI Traffic weekly digest (AT-013, spec §3.8): every Monday, for the
  * week before, "the summary line and the top three changes" to the Daily
  * Pulse's recipients (00036), unless Settings › Notifications turned it off
- * for the brand (00187) or the brand's pulse is off.
+ * for the brand (00187) or the brand's pulse is off. Since 00554 each person
+ * picks it for themselves ("Your e-mails"); the brand's setting stays for
+ * its outside recipients and the teammates who haven't saved their own.
  *
  * A brand with no AI visits in either week gets nothing. A week is claimed in
  * ai_traffic_digests before anything is sent, so two sweeps can't mail it
@@ -165,31 +175,55 @@ export async function readDigestData(brandId, week) {
   };
 }
 
-/** What the e-mail says and shows, from the numbers. */
+/**
+ * The words of the digest that depend on the reader's language (LOC-008):
+ * the summary line and the share of traffic. English when none.
+ */
+export function digestWords(data, locale) {
+  const visits = Number(data.cur.visits) || 0;
+  return {
+    share: data.gaSessions ? formatShare(visits, data.gaSessions, locale) : null,
+    sentences: summarySentences(
+      {
+        visits,
+        prevVisits: Number(data.prev.visits) || 0,
+        platforms: data.cur.platforms ?? [],
+        gaSessions: data.gaSessions ?? null,
+        platformValue: data.platformValue ?? null,
+        citedNotClicked: data.citedNotClicked ?? 0,
+        untrackedQueries: data.untrackedQueries ?? 0,
+      },
+      locale,
+    ),
+  };
+}
+
+/** What the e-mail says and shows, from the numbers (the record keeps it in English). */
 export function digestContent(data, week) {
   const visits = Number(data.cur.visits) || 0;
   const prevVisits = Number(data.prev.visits) || 0;
   const platforms = topPlatforms(data.cur.platforms ?? []);
+  const { share, sentences } = digestWords(data);
   return {
     visits,
     prevVisits,
     change: visitChangePct(visits, prevVisits),
     // The cards and charts (the summary line says the same in words).
-    share: data.gaSessions ? formatShare(visits, data.gaSessions) : null,
+    share,
     citedNotClicked: data.citedNotClicked ?? 0,
     platforms,
     days: dailyVisits(week, data.cur.days ?? []),
-    sentences: summarySentences({
-      visits,
-      prevVisits,
-      platforms: data.cur.platforms ?? [],
-      gaSessions: data.gaSessions ?? null,
-      platformValue: data.platformValue ?? null,
-      citedNotClicked: data.citedNotClicked ?? 0,
-      untrackedQueries: data.untrackedQueries ?? 0,
-    }),
+    sentences,
     changes: topChanges(data),
   };
+}
+
+/** One outcome for the sends of all languages: an unknown one stands (it may have gone), then sent, then refused. */
+function combine(outcomes) {
+  for (const outcome of ['unknown', 'sent', 'refused']) {
+    if (outcomes.includes(outcome)) return outcome;
+  }
+  return 'skipped';
 }
 
 /**
@@ -220,10 +254,14 @@ export async function sendTrafficDigestForBrand(
     .select('recipients, traffic_digest, frequency')
     .eq('brand_id', brandId)
     .maybeSingle();
-  // On by default, but not where the brand's pulse is off. No settings row: on.
-  if (settings?.traffic_digest === false || settings?.frequency === 'off') {
-    return { skipped: 'off' };
-  }
+  // The brand's own audience: on by default, but not where the brand's pulse
+  // is off. No settings row: on.
+  const brandOn = settings?.traffic_digest !== false && settings?.frequency !== 'off';
+  // People who saved their own choices (00554): those who picked it, wherever
+  // the brand's setting stands.
+  const choices = await brandChoices(brand.organization_id, brandId, 'traffic_digest');
+  const chosen = chose(choices.people, 'weekly');
+  if (!brandOn && chosen.length === 0) return { skipped: 'off' };
 
   const week = digestWeek(now);
   const { data: existing } = await supabaseAdmin
@@ -260,21 +298,43 @@ export async function sendTrafficDigestForBrand(
   let recipients;
   // Nothing to send to, or Resend isn't set up: the week is done all the same.
   let outcome = 'skipped';
+  // Those whose language's send went.
+  let reached = 0;
   try {
-    recipients = await resolveRecipients(brand.organization_id, settings, brandId);
+    recipients = await digestRecipients({
+      organizationId: brand.organization_id,
+      brandId,
+      settings,
+      brandOn,
+      choices,
+      chosen,
+    });
     if (recipients.length) {
       const settingsUrl = `${appUrl()}/dashboard/settings?tab=notifications`;
-      const { subject, html } = renderTrafficDigestEmail({
-        brandName: brand.name,
-        week,
-        ...content,
-        trafficUrl: `${appUrl()}/dashboard/traffic`,
-        settingsUrl,
-      });
+      // Each in their own language (LOC-008): one send per language.
+      const groups = await addressesByLanguage(brand.organization_id, recipients);
       // Marked sent before it goes. When this fails, nothing went out.
       await updateDigest(row.id, { sent_at: new Date().toISOString() }, retryWaitMs);
-      outcome = await sendTrafficDigestEmail({ to: recipients, subject, html, settingsUrl });
-      // Resend answered with an error: nothing went out.
+      const outcomes = [];
+      for (const [locale, to] of groups) {
+        const { subject, html } = renderTrafficDigestEmail({
+          brandName: brand.name,
+          week,
+          ...content,
+          ...digestWords(data, locale),
+          trafficUrl: `${appUrl()}/dashboard/traffic`,
+          settingsUrl,
+          locale,
+        });
+        const sent = await sendTrafficDigestEmail({ to, subject, html, settingsUrl });
+        outcomes.push(sent);
+        if (sent === 'sent') reached += to.length;
+        else if (sent === 'refused' && groups.length > 1) {
+          logger.warn({ brandId, locale }, '[traffic-digest] Resend refused one language');
+        }
+      }
+      outcome = combine(outcomes);
+      // Resend answered with an error for every language: nothing went out.
       if (outcome === 'refused') throw new Error('Resend refused the digest');
     }
   } catch (err) {
@@ -294,7 +354,7 @@ export async function sendTrafficDigestForBrand(
       row.id,
       {
         email_sent: emailSent,
-        email_recipient_count: emailSent ? recipients.length : 0,
+        email_recipient_count: emailSent ? reached : 0,
         sent_at: new Date().toISOString(),
       },
       retryWaitMs,
@@ -313,6 +373,28 @@ export async function sendTrafficDigestForBrand(
     '[traffic-digest] sent',
   );
   return { sent: true, emailSent, recipients: recipients.length };
+}
+
+/**
+ * Who gets the digest: the brand's own audience while it is on
+ * (resolveRecipients, less the people who saved their own choices), and the
+ * people who picked it.
+ */
+export async function digestRecipients({
+  organizationId,
+  brandId,
+  settings,
+  brandOn,
+  choices,
+  chosen,
+}) {
+  const addresses = [];
+  if (brandOn) {
+    const list = await resolveRecipients(organizationId, settings, brandId);
+    addresses.push(...(await withoutSavers(list, choices.savers)));
+  }
+  addresses.push(...(await emailsOf(chosen)));
+  return uniqueAddresses(addresses);
 }
 
 /** Take back a claim, so a later sweep sends the week. */

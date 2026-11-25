@@ -2,7 +2,9 @@
 
 import { revalidatePath } from 'next/cache';
 import { createClient } from '@/lib/supabase/server';
+import { isManager } from '@/lib/session-role';
 import { computeAiVisibilityScore } from '@/lib/visibility-score';
+import { REPORT_TEMPLATE_TITLES } from '@/lib/reports/template-titles';
 import type { Json } from '@/types/supabase';
 import { API_BASE_URL } from '@/config/api';
 import {
@@ -26,7 +28,7 @@ import { type SourceCategory } from '@/lib/citations/classify';
 import { auditSnapshotFrom, type AuditSnapshotRow } from '@/lib/reports/audit-score';
 import { readEarlierPageAudits } from '@/lib/audit/page-trend';
 import type { ScoreRange } from '@/lib/audit/score-range';
-import { stripEntityMarkup } from '@/lib/entity-markup';
+import { markdownToPlainText } from '@/lib/markdown-plain';
 import { countTrafficLogs, scanTrafficLogs } from '@/lib/traffic-scan';
 import { LOW_SAMPLE_VISITS } from '@/lib/traffic-change';
 import {
@@ -35,6 +37,7 @@ import {
   type ReportSection,
   type ReportTemplateId,
 } from '@/lib/reports/templates';
+import { gatherSection } from '@/lib/reports/gather';
 import { assertWritable } from '@/lib/subscription-guard';
 
 /**
@@ -253,9 +256,10 @@ export interface ReportPayload {
   /** AI-generated executive summary (plain prose). */
   summaryText: string;
   /**
-   * Sections that were asked for but could not be gathered. A report is
-   * generated without them rather than not at all, and this is how the page
-   * says which ones are missing instead of leaving the reader to guess.
+   * Sections that were asked for but could not be gathered, even on a second
+   * try. A report is generated without them rather than not at all. The
+   * report itself never names them (RP-06): only an Admin sees a quiet note
+   * on its page, outside what the PDF draws.
    */
   missingSections?: ReportSection[];
   insights?: InsightsSummary;
@@ -702,23 +706,13 @@ const REPORT_EVIDENCE_COUNT = 10;
 /** How many sourcing prompts each cited URL lists. */
 const EVIDENCE_PROMPTS_PER_URL = 3;
 
-/** Light markdown/URL/entity-tag strip so excerpts read as prose. */
-function stripMarkdown(text: string): string {
-  return stripEntityMarkup(text)
-    .replace(/\[([^\]]*)\]\([^)]+\)/g, '$1')
-    .replace(/https?:\/\/[^\s)>\]]+/g, '')
-    .replace(/[*_#`]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
 /**
  * The passage of an answer around the first brand mention — the "how was I
  * mentioned" a KPI total can't convey. Falls back to the answer's opening
  * when the mention came via a domain rather than the brand name.
  */
 function mentionExcerpt(response: string, brandName: string): string {
-  const clean = stripMarkdown(response);
+  const clean = markdownToPlainText(response);
   const idx = clean.toLowerCase().indexOf(brandName.toLowerCase());
   if (idx === -1) {
     return clean.length > 180 ? `${clean.slice(0, 180).trimEnd()}…` : clean;
@@ -773,13 +767,16 @@ async function getMentionEvidence(
     for (const p of promptRows ?? []) promptTextById.set(p.id as string, p.text as string);
   }
 
-  return results.map((r) => ({
-    promptText: (r.prompt_id && promptTextById.get(r.prompt_id)) || '(deleted prompt)',
-    platform: r.platform ?? '',
-    date: r.created_at,
-    mentionCount: r.mention_count ?? 0,
-    excerpt: mentionExcerpt(r.response ?? '', brandName),
-  }));
+  // The most mentioning answers, listed newest first (UX audit RP-04).
+  return results
+    .map((r) => ({
+      promptText: (r.prompt_id && promptTextById.get(r.prompt_id)) || '(deleted prompt)',
+      platform: r.platform ?? '',
+      date: r.created_at,
+      mentionCount: r.mention_count ?? 0,
+      excerpt: mentionExcerpt(r.response ?? '', brandName),
+    }))
+    .sort((a, b) => Date.parse(b.date) - Date.parse(a.date));
 }
 
 /**
@@ -821,14 +818,6 @@ async function getCitationEvidence(
 }
 
 // ─── Actions ─────────────────────────────────────────────────────────────────
-
-/** English display names used in stored (immutable) report titles. */
-const TEMPLATE_TITLES: Record<ReportTemplateId, string> = {
-  weekly_visibility: 'Weekly Visibility Summary',
-  executive_summary: 'Executive Summary',
-  competitor_benchmark: 'Competitor Benchmark',
-  citation_sources: 'Citation & Sources Report',
-};
 
 export async function createReport(
   brandId: string,
@@ -882,20 +871,19 @@ export async function createReport(
   // 1. Gather the metric snapshot through the existing analytics actions —
   //    only the picked sections (null = section not gathered).
   //
-  //    A section that fails does not take the report with it. Losing one
-  //    module is a gap the reader can see; losing all fourteen because the
-  //    last one timed out is a report that never existed. What went missing is
-  //    recorded so the output can say so rather than quietly shrink.
+  //    A section that fails does not take the report with it: it is tried
+  //    once more, and if it still fails the report is saved without it.
+  //    Losing all fourteen because the last one timed out is a report that
+  //    never existed. The gap is logged and kept in the payload for the
+  //    team, but the report a client reads never names it (UX audit RP-06).
   const failed = new Set<ReportSection>();
-  async function section<T>(name: ReportSection, run: () => Promise<T>): Promise<T | null> {
-    try {
-      return await run();
-    } catch (err) {
-      console.error(`[reports] section "${name}" failed for brand ${brandId}:`, err);
-      failed.add(name);
-      return null;
-    }
-  }
+  const section = <T>(name: ReportSection, run: () => Promise<T>) =>
+    gatherSection(
+      name,
+      run,
+      (message, err) => console.error(`${message} (brand ${brandId})`, err),
+      () => failed.add(name),
+    );
   const pick = <T>(name: ReportSection, run: () => Promise<T>) =>
     has(name) ? section(name, run) : Promise.resolve(null);
 
@@ -1014,7 +1002,15 @@ export async function createReport(
       'Content-Type': 'application/json',
       Authorization: `Bearer ${session.access_token}`,
     },
-    body: JSON.stringify({ brandId, snapshot, dateFrom, dateTo, template: template.id }),
+    // The gaps stay out of what the summary is written from: its prose must
+    // not tell a client what could not be gathered (RP-06).
+    body: JSON.stringify({
+      brandId,
+      snapshot: { ...snapshot, missingSections: undefined },
+      dateFrom,
+      dateTo,
+      template: template.id,
+    }),
   });
   //    The prose is the one part of a report the reader can do without. If it
   //    cannot be written, the figures are still worth keeping — the page shows
@@ -1033,9 +1029,8 @@ export async function createReport(
   const payload: ReportPayload = { ...snapshot, summaryText: summary };
 
   // 3. Persist the immutable snapshot (RLS scopes the insert to org members).
-  const title =
-    opts.title?.trim() ||
-    `${brandName} — ${TEMPLATE_TITLES[template.id]} (${dateFrom.slice(0, 10)} → ${dateTo.slice(0, 10)})`;
+  // The template's name alone: the period shows beside it (UX audit RP-12).
+  const title = opts.title?.trim() || REPORT_TEMPLATE_TITLES[template.id];
 
   const { data: created, error } = await supabase
     .from('reports')
@@ -1096,6 +1091,52 @@ export async function getReport(id: string): Promise<Report | null> {
     createdAt: data.created_at as string,
     payload: data.payload as unknown as ReportPayload,
   };
+}
+
+/**
+ * Renames a report (UX audit RP-11): its title alone. Reports stay
+ * immutable snapshots for members (00023 has no UPDATE policy), so the
+ * write goes through the service role, and only after every check a
+ * member's own write would face: a workspace that can write
+ * (assertWritable), an Admin or a Manager, a report the person reads
+ * themselves (RLS) of a brand they may see (can_access_brand), and the
+ * brand's own plan check (a demo brand changes nothing). The update is
+ * held to that report of that brand, the snapshot never touched. A blank
+ * title, or one over 200 characters, isn't sent. Says whether it was
+ * renamed.
+ */
+export async function renameReport(id: string, title: string): Promise<boolean> {
+  await assertWritable();
+  const name = title.replace(/\s+/g, ' ').trim();
+  if (!name || name.length > 200) return false;
+  const supabase = await createClient();
+  if (!(await isManager(supabase))) return false;
+  // The person's own read: another workspace's report isn't found (RLS).
+  const { data: report, error: readError } = await supabase
+    .from('reports')
+    .select('id, brand_id')
+    .eq('id', id)
+    .maybeSingle();
+  if (readError) throw new Error(readError.message);
+  if (!report) return false;
+  const { data: allowed, error: accessError } = await supabase.rpc('can_access_brand', {
+    p_brand_id: report.brand_id,
+  });
+  if (accessError) throw new Error(accessError.message);
+  if (allowed !== true) return false;
+  await assertWritable({ brandId: report.brand_id });
+  // Loaded here, not at the top: the service-role client needs its key, which
+  // the module's other reads (and their tests) never do.
+  const { supabaseAdmin } = await import('@/lib/supabase/admin');
+  const { data: renamed, error } = await supabaseAdmin
+    .from('reports')
+    .update({ title: name })
+    .eq('id', report.id)
+    .eq('brand_id', report.brand_id)
+    .select('id');
+  if (error) throw new Error(error.message);
+  revalidatePath('/dashboard/reports');
+  return (renamed ?? []).length > 0;
 }
 
 export async function deleteReport(id: string): Promise<void> {

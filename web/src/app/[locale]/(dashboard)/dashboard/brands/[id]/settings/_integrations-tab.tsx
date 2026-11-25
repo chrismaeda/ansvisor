@@ -20,6 +20,7 @@ import { useUpgradeGate } from '@/components/providers/upgrade-gate';
 import { useBrandStore } from '@/stores/use-brand-store';
 import { setBrandGaProperty, setBrandGscProperty } from '@/lib/actions/integrations';
 import { formatDate } from '@/lib/format';
+import { useCaughtErrorText, useServerErrorText } from '@/hooks/use-server-error';
 import {
   activateBrandSignIn,
   chooseBrandSignIn,
@@ -111,6 +112,7 @@ function GoogleCard({
   const { canManage } = useUserRole();
   const { guard, openUpgrade } = useUpgradeGate();
   const tActions = useTranslations('readOnly.actions');
+  const serverError = useServerErrorText();
   const { brands } = useBrandStore();
   const [busy, setBusy] = useState<'use' | 'connect' | 'disconnect' | null>(null);
   const pollGen = useRef(0);
@@ -149,7 +151,7 @@ function GoogleCard({
     setBusy(null);
     if (!result.ok) {
       if (result.reason === 'subscription') openUpgrade();
-      else toast.error(result.error ?? t('failed'));
+      else toast.error(serverError(result, result.error ?? t('failed')));
       return;
     }
     toast.success(t('switched', { label }));
@@ -167,7 +169,7 @@ function GoogleCard({
       );
       if (!started.ok) {
         if (started.reason === 'subscription') openUpgrade();
-        else toast.error(started.error ?? t('failed'));
+        else toast.error(serverError(started, started.error ?? t('failed')));
         return;
       }
       const popup = window.open(
@@ -203,7 +205,7 @@ function GoogleCard({
     const result = await disconnectBrandSignIn(product.provider, brand.id);
     setBusy(null);
     if (!result.ok) {
-      toast.error(result.error ?? t('failed'));
+      toast.error(serverError(result, result.error ?? t('failed')));
       return;
     }
     toast.success(t('disconnected', { label }));
@@ -280,9 +282,9 @@ function GoogleCard({
             onClick={guard(connect, { action: tActions('connectIntegrations') })}
           >
             {busy === 'connect' ? (
-              <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+              <Loader2 className="me-1.5 h-3.5 w-3.5 animate-spin" />
             ) : (
-              <Plus className="mr-1.5 h-3.5 w-3.5" />
+              <Plus className="me-1.5 h-3.5 w-3.5" />
             )}
             {t(current ? 'connectAnother' : 'connect')}
           </Button>
@@ -295,9 +297,9 @@ function GoogleCard({
               className="text-muted-foreground"
             >
               {busy === 'disconnect' ? (
-                <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                <Loader2 className="me-1.5 h-3.5 w-3.5 animate-spin" />
               ) : (
-                <Unplug className="mr-1.5 h-3.5 w-3.5" />
+                <Unplug className="me-1.5 h-3.5 w-3.5" />
               )}
               {t('disconnect')}
             </Button>
@@ -335,6 +337,7 @@ function PropertyPicker({
   const t = useTranslations('brands.settings.integrations');
   const { guard } = useUpgradeGate();
   const tActions = useTranslations('readOnly.actions');
+  const caughtError = useCaughtErrorText();
   const isGa = provider === 'google-analytics';
   const [options, setOptions] = useState<{ value: string; label: string }[] | null | 'failed'>(
     null,
@@ -369,7 +372,7 @@ function PropertyPicker({
       toast.success(t('propertySaved'));
       onSaved();
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t('failed'));
+      toast.error(caughtError(err, t('failed')));
     } finally {
       setSaving(false);
     }

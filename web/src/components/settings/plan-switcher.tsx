@@ -3,6 +3,8 @@
 import { useState } from 'react';
 import { useTranslations } from 'next-intl';
 import { toast } from 'sonner';
+import { refusalError } from '@/lib/server-error';
+import { useCaughtErrorText } from '@/hooks/use-server-error';
 import { Check, ArrowUp, ArrowDown, Mail, ExternalLink, Repeat, ShoppingCart } from 'lucide-react';
 import {
   PlanDetailsToggle,
@@ -32,6 +34,7 @@ import {
   SUBSCRIBABLE_PLANS,
   firstMonthOfferOn,
   type PlanId,
+  CUSTOM_PLAN_STARTING_PRICE,
 } from '@/config/plans';
 import {
   FIRST_MONTH_CODE,
@@ -48,6 +51,7 @@ import { useRouter } from '@/i18n/navigation';
 import { formatNumber } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import { CancelSubscriptionDialog } from './cancel-subscription-dialog';
+import { ExpandableMark } from './plan-feature-mark';
 import { trackCancelOpened, trackReactivated } from '@/lib/billing/cancel-events';
 import {
   aiUsageMultiple,
@@ -88,6 +92,7 @@ export function PlanSwitcher({
   const t = useTranslations('settings');
   const tCards = useTranslations('settings.planCards');
   const tPlans = useTranslations('readOnly.plans');
+  const caughtError = useCaughtErrorText();
   const planFeatures = usePlanFeatures();
   // Buying or changing the plan charges the organization's card: admins only,
   // as the subscription route checks.
@@ -161,7 +166,7 @@ export function PlanSwitcher({
           });
           return;
         }
-        throw new Error(err.error || 'Failed to change plan');
+        throw refusalError(err, t('changePlanFailed'), res.status);
       }
       const data = await res.json();
       onUpdate(data);
@@ -172,7 +177,7 @@ export function PlanSwitcher({
       );
       setPending(null);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to change plan');
+      toast.error(caughtError(err, t('changePlanFailed')));
     } finally {
       setLoading(false);
     }
@@ -183,7 +188,7 @@ export function PlanSwitcher({
       const res = await fetch('/api/stripe/subscription', { method: 'DELETE' });
       if (!res.ok) {
         const err = await res.json();
-        throw new Error(err.error || 'Failed to cancel');
+        throw refusalError(err, t('cancelFailed'), res.status);
       }
       const data = await res.json();
       onUpdate({
@@ -196,7 +201,7 @@ export function PlanSwitcher({
       toast.success(t('subscriptionCanceled'));
       return true;
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to cancel');
+      toast.error(caughtError(err, t('cancelFailed')));
       return false;
     }
   }
@@ -211,7 +216,7 @@ export function PlanSwitcher({
       });
       if (!res.ok) {
         const err = await res.json();
-        throw new Error(err.error || 'Failed to reactivate');
+        throw refusalError(err, t('reactivateFailed'), res.status);
       }
       const data = await res.json();
       onUpdate({
@@ -224,7 +229,7 @@ export function PlanSwitcher({
       trackReactivated({ plan: currentPlanId, interval: currentInterval });
       toast.success(t('subscriptionReactivated'));
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to reactivate');
+      toast.error(caughtError(err, t('reactivateFailed')));
     } finally {
       setLoading(false);
     }
@@ -236,13 +241,13 @@ export function PlanSwitcher({
       const res = await fetch('/api/stripe/portal', { method: 'POST' });
       if (!res.ok) {
         const err = await res.json();
-        throw new Error(err.error || 'Failed to open billing portal');
+        throw refusalError(err, t('portalFailed'), res.status);
       }
       const { url } = await res.json();
       window.location.href = url;
       // No loading reset — we're navigating away to Stripe.
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to open billing portal');
+      toast.error(caughtError(err, t('portalFailed')));
       setPortalLoading(false);
     }
   }
@@ -392,7 +397,7 @@ export function PlanSwitcher({
                   </div>
                   {isCurrent && (
                     <Badge variant="default">
-                      <Check className="mr-1 h-3 w-3" />
+                      <Check className="me-1 h-3 w-3" />
                       {t('currentPlan')}
                     </Badge>
                   )}
@@ -438,6 +443,7 @@ export function PlanSwitcher({
                       >
                         {feature.text}
                       </span>
+                      {feature.expandable && <ExpandableMark />}
                     </li>
                   ))}
                 </ul>
@@ -462,22 +468,22 @@ export function PlanSwitcher({
                   >
                     {action === 'buy' ? (
                       <>
-                        <ShoppingCart className="mr-1 h-4 w-4" />
+                        <ShoppingCart className="me-1 h-4 w-4" />
                         {t('buyPlanNow', { plan: plan.name })}
                       </>
                     ) : action === 'period' ? (
                       <>
-                        <Repeat className="mr-1 h-4 w-4" />
+                        <Repeat className="me-1 h-4 w-4" />
                         {period === 'year' ? t('switchToAnnual') : t('switchToMonthly')}
                       </>
                     ) : upgrade ? (
                       <>
-                        <ArrowUp className="mr-1 h-4 w-4" />
+                        <ArrowUp className="me-1 h-4 w-4" />
                         {t('upgradeTo', { plan: plan.name })}
                       </>
                     ) : (
                       <>
-                        <ArrowDown className="mr-1 h-4 w-4" />
+                        <ArrowDown className="me-1 h-4 w-4" />
                         {t('downgradeTo', { plan: plan.name })}
                       </>
                     )}
@@ -601,7 +607,9 @@ export function PlanSwitcher({
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div className="min-w-0 space-y-1">
             <p className="text-sm font-medium">{t('needCustomPlan')}</p>
-            <p className="text-xs text-muted-foreground">{t('customPlanDescription')}</p>
+            <p className="text-xs text-muted-foreground">
+              {t('customPlanDescription', { price: formatNumber(CUSTOM_PLAN_STARTING_PRICE) })}
+            </p>
           </div>
           <a
             href={CONTACT_SALES_URL}
@@ -609,7 +617,7 @@ export function PlanSwitcher({
             rel="noopener noreferrer"
             className="inline-flex shrink-0 items-center justify-center rounded-md border bg-background px-5 py-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground"
           >
-            <Mail className="mr-2 h-4 w-4" />
+            <Mail className="me-2 h-4 w-4" />
             {t('contactUs')}
           </a>
         </div>
@@ -682,7 +690,7 @@ export function PlanSwitcher({
           title={t('manageBillingHint')}
         >
           {portalLoading ? t('processing') : t('manageBilling')}
-          <ExternalLink className="ml-2 h-4 w-4" />
+          <ExternalLink className="ms-2 h-4 w-4" />
         </Button>
       </div>
       {/* Mounted outside the button's branch: it still sends the answer once

@@ -1,8 +1,9 @@
 'use client';
 
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef, type ReactNode } from 'react';
 import { useLocale, useTranslations } from 'next-intl';
 import { useFailureToast } from '@/hooks/use-failure-toast';
+import { useCaughtErrorText, useServerErrorText } from '@/hooks/use-server-error';
 import {
   ClampedText,
   ClampedTextPreview,
@@ -15,6 +16,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { DatePicker } from '@/components/ui/date-picker';
 import { Checkbox } from '@/components/ui/checkbox';
 import {
   Select,
@@ -67,6 +69,7 @@ import {
   ChevronDown,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useAiText } from '@/hooks/use-ai-text';
 import { useBrandStore } from '@/stores/use-brand-store';
 import { useChatPageContext } from '@/components/chat/panel/chat-panel-context';
 import type { ChatPageFilter } from '@/lib/chat/page-context';
@@ -77,6 +80,7 @@ import {
   getGenerationJobStatus,
   getContentUsage,
   getOpportunities,
+  getOpportunityAvailability,
   getOpportunityPrompts,
   getOpportunityTopics,
   type OpportunityPrompt,
@@ -116,6 +120,8 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { OpportunityDetail } from '@/components/content/opportunity-detail';
 import { ContentUsageCard } from '@/components/content/content-usage-card';
+import { OpportunityFlowNote } from '@/components/content/opportunity-flow-note';
+import { opportunityFlowState } from '@/lib/opportunity-flow';
 import { hasContentQuota, onDemandMax, type ContentUsage } from '@/lib/content-usage';
 import { isNoPlan } from '@/lib/billing/no-plan';
 import { suggestedBounds, suggestedDate, type SuggestedRange } from '@/lib/suggested-date';
@@ -137,6 +143,7 @@ import { readUrlChoice, writeUrlParams } from '@/lib/url-state';
 import { exportFileName } from '@/lib/white-label/export-name';
 import { actionCode } from '@/lib/action-center/action-ref';
 import { HeaderWithAiUsage } from '@/components/ai-usage/ai-usage-meter';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { FirstRunEmptyState } from '@/components/first-run/first-run-empty-state';
 import { useFirstRun } from '@/hooks/use-first-run';
 
@@ -259,6 +266,21 @@ const STATUS_COLORS: Record<string, string> = {
   archived: 'border-zinc-500/30 bg-zinc-500/5 text-zinc-500 dark:text-zinc-400',
 };
 
+/**
+ * A header icon button, named in a tooltip on hover. The trigger is a span so
+ * a disabled button still says what it is.
+ */
+function HeaderIconButton({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger delay={150} closeDelay={0} render={<span className="inline-flex" />}>
+        {children}
+      </TooltipTrigger>
+      <TooltipContent side="bottom">{label}</TooltipContent>
+    </Tooltip>
+  );
+}
+
 function KpiCard({
   title,
   icon: Icon,
@@ -339,7 +361,7 @@ function OpportunityScope({ opp }: { opp: ContentOpportunity }) {
   return (
     <span
       className={cn(
-        'mr-1.5 inline-flex items-center rounded px-1.5 py-px align-middle text-[11px] font-medium leading-4 ring-1 ring-inset',
+        'me-1.5 inline-flex items-center rounded px-1.5 py-px align-middle text-[11px] font-medium leading-4 ring-1 ring-inset',
         group
           ? 'bg-violet-50 text-violet-700 ring-violet-200 dark:bg-violet-950/40 dark:text-violet-300 dark:ring-violet-900'
           : 'bg-muted text-foreground/80 ring-border',
@@ -374,7 +396,7 @@ function OpportunityTextCell({
       <button
         type="button"
         onClick={onOpen}
-        className="block min-w-0 flex-1 text-left hover:underline"
+        className="block min-w-0 flex-1 text-start hover:underline"
       >
         <ClampedText
           handle={handle}
@@ -389,7 +411,7 @@ function OpportunityTextCell({
           {opp.sourceData?.reopened && opp.status === 'new' && (
             <Badge
               variant="outline"
-              className="mr-1.5 border-amber-500/30 bg-amber-500/10 text-[10px] text-amber-700 dark:text-amber-400"
+              className="me-1.5 border-amber-500/30 bg-amber-500/10 text-[10px] text-amber-700 dark:text-amber-400"
             >
               {t('newSignal')}
             </Badge>
@@ -398,7 +420,7 @@ function OpportunityTextCell({
           {opp.sourceData?.alternativeOf && (
             <Badge
               variant="outline"
-              className="mr-1.5 align-middle text-[10px] font-normal text-muted-foreground"
+              className="me-1.5 align-middle text-[10px] font-normal text-muted-foreground"
               title={t('alternative.of') + ' ' + opp.sourceData.alternativeOf.title}
             >
               {t('alternative.badge')}
@@ -407,7 +429,7 @@ function OpportunityTextCell({
           {opp.source && opp.source !== 'system' && (
             <Badge
               variant="outline"
-              className="mr-1.5 align-middle text-[10px] font-normal text-muted-foreground"
+              className="me-1.5 align-middle text-[10px] font-normal text-muted-foreground"
               title={t(`sourceHint.${opp.source}`)}
             >
               {t(`source.${opp.source}`)}
@@ -463,6 +485,13 @@ export default function ContentPage() {
   const tActions = useTranslations('readOnly.actions');
   const tManagers = useTranslations('managersOnly');
   const tChat = useTranslations('chatPanel.suggest');
+  const serverError = useServerErrorText();
+  const caughtError = useCaughtErrorText();
+  /** A webhook send's refusal in the person's language (LOC-008). */
+  const sendError = (result: { error: string; code?: string; status?: number }) =>
+    result.code === 'no_webhook'
+      ? t('noWorkflowConnected')
+      : serverError(result, result.error, result.status);
   // The bulk bar's Dismiss and Delete ask first: the upgrade dialog instead.
   const confirmUnlessLocked =
     (action: string) => (open: boolean, details: { cancel: () => void }) => {
@@ -473,6 +502,8 @@ export default function ContentPage() {
 
   const [opportunities, setOpportunities] = useState<ContentOpportunity[]>([]);
   const [total, setTotal] = useState(0);
+  // The open ones among them: "Available" (Content test 2026-11-19, item 10).
+  const [openCount, setOpenCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
   const [exporting, setExporting] = useState(false);
@@ -510,6 +541,9 @@ export default function ContentPage() {
   const [contentUsage, setContentUsage] = useState<ContentUsage | null>(null);
   // Bumped after a "+ New" run, which may use quota without changing the total.
   const [usageVersion, setUsageVersion] = useState(0);
+  // Needs with and without an opportunity, for the note on why none arrive
+  // overnight; null hides it.
+  const [needs, setNeeds] = useState<{ needs: number; open: number } | null>(null);
   const [newOpen, setNewOpen] = useState(false);
   // Placeholder rows while a "+ New" request runs (CONTENT-003).
   const [pendingCount, setPendingCount] = useState(0);
@@ -561,12 +595,19 @@ export default function ContentPage() {
     sortOrder,
   ]);
 
+  // The brand whose list has been read once (Content test 2026-11-19, item
+  // 9): Next runs a page's server actions one at a time, so the filters'
+  // options and the usage card are read after the list, never ahead of it.
+  const [listReadFor, setListReadFor] = useState<string | null>(null);
+  const listReady = !!activeBrandId && listReadFor === activeBrandId;
+
   const loadData = useCallback(
     async (silent = false, isCancelled?: () => boolean) => {
       if (!urlRead) return;
       if (!activeBrandId) {
         setOpportunities([]);
         setTotal(0);
+        setOpenCount(0);
         setAggregates({
           avgScore: 0,
           highImpactCount: 0,
@@ -588,6 +629,7 @@ export default function ContentPage() {
         if (isCancelled?.()) return;
         setOpportunities(data.opportunities);
         setTotal(data.total);
+        setOpenCount(data.open ?? data.total);
         setAggregates(
           data.aggregates ?? {
             avgScore: 0,
@@ -599,15 +641,16 @@ export default function ContentPage() {
         return data.total;
       } catch (err) {
         console.error('Failed to load opportunities:', err);
-        toast.error(t('loadError'));
+        toast.error(serverError(err, t('loadError')));
         return 0;
       } finally {
         if (!isCancelled?.()) {
           setLoading(false);
+          setListReadFor(activeBrandId);
         }
       }
     },
-    [urlRead, activeBrandId, listFilters, pager.start, t],
+    [urlRead, activeBrandId, listFilters, pager.start, t, serverError],
   );
 
   useEffect(() => {
@@ -684,8 +727,8 @@ export default function ContentPage() {
       toast.success(t('sentToPlan'), {
         action: { label: t('openPlan'), onClick: () => router.push('/dashboard/content/plan') },
       });
-    } catch {
-      toast.error(t('sendToPlanError'));
+    } catch (err) {
+      toast.error(serverError(err, t('sendToPlanError')));
     }
   };
 
@@ -773,17 +816,21 @@ export default function ContentPage() {
   useEffect(() => {
     let cancelled = false;
     setPromptOptions(null);
-    loadPromptOptions(() => cancelled);
+    // After the list: see listReadFor.
+    if (listReady) loadPromptOptions(() => cancelled);
     return () => {
       cancelled = true;
     };
-  }, [loadPromptOptions]);
+  }, [loadPromptOptions, listReady]);
+
+  useEffect(() => {
+    setTopicFilter('');
+    setTopicOptions([]);
+  }, [activeBrandId]);
 
   useEffect(() => {
     let cancelled = false;
-    setTopicFilter('');
-    setTopicOptions([]);
-    if (!activeBrandId) return;
+    if (!activeBrandId || !listReady) return;
     getOpportunityTopics(activeBrandId)
       .then((options) => !cancelled && setTopicOptions(options))
       // Like the prompt filter, it just stays hidden without its options.
@@ -791,7 +838,7 @@ export default function ContentPage() {
     return () => {
       cancelled = true;
     };
-  }, [activeBrandId]);
+  }, [activeBrandId, listReady]);
 
   // A prompt id from another brand, or one whose prompt was deleted, would
   // filter to nothing while the picker shows "All prompts". Drop it.
@@ -814,6 +861,8 @@ export default function ContentPage() {
   // have used the quota. A failure only hides the card.
   useEffect(() => {
     let cancelled = false;
+    // After the list: see listReadFor.
+    if (!listReady) return;
     getContentUsage().then(
       (usage) => !cancelled && setContentUsage(usage),
       () => !cancelled && setContentUsage(null),
@@ -821,7 +870,21 @@ export default function ContentPage() {
     return () => {
       cancelled = true;
     };
-  }, [activeBrandId, total, usageVersion]);
+  }, [activeBrandId, total, usageVersion, listReady]);
+
+  // Read with the usage, when the list's size may have moved. A failure only
+  // hides the note.
+  useEffect(() => {
+    let cancelled = false;
+    if (!activeBrandId || !listReady) return;
+    getOpportunityAvailability(activeBrandId).then(
+      (result) => !cancelled && setNeeds(result),
+      () => !cancelled && setNeeds(null),
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [activeBrandId, total, usageVersion, listReady]);
 
   const pollJob = useCallback(
     (jobId: string, startedAt: number) => {
@@ -949,7 +1012,7 @@ export default function ContentPage() {
       URL.revokeObjectURL(url);
     } catch (err) {
       console.error('Failed to export opportunities:', err);
-      toast.error(t('exportError'));
+      toast.error(serverError(err, t('exportError')));
     } finally {
       setExporting(false);
     }
@@ -966,7 +1029,7 @@ export default function ContentPage() {
       idempotencyKey: crypto.randomUUID(),
     }).catch((err: unknown) => ({
       ok: false as const,
-      error: err instanceof Error ? err.message : t('generateError'),
+      error: caughtError(err, t('generateError')),
       failure: 'failed' as const,
       quotaExhausted: false,
       periodEnd: null,
@@ -1008,6 +1071,7 @@ export default function ContentPage() {
         timeZone: 'UTC',
       })
     : '';
+  const flowState = opportunityFlowState({ limitReached, needs });
   // Generating opportunities costs AI: admins and managers start it, and
   // anyone else reads who can.
   const newButton = canManage ? (
@@ -1029,14 +1093,14 @@ export default function ContentPage() {
     try {
       const result = await sendToWebhook(id);
       if (result.success === false) {
-        toast.error(result.error);
+        toast.error(sendError(result));
       } else {
         toast.success(t('sentToWorkflow'));
         await loadData(true);
       }
     } catch (err) {
       console.error('Webhook send failed:', err);
-      toast.error(t('sendError'));
+      toast.error(serverError(err, t('sendError')));
     } finally {
       setSendingId(null);
     }
@@ -1053,15 +1117,15 @@ export default function ContentPage() {
             try {
               await updateOpportunityStatus(id, 'new');
               await loadData(true);
-            } catch {
-              toast.error(t('undoFailed'));
+            } catch (err) {
+              toast.error(serverError(err, t('undoFailed')));
             }
           },
         },
       });
     } catch (err) {
       console.error('Dismiss failed:', err);
-      toast.error(t('dismissError'));
+      toast.error(serverError(err, t('dismissError')));
     }
   };
 
@@ -1070,7 +1134,7 @@ export default function ContentPage() {
     try {
       const result = await bulkSendToWebhook(Array.from(selectedIds));
       if (!result.success) {
-        toast.error(result.error);
+        toast.error(sendError(result));
         return;
       }
       const notes = bulkSendNotes(result);
@@ -1081,7 +1145,7 @@ export default function ContentPage() {
       await loadData(true);
     } catch (err) {
       console.error('Bulk webhook send failed:', err);
-      toast.error(t('bulkSendError'));
+      toast.error(serverError(err, t('bulkSendError')));
     } finally {
       setBulkSending(false);
     }
@@ -1097,7 +1161,7 @@ export default function ContentPage() {
       setSelectedIds(new Set());
       await loadData(true);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t('bulkUpdateError'));
+      toast.error(caughtError(err, t('bulkUpdateError')));
     } finally {
       setBulkSending(false);
     }
@@ -1112,7 +1176,7 @@ export default function ContentPage() {
       setSelectedIds(new Set());
       await loadData(true);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t('bulkDismissError'));
+      toast.error(caughtError(err, t('bulkDismissError')));
     } finally {
       setBulkSending(false);
     }
@@ -1130,11 +1194,22 @@ export default function ContentPage() {
       // here as well would fire a second, competing load.
       await loadData(true);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t('bulkDeleteError'));
+      toast.error(caughtError(err, t('bulkDeleteError')));
     } finally {
       setBulkSending(false);
     }
   };
+
+  // The rows' titles and reasons in the person's interface language (LOC-010).
+  const aiText = useAiText(
+    'opportunity',
+    opportunities.map((o) => o.id),
+  );
+  const shownText = (opp: ContentOpportunity): ContentOpportunity => ({
+    ...opp,
+    title: aiText(opp.id, 'title', opp.title),
+    description: opp.description ? aiText(opp.id, 'description', opp.description) : opp.description,
+  });
 
   const filtered = opportunities.filter(
     (o) =>
@@ -1250,19 +1325,28 @@ export default function ContentPage() {
           </div>
           <div className="flex items-center gap-2">
             {newButton}
-            <Button
-              onClick={handleExportCsv}
-              disabled={exporting || loading || total === 0}
-              variant="outline"
-              className="gap-2"
-            >
-              {exporting ? <LoadingDots /> : <Download className="h-4 w-4" />}
-              {tCommon('exportCsv')}
-            </Button>
-            <Button onClick={() => setWebhookOpen(true)} variant="outline" className="gap-2">
-              <Settings2 className="h-4 w-4" />
-              {t('webhook.title')}
-            </Button>
+            {/* Icons only, named on hover and to screen readers. */}
+            <HeaderIconButton label={tCommon('exportCsv')}>
+              <Button
+                onClick={handleExportCsv}
+                disabled={exporting || loading || total === 0}
+                variant="outline"
+                size="icon"
+                aria-label={tCommon('exportCsv')}
+              >
+                {exporting ? <LoadingDots /> : <Download className="h-4 w-4" />}
+              </Button>
+            </HeaderIconButton>
+            <HeaderIconButton label={t('webhook.title')}>
+              <Button
+                onClick={() => setWebhookOpen(true)}
+                variant="outline"
+                size="icon"
+                aria-label={t('webhook.title')}
+              >
+                <Settings2 className="h-4 w-4" />
+              </Button>
+            </HeaderIconButton>
           </div>
         </div>
       </HeaderWithAiUsage>
@@ -1293,6 +1377,9 @@ export default function ContentPage() {
         </Card>
       ) : (
         <>
+          {flowState && (
+            <OpportunityFlowNote state={flowState} resetsOn={resetsOn} canManage={canManage} />
+          )}
           <div
             className={cn(
               'grid grid-cols-2 gap-4 sm:grid-cols-3',
@@ -1317,14 +1404,15 @@ export default function ContentPage() {
               title={t('kpi.highImpact')}
               icon={Zap}
               value={aggregates.highImpactCount}
-              sub={t('kpi.opportunities')}
+              // All statuses: said, as "Available" counts the open ones only.
+              sub={statusFilter === 'all' ? t('kpi.opportunitiesAll') : t('kpi.opportunities')}
             />
             {/* Two to a row on a phone: the third takes the row's width. */}
             <KpiCard
               title={t('kpi.avgScore')}
               icon={BarChart3}
               value={aggregates.avgScore}
-              sub={t('kpi.outOf100')}
+              sub={statusFilter === 'all' ? t('kpi.outOf100All') : t('kpi.outOf100')}
               className="col-span-2 sm:col-span-1"
             />
           </div>
@@ -1341,17 +1429,17 @@ export default function ContentPage() {
                       variant="outline"
                       className="text-xs border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
                     >
-                      {t('available', { count: total })}
+                      {t('available', { count: openCount })}
                     </Badge>
                   </div>
                   <div className="relative w-full max-w-80">
-                    <Search className="absolute left-3 top-2.5 h-4 w-4 text-muted-foreground" />
+                    <Search className="absolute start-3 top-2.5 h-4 w-4 text-muted-foreground" />
                     <Input
                       placeholder={t('filters.search')}
                       value={search}
                       onChange={(e) => setSearch(e.target.value)}
                       aria-label={t('filters.search')}
-                      className="h-9 pl-9 text-sm"
+                      className="h-9 ps-9 text-sm"
                     />
                   </div>
                 </div>
@@ -1386,7 +1474,7 @@ export default function ContentPage() {
                             <span className="min-w-0 flex-1 truncate" title={o.name}>
                               {o.name}
                             </span>
-                            <span className="ml-2 shrink-0 tabular-nums text-muted-foreground">
+                            <span className="ms-2 shrink-0 tabular-nums text-muted-foreground">
                               {o.count}
                             </span>
                           </SelectItem>
@@ -1417,7 +1505,7 @@ export default function ContentPage() {
                               <ComboboxItem key={item.value} value={item} title={item.label}>
                                 <span className="min-w-0 flex-1 truncate">{item.label}</span>
                                 {item.count !== null && (
-                                  <span className="ml-2 shrink-0 tabular-nums text-muted-foreground">
+                                  <span className="ms-2 shrink-0 tabular-nums text-muted-foreground">
                                     {item.count}
                                   </span>
                                 )}
@@ -1477,13 +1565,23 @@ export default function ContentPage() {
                         }
                       </SelectValue>
                     </SelectTrigger>
-                    <SelectContent>
+                    {/* Wider than the 130px trigger so the hints fit; if one is
+                        still too long it wraps instead of being cut off. */}
+                    <SelectContent
+                      align="start"
+                      alignItemWithTrigger={false}
+                      className="w-auto min-w-(--anchor-width) max-w-72"
+                    >
                       <SelectItem value="all">{t('filters.allSources')}</SelectItem>
                       {(['system', 'manual', 'prompt', 'action'] as const).map((value) => (
-                        <SelectItem key={value} value={value}>
+                        <SelectItem
+                          key={value}
+                          value={value}
+                          className="[&>div]:min-w-0 [&>div]:shrink"
+                        >
                           <span className="flex flex-col">
                             <span>{t(`source.${value}`)}</span>
-                            <span className="text-[11px] text-muted-foreground">
+                            <span className="whitespace-normal text-[11px] text-muted-foreground">
                               {t(`sourceHint.${value}`)}
                             </span>
                           </span>
@@ -1496,7 +1594,7 @@ export default function ContentPage() {
                   <DropdownMenu>
                     <DropdownMenuTrigger
                       aria-label={`${t('suggestedRange.label')}: ${t(`suggestedRange.${suggestedRange}`)}, ${t('sort.label')}: ${t(`sort.${sortOrder as OpportunitySort}`)}`}
-                      className="flex h-8 w-fit items-center justify-between gap-1.5 rounded-lg border border-input bg-transparent py-2 pr-2 pl-2.5 text-xs whitespace-nowrap transition-colors outline-none select-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30 dark:hover:bg-input/50"
+                      className="flex h-8 w-fit items-center justify-between gap-1.5 rounded-lg border border-input bg-transparent py-2 pe-2 ps-2.5 text-xs whitespace-nowrap transition-colors outline-none select-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30 dark:hover:bg-input/50"
                     >
                       {t(`suggestedRange.${suggestedRange}`)} ·{' '}
                       {t(`sort.${sortOrder as OpportunitySort}`)}
@@ -1544,22 +1642,20 @@ export default function ContentPage() {
                   </DropdownMenu>
                   {suggestedRange === 'custom' && (
                     <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                      <Input
-                        type="date"
+                      <DatePicker
                         aria-label={t('suggestedRange.from')}
-                        value={customFrom}
+                        value={customFrom || null}
                         max={customTo || undefined}
-                        onChange={(e) => setCustomFrom(e.target.value)}
-                        className="h-8 w-[140px] text-xs"
+                        onChange={(day) => setCustomFrom(day ?? '')}
+                        className="w-[140px]"
                       />
                       –
-                      <Input
-                        type="date"
+                      <DatePicker
                         aria-label={t('suggestedRange.to')}
-                        value={customTo}
+                        value={customTo || null}
                         min={customFrom || undefined}
-                        onChange={(e) => setCustomTo(e.target.value)}
-                        className="h-8 w-[140px] text-xs"
+                        onChange={(day) => setCustomTo(day ?? '')}
+                        className="w-[140px]"
                       />
                     </span>
                   )}
@@ -1590,7 +1686,7 @@ export default function ContentPage() {
                 <span className="text-xs text-muted-foreground">
                   {t('bulk.selected', { count: selectedIds.size })}
                 </span>
-                <div className="flex items-center gap-1 ml-auto">
+                <div className="flex items-center gap-1 ms-auto">
                   {/* Sending to the webhook, bulk changes, dismissing and deleting are
                       for admins and managers, as the server and the database allow them. */}
                   {canManage && (
@@ -1707,7 +1803,7 @@ export default function ContentPage() {
                   <TableRow>
                     {/* Every bulk action is for admins and managers, so the others
                         get no boxes to tick; the column stays for the layout. */}
-                    <TableHead className="w-10 pl-4">
+                    <TableHead className="w-10 ps-4">
                       {canManage && (
                         <Checkbox
                           checked={filtered.length > 0 && selectedIds.size === filtered.length}
@@ -1724,7 +1820,7 @@ export default function ContentPage() {
                     {/* The other columns are sized to fit their badges and buttons;
                         the action takes what is left, so nothing spills into its
                         neighbour on narrower screens. */}
-                    <TableHead className="pl-6">{t('table.action')}</TableHead>
+                    <TableHead className="ps-6">{t('table.action')}</TableHead>
                     {/* Hidden on narrower screens, where the action column needs the room. */}
                     <TableHead className="hidden w-[112px] whitespace-nowrap xl:table-cell">
                       {t('table.suggested')}
@@ -1733,14 +1829,14 @@ export default function ContentPage() {
                     <TableHead className="w-[88px] text-center">{t('table.impact')}</TableHead>
                     <TableHead className="w-[72px] text-center">{t('table.score')}</TableHead>
                     <TableHead className="w-[136px] text-center">{t('table.status')}</TableHead>
-                    <TableHead className="w-[96px] text-right pr-6">{t('table.actions')}</TableHead>
+                    <TableHead className="w-[96px] text-end pe-6">{t('table.actions')}</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {Array.from({ length: pendingCount }, (_, i) => (
                     <TableRow key={`pending-${i}`} aria-busy="true">
-                      <TableCell className="w-10 pl-4" />
-                      <TableCell className="pl-6">
+                      <TableCell className="w-10 ps-4" />
+                      <TableCell className="ps-6">
                         <Skeleton className="h-4 w-4/5" />
                         <Skeleton className="mt-1.5 h-3 w-3/5" />
                       </TableCell>
@@ -1766,7 +1862,7 @@ export default function ContentPage() {
                   ))}
                   {filtered.map((opp) => (
                     <TableRow key={opp.id} className="hover:bg-muted/50">
-                      <TableCell className="w-10 pl-4">
+                      <TableCell className="w-10 ps-4">
                         {canManage && (
                           <Checkbox
                             checked={selectedIds.has(opp.id)}
@@ -1779,9 +1875,9 @@ export default function ContentPage() {
                           />
                         )}
                       </TableCell>
-                      <TableCell className="pl-6 max-w-0">
+                      <TableCell className="ps-6 max-w-0">
                         <OpportunityTextCell
-                          opp={opp}
+                          opp={shownText(opp)}
                           handle={fullText}
                           onOpen={() => selectOpportunity(opp.id)}
                         />
@@ -1843,7 +1939,7 @@ export default function ContentPage() {
                           {t(`status.${opp.status}` as `status.${ContentOpportunityStatus}`)}
                         </Badge>
                       </TableCell>
-                      <TableCell className="text-right pr-6">
+                      <TableCell className="text-end pe-6">
                         <OpportunityRowMenu
                           title={opp.title}
                           editor={{

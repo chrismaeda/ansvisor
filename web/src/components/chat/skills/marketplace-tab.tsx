@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslations } from 'next-intl';
+import { useServerErrorText } from '@/hooks/use-server-error';
 import { toast } from 'sonner';
 import { Search } from 'lucide-react';
 import { useUpgradeGate } from '@/components/providers/upgrade-gate';
@@ -80,7 +81,8 @@ function keepInAddress(topic: Topic, sort: MarketplaceSort, query: string) {
 export async function addLibrarySkill(
   id: string,
 ): Promise<
-  { ok: true; skill: ImportedSkill } | { ok: false; error: string | null; upgrade: boolean }
+  | { ok: true; skill: ImportedSkill }
+  | { ok: false; error: string | null; code?: string; status?: number; upgrade: boolean }
 > {
   const res = await fetch('/api/chat/skills/marketplace/skill', {
     method: 'POST',
@@ -96,11 +98,12 @@ export async function addLibrarySkill(
   if (res?.ok && body?.ok && body.skill) return { ok: true, skill: body.skill };
   // A read-only workspace, or the trial: the plans.
   const upgrade = res?.status === 402 || body?.code === 'library_plan';
-  return { ok: false, error: body?.error ?? null, upgrade };
+  return { ok: false, error: body?.error ?? null, code: body?.code, status: res?.status, upgrade };
 }
 
 export function MarketplaceTab() {
   const t = useTranslations('chatSkills.library');
+  const serverError = useServerErrorText();
   const router = useRouter();
   const { openUpgrade } = useUpgradeGate();
   // What the address holds (Back from a skill's detail). The tab shows only
@@ -162,7 +165,7 @@ export function MarketplaceTab() {
     setAdding(null);
     if (!added.ok) {
       if (added.upgrade) openUpgrade();
-      else toast.error(added.error ?? t('addFailed'));
+      else toast.error(serverError(added, added.error ?? t('addFailed'), added.status));
       return;
     }
     const { skill } = added;
@@ -200,7 +203,7 @@ export function MarketplaceTab() {
         <div className="relative w-full max-w-[260px]">
           <Search
             aria-hidden
-            className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground"
+            className="pointer-events-none absolute top-1/2 start-2.5 size-3.5 -translate-y-1/2 text-muted-foreground"
           />
           <Input
             value={query}
@@ -209,7 +212,7 @@ export function MarketplaceTab() {
             aria-label={t('search')}
             maxLength={200}
             data-action="skills.library.search"
-            className="h-8 pl-8 text-[13px]"
+            className="h-8 ps-8 text-[13px]"
           />
         </div>
         <div role="group" aria-label={t('topicsLabel')} className="flex flex-wrap gap-1.5">
@@ -241,7 +244,7 @@ export function MarketplaceTab() {
         <span data-slot="library-meta" className="tabular-nums">
           {page && page !== 'failed' ? t('meta', { count: page.total }) : ' '}
         </span>
-        <label className="ml-auto flex items-center gap-1.5">
+        <label className="ms-auto flex items-center gap-1.5">
           <span className="sr-only">{t('sortLabel')}</span>
           <select
             value={sort}
@@ -438,7 +441,7 @@ function LibraryCard({
         <span title={card.repo} className="min-w-0 truncate text-[11.5px] text-muted-foreground">
           {t('owner', { owner })}
         </span>
-        <span className="ml-auto">
+        <span className="ms-auto">
           <AddOrState card={card} can={can} adding={adding} onAdd={onAdd} t={t} />
         </span>
       </div>

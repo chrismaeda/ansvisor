@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { useTranslations } from 'next-intl';
+import { useCaughtErrorText, useServerErrorText } from '@/hooks/use-server-error';
 import { FlaskConical, Loader2, Play, StopCircle } from 'lucide-react';
 import { toast } from 'sonner';
 import { Badge } from '@/components/ui/badge';
@@ -41,15 +42,18 @@ export function RunSinglePromptDialog({
   >([]);
   const [loading, setLoading] = useState(false);
   const [runningId, setRunningId] = useState<string | null>(null);
+  const t = useTranslations('runSingle');
+  const caughtError = useCaughtErrorText();
+  const serverError = useServerErrorText();
 
   useEffect(() => {
     if (!open) return;
     setLoading(true);
     getBrandPrompts(brandId)
       .then(setPrompts)
-      .catch(() => toast.error('Failed to load prompts'))
+      .catch((err: unknown) => toast.error(serverError(err, t('loadFailed'))))
       .finally(() => setLoading(false));
-  }, [open, brandId]);
+  }, [open, brandId, serverError, t]);
 
   const handleRun = async (promptId: string) => {
     setRunningId(promptId);
@@ -58,7 +62,7 @@ export function RunSinglePromptDialog({
       onClose();
       onJobStarted(jobId);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to run prompt');
+      toast.error(caughtError(err, t('runFailed')));
     } finally {
       setRunningId(null);
     }
@@ -70,11 +74,9 @@ export function RunSinglePromptDialog({
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2 text-base">
             <FlaskConical className="h-4 w-4" />
-            Run Single Prompt
+            {t('title')}
           </DialogTitle>
-          <p className="text-sm text-muted-foreground">
-            Pick a prompt to test. Only that prompt will run across your enabled platforms.
-          </p>
+          <p className="text-sm text-muted-foreground">{t('description')}</p>
         </DialogHeader>
 
         <div className="space-y-2 pt-2">
@@ -87,9 +89,7 @@ export function RunSinglePromptDialog({
           )}
 
           {!loading && prompts.length === 0 && (
-            <p className="text-sm text-muted-foreground py-6 text-center">
-              No active prompts found. Add prompts in brand settings first.
-            </p>
+            <p className="text-sm text-muted-foreground py-6 text-center">{t('empty')}</p>
           )}
 
           {!loading &&

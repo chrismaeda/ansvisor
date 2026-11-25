@@ -68374,3 +68374,859 @@ grant all on table public.usage_top_ups to service_role;
 
 notify pgrst, 'reload schema';
 
+-- ─────────────────────────────────────────────────────────────────────────
+-- migrations/00547_retire_ai_credit_packs.sql
+-- ─────────────────────────────────────────────────────────────────────────
+-- ============================================================================
+-- 00547: AI credit packs leave the sale; AI usage top-ups take their place
+-- ============================================================================
+-- Growth add-ons (00546) sell one-time AI usage top-ups (+5x, +10x, +20x),
+-- valid until the plan renews. CHAT-18's AI credit packs ($10 … $1,000,
+-- 12 months) are no longer sold: their rows are switched off, so Billing
+-- and the Get more window stop offering them. Packs already bought keep
+-- their credits until they expire (ai_credit_grants is untouched), and
+-- storage packs stay on sale. Four rows; nothing else changes.
+
+update public.add_on_products
+set active = false
+where kind = 'ai'
+  and active;
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- migrations/00548_enterprise_grandfather.sql
+-- ─────────────────────────────────────────────────────────────────────────
+-- ============================================================================
+-- 00548: Enterprise's new defaults; existing contracts keep what they have
+-- ============================================================================
+-- Enterprise now starts from $1,999 a month with 1 brand and 3,000 prompt
+-- locations by default (web/src/config/plans.ts, server/src/config/plans.js);
+-- more is set per contract in plan_overrides, as today. Workspaces already
+-- on Enterprise were sold unlimited brands and prompts: their overrides get
+-- maxBrands -1 and maxPrompts -1, only where the contract set no number of
+-- its own, so nothing a customer has today changes. A few rows; running it
+-- again changes nothing.
+
+update public.organizations
+set plan_overrides = jsonb_build_object('maxBrands', -1, 'maxPrompts', -1)
+  || coalesce(plan_overrides, '{}'::jsonb)
+where plan = 'enterprise'
+  and (
+    plan_overrides is null
+    or not (plan_overrides ? 'maxBrands')
+    or not (plan_overrides ? 'maxPrompts')
+  );
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- migrations/00549_profiles_ui_language.sql
+-- ─────────────────────────────────────────────────────────────────────────
+-- ============================================================================
+-- 00549: a person's own interface language (Settings › Account › Language)
+-- ============================================================================
+-- profiles.ui_language: the language the person picked for Ansvisor's screens,
+-- as a locale code ("tr", "de", "pt-BR"); null is Automatic, their browser's
+-- language, else English. Per person, never per workspace, and apart from a
+-- brand's content language (what prompts are tracked and content is written
+-- in), which it never changes. Theirs to set, on their own row
+-- ("profiles: own row update", 00001): 00228's guard keeps role and
+-- organization with the server and leaves this column to the person.
+--
+-- The format check only keeps a stray value out; which codes the app has
+-- (and which have a messages file) is the web app's list (web/src/i18n/
+-- locales.ts), so a new language needs no migration.
+
+alter table public.profiles
+  add column if not exists ui_language text
+    constraint profiles_ui_language_format check (
+      ui_language is null
+      or ui_language ~ '^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$'
+    );
+
+comment on column public.profiles.ui_language is
+  'The interface language the person picked (Settings › Account › Language), a locale code such as tr or pt-BR; null = Automatic, their browser''s language, else English. Never the brand''s content language.';
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- migrations/00550_ai_text_translations.sql
+-- ─────────────────────────────────────────────────────────────────────────
+-- ============================================================================
+-- 00550: AI-written text in the reader's language (LOC-010)
+-- ============================================================================
+-- Ansvisor writes some text once, in English: content opportunities' titles
+-- and reasons, Action Center actions and signals, Site Audit
+-- recommendations. A person whose interface language (profiles.ui_language,
+-- 00549) is another reads them translated: on first view, the API translates
+-- the rows on screen and keeps each field's translation here; later viewers
+-- in that language read the kept one. The text is never written again per
+-- language.
+--
+--   * One row per source row, field and language. source_hash is the
+--     English text's hash when it was translated: when the source changes,
+--     the hash no longer matches and the field is translated again.
+--   * source_kind names the table the text comes from ('opportunity',
+--     'action', …); the API's list of kinds decides which exist, so a new
+--     kind needs no migration. No foreign key: the source tables differ. A
+--     translation left after its source row goes is never read.
+--   * The server reads and writes it with the service role, after checking
+--     the viewer may see each source row (the source's brand in their
+--     organization). Row-level security is on with no policy: no client reads
+--     or writes it directly.
+--
+-- Schema only: the table starts empty and fills as people read.
+
+create table if not exists public.ai_text_translations (
+  source_kind text not null
+    constraint ai_text_translations_kind_format check (source_kind ~ '^[a-z_]{1,40}$'),
+  source_id uuid not null,
+  field text not null
+    constraint ai_text_translations_field_format check (field ~ '^[A-Za-z_]{1,40}$'),
+  locale text not null
+    constraint ai_text_translations_locale_format check (
+      locale ~ '^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$'
+    ),
+  source_hash text not null
+    constraint ai_text_translations_hash_format check (char_length(source_hash) between 8 and 64),
+  text text not null
+    constraint ai_text_translations_text_length check (char_length(text) <= 20000),
+  created_at timestamptz not null default now(),
+  primary key (source_kind, source_id, field, locale)
+);
+
+comment on table public.ai_text_translations is
+  'LOC-010: AI-written text (opportunities, Action Center, Site Audit) translated into a viewer''s interface language on first view, kept per source row, field and language; source_hash marks the English it was made from. Server only (RLS on, no policy).';
+
+alter table public.ai_text_translations enable row level security;
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- migrations/00552_head_to_head_window_daily.sql
+-- ─────────────────────────────────────────────────────────────────────────
+-- Head-to-head follows the Competitors page's date picker (UX audit CP-02).
+--
+-- head_to_head_daily (00169, body 00434) read every day of the rollups, so
+-- the head-to-head summary, Gaps, Strengths and Prompt-by-Prompt were all
+-- time while the competitor cards above them followed the picker (7d, 30d,
+-- 90d, a custom range). head_to_head_window_daily is the same read over the
+-- picker's days, as the other Insights reads take them
+-- (insights_topic_competitors_daily, 00434): p_day_from / p_day_to, both
+-- inclusive UTC days, null for no bound, both null for all time.
+--
+-- A function of its own beside head_to_head_daily, which stays as it is for
+-- a caller still on it (the app before this change) and can be dropped once
+-- nothing calls it. Not an overload of it: a call naming only the brand and
+-- the competitor would then match both (with defaulted bounds), and the
+-- brand-access checks keep one definition per function name.
+--
+-- Each group and engine also carries the Visibility score's parts for both
+-- sides (mention and citation answers, the 1/position sum and count, from
+-- the same rollups), so the head-to-head can show the score the cards show
+-- (UX audit CP-01, decision D3).
+--
+-- Functions only: nothing is backfilled; it applies in seconds.
+
+create function public.head_to_head_window_daily(
+  p_brand_id uuid,
+  p_competitor_id text,
+  p_day_from date,
+  p_day_to date
+)
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path to 'public'
+set work_mem to '64MB'
+set plan_cache_mode to 'force_custom_plan'
+as $$
+declare
+  v_result jsonb;
+begin
+  if auth.role() is distinct from 'service_role'
+     and not public.can_access_brand(p_brand_id) then
+    return null;
+  end if;
+
+  with brand_groups as (
+    select d.prompt_id, d.platform, d.model_used, d.region,
+           sum(d.answer_count)   as runs,
+           sum(d.sum_visibility) as brand_total,
+           max(d.max_created_at) as latest_at,
+           sum(coalesce(d.mention_answers, 0))   as brand_mention_answers,
+           sum(coalesce(d.citation_answers, 0))  as brand_citation_answers,
+           sum(coalesce(d.sum_inv_position, 0))  as brand_inv_position,
+           sum(coalesce(d.position_count, 0))    as brand_position_count
+    from public.insights_prompt_daily d
+    where d.brand_id = p_brand_id
+      and (p_day_from is null or d.day >= p_day_from)
+      and (p_day_to is null or d.day <= p_day_to)
+    group by d.prompt_id, d.platform, d.model_used, d.region
+  ),
+  comp_groups as (
+    select cd.prompt_id, cd.platform, cd.model_used, cd.region,
+           sum(cd.sum_visibility) as comp_total,
+           sum(coalesce(cd.mention_answers, 0))  as comp_mention_answers,
+           sum(coalesce(cd.citation_answers, 0)) as comp_citation_answers,
+           sum(coalesce(cd.sum_inv_position, 0)) as comp_inv_position,
+           sum(coalesce(cd.position_count, 0))   as comp_position_count
+    from public.insights_competitor_prompt_daily cd
+    where cd.brand_id = p_brand_id
+      and cd.competitor_id = p_competitor_id
+      and (p_day_from is null or cd.day >= p_day_from)
+      and (p_day_to is null or cd.day <= p_day_to)
+    group by cd.prompt_id, cd.platform, cd.model_used, cd.region
+  ),
+  brand_engines as (
+    select d.platform, d.model_used,
+           sum(d.answer_count)   as brand_count,
+           sum(d.sum_visibility) as brand_total,
+           sum(d.mention_answers)                as brand_mention_answers,
+           sum(d.citation_answers)               as brand_citation_answers,
+           sum(coalesce(d.sum_inv_position, 0))  as brand_inv_position,
+           sum(d.position_count)                 as brand_position_count
+    from public.insights_brand_daily d
+    where d.brand_id = p_brand_id
+      and (p_day_from is null or d.day >= p_day_from)
+      and (p_day_to is null or d.day <= p_day_to)
+    group by d.platform, d.model_used
+  ),
+  comp_engines as (
+    select cd.platform, cd.model_used,
+           sum(cd.answer_count)   as comp_count,
+           sum(cd.sum_visibility) as comp_total,
+           sum(cd.mention_answers)               as comp_mention_answers,
+           sum(cd.citation_answers)              as comp_citation_answers,
+           sum(coalesce(cd.sum_inv_position, 0)) as comp_inv_position,
+           sum(cd.position_count)                as comp_position_count
+    from public.insights_competitor_daily cd
+    where cd.brand_id = p_brand_id
+      and cd.competitor_id = p_competitor_id
+      and (p_day_from is null or cd.day >= p_day_from)
+      and (p_day_to is null or cd.day <= p_day_to)
+    group by cd.platform, cd.model_used
+  )
+  select jsonb_build_object(
+    'groups', coalesce((
+      select jsonb_agg(jsonb_build_object(
+               'prompt_id',       g.prompt_id,
+               'platform',        g.platform,
+               'model_used',      g.model_used,
+               'region',          g.region,
+               'runs',            g.runs,
+               'brand_total',     coalesce(g.brand_total, 0),
+               'comp_total',      coalesce(c.comp_total, 0),
+               'latest_at',       g.latest_at,
+               -- The Visibility score's parts (00164 rollups), both over the
+               -- brand's answers in the group (CP-01, D3).
+               'brand_mention_answers',  g.brand_mention_answers,
+               'brand_citation_answers', g.brand_citation_answers,
+               'brand_inv_position',     g.brand_inv_position,
+               'brand_position_count',   g.brand_position_count,
+               'comp_mention_answers',   coalesce(c.comp_mention_answers, 0),
+               'comp_citation_answers',  coalesce(c.comp_citation_answers, 0),
+               'comp_inv_position',      coalesce(c.comp_inv_position, 0),
+               'comp_position_count',    coalesce(c.comp_position_count, 0)))
+      from brand_groups g
+      left join comp_groups c
+        on c.prompt_id = g.prompt_id
+       and c.platform is not distinct from g.platform
+       and c.model_used is not distinct from g.model_used
+       and c.region is not distinct from g.region
+    ), '[]'::jsonb),
+    -- Each prompt's text once, rather than on each of its groups.
+    'prompts', coalesce((
+      select jsonb_agg(jsonb_build_object('id', p.id, 'text', p.text, 'category', p.category))
+      from public.prompts p
+      where p.id in (select g.prompt_id from brand_groups g)
+    ), '[]'::jsonb),
+    'engines', coalesce((
+      select jsonb_agg(jsonb_build_object(
+               'platform',    e.platform,
+               'model_used',  e.model_used,
+               'brand_count', e.brand_count,
+               'brand_total', coalesce(e.brand_total, 0),
+               'comp_count',  coalesce(c.comp_count, 0),
+               'comp_total',  coalesce(c.comp_total, 0),
+               'brand_mention_answers',  e.brand_mention_answers,
+               'brand_citation_answers', e.brand_citation_answers,
+               'brand_inv_position',     e.brand_inv_position,
+               'brand_position_count',   e.brand_position_count,
+               'comp_mention_answers',   coalesce(c.comp_mention_answers, 0),
+               'comp_citation_answers',  coalesce(c.comp_citation_answers, 0),
+               'comp_inv_position',      coalesce(c.comp_inv_position, 0),
+               'comp_position_count',    coalesce(c.comp_position_count, 0)))
+      from brand_engines e
+      left join comp_engines c
+        on c.platform is not distinct from e.platform
+       and c.model_used is not distinct from e.model_used
+    ), '[]'::jsonb)
+  )
+  into v_result;
+
+  return v_result;
+end;
+$$;
+
+revoke execute on function public.head_to_head_window_daily(uuid, text, date, date) from public, anon;
+grant execute on function public.head_to_head_window_daily(uuid, text, date, date) to authenticated, service_role;
+
+comment on function public.head_to_head_window_daily(uuid, text, date, date) is
+  'Head-to-head on the Competitors page (#923) over the picker''s days, beside the all-time head_to_head_daily (p_day_from..p_day_to, inclusive UTC days; null for no bound, both null for all time; CP-02), from the daily rollups (00164): per (prompt, platform, model, region) the runs and the brand''s and the competitor''s visibility and Visibility score parts, their averages per engine and overall, and each prompt''s text once. Security definer, for a person who can access the brand (00434, can_access_brand), and for the service role, whose callers check the brand first; anyone else reads null.';
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- migrations/00553_action_scorecard_closed_window.sql
+-- ─────────────────────────────────────────────────────────────────────────
+-- ============================================================================
+-- 00553: the Scorecard counts actions closed in its range (UX audit AC-61)
+-- ============================================================================
+-- History › Scorecard's table (action_scorecard, 00368; by play 00484) read
+-- the completed and dismissed actions raised since the range's first day
+-- (created_at), while History's list and the Scorecard's cards now read when
+-- things happened (decision D13): a completed action by completed_at, a
+-- dismissed one by updated_at (dismissing sets no completed_at). An action
+-- raised before the range and closed in it was in the cards but not the
+-- table. The table now reads the same: the actions closed in the range.
+-- The priority score's past success (learning B4) reads it the same way.
+--
+-- Functions only: the same name, arguments, columns and default; the date
+-- filter alone changes. Nothing is backfilled; it applies in seconds.
+
+create or replace function public.action_scorecard(
+  p_brand_id uuid,
+  p_since timestamptz default null,
+  p_by text default 'kind'
+)
+returns table (
+  kind text,
+  completed integer,
+  improved integer,
+  mixed integer,
+  no_change integer,
+  declined integer,
+  not_measurable integer,
+  pending integer,
+  final integer,
+  median_change numeric,
+  dismissed integer,
+  dismiss_reasons jsonb
+)
+language sql
+stable
+security invoker
+set search_path to 'public'
+as $$
+  with closed as (
+    select case
+             when p_by = 'play'
+               then coalesce(a.validation->>'play', a.payload->'play'->>'id')
+             else a.kind
+           end as kind,
+           a.status,
+           a.outcome,
+           a.dismiss_reason,
+           a.validation->>'final' = 'true' as is_final,
+           -- The relative change in its main metric (learning A4), when the
+           -- metric was read before and after and had a before to scale by.
+           (select (m->>'after')::numeric / nullif((m->>'before')::numeric, 0) - 1
+              from jsonb_array_elements(
+                     case when jsonb_typeof(a.validation->'metrics') = 'array'
+                          then a.validation->'metrics' else '[]'::jsonb end
+                   ) as m
+             where m->>'metric' = a.validation->>'primary'
+               and jsonb_typeof(m->'before') = 'number'
+               and jsonb_typeof(m->'after') = 'number'
+             limit 1) as change
+      from public.actions a
+     where a.brand_id = p_brand_id
+       and a.deleted_at is null
+       and a.status in ('completed', 'dismissed')
+       -- Closed in the range (UX audit AC-61, decision D13): a completed
+       -- action by when it was completed, a dismissed one by its last change
+       -- (dismissing sets no completed_at), as History's list reads them.
+       and (
+         p_since is null
+         or case
+              when a.status = 'completed' then coalesce(a.completed_at, a.updated_at)
+              else a.updated_at
+            end >= p_since
+       )
+       and p_by in ('kind', 'play')
+  )
+  select c.kind,
+         count(*) filter (where c.status = 'completed')::integer,
+         count(*) filter (where c.status = 'completed' and c.outcome = 'improved')::integer,
+         count(*) filter (where c.status = 'completed' and c.outcome = 'mixed')::integer,
+         count(*) filter (where c.status = 'completed' and c.outcome = 'no_meaningful_change')::integer,
+         count(*) filter (where c.status = 'completed' and c.outcome = 'declined')::integer,
+         count(*) filter (where c.status = 'completed' and c.outcome = 'not_measurable')::integer,
+         count(*) filter (
+           where c.status = 'completed'
+             and (c.outcome is null or c.outcome = 'pending_measurement')
+         )::integer,
+         count(*) filter (where c.status = 'completed' and c.is_final)::integer,
+         -- The median, so one small page that went from 1 to 20 doesn't
+         -- read as the kind's typical result. Over the results with a
+         -- verdict only.
+         round(
+           (percentile_cont(0.5) within group (order by c.change) filter (
+             where c.status = 'completed'
+               and c.outcome in ('improved', 'mixed', 'no_meaningful_change', 'declined')
+           ))::numeric,
+           4
+         ),
+         count(*) filter (where c.status = 'dismissed')::integer,
+         coalesce(
+           (select jsonb_object_agg(r.reason, r.n)
+              from (select coalesce(d.dismiss_reason, 'none') as reason, count(*) as n
+                      from closed d
+                     where d.kind = c.kind and d.status = 'dismissed'
+                     group by 1) as r),
+           '{}'::jsonb
+         )
+    from closed c
+   -- By play, the actions opened without one aren't a group.
+   where c.kind is not null
+   group by c.kind;
+$$;
+
+comment on function public.action_scorecard(uuid, timestamptz, text) is
+  'A brand''s actions closed since a day (completed by completed_at, dismissed by updated_at; 00553, AC-61), by kind or (p_by ''play'') by the play they were opened with: completed, results, median change in the main metric, dismissed and why (00368, learning B3; 00484, AC plan P-4). RLS applies to the caller.';
+
+notify pgrst, 'reload schema';
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- migrations/00554_notification_preferences.sql
+-- ─────────────────────────────────────────────────────────────────────────
+-- ============================================================================
+-- 00554: a person's own e-mail choices (Settings › Notifications, "Your e-mails")
+-- ============================================================================
+-- Until now the Daily Pulse (00036) and the AI Traffic weekly digest (00187)
+-- were set per brand, for everyone: pulse_settings' frequency and recipient
+-- list. Now each person picks the e-mails they get and how often; the brand's
+-- pulse_settings stay for people outside the workspace (its recipients) and
+-- for teammates who haven't saved their own choices yet.
+--
+--   * one row per person, workspace, e-mail kind and brand scope: brand_id
+--     null is "All my brands", a brand's row overrides it for that brand.
+--     Account e-mails (AI usage) only ever have the null row.
+--   * frequency: the choice, from the kind's own list (the web checks which
+--     fit a kind): instant, daily, weekly, notable, on or off.
+--   * delivery: brand e-mails one per brand, or all brands in one e-mail.
+--     The person's choice, the same on each of their rows.
+--
+-- Nothing is copied here. A person with no rows gets what pulse_settings gives
+-- them today (the web shows it as their starting choices, the senders send
+-- by it), so nobody's e-mail changes until they save their own.
+--
+-- A person reads and writes only their own rows, in their own workspace, and
+-- a brand's row only for a brand they can reach (brand access, 00388).
+-- save_notification_preferences replaces a person's rows in one go.
+
+create table if not exists public.notification_preferences (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users (id) on delete cascade,
+  organization_id uuid not null references public.organizations (id) on delete cascade,
+  kind text not null,
+  -- Null: All my brands.
+  brand_id uuid references public.brands (id) on delete cascade,
+  frequency text not null,
+  delivery text not null default 'per_brand',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint notification_preferences_kind_check check (
+    kind in (
+      'daily_pulse',
+      'traffic_digest',
+      'critical_action',
+      'due_actions',
+      'weekly_actions',
+      'run_finished',
+      'audit_finished',
+      'score_dropped',
+      'drafts_review',
+      'ai_usage'
+    )
+  ),
+  constraint notification_preferences_frequency_check check (
+    frequency in ('instant', 'daily', 'weekly', 'notable', 'on', 'off')
+  ),
+  constraint notification_preferences_delivery_check check (
+    delivery in ('per_brand', 'combined')
+  ),
+  constraint notification_preferences_scope_key unique nulls not distinct (
+    user_id, organization_id, kind, brand_id
+  )
+);
+
+-- The senders read a workspace's rows: who saved, and their choices.
+create index if not exists notification_preferences_org_kind_idx
+  on public.notification_preferences (organization_id, kind);
+
+create index if not exists notification_preferences_brand_idx
+  on public.notification_preferences (brand_id)
+  where brand_id is not null;
+
+drop trigger if exists trg_notification_preferences_updated_at on public.notification_preferences;
+create trigger trg_notification_preferences_updated_at
+  before update on public.notification_preferences
+  for each row execute function public.handle_updated_at();
+
+alter table public.notification_preferences enable row level security;
+revoke all on table public.notification_preferences from anon, authenticated;
+grant select, insert, update, delete on table public.notification_preferences to authenticated;
+grant all on table public.notification_preferences to service_role;
+
+drop policy if exists "notification_preferences: own rows" on public.notification_preferences;
+create policy "notification_preferences: own rows"
+  on public.notification_preferences
+  for all
+  to authenticated
+  using (
+    user_id = auth.uid()
+    and organization_id in (select p.organization_id from public.profiles p where p.id = auth.uid())
+    and (brand_id is null or brand_id in (select public.user_brand_ids()))
+  )
+  with check (
+    user_id = auth.uid()
+    and organization_id in (select p.organization_id from public.profiles p where p.id = auth.uid())
+    and (
+      brand_id is null
+      or brand_id in (
+        select b.id from public.brands b
+        where b.organization_id = notification_preferences.organization_id
+          and public.can_access_brand(b.id)
+      )
+    )
+  );
+
+-- Replaces the caller's rows in their workspace with p_rows, in one go:
+-- [{"kind", "brand_id" (or null), "frequency", "delivery"}]. Runs as the
+-- caller, so the policy above checks every row.
+create or replace function public.save_notification_preferences(p_rows jsonb)
+returns void
+language plpgsql
+security invoker
+set search_path = public
+as $$
+declare
+  v_org uuid;
+begin
+  select organization_id into v_org from public.profiles where id = auth.uid();
+  if v_org is null then
+    raise exception 'No organization';
+  end if;
+  if jsonb_typeof(p_rows) <> 'array' or jsonb_array_length(p_rows) > 500 then
+    raise exception 'Invalid preferences';
+  end if;
+
+  delete from public.notification_preferences
+  where user_id = auth.uid() and organization_id = v_org;
+
+  insert into public.notification_preferences (user_id, organization_id, kind, brand_id, frequency, delivery)
+  select auth.uid(), v_org, r.kind, r.brand_id, r.frequency, coalesce(r.delivery, 'per_brand')
+  from jsonb_to_recordset(p_rows) as r(kind text, brand_id uuid, frequency text, delivery text);
+end;
+$$;
+
+revoke all on function public.save_notification_preferences(jsonb) from public, anon;
+grant execute on function public.save_notification_preferences(jsonb) to authenticated;
+
+comment on table public.notification_preferences is
+  'A person''s own e-mail choices (00554, Settings › Notifications): per kind, for All my brands (brand_id null) or one brand, how often, and one e-mail per brand or all in one. No rows: what pulse_settings gives them, until they save.';
+comment on column public.notification_preferences.brand_id is
+  'Null: All my brands. A brand''s row overrides it for that brand.';
+comment on column public.notification_preferences.frequency is
+  'instant, daily, weekly, notable, on or off, from the kind''s own list.';
+comment on column public.notification_preferences.delivery is
+  'Brand e-mails one per brand (per_brand) or all brands in one (combined): the person''s choice, the same on each of their rows.';
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- migrations/00555_translation_suggestions.sql
+-- ─────────────────────────────────────────────────────────────────────────
+-- ============================================================================
+-- 00555: "Suggest a better translation" (LOC-009)
+-- ============================================================================
+-- In any language but English, Settings › Account › Language and the account
+-- menu's Language item offer "Suggest a better translation": a form that
+-- already knows the screen and the language, where the person gives the text
+-- as it reads now, their better version and, if they like, a note.
+--
+-- Each suggestion is a row here, in the review queue Ansvisor staff work
+-- through (the review list, STAFF_EMAILS, with the service role). Accepting
+-- one only marks the row: the string in messages/<locale>.json and the
+-- glossary are changed by hand, by running web/scripts/translate-messages.mjs
+-- again.
+--
+-- Schema only: no backfill. A person adds and reads their own rows (RLS);
+-- staff read and change every row with the service role, which skips RLS.
+
+create table if not exists public.translation_suggestions (
+  id uuid primary key default gen_random_uuid(),
+  organization_id uuid not null references public.organizations (id) on delete cascade,
+  user_id uuid not null references auth.users (id) on delete cascade,
+  -- The interface language the suggestion is for, a locale code such as tr or pt-BR.
+  locale text not null check (locale ~ '^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$'),
+  -- The screen the person was on (the address without a locale prefix).
+  path text not null default '' check (char_length(path) <= 500),
+  -- The messages key of the text, when it is known (found from the current text, or null).
+  message_key text check (message_key is null or char_length(message_key) <= 300),
+  current_text text not null check (char_length(current_text) between 1 and 1000),
+  suggestion text not null check (char_length(suggestion) between 1 and 1000),
+  note text not null default '' check (char_length(note) <= 1000),
+  status text not null default 'new' check (status in ('new', 'accepted', 'rejected')),
+  reviewed_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists translation_suggestions_status_created_idx
+  on public.translation_suggestions (status, created_at desc);
+create index if not exists translation_suggestions_user_idx
+  on public.translation_suggestions (user_id, created_at desc);
+
+alter table public.translation_suggestions enable row level security;
+
+-- No insert policy: the app adds a suggestion with the service role after its
+-- checks (signed in, writable workspace, the daily limit), so no one signed in
+-- can insert around them through the API.
+
+-- A person reads their own suggestions, and no one else's.
+create policy "translation_suggestions: read own"
+  on public.translation_suggestions for select to authenticated
+  using (user_id = (select auth.uid()));
+
+-- No insert, update or delete for anyone signed in: adding is the app's and review
+-- is staff's, both through the service role.
+revoke insert, update, delete on public.translation_suggestions from anon, authenticated;
+revoke all on public.translation_suggestions from anon;
+
+comment on table public.translation_suggestions is
+  'Suggested better translations of the interface (LOC-009): a person reads their own rows by RLS; the app inserts after its checks and staff review with the service role. Accepting only marks the row; messages/<locale>.json and the glossary are changed by hand.';
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- migrations/00556_notification_sends.sql
+-- ─────────────────────────────────────────────────────────────────────────
+-- ============================================================================
+-- 00556: which notification e-mail went to whom (Settings › Notifications)
+-- ============================================================================
+-- The e-mails people choose in "Your e-mails" (00554) beyond the Daily Pulse
+-- and the AI Traffic digest: a new Critical action, drafts waiting for review,
+-- and the later kinds. Each sender claims a row here before it sends, so a
+-- person gets each e-mail once, however often the sender runs or however
+-- many server instances run it.
+--
+--   * kind: the e-mail, as notification_preferences names it.
+--   * subject: what the e-mail is about, the sender's own key: an action
+--     ("action:<id>"), a day's or a week's summary of a brand
+--     ("daily:2026-11-20:<brand id>"). Unique per kind, person and subject.
+--   * sent_at: set once the e-mail went out; a claim without it is a send
+--     that failed after its claim, kept so it isn't sent twice.
+--
+-- Only the server reads and writes it (the service role): RLS on, no policy.
+-- Schema only: it starts empty.
+
+create table if not exists public.notification_sends (
+  id uuid primary key default gen_random_uuid(),
+  kind text not null
+    constraint notification_sends_kind_format check (kind ~ '^[a-z_]{1,40}$'),
+  user_id uuid not null references auth.users (id) on delete cascade,
+  brand_id uuid references public.brands (id) on delete cascade,
+  subject text not null
+    constraint notification_sends_subject_length check (char_length(subject) between 1 and 200),
+  sent_at timestamptz,
+  created_at timestamptz not null default now(),
+  constraint notification_sends_once unique (kind, user_id, subject)
+);
+
+create index if not exists notification_sends_brand_idx
+  on public.notification_sends (brand_id)
+  where brand_id is not null;
+
+alter table public.notification_sends enable row level security;
+revoke all on table public.notification_sends from anon, authenticated;
+grant all on table public.notification_sends to service_role;
+
+comment on table public.notification_sends is
+  'Notification e-mails sent (00556): one row per kind, person and subject, claimed before sending so each goes once. Server only.';
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- migrations/00559_chat_files_pptx.sql
+-- ─────────────────────────────────────────────────────────────────────────
+-- ============================================================================
+-- 00559: a file in Files may download as PowerPoint
+-- ============================================================================
+-- Chat turns a saved report into an editable .pptx deck (#2298) and files
+-- it. The formats check (00411, last set by 00477) knew no 'pptx', and the
+-- bucket's types (00411, with 00476's image/jpeg) knew no presentation type,
+-- so the deck could be neither filed nor downloaded. The same list, with
+-- 'pptx'; the bucket takes the deck's own type. Run again, both end the
+-- same; any type an admin added stays.
+
+alter table public.chat_files drop constraint if exists chat_files_formats_check;
+alter table public.chat_files add constraint chat_files_formats_check check (
+  formats <@ array[
+    'md', 'html', 'docx', 'pdf', 'csv', 'xlsx', 'pptx', 'json', 'jsonld', 'txt', 'png', 'jpg', 'webp'
+  ]::text[]
+  and public.chat_text_array_distinct(formats)
+);
+
+update storage.buckets
+set allowed_mime_types = array_append(
+  allowed_mime_types,
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+)
+where id = 'chat-files'
+  and allowed_mime_types is not null
+  and not (
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+    = any (allowed_mime_types)
+  );
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- migrations/00560_ads_accounts.sql
+-- ─────────────────────────────────────────────────────────────────────────
+-- ============================================================================
+-- 00560: Ads' read connections: ad accounts, keys and daily metrics (Phase 1, A1)
+-- ============================================================================
+-- Ads Phase 1, behind ADS_ENABLED. Schema only: no rows are written here and
+-- nothing is backfilled. The sync jobs (lib/ads, later PRs) fill the metric
+-- tables in chunks, one account and date window at a time.
+--
+-- As with 00530–00532, only the server reads and writes these tables (service
+-- role). It checks the person's role, their brand access and their plan
+-- itself. A session reads no row: spend and keys are an Admin's business, and
+-- the plan decides what the Ads area shows.
+--
+--   * ads_accounts: an ad account a brand reads, on Google Ads (through the
+--     Account's Composio sign-in, integration_accounts) or ChatGPT Ads
+--     (through the customer's own API key). One brand may read several.
+--   * ads_account_keys: a ChatGPT Ads account's API key, encrypted by the API
+--     (AES-256-GCM with CONNECTOR_CREDENTIALS_KEY, bound to the account id),
+--     as catalog_source_credentials (00282) keeps a store's sign-in.
+--   * ads_campaign_daily: each campaign's day: impressions, clicks, cost,
+--     conversions. Both platforms, in the account's currency.
+--   * ads_search_term_daily: Google's search terms per campaign and day, which
+--     the Overlap view matches to tracked prompts.
+
+create table if not exists public.ads_accounts (
+  id uuid primary key default gen_random_uuid(),
+  organization_id uuid not null references public.organizations(id) on delete cascade,
+  brand_id uuid not null references public.brands(id) on delete cascade,
+  platform text not null check (platform in ('google', 'chatgpt')),
+  -- Google's customer id (10 digits) or ChatGPT's ad account id.
+  external_id text not null check (char_length(external_id) between 1 and 64),
+  name text check (name is null or char_length(name) <= 300),
+  currency_code text check (currency_code is null or currency_code ~ '^[A-Z]{3}$'),
+  time_zone text check (time_zone is null or char_length(time_zone) <= 64),
+  -- Google only: the customer's manager account, when the account is reached through one.
+  login_customer_id text check (login_customer_id is null or login_customer_id ~ '^[0-9]{10}$'),
+  -- Google only: the Account's sign-in the account is read with.
+  integration_account_id uuid references public.integration_accounts(id) on delete set null,
+  status text not null default 'active' check (status in ('active', 'error', 'disconnected')),
+  last_error text check (last_error is null or char_length(last_error) <= 500),
+  -- The last finished sync, and the last day it has complete rows for.
+  last_synced_at timestamptz,
+  synced_through date,
+  connected_by uuid references public.profiles(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint ads_accounts_brand_platform_external_key unique (brand_id, platform, external_id),
+  constraint ads_accounts_google_fields_check check (
+    platform = 'google' or (login_customer_id is null and integration_account_id is null)
+  )
+);
+
+create index if not exists ads_accounts_organization_idx
+  on public.ads_accounts (organization_id);
+-- The sync's queue: active accounts, the longest waiting first.
+create index if not exists ads_accounts_sync_due_idx
+  on public.ads_accounts (last_synced_at nulls first)
+  where status = 'active';
+
+create table if not exists public.ads_account_keys (
+  account_id uuid primary key references public.ads_accounts(id) on delete cascade,
+  secret text not null check (char_length(secret) between 1 and 16384),
+  set_at timestamptz not null default now(),
+  set_by uuid references public.profiles(id) on delete set null
+);
+
+create table if not exists public.ads_campaign_daily (
+  account_id uuid not null references public.ads_accounts(id) on delete cascade,
+  campaign_id text not null check (char_length(campaign_id) between 1 and 64),
+  day date not null,
+  campaign_name text check (campaign_name is null or char_length(campaign_name) <= 500),
+  campaign_status text check (campaign_status is null or char_length(campaign_status) <= 40),
+  impressions bigint not null default 0 check (impressions >= 0),
+  clicks bigint not null default 0 check (clicks >= 0),
+  -- Millionths of the account's currency, as Google reports cost.
+  cost_micros bigint not null default 0 check (cost_micros >= 0),
+  conversions numeric(14, 2) not null default 0 check (conversions >= 0),
+  conversion_value numeric(18, 2) not null default 0 check (conversion_value >= 0),
+  updated_at timestamptz not null default now(),
+  primary key (account_id, campaign_id, day)
+);
+
+-- An account's date range, for the Campaigns tab and the sync's windows.
+create index if not exists ads_campaign_daily_account_day_idx
+  on public.ads_campaign_daily (account_id, day);
+
+create table if not exists public.ads_search_term_daily (
+  account_id uuid not null references public.ads_accounts(id) on delete cascade,
+  campaign_id text not null check (char_length(campaign_id) between 1 and 64),
+  search_term text not null check (char_length(search_term) between 1 and 1000),
+  day date not null,
+  impressions bigint not null default 0 check (impressions >= 0),
+  clicks bigint not null default 0 check (clicks >= 0),
+  cost_micros bigint not null default 0 check (cost_micros >= 0),
+  conversions numeric(14, 2) not null default 0 check (conversions >= 0),
+  updated_at timestamptz not null default now(),
+  primary key (account_id, campaign_id, search_term, day)
+);
+
+create index if not exists ads_search_term_daily_account_day_idx
+  on public.ads_search_term_daily (account_id, day);
+
+comment on table public.ads_accounts is
+  'Ads Phase 1 (00560): an ad account a brand reads, on Google Ads (through an integration_accounts sign-in) or ChatGPT Ads (through the customer''s own key). Server only.';
+comment on table public.ads_account_keys is
+  'Ads Phase 1 (00560): a ChatGPT Ads account''s API key, encrypted by the API (AES-256-GCM, bound to the account id). Service role only; removed with its account.';
+comment on table public.ads_campaign_daily is
+  'Ads Phase 1 (00560): a campaign''s day (impressions, clicks, cost in micros, conversions) in the account''s currency, written by the sync. Server only.';
+comment on table public.ads_search_term_daily is
+  'Ads Phase 1 (00560): Google Ads search terms per campaign and day, written by the sync for the Overlap view. Server only.';
+
+-- ─── Who reads and writes ───────────────────────────────────────────────────
+
+alter table public.ads_accounts enable row level security;
+alter table public.ads_account_keys enable row level security;
+alter table public.ads_campaign_daily enable row level security;
+alter table public.ads_search_term_daily enable row level security;
+
+revoke all on table public.ads_accounts from public, anon, authenticated;
+revoke all on table public.ads_account_keys from public, anon, authenticated;
+revoke all on table public.ads_campaign_daily from public, anon, authenticated;
+revoke all on table public.ads_search_term_daily from public, anon, authenticated;
+grant all on table public.ads_accounts to service_role;
+grant all on table public.ads_account_keys to service_role;
+grant all on table public.ads_campaign_daily to service_role;
+grant all on table public.ads_search_term_daily to service_role;
+-- No grant and no policy for a session (anon, authenticated): it reads no row.
+
+notify pgrst, 'reload schema';
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- migrations/00562_cloro_pending_tasks_provider.sql
+-- ─────────────────────────────────────────────────────────────────────────
+-- ============================================================================
+-- 00562: which answer provider each pending task was submitted to
+-- ============================================================================
+-- cloro_pending_tasks holds the tasks a run waits on, for Cloro and Anakin
+-- alike (answer-providers/index.js). Each provider's webhook
+-- (routes/cloro-callback.js, routes/anakin-callback.js) looks a delivery up
+-- here by task id, so the row says whose task it is, and a webhook leaves
+-- another provider's task alone. Rows from before this file, and rows
+-- written without it, are Cloro's: null reads as 'cloro'.
+--
+-- Schema only: a nullable column with no default rewrites nothing, and the
+-- table holds one run's tasks at a time.
+
+alter table public.cloro_pending_tasks
+  add column if not exists provider text
+    check (provider is null or provider in ('cloro', 'anakin'));
+
